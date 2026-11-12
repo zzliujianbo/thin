@@ -9,9 +9,6 @@ const text = @import("text.zig");
 pub const Menu = @import("provider_picker.zig").Picker;
 pub const Rows = @import("settings_menu.zig").Rows;
 pub const Provider = @import("model_picker.zig").Provider;
-pub const max_models = 4096;
-pub const max_providers = 256;
-pub const max_selected = 4096;
 pub const max_name_bytes = 1089;
 pub const Fingerprint = [32]u8;
 
@@ -27,7 +24,7 @@ fn eligible(model: cfg.Model, providers: []const Provider) bool {
     if (!validName(model.name)) return false;
     const slash = std.mem.indexOfScalar(u8, model.name, '/') orelse return false;
     if (slash == 0 or slash + 1 == model.name.len) return false;
-    for (providers[0..@min(providers.len, max_providers)]) |entry| {
+    for (providers) |entry| {
         if (std.mem.eql(u8, entry.name, model.name[0..slash])) return true;
     }
     return false;
@@ -53,7 +50,7 @@ fn matches(label: []const u8, query: []const u8) bool {
 pub fn count(models: []const cfg.Model, providers: ?[]const Provider, query: []const u8) usize {
     const entries = providers orelse &.{};
     var n: usize = 0;
-    for (models[0..@min(models.len, max_models)]) |model| {
+    for (models) |model| {
         if (eligible(model, entries) and matches(model.name, query)) n += 1;
     }
     return n;
@@ -62,7 +59,7 @@ pub fn count(models: []const cfg.Model, providers: ?[]const Provider, query: []c
 pub fn candidate(models: []const cfg.Model, providers: ?[]const Provider, query: []const u8, index: usize) ?[]const u8 {
     const entries = providers orelse &.{};
     var n: usize = 0;
-    for (models[0..@min(models.len, max_models)]) |model| {
+    for (models) |model| {
         if (!eligible(model, entries) or !matches(model.name, query)) continue;
         if (n == index) return model.name;
         n += 1;
@@ -85,11 +82,9 @@ fn hashString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
 }
 
 /// Fixed-size identity proof over the candidates, the selected list and the
-/// configured host/port state. Work stays bounded; oversized state cannot
-/// authorize a save instead of allocating a snapshot.
+/// configured host/port state, without allocating a snapshot.
 pub fn fingerprint(models: []const cfg.Model, providers: ?[]const Provider, selected_models: []const []const u8, proxy_configured: bool, proxy_address: ?[]const u8, proxy_port: u16) ?Fingerprint {
     const entries = providers orelse &.{};
-    if (models.len > max_models or entries.len > max_providers or selected_models.len > max_selected) return null;
     const address = proxy_address orelse "";
     if (address.len > cfg.max_proxy_endpoint_bytes) return null;
     var candidates: usize = 0;

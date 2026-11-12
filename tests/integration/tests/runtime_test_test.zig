@@ -124,18 +124,19 @@ test "decision ask requires a new approval for every successive operation" {
     try std.testing.expectEqual(@as(u32, 2), fake.executions);
 }
 test "automatic no candidate is quiet below normal budget and manual no candidate is unchanged" {
-    var fake: Fake = .{};
+    var fake: Fake = .{ .stop_after = 0 };
     var config = configuration();
-    config.limits.compaction_trigger_percent = 2;
-    config.limits.compaction_target_percent = 1;
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
-    // The fixed system baseline alone stays over the 2% trigger yet well below
-    // the normal input budget, so this covers "no candidate while still fitting".
+    // Size the real window around the COMPLETE incoming request, not just
+    // the empty history's fixed overhead. Keep policy unchanged.
+    const pending = [_]p.Message{.{ .role = .user, .blocks = &.{.{ .text = "Do the task" }} }};
+    const incoming = runtime.estimator.tokens(context.rawTokens(runtime.system, &tool_schemas, &pending));
+    config.model.context_tokens = windowForInputBudget(@intCast(incoming * 100 / 81));
     const budget = context.inputBudget(config);
-    try std.testing.expect(runtime.estimatedTokens() > context.threshold(budget, 2));
-    try std.testing.expect(runtime.estimatedTokens() < budget);
+    try std.testing.expect(incoming > context.threshold(budget, cfg.Policy.compaction_trigger_percent));
+    try std.testing.expect(incoming < budget);
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(r.Status.success, (try runtime.run("Do the task", &cancel)).status);
     try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
@@ -346,10 +347,7 @@ test "tool duration measures success failure and cancellation but not denial or 
 test "owner publishes actual request snapshots across tools and compaction not cumulative usage" {
     const a = std.testing.allocator;
     var fake: Fake = .{ .output = &long_output, .stop_after = 7, .nonzero_usage = true };
-    var config = smallConfiguration();
-    // Nonzero usage raises the safety multiplier; leave room for the summary
-    // instruction as well as retained input, instead of an invalid late trigger.
-    config.limits.compaction_trigger_percent = 70;
+    const config = smallConfiguration();
     var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
@@ -363,7 +361,7 @@ test "owner publishes actual request snapshots across tools and compaction not c
     try std.testing.expectEqual(r.Status.success, result.status);
     try std.testing.expect(fake.compactions > 0 and fake.snapshots > fake.executions);
     try std.testing.expectEqualDeep(runtime.contextSnapshot(), fake.last_context.?);
-    try std.testing.expectEqual(@as(u64, 3000), fake.last_context.?.limit);
+    try std.testing.expectEqual(@as(u64, config.model.context_tokens), fake.last_context.?.limit);
     try std.testing.expect(fake.last_context.?.known);
     try std.testing.expectEqual(fake.last_actual_total.?, fake.last_context.?.tokens);
     try std.testing.expect(runtime.estimator.per_mille > 1000);
@@ -395,9 +393,9 @@ test "context publication failure inside committed batch still pairs every unsta
     try std.testing.expectEqual(calls, results);
     try std.testing.expectEqualDeep(runtime.contextSnapshot(), result.context_snapshot.?);
 }
-test "file metadata survives actual result fitting and prepare errors publish retained snapshots" {
+test "file metadata survives complete results and prepare errors publish retained snapshots" {
     const large: [20000]u8 = @splat('x');
-    var config = smallConfiguration();
+    var config = configuration();
     var fake: Fake = .{ .output = &large, .file_stats = .{ .changes = .{ .modified = 2, .added = 3, .removed = 4 } } };
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "system");
     defer runtime.deinit();
@@ -405,7 +403,8 @@ test "file metadata survives actual result fitting and prepare errors publish re
     var cancel = p.Cancellation{};
     const result = try runtime.run("task", &cancel);
     try std.testing.expectEqual(r.Status.success, result.status);
-    try std.testing.expect(fake.fitted_result);
+    try std.testing.expect(!fake.fitted_result);
+    try std.testing.expectEqualStrings(&large, fake.last_result);
     try std.testing.expectEqualDeep(fake.file_stats, fake.last_file_stats);
     var denied: Fake = .{ .fail_prepare = true };
     var next = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, denied.model(), denied.executor(), denied.host(), "system");
@@ -616,7 +615,6 @@ test "Runtime rejected prompts keep outstanding allocations bounded" {
             const calls_before = fake.normal_calls;
             const messages_before = runtime.messages().len;
             const oversized: [16000]u8 = @splat('x');
-            try std.testing.expect(oversized.len < config.limits.max_response_bytes);
             var first_outstanding: usize = 0;
             for (0..16) |i| {
                 const terminal = try runtime.run(&oversized, &cancel);
@@ -652,25 +650,27 @@ test "Runtime successful input owns bytes after caller mutation" {
     try std.testing.expectEqual(r.Status.success, (try runtime.run("continue", &cancel)).status);
     try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
 }
-test "Runtime round pause after compaction retains the remapped explicit goal" {
+test "Runtime finite tool rounds after compaction retain the remapped explicit goal" {
     var fake = Fake{ .stop_after = 0 };
     var config = configuration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
     var cancel = p.Cancellation{};
-    const older: [6000]u8 = @splat('x');
-    try std.testing.expectEqual(r.Status.success, (try runtime.run(&older, &cancel)).status);
-    config = smallConfiguration();
-    config.limits.compaction_trigger_percent = 50;
-    // Compaction is free. The one model round runs a tool, then the next loop pauses.
-    config.limits.max_rounds = 1;
-    fake.stop_after = 100;
+    var small = configuration();
+    small.model.context_tokens = windowForInputBudget(6000);
+    const trigger = context.threshold(context.inputBudget(small), cfg.Policy.compaction_trigger_percent);
+    const older = try std.testing.allocator.alloc(u8, (trigger + 128) * 3);
+    defer std.testing.allocator.free(older);
+    @memset(older, 'x');
+    try std.testing.expectEqual(r.Status.success, (try runtime.run(older, &cancel)).status);
+    config = small;
+    // One finite tool round followed by a final answer, without a round cap.
+    fake.stop_after = 2;
     const terminal = try runtime.run("Do the task", &cancel);
-    try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
-    try std.testing.expectEqual(r.Status.paused, terminal.status);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
     try std.testing.expectEqual(@as(u32, 1), fake.compactions);
-    try std.testing.expectEqual(@as(u32, 2), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 3), fake.normal_calls);
     try std.testing.expectEqual(@as(u32, 1), fake.executions);
     var kept_goal = false;
     for (runtime.messages()) |message| {
@@ -709,19 +709,17 @@ test "permission ids do not wrap into a non-monotonic host id" {
     try std.testing.expectEqual(@as(u64, 1), rebased.permission_id);
     try std.testing.expectEqual(@as(u32, 1), fake.executions);
 }
-test "Runtime unlimited default omitted and null exceed fifty rounds after checkpoint restore" {
+test "Runtime unlimited default and parsed config exceed fifty rounds after checkpoint restore" {
     const a = std.testing.allocator;
     const inputs = [_][]const u8{
         "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":32768,\"protocol\":\"chat\"}}}}},\"limits\":{\"low_price_input\":false}}",
-        "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":32768,\"protocol\":\"chat\"}}}}},\"limits\":{\"low_price_input\":false,\"max_rounds\":null}}",
     };
-    for (0..3) |variant| {
-        var parsed = try cfg.parse(a, inputs[if (variant == 2) 1 else 0]);
+    for (0..2) |variant| {
+        var parsed = try cfg.parse(a, inputs[0]);
         defer cfg.release(&parsed);
         const empty_cache: @import("../app/model_metadata.zig").Cache = .{};
         try @import("../app/model_resolver.zig").applyDefault(parsed.arena.allocator(), &parsed.value, &empty_cache);
         const config = if (variant == 0) configuration() else parsed.value;
-        try std.testing.expect(config.limits.max_rounds == null);
         var fake: Fake = .{ .stop_after = 55, .explicit_denial = null };
         var original = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
         defer original.deinit();
@@ -742,12 +740,9 @@ test "Runtime unlimited default omitted and null exceed fifty rounds after check
         try std.testing.expectEqual(@as(u32, 55), fake.executions);
     }
 }
-test "Runtime explicit fifty survives config and checkpoint roundtrip and pauses with free compaction" {
+test "Runtime exceeds fifty with config and checkpoint roundtrip and compaction" {
     const a = std.testing.allocator;
-    var config = smallConfiguration();
-    // Leave room for the summary instruction during repeated compactions.
-    config.limits.compaction_trigger_percent = 70;
-    config.limits.max_rounds = 50;
+    const config = smallConfiguration();
     var copied = try cfg.clone(a, config);
     defer cfg.release(&copied);
     var fake: Fake = .{ .stop_after = 55, .output = &long_output, .explicit_denial = null };
@@ -764,10 +759,9 @@ test "Runtime explicit fifty survives config and checkpoint roundtrip and pauses
     fake.current_runtime = &runtime;
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run("Do the task", &cancel);
-    try std.testing.expectEqual(r.Status.paused, terminal.status);
-    try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
-    try std.testing.expectEqual(@as(u32, 50), fake.normal_calls);
-    try std.testing.expectEqual(@as(u32, 50), fake.executions);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expectEqual(@as(u32, 56), fake.normal_calls);
+    try std.testing.expectEqual(@as(u32, 55), fake.executions);
     try std.testing.expect(fake.summary_calls > 0);
     try std.testing.expectEqual(fake.summary_calls, fake.compactions);
 }
@@ -775,15 +769,13 @@ test "Runtime unlimited still compacts beyond fifty and cancellation stops it" {
     for ([_]bool{ false, true }) |cancel_run| {
         var cancel: p.Cancellation = .{};
         var fake: Fake = .{
-            .stop_after = if (cancel_run) std.math.maxInt(u32) else 55,
+            .stop_after = 55,
             .output = &long_output,
             .explicit_denial = null,
             .cancel_after_execution = if (cancel_run) &cancel else null,
             .cancel_execution_number = 55,
         };
-        var config = smallConfiguration();
-        // Fixture budget must fit both history and the summary instruction.
-        config.limits.compaction_trigger_percent = 70;
+        const config = smallConfiguration();
         var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
         defer runtime.deinit();
         fake.current_runtime = &runtime;
@@ -797,18 +789,17 @@ test "Runtime unlimited still compacts beyond fifty and cancellation stops it" {
         try std.testing.expectEqual(@as(u32, 1), fake.terminals);
     }
 }
-test "Runtime round budget pauses and explicit continuation never replays completed tools" {
-    var fake = Fake{ .stop_after = 1 };
-    var config = configuration();
-    config.limits.max_rounds = 1;
+test "Runtime cancellation and explicit continuation never replay completed tools" {
+    var cancel = p.Cancellation{};
+    var fake = Fake{ .stop_after = 1, .cancel_after_execution = &cancel };
+    const config = configuration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
-    var cancel = p.Cancellation{};
     var goal = "Do the task".*;
     const paused = try runtime.run(&goal, &cancel);
-    try std.testing.expectEqual(r.Status.paused, paused.status);
-    try std.testing.expectEqual(error.RoundLimit, paused.detail.?);
+    try std.testing.expectEqual(r.Status.canceled, paused.status);
+    try std.testing.expectEqual(error.Canceled, paused.detail.?);
     try std.testing.expect(paused.model_failure == null);
     try std.testing.expectEqual(@as(u32, 1), fake.normal_calls);
     try std.testing.expectEqual(@as(u32, 1), fake.executions);
@@ -816,7 +807,9 @@ test "Runtime round budget pauses and explicit continuation never replays comple
     try std.testing.expectEqualStrings(runtime.messages()[1].blocks[0].tool_call.id, runtime.messages()[2].blocks[0].tool_result.call_id);
     @memset(&goal, 'x');
     try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
-    try std.testing.expectEqual(r.Status.success, (try runtime.run("continue", &cancel)).status);
+    fake.cancel_after_execution = null;
+    var next_cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("continue", &next_cancel)).status);
     try std.testing.expectEqual(@as(u32, 2), fake.normal_calls);
     try std.testing.expectEqual(@as(u32, 1), fake.executions);
     try std.testing.expectEqual(@as(u32, 2), fake.terminals);
@@ -1022,8 +1015,7 @@ test "Runtime rolls a single summary within a long plain tool task and continues
 }
 test "summary tool calls are never executed and failure preserves history" {
     var fake = Fake{ .stop_after = 20, .output = &long_output, .bad_summary = true };
-    var config = smallConfiguration();
-    config.limits.max_rounds = 6;
+    const config = smallConfiguration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
@@ -1064,10 +1056,7 @@ test "actual summary context distinguishes thrown request from rejected atomic c
             .summary_usage = .{ .input_tokens = 12, .output_tokens = 34, .total_tokens = 46 },
             .cancel_compaction_failure = &cancel,
         };
-        var config = smallConfiguration();
-        // Leave room for the summary instruction after real-input calibration;
-        // the production trigger/budgets are unchanged.
-        config.limits.compaction_trigger_percent = 70;
+        const config = smallConfiguration();
         var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
         defer runtime.deinit();
         fake.current_runtime = &runtime;
@@ -1087,18 +1076,34 @@ test "actual summary context distinguishes thrown request from rejected atomic c
         for (runtime.messages()) |message| try std.testing.expect(message.role != .context);
     }
 }
-test "task deadline reaches a blocked model independently of output" {
+test "explicit cancellation reaches a blocked individual model request" {
+    const Job = struct {
+        runtime: *r.Runtime,
+        cancel: *p.Cancellation,
+        fn run(self: *@This()) !r.Terminal {
+            return self.runtime.run("Do the task", self.cancel);
+        }
+    };
     var fake = Fake{ .block_model = true };
-    var config = configuration();
-    config.limits.task_timeout_ms = 100;
+    const config = configuration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
     var cancel = p.Cancellation{};
-    const terminal = try runtime.run("Do the task", &cancel);
-    try std.testing.expectEqual(r.Status.failed, terminal.status);
-    try std.testing.expectEqual(error.TaskTimeout, terminal.detail.?);
-    try std.testing.expect(fake.entered_model);
+    var job = Job{ .runtime = &runtime, .cancel = &cancel };
+    var future = try std.Io.concurrent(std.testing.io, Job.run, .{&job});
+    defer {
+        cancel.cancel();
+        _ = future.cancel(std.testing.io) catch {};
+    }
+    var attempts: usize = 0;
+    while (!fake.entered_model.load(.acquire) and attempts < 500) : (attempts += 1)
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(2), .awake);
+    try std.testing.expect(fake.entered_model.load(.acquire));
+    cancel.cancel();
+    const terminal = try future.await(std.testing.io);
+    try std.testing.expectEqual(r.Status.canceled, terminal.status);
+    try std.testing.expectEqual(error.Canceled, terminal.detail.?);
     try std.testing.expectEqual(@as(u32, 1), fake.terminals);
 }
 test "standalone runtime pairs observer spans for commit and finish without delta spans" {
@@ -1271,8 +1276,7 @@ test "manual summary output limit pauses with history intact and no normal fallb
 }
 test "manual compaction summary-only Job has one terminal and unknown post-summary context" {
     var fake: Fake = .{ .summary_usage = .{ .input_tokens = 100, .output_tokens = 10 } };
-    var config = smallConfiguration(); // well BELOW automatic threshold
-    config.limits.compaction_target_percent = 10;
+    const config = smallConfiguration(); // well BELOW automatic threshold
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
     fake.current_runtime = &runtime;
@@ -1327,7 +1331,7 @@ test "manual compaction below automatic target includes long old assistant and r
             .last_context_tokens = 500,
             .permission_id = 0,
         });
-        try std.testing.expect(runtime.estimatedTokens() < context.threshold(context.inputBudget(config), config.limits.compaction_trigger_percent));
+        try std.testing.expect(runtime.estimatedTokens() < context.threshold(context.inputBudget(config), cfg.Policy.compaction_trigger_percent));
         var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer scratch.deinit();
         const automatic = try context.plan(scratch.allocator(), config, runtime.estimator, runtime.system, &tool_schemas, runtime.messages(), 2);
@@ -1359,8 +1363,7 @@ test "manual compaction canceled or failed summary preserves canonical history a
             .throw_summary = mode == 2,
             .summary_usage = .{ .input_tokens = 100, .output_tokens = 10 },
         };
-        var config = smallConfiguration();
-        config.limits.compaction_target_percent = 10;
+        const config = smallConfiguration();
         var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
         defer runtime.deinit();
         fake.current_runtime = &runtime;
@@ -1425,12 +1428,20 @@ test "frozen output metadata provenance never changes physical input checks" {
     const prefix = "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":131072,\"protocol\":\"chat\"}}}}},\"limits\":";
     var parsed = try cfg.parse(t.allocator, prefix ++ "{\"low_price_input\":false}}");
     defer cfg.release(&parsed);
-    try t.expectEqual(@as(u32, 4096), parsed.value.limits.safety_tokens);
-    for ([_][]const u8{ "{\"max_output_tokens\":null}", "{\"max_output_tokens\":4096}", "{\"summary_tokens\":100}" }) |limits| {
+    try t.expectEqual(@as(u32, 4096), cfg.Policy.safety_tokens);
+    for ([_][]const u8{ "{\"max_output_tokens\":null}", "{\"max_output_tokens\":4096}", "{\"summary_tokens\":100}", "{\"unknown_input_tokens\":100}" }) |limits| {
         const json = try std.mem.concat(t.allocator, u8, &.{ prefix, limits, "}" });
         defer t.allocator.free(json);
         try t.expectError(error.UnknownField, cfg.parse(t.allocator, json));
     }
+    var legacy = try cfg.parse(t.allocator, prefix ++ "{\"low_price_input\":false,\"max_input_tokens\":100000,\"input_margin_tokens\":5000,\"max_rounds\":50,\"task_timeout_ms\":100}}");
+    defer cfg.release(&legacy);
+    try t.expectEqualDeep(parsed.value.limits, legacy.value.limits);
+    var canonical: std.Io.Writer.Allocating = .init(t.allocator);
+    defer canonical.deinit();
+    try cfg.writeDisk(legacy.value, &canonical.writer);
+    for ([_][]const u8{ "\"max_input_tokens\"", "\"input_margin_tokens\"", "\"max_rounds\"", "\"task_timeout_ms\"" }) |retired|
+        try t.expect(std.mem.indexOf(u8, canonical.written(), retired) == null);
     var config = configuration();
     config.model.context_tokens = 131072;
     config.model.output_source = .metadata;
@@ -1451,7 +1462,7 @@ test "frozen output metadata provenance never changes physical input checks" {
     config.model.output_tokens = 0;
     try t.expectError(error.InvalidBudget, cfg.validate(config));
     config.model.output_tokens = 1048577;
-    try t.expectError(error.InvalidBudget, cfg.validate(config));
+    try cfg.validate(config); // Actual capability metadata has no local capacity quota.
     config.model.output_tokens = null;
     try t.expectError(error.ContextTooLarge, context.checkInput(config, std.math.maxInt(usize)));
     const estimator: context.Estimator = .{ .per_mille = std.math.maxInt(u64) };
@@ -1519,7 +1530,7 @@ test "summary text is not rejected by a former local output token ceiling" {
 test "physical context exhaustion sends no request" {
     var fake: Fake = .{};
     var config = configuration();
-    config.model.context_tokens = 5000;
+    config.model.context_tokens = windowForInputBudget(1000);
     config.model.output_tokens = 131072;
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
     defer runtime.deinit();
@@ -1527,7 +1538,8 @@ test "physical context exhaustion sends no request" {
     const oversized: [6000]u8 = @splat('x');
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run(&oversized, &cancel);
-    try std.testing.expectEqual(error.ContextTooLarge, terminal.detail.?);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(@as(?anyerror, error.ContextTooLarge), terminal.detail);
     try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
     try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
     try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);

@@ -113,7 +113,7 @@ test "App automatic memory skips Decision even when configured and preserves pri
             try std.testing.expect(app.client.authorization.ptr == primary);
             try std.testing.expectEqualDeep(context, app.runtime.contextSnapshot());
             // Off is not a switch disabling manual memory or project retrieval.
-            const reference = try app.memory_coordinator.retrieve(a, "concise reviews", 1024);
+            const reference = try app.memory_coordinator.retrieve(a, "concise reviews");
             defer a.free(reference);
             try std.testing.expect(std.mem.find(u8, reference, "concise") != null);
             app.journal.flush();

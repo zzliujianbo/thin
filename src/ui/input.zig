@@ -331,12 +331,11 @@ pub const Editor = struct {
         self.bytes.deinit(self.allocator);
     }
 
-    /// 在光标处插入 value。超过 65536 字节上限时返回 false 且不修改内容。
+    /// 在光标处插入 value；分配失败时保持原内容和光标。
     pub fn insert(self: *Editor, value: []const u8) !bool {
-        if (value.len > 65536 - self.bytes.items.len) return false;
-
         const old = self.bytes.items.len;
-        try self.bytes.resize(self.allocator, old + value.len);
+        const len = std.math.add(usize, old, value.len) catch return error.OutOfMemory;
+        try self.bytes.resize(self.allocator, len);
 
         // 中文：先把光标后的尾部整体后移，腾出空间再拷贝新内容。
         std.mem.copyBackwards(u8, self.bytes.items[self.cursor + value.len ..], self.bytes.items[self.cursor..old]);

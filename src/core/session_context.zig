@@ -3,15 +3,12 @@
 //! git root of the session cwd, or at that cwd when it is not inside a git work tree.
 //! Intermediate parents and subdirectories are not searched. Override files win over
 //! the base name at the same directory. Missing or unreadable files are skipped.
-//! 中文：只注入两处 AGENTS（thin 主目录、仓库根），缺文件就跳过；总正文不超过 32KiB。
+//! 中文：只注入两处 AGENTS（thin 主目录、仓库根），缺文件就跳过。
 
 const std = @import("std");
 const builtin = @import("builtin");
 const fs = @import("../platform/filesystem.zig");
 const skill_catalog = @import("skill_catalog.zig");
-
-/// Combined raw AGENTS file bytes injected into one session preface.
-pub const max_agents_bytes: usize = 32 * 1024;
 
 /// Body used when a later turn drops previously injected AGENTS text.
 pub const agents_cleared = "source: none\n";
@@ -27,7 +24,7 @@ pub const Snapshot = struct {
     arch: std.Target.Cpu.Arch = builtin.cpu.arch,
     /// Formatted layer text. Empty when both sources are absent.
     agents: []const u8,
-    /// Concatenated file bytes only, in discovery order. Never above max_agents_bytes.
+    /// Concatenated file bytes only, in discovery order.
     agents_text: []const u8,
     truncated: bool,
 };
@@ -52,7 +49,6 @@ pub fn validateSnapshot(snap: Snapshot) !void {
     try requireField(snap.cwd, true);
     try requireField(snap.shell, false);
     try requireField(snap.project_root, true);
-    if (snap.agents_text.len > max_agents_bytes) return error.AgentsTooLarge;
     if (snap.agents.len != 0 and !std.unicode.utf8ValidateSlice(snap.agents)) return error.InvalidSessionContext;
 }
 
@@ -148,18 +144,16 @@ pub fn load(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8,
     errdefer raw.deinit(a);
     var formatted: std.ArrayList(u8) = .empty;
     errdefer formatted.deinit(a);
-    var budget: usize = max_agents_bytes;
-    var truncated = false;
 
     var global_opt = try openThinHome(a, io, home);
     if (global_opt) |*global| {
         defer global.deinit();
-        try takeLayer(a, io, global.dir.handle, global.path, .global, &budget, &truncated, &raw, &formatted);
+        try takeLayer(a, io, global.dir.handle, global.path, .global, &raw, &formatted);
     }
 
     var project = try fs.Root.open(a, io, project_root);
     defer project.deinit();
-    try takeLayer(a, io, project.dir.handle, project.path, .project, &budget, &truncated, &raw, &formatted);
+    try takeLayer(a, io, project.dir.handle, project.path, .project, &raw, &formatted);
     try skill_catalog.append(a, io, home, &formatted);
 
     const shell_copy = try a.dupe(u8, shell_text);
@@ -170,7 +164,7 @@ pub fn load(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8,
         .project_root = project_root,
         .agents = formatted.items,
         .agents_text = raw.items,
-        .truncated = truncated,
+        .truncated = false,
     };
     try validateSnapshot(snap);
     return snap;
@@ -201,21 +195,15 @@ fn takeLayer(
     dirfd: c_int,
     dir_path: []const u8,
     source: Source,
-    budget: *usize,
-    truncated: *bool,
     raw: *std.ArrayList(u8),
     formatted: *std.ArrayList(u8),
 ) !void {
-    const choice = try preferred(a, io, dirfd, budget.*);
+    const choice = try preferred(a, io, dirfd);
     switch (choice) {
         .missing, .invalid => return,
         .data => |data| {
             defer if (data.bytes.len != 0) a.free(data.bytes);
-            if (data.truncated) truncated.* = true;
-            // A later source can be nonempty while the shared budget is already
-            // spent. Still name that source and mark the cut; an empty body with
-            // no marker looks like the project file was absent.
-            if (data.bytes.len == 0 and !data.truncated) return;
+            if (data.bytes.len == 0) return;
             const path = try std.fs.path.join(a, &.{ dir_path, data.name });
             defer a.free(path);
             try formatted.appendSlice(a, "source: ");
@@ -228,12 +216,6 @@ fn takeLayer(
                 try formatted.appendSlice(a, data.bytes);
                 if (data.bytes[data.bytes.len - 1] != '\n') try formatted.append(a, '\n');
             }
-            if (data.truncated) {
-                try formatted.appendSlice(a, "[truncated]\n");
-                budget.* = 0;
-            } else {
-                budget.* -= data.bytes.len;
-            }
         },
     }
 }
@@ -245,20 +227,20 @@ const Chosen = union(enum) {
 };
 
 /// Override wins. A present override is never replaced by AGENTS.md, even when empty or unreadable.
-fn preferred(a: std.mem.Allocator, io: std.Io, dirfd: c_int, budget: usize) !Chosen {
-    switch (try readFile(a, io, dirfd, "AGENTS.override.md", budget)) {
+fn preferred(a: std.mem.Allocator, io: std.Io, dirfd: c_int) !Chosen {
+    switch (try readFile(a, io, dirfd, "AGENTS.override.md")) {
         .missing => {},
         .invalid => return .invalid,
         .data => |data| return .{ .data = .{ .name = "AGENTS.override.md", .bytes = data.bytes, .truncated = data.truncated } },
     }
-    switch (try readFile(a, io, dirfd, "AGENTS.md", budget)) {
+    switch (try readFile(a, io, dirfd, "AGENTS.md")) {
         .missing => return .missing,
         .invalid => return .invalid,
         .data => |data| return .{ .data = .{ .name = "AGENTS.md", .bytes = data.bytes, .truncated = data.truncated } },
     }
 }
 
-fn readFile(a: std.mem.Allocator, io: std.Io, dirfd: c_int, name: [*:0]const u8, budget: usize) !Read {
+fn readFile(a: std.mem.Allocator, io: std.Io, dirfd: c_int, name: [*:0]const u8) !Read {
     const fd = fs.openAt(dirfd, name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
     if (fd < 0) {
         return switch (fs.errno()) {
@@ -274,35 +256,16 @@ fn readFile(a: std.mem.Allocator, io: std.Io, dirfd: c_int, name: [*:0]const u8,
     const stat = try fs.fileFromFd(fd).stat(io);
     if (stat.kind != .file) return .invalid;
     if (stat.size == 0) return .{ .data = .{ .bytes = &.{}, .truncated = false } };
-    if (budget == 0) return .{ .data = .{ .bytes = &.{}, .truncated = true } };
-
-    const want: usize = @intCast(@min(stat.size, @as(u64, budget)));
+    const want = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
     const buf = try a.alloc(u8, want);
     errdefer a.free(buf);
     const n = try fs.fileFromFd(fd).readPositionalAll(io, buf, 0);
     if (n != want) return error.FileChanged;
-    const keep = utf8Prefix(buf);
-    if (keep < buf.len and stat.size == want) {
+    fs.validateText(buf) catch {
         a.free(buf);
         return .invalid;
-    }
-    const exact = if (keep == buf.len) buf else try a.dupe(u8, buf[0..keep]);
-    if (exact.ptr != buf.ptr) a.free(buf);
-    fs.validateText(exact) catch {
-        a.free(exact);
-        return .invalid;
     };
-    return .{ .data = .{ .bytes = exact, .truncated = stat.size > keep } };
-}
-
-fn utf8Prefix(bytes: []const u8) usize {
-    var end: usize = 0;
-    while (end < bytes.len) {
-        const width = std.unicode.utf8ByteSequenceLength(bytes[end]) catch return end;
-        if (width > bytes.len - end) return end;
-        end += width;
-    }
-    return end;
+    return .{ .data = .{ .bytes = buf, .truncated = false } };
 }
 
 /// Git root of `cwd`, or `cwd` itself when no `.git` marker exists on the walk.

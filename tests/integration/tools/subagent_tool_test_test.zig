@@ -15,7 +15,7 @@ test "subagent job tools publish exactly when the host service exists" {
     try std.testing.expectEqual(parent.ptr, tools.executor().schemas.ptr);
     try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "Parent and child tools can run concurrently") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent[4].description, "coordinate overlapping changes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parent[4].parameters_json, "\"model\":{\"type\":[\"string\",\"null\"],\"minLength\":1,\"maxLength\":1089}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[4].parameters_json, "\"model\":{\"type\":[\"string\",\"null\"],\"minLength\":1}") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent[4].parameters_json, "\"additionalProperties\":false") != null);
     const parsed_schema = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, parent[4].parameters_json, .{});
     defer parsed_schema.deinit();
@@ -28,16 +28,29 @@ test "subagent job tools publish exactly when the host service exists" {
     try std.testing.expect(model_type.array.items[1] == .string);
     try std.testing.expectEqualStrings("null", model_type.array.items[1].string);
     const model_min = model_schema.get("minLength").?;
-    const model_max = model_schema.get("maxLength").?;
+    try std.testing.expect(model_schema.get("maxLength") == null);
     try std.testing.expect(model_min == .integer);
     try std.testing.expectEqual(@as(i64, 1), model_min.integer);
-    try std.testing.expect(model_max == .integer);
-    try std.testing.expectEqual(@as(i64, 1089), model_max.integer);
+    const properties = parsed_schema.value.object.get("properties").?.object;
+    try std.testing.expectEqual(@as(i64, 1), properties.get("task").?.object.get("minLength").?.integer);
+    try std.testing.expect(properties.get("task").?.object.get("maxLength") == null);
+    try std.testing.expect(properties.get("context").?.object.get("minLength") == null);
+    try std.testing.expect(properties.get("context").?.object.get("maxLength") == null);
+    for (parent[5..8]) |schema| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema.parameters_json, .{});
+        defer parsed.deinit();
+        const props = parsed.value.object.get("properties").?.object;
+        try std.testing.expectEqual(@as(i64, 1), props.get("id").?.object.get("minLength").?.integer);
+        if (props.get("message")) |message| {
+            try std.testing.expectEqual(@as(i64, 1), message.object.get("minLength").?.integer);
+            try std.testing.expect(message.object.get("maxLength") == null);
+        }
+    }
     // A terminal job is collected even with wait=false, so the report must be kept.
     try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "collected and released even with wait=false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "bounded terminal cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[5].description, "retained result for this root task") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent[7].description, "already collected") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parent[7].description, "bounded terminal cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent[7].description, "retained result for this root task") != null);
 
     var image_dummy: u8 = 0;
     tools.image = .{ .context = &image_dummy, .inspect_fn = FakeImage.inspect, .check_fn = FakeImage.check };
@@ -194,7 +207,7 @@ test "parent write and bash execute with an uncollected child" {
     var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
     defer root.deinit();
     var config = fixtureConfig();
-    var store = mem.Store.init(&root, config.limits);
+    var store = mem.Store.init(&root);
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/bin:/bin");
@@ -222,7 +235,7 @@ test "parent write and bash execute with an uncollected child" {
     const got = try tools.execute(a, .{ .get_subagent_result = .{ .id = "job-1" } }, &cancel);
     try std.testing.expectEqualStrings(payload_snapshot, got.text);
 }
-test "subagent model references are strict and preserve maximum escaped envelope" {
+test "subagent model references are strict and preserve large escaped input" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -258,21 +271,25 @@ test "subagent model references are strict and preserve maximum escaped envelope
         try std.testing.expectError(error.InvalidSubagentModel, sub.validate(.{ .task = "x", .model = model }));
     }
 
-    const escaped_task = try a.alloc(u8, 6 * sub.max_task_bytes);
-    const escaped_context = try a.alloc(u8, 6 * sub.max_context_bytes);
+    const task_len = 8193;
+    const context_len = 16385;
+    const escaped_task = try a.alloc(u8, 6 * task_len);
+    const escaped_context = try a.alloc(u8, 6 * context_len);
     const escaped_model = try a.alloc(u8, 6 * sub.max_model_bytes);
-    for (0..sub.max_task_bytes) |i| @memcpy(escaped_task[i * 6 ..][0..6], "\\u0074");
-    for (0..sub.max_context_bytes) |i| @memcpy(escaped_context[i * 6 ..][0..6], "\\u0063");
+    for (0..task_len) |i| @memcpy(escaped_task[i * 6 ..][0..6], "\\u0074");
+    for (0..context_len) |i| @memcpy(escaped_context[i * 6 ..][0..6], "\\u0063");
     for (0..sub.max_model_bytes) |i| @memcpy(escaped_model[i * 6 ..][0..6], if (i == 64) "\\u002f" else "\\u0061");
     const json = try std.fmt.allocPrint(a, "{{\"task\":\"{s}\",\"context\":\"{s}\",\"model\":\"{s}\"}}", .{ escaped_task, escaped_context, escaped_model });
     const max = try tools_mod.parse(a, "subagent", json, limits);
+    try std.testing.expectEqual(@as(usize, task_len), max.subagent.task.len);
+    try std.testing.expectEqual(@as(usize, context_len), max.subagent.context.?.len);
     try std.testing.expectEqual(@as(usize, sub.max_model_bytes), max.subagent.model.?.len);
     const expected = try a.alloc(u8, sub.max_model_bytes);
     @memset(expected, 'a');
     expected[64] = '/';
     try std.testing.expectEqualStrings(expected, max.subagent.model.?);
 }
-test "job control arguments stay strict bounded and utf8 checked" {
+test "job control arguments stay strict and utf8 checked" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -289,9 +306,10 @@ test "job control arguments stay strict bounded and utf8 checked" {
     try std.testing.expectError(error.MissingField, tools_mod.parse(a, "send_subagent_message", "{\"id\":\"j\"}", limits));
     try std.testing.expectError(error.InvalidSubagentMessage, tools_mod.parse(a, "send_subagent_message", "{\"id\":\"j\",\"message\":\"\"}", limits));
     try std.testing.expectError(error.InvalidSubagentMessage, tools_mod.parse(a, "send_subagent_message", "{\"id\":\"j\",\"message\":\"a\\u0000b\"}", limits));
-    const long_message: [sub.max_message_bytes + 1]u8 = @splat('m');
+    const long_message: [4097]u8 = @splat('m');
     const message_json = try std.fmt.allocPrint(a, "{{\"id\":\"j\",\"message\":\"{s}\"}}", .{long_message[0..]});
-    try std.testing.expectError(error.InvalidSubagentMessage, tools_mod.parse(a, "send_subagent_message", message_json, limits));
+    const long_send = try tools_mod.parse(a, "send_subagent_message", message_json, limits);
+    try std.testing.expectEqualStrings(&long_message, long_send.send_subagent_message.message);
 
     try std.testing.expectError(error.UnknownField, tools_mod.parse(a, "cancel_subagent", "{\"id\":\"j\",\"force\":true}", limits));
     try std.testing.expectError(error.MissingField, tools_mod.parse(a, "cancel_subagent", "{}", limits));
@@ -366,7 +384,7 @@ test "pre-canceled write and bash perform no side effects" {
     var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
     defer root.deinit();
     var config = fixtureConfig();
-    var store = mem.Store.init(&root, config.limits);
+    var store = mem.Store.init(&root);
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/bin:/bin");

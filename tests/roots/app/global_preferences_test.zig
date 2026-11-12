@@ -42,7 +42,7 @@ fn seed(home: []const u8, config: []const u8, legacy: ?[]const u8) !void {
 fn read(home: []const u8, name: []const u8) ![]const u8 {
     var store = try Store.openExisting(a, io, home);
     defer store.deinit();
-    return (try store.root.read(a, name, 0, cfg.max_config_bytes)).data;
+    return try store.root.readBinaryGuarded(a, name, null, null);
 }
 fn toggle(session: *Session, setting: @import("../ui/tui.zig").Connection.Setting, enabled: bool) !void {
     const connection = session.connection();

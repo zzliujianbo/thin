@@ -47,6 +47,14 @@ fn testConfig() cfg.Config {
     return .{ .provider = .{ .base_url = "http://primary.invalid/v1", .api_key_env = "SYNTHETIC_MEMORY_KEY" }, .selected_provider = "primary", .model = .{ .name = "primary/model", .protocol = .chat, .context_tokens = 32768, .output_tokens = 8192, .input_price_flat_limit = 32768 }, .limits = .{ .request_timeout_ms = 1234 } };
 }
 
+fn windowForInputBudget(budget: u32) u32 {
+    std.debug.assert(budget > 0);
+    const room = @as(u64, budget) + 1;
+    const window: u32 = @intCast(room + @min(cfg.Policy.safety_tokens, room / 7));
+    std.debug.assert(@as(u64, window) - cfg.Policy.safetyTokens(window) - 1 == budget);
+    return window;
+}
+
 fn creationCase(a: std.mem.Allocator) !void {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -59,8 +67,7 @@ fn creationCase(a: std.mem.Allocator) !void {
     try env.put("SYNTHETIC_MEMORY_KEY", "replaced");
     try std.testing.expectEqualStrings("Bearer own-key", client.transport.?.authorization);
     try std.testing.expectEqual(testConfig().model.output_tokens, client.source.value.model.output_tokens);
-    try std.testing.expectEqual(testConfig().limits.max_response_bytes, client.source.value.limits.max_response_bytes);
-    try std.testing.expectEqual(testConfig().limits.max_event_bytes, client.source.value.limits.max_event_bytes);
+    try std.testing.expectEqualDeep(testConfig().limits, client.source.value.limits);
 }
 
 const WireFake = struct {

@@ -17,7 +17,7 @@ fn seed(home: []const u8, bytes: []const u8) !void {
 fn disk(home: []const u8) ![]const u8 {
     var store = try Store.openExisting(a, io, home);
     defer store.deinit();
-    return (try store.root.read(a, cfg.file_name, 0, cfg.max_config_bytes)).data;
+    return try store.root.readBinaryGuarded(a, cfg.file_name, null, null);
 }
 fn choose(session: *Session, name: []const u8) !void {
     const connection = session.connection();
@@ -58,9 +58,12 @@ fn publishListing(home: []const u8, provider: cfg.providers.Id, body: []const u8
     var store = try Store.openExisting(a, io, home);
     defer store.deinit();
     const mask = metadata.bit(provider);
-    const claim = try metadata.claimAt(&store.root, mask, true, now, .{});
-    const listing = try metadata.parseListing(a, body, provider);
-    const result = try metadata.commitClaimedAt(&store.root, mask, listing, claim.generations, now + 1);
+    var claim = try metadata.claimAt(&store.root, mask, true, now, .{});
+    defer claim.cache.deinit(a);
+    var listing = try metadata.parseListing(a, body, provider);
+    defer listing.deinit(a);
+    var result = try metadata.commitClaimedAt(&store.root, mask, listing, claim.generations, now + 1);
+    defer result.cache.deinit(a);
     try std.testing.expectEqual(mask, result.accepted);
 }
 

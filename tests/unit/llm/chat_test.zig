@@ -156,9 +156,6 @@ test "chat finish sentinel bounds replay and history association guards" {
     var no_reason = Stream.init(a, test_support.chat_scope, .{});
     try no_reason.feed("", "[DONE]");
     try std.testing.expectError(error.TruncatedStream, no_reason.finish());
-    var oversized = Stream.init(a, test_support.chat_scope, .{});
-    oversized.bytes = c.max_bytes;
-    try std.testing.expectError(error.InputLimit, oversized.feed("", "{}"));
     var wrong_id = Stream.init(a, test_support.chat_scope, .{});
     try wrong_id.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\"}]}}]}");
     try std.testing.expectError(error.InconsistentToolId, wrong_id.feed("", "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"b\"}]}}]}"));

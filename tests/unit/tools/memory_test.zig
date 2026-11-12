@@ -7,8 +7,8 @@ test "memory empty snapshot has no side effects and CAS updates across Stores" {
     defer tmp.cleanup();
     var root = try testRoot(a, io, tmp.dir);
     defer root.deinit();
-    var one = Store.init(&root, .{});
-    var two = Store.init(&root, .{});
+    var one = Store.init(&root);
+    var two = Store.init(&root);
     const empty = try one.snapshot(a);
     defer a.free(empty);
     try std.testing.expectEqualStrings("", empty);
@@ -42,8 +42,8 @@ test "memory real concurrent Stores and cross-process flock exclusion" {
     defer tmp.cleanup();
     var root = try testRoot(a, io, tmp.dir);
     defer root.deinit();
-    var one = Store.init(&root, .{});
-    var two = Store.init(&root, .{});
+    var one = Store.init(&root);
+    var two = Store.init(&root);
     const initial = try one.write(a, "topic", "initial", null);
     defer freeEntry(a, initial);
 
@@ -91,7 +91,7 @@ test "memory refuses symlink directories and shards" {
     defer tmp.cleanup();
     var root = try testRoot(a, backend.io(), tmp.dir);
     defer root.deinit();
-    var store = Store.init(&root, .{});
+    var store = Store.init(&root);
     try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("/", root.dir.handle, ".thin"));
     try std.testing.expectError(error.NotDir, store.snapshot(a));
     try std.testing.expectError(error.NotDir, store.write(a, "core", "text", null));
@@ -113,7 +113,7 @@ test "index reads bounded titles, not full shard bodies" {
     defer tmp.cleanup();
     var root = try testRoot(a, io, tmp.dir);
     defer root.deinit();
-    var store = Store.init(&root, .{});
+    var store = Store.init(&root);
     const initial = try store.write(a, "topic", "Title\nbody", null);
     defer freeEntry(a, initial);
 
@@ -126,9 +126,6 @@ test "index reads bounded titles, not full shard bodies" {
     defer a.free(snapshot);
     try std.testing.expectEqualStrings("topic.md: Title\n", snapshot);
     try std.testing.expectError(error.BinaryFile, store.read(a, "topic"));
-
-    store.limits.shard_bytes = 100;
-    try std.testing.expectError(error.ShardTooLarge, store.snapshot(a));
 
     try std.testing.expectError(error.InvalidTopic, validTopic("-topic"));
     try std.testing.expectError(error.InvalidTopic, validTopic("a_b"));
@@ -149,10 +146,8 @@ test "memory sorted listing independent limits and project isolation" {
     defer root.deinit();
     var root2 = try testRoot(a, io, other.dir);
     defer root2.deinit();
-    // index_bytes is retained only for configuration compatibility. Even a
-    // one-byte value must not reject a write or a listing.
-    var store = Store.init(&root, .{ .core_bytes = 4, .index_bytes = 1, .shard_bytes = 12, .read_bytes = 1 });
-    var isolated = Store.init(&root2, .{});
+    var store = Store.init(&root);
+    var isolated = Store.init(&root2);
 
     const c = try store.write(a, "core", "CORE", null);
     defer freeEntry(a, c);
@@ -165,8 +160,6 @@ test "memory sorted listing independent limits and project isolation" {
     defer a.free(snap);
     try std.testing.expectEqualStrings("CORE\n\na.md: alpha\nz.md: zed\n", snap);
     try std.testing.expectError(error.FileNotFound, isolated.read(a, "core"));
-    try std.testing.expectError(error.CoreTooLarge, store.write(a, "core", "large", c.version));
-    try std.testing.expectError(error.ShardTooLarge, store.write(a, "shard", "1234567890123", null));
 
     const extra = try store.write(a, "extra", "123456789", null);
     defer freeEntry(a, extra);
@@ -194,12 +187,19 @@ test "memory sorted listing independent limits and project isolation" {
     const stat = try root.dir.statFile(io, ".thin/memory/core.md", .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
 
-    store.limits.core_bytes = 3;
-    try std.testing.expectError(error.CoreTooLarge, store.snapshot(a));
-    store.limits.core_bytes = 4;
-
-    store.limits.shard_bytes = 2;
-    try std.testing.expectError(error.ShardTooLarge, store.read(a, "a"));
+    const large = try a.alloc(u8, 40_000);
+    defer a.free(large);
+    @memset(large, 'x');
+    const updated = try store.write(a, "core", large, c.version);
+    defer freeEntry(a, updated);
+    const shard = try store.write(a, "shard", large, null);
+    defer freeEntry(a, shard);
+    const roundtrip = try store.read(a, "shard");
+    defer freeEntry(a, roundtrip);
+    try std.testing.expectEqualStrings(large, roundtrip.content);
+    const core_read = try store.read(a, "core");
+    defer freeEntry(a, core_read);
+    try std.testing.expectEqualStrings(large, core_read.content);
 }
 test "memory listing caps oversized titles on a UTF-8 boundary" {
     const a = std.testing.allocator;
@@ -208,7 +208,7 @@ test "memory listing caps oversized titles on a UTF-8 boundary" {
     defer tmp.cleanup();
     var root = try testRoot(a, io, tmp.dir);
     defer root.deinit();
-    var store = Store.init(&root, .{});
+    var store = Store.init(&root);
     const prefix: [max_title_bytes]u8 = @splat('a');
     const content = try std.fmt.allocPrint(a, "{s}中\nbody", .{prefix[0 .. max_title_bytes - 1]});
     defer a.free(content);

@@ -24,8 +24,8 @@ const inbox = @import("../core/inbox.zig");
 
 pub const TaskKind = enum { prompt, compact, command };
 pub const QueueKind = inbox.Kind;
+// Coalescing quantum only; individual owned events are never clipped to it.
 pub const max_item_bytes = 64 * 1024;
-pub const block_limit = 256;
 pub const max_previews = 3;
 pub const max_notice_bytes = 64 * 1024;
 
@@ -126,11 +126,12 @@ pub const Item = struct {
         // target swallow the earlier event's sequence and hide the boundary
         // from selective ACK proof. Both sides must stay individually ownable.
         if (std.mem.indexOfScalar(u8, left, '\r') != null or std.mem.indexOfScalar(u8, right, '\r') != null) return false;
-        const limit = @min(max_item_bytes, byte_limit);
+        const limit = byte_limit;
         if (left.len > limit or right.len > limit - left.len) return false;
         const len = left.len + right.len;
         if (len > self.storage.len) {
-            const capacity = @min(limit, @max(len, @max(256, self.storage.len * 2)));
+            const doubled = std.math.mul(usize, self.storage.len, 2) catch len;
+            const capacity = @min(limit, @max(len, @max(256, doubled)));
             self.storage = try self.allocator.realloc(self.storage, capacity);
         }
         @memcpy(self.storage[left.len..len], right);
@@ -155,7 +156,7 @@ pub const Item = struct {
     }
 };
 
-/// Bounded, caller-owned deep copy of one typed event. Adapters build an
+/// Caller-owned deep copy of one typed event. Adapters build an
 /// `r.Event` from their own typed snapshot/delta and call this before returning
 /// it from `poll`; thereafter no backend memory is borrowed. The local history
 /// markers stay false here: only an adapter that read an owned history page
@@ -163,6 +164,7 @@ pub const Item = struct {
 pub fn ownEvent(a: std.mem.Allocator, epoch: u64, event: r.Event) !Item {
     var measure = Copy{};
     _ = measure.event(event);
+    if (measure.overflow) return error.OutOfMemory;
     const storage = try a.alignedAlloc(u8, .of(p.Block), measure.used);
     errdefer a.free(storage);
     var copy = Copy{ .storage = storage };
@@ -170,8 +172,6 @@ pub fn ownEvent(a: std.mem.Allocator, epoch: u64, event: r.Event) !Item {
     return .{
         .epoch = epoch,
         .event = owned,
-        .display_truncated = copy.clipped,
-        .canonical_complete = copy.canonical_complete,
         .storage = storage,
         .allocator = a,
     };
@@ -180,21 +180,17 @@ pub fn ownEvent(a: std.mem.Allocator, epoch: u64, event: r.Event) !Item {
 const Copy = struct {
     storage: ?Storage = null,
     used: usize = 0,
-    clipped: bool = false,
-    canonical_complete: bool = true,
+    overflow: bool = false,
 
     fn text(self: *Copy, src: []const u8) []const u8 {
-        const room = if (self.used < max_item_bytes) max_item_bytes - self.used else 0;
-        var n = @min(src.len, room);
-        if (n < src.len) {
-            while (n > 0 and (src[n] & 0xc0) == 0x80) n -= 1;
-            self.clipped = true;
-        }
         const start = self.used;
-        self.used += n;
+        self.used = std.math.add(usize, self.used, src.len) catch {
+            self.overflow = true;
+            return "";
+        };
         if (self.storage) |buf| {
-            @memcpy(buf[start..][0..n], src[0..n]);
-            return buf[start..][0..n];
+            @memcpy(buf[start..][0..src.len], src);
+            return buf[start..][0..src.len];
         }
         return "";
     }
@@ -256,10 +252,11 @@ const Copy = struct {
             .memory_completed => |terminal| .{ .memory_completed = terminal },
             .background_completed => |terminal| .{ .background_completed = terminal },
             .assistant_committed => |blocks| blk: {
-                const n: usize = @min(blocks.len, block_limit);
-                self.canonical_complete = blocks.len == n;
-                self.clipped = self.clipped or !self.canonical_complete;
-                self.used = n * @sizeOf(p.Block);
+                const n = blocks.len;
+                self.used = std.math.mul(usize, n, @sizeOf(p.Block)) catch {
+                    self.overflow = true;
+                    break :blk .{ .assistant_committed = &.{} };
+                };
                 var dst: []p.Block = &.{};
                 if (self.storage) |buf| dst = @as([*]p.Block, @ptrCast(buf.ptr))[0..n];
                 for (blocks[0..n], 0..) |b, i| {

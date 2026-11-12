@@ -20,7 +20,7 @@ test "proxy allowlist appends exact IDs removes only matches and preserves order
     try std.testing.expectError(error.InvalidDefault, apply(arena, &parsed.value, "p", true));
     try cfg.validate(parsed.value);
 }
-test "proxy allowlist refuses to exceed the declaration bound" {
+test "proxy allowlist grows beyond the former declaration bound" {
     const a = std.testing.allocator;
     var parsed = try cfg.parse(a,
         \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main","models":{"main":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false},"proxy":{"address":"127.0.0.1","port":1}}
@@ -32,8 +32,13 @@ test "proxy allowlist refuses to exceed the declaration bound" {
         var buffer: [32]u8 = undefined;
         try std.testing.expect(try apply(arena, &parsed.value, try std.fmt.bufPrint(&buffer, "p/m{d}", .{index}), true));
     }
-    try std.testing.expectError(error.TooManyProxyModels, apply(arena, &parsed.value, "p/extra", true));
-    try std.testing.expectEqual(@as(usize, 128), parsed.value.proxy.?.models.len);
+    try std.testing.expect(try apply(arena, &parsed.value, "p/extra", true));
+    try std.testing.expectEqual(@as(usize, 129), parsed.value.proxy.?.models.len);
+    try std.testing.expectEqualStrings("p/m0", parsed.value.proxy.?.models[0]);
+    try std.testing.expectEqualStrings("p/m127", parsed.value.proxy.?.models[127]);
+    try std.testing.expectEqualStrings("p/extra", parsed.value.proxy.?.models[128]);
+    try std.testing.expect(!try apply(arena, &parsed.value, "p/extra", true));
+    try cfg.validate(parsed.value);
 }
 test "proxy endpoint edit keeps members and unrelated settings" {
     const a = std.testing.allocator;

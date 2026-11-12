@@ -21,7 +21,6 @@ fn message(a: std.mem.Allocator, role: []const u8, content: j.Value) !j.Value {
 pub fn nativeBlocks(a: std.mem.Allocator, native: j.Value) ![]p.Block {
     if (!c.onlyKeys(native, &.{ "role", "content" }) or !c.eq(try c.text(native, "role"), "assistant")) return error.InvalidReplay;
     const content = try c.list(j.get(native, "content") orelse return error.InvalidReplay);
-    if (content.len > c.max_items) return error.InputLimit;
     const encoded = try j.encode(a, native);
     _ = try c.parse(a, encoded);
     var blocks: std.ArrayList(p.Block) = .empty;
@@ -39,7 +38,6 @@ pub fn nativeBlocks(a: std.mem.Allocator, native: j.Value) ![]p.Block {
         } else if (c.eq(typ, "redacted_thinking")) {
             if ((try c.text(b, "data")).len == 0) return error.InvalidReplay;
         } else if (c.eq(typ, "tool_use")) {
-            if (ids.count() >= c.max_tools) return error.InputLimit;
             const id = try c.text(b, "id");
             const name = try c.text(b, "name");
             try c.checkUnique(&ids, id);
@@ -162,12 +160,7 @@ pub fn encode(a: std.mem.Allocator, req: p.Request) ![]u8 {
     }
     if (pending != 0) return error.UnmatchedToolCall;
     try j.put(t, &root, "messages", messages);
-    const out = try j.encode(a, root);
-    if (out.len > c.max_bytes) {
-        a.free(out);
-        return error.InputLimit;
-    }
-    return out;
+    return j.encode(a, root);
 }
 
 const Item = struct {
@@ -182,8 +175,6 @@ pub const Stream = struct {
     a: std.mem.Allocator,
     scope: p.ReplayScope,
     sink: p.ModelSink,
-    bytes: usize = 0,
-    events: usize = 0,
     poisoned: bool = false,
     committed: bool = false,
     started: bool = false,
@@ -233,9 +224,6 @@ pub const Stream = struct {
     fn feedInner(self: *Stream, event: []const u8, data: []const u8) !void {
         if (self.poisoned or self.committed or self.failed or self.stopped) return error.InvalidStreamState;
         if (self.scope.protocol != .anthropic) return error.ReplayScopeMismatch;
-        if (data.len > c.max_bytes -| self.bytes or event.len > c.max_bytes -| self.bytes -| data.len or self.events >= 65536) return error.InputLimit;
-        self.bytes += data.len + event.len;
-        self.events += 1;
         var temp = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer temp.deinit();
         const v = try c.parse(temp.allocator(), data);
@@ -294,7 +282,6 @@ pub const Stream = struct {
         if (index != self.content.items.len) return error.InconsistentItem;
         if (c.eq(typ, "content_block_start")) {
             if (self.open != null) return error.InvalidStreamState;
-            if (self.content.items.len >= c.max_items) return error.InputLimit;
             const b = j.get(v, "content_block") orelse return error.InvalidEvent;
             const kind = try c.text(b, "type");
             var item = Item{ .native = try c.clone(self.a, b), .tool_index = self.tool_count };
@@ -316,7 +303,6 @@ pub const Stream = struct {
                 if ((try c.text(b, "data")).len == 0) return error.InvalidEvent;
                 self.observed = true;
             } else if (c.eq(kind, "tool_use")) {
-                if (self.tool_count >= c.max_tools) return error.InputLimit;
                 const id = try c.text(b, "id");
                 const name = try c.text(b, "name");
                 if (id.len == 0 or name.len == 0) return error.InvalidEvent;

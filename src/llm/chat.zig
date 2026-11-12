@@ -142,8 +142,6 @@ pub const Stream = struct {
     sink: p.ModelSink,
 
     // 输入字节与事件数上限，防止恶意或异常大的流耗尽资源。
-    bytes: usize = 0,
-    events: usize = 0,
 
     // 是否收到过非空内容或工具增量，决定失败时是否已有可见输出。
     observed: bool = false,
@@ -201,11 +199,6 @@ pub const Stream = struct {
 
         // 只接受 chat 协议的作用域，防止与 responses 流混用。
         if (self.scope.protocol != .chat) return error.ReplayScopeMismatch;
-
-        // 在解析前先做上限检查（字节 16MB，事件 65536），防止资源放大。
-        self.bytes += data.len + event.len;
-        self.events += 1;
-        if (self.bytes > c.max_bytes or self.events > 65536) return error.InputLimit;
 
         // [DONE] 只标记结束，是否完整由 finish 判断。
         if (c.eq(data, "[DONE]")) {
@@ -270,8 +263,6 @@ pub const Stream = struct {
                 // 非空 refusal 必须是可展示的字符串，不能只当作未知结构回放。
                 if ((c.eq(key, "content") or c.eq(key, "reasoning_content") or c.eq(key, "refusal")) and val != .string) return error.InvalidEvent;
                 if (val == .string) {
-                    // 字段数量上限，防止恶意流产生大量键。
-                    if (self.fields.items.len >= c.max_items) return error.InputLimit;
                     var idx: ?usize = null;
                     for (self.fields.items, 0..) |f, i| if (c.eq(f.key, key)) {
                         idx = i;
@@ -312,16 +303,13 @@ pub const Stream = struct {
         for (try c.list(value)) |delta| {
             const index = j.uint(j.get(delta, "index")) orelse return error.InvalidEvent;
 
-            // 工具调用数量与 index 均受上限约束。
-            if (index >= c.max_tools) return error.InputLimit;
             var idx: ?usize = null;
             for (self.calls.items, 0..) |call, i| if (call.index == index) {
                 idx = i;
                 break;
             };
             if (idx == null) {
-                if (self.calls.items.len >= c.max_tools) return error.InputLimit;
-                try self.calls.append(self.a, .{ .index = @intCast(index), .native = c.object(self.a), .function = c.object(self.a) });
+                try self.calls.append(self.a, .{ .index = std.math.cast(usize, index) orelse return error.InvalidEvent, .native = c.object(self.a), .function = c.object(self.a) });
                 idx = self.calls.items.len - 1;
                 // 工具调用在首次出现时占据一个内容段，保证与文本的相对顺序。
                 try self.segments.append(self.a, .{ .kind = .tool, .call = idx.? });

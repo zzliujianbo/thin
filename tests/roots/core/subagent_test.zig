@@ -104,6 +104,7 @@ const Lifecycle = struct {
     ends: usize = 0,
     before_calls: usize = 0,
     end_error: ?anyerror = null,
+    before_error: ?anyerror = null,
     finalized: usize = 0,
     user_sources: usize = 0,
     tool_sources: usize = 0,
@@ -118,6 +119,7 @@ const Lifecycle = struct {
     fn before(raw: *anyopaque, a: std.mem.Allocator, _: *const p.Cancellation) anyerror!?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.before_calls += 1;
+        if (self.before_error) |err| return err;
         if (self.hints == 0) return null;
         self.hints -= 1;
         self.hint_calls += 1;
@@ -128,7 +130,7 @@ const Lifecycle = struct {
         self.ends += 1;
         if (self.end_error) |err| return err;
     }
-    fn retrieve(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: usize) anyerror![]const u8 {
+    fn retrieve(_: *anyopaque, a: std.mem.Allocator, _: []const u8) anyerror![]const u8 {
         return try a.dupe(u8, "");
     }
     fn finalize(raw: *anyopaque, capture: *const knowledge.Capture, _: p.Protocol) void {

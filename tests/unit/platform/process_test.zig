@@ -1,3 +1,25 @@
+test "unlimited capture reports allocation failure without losing retained bytes" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var empty: [0]u8 = .{};
+    var capture: Capture = .{ .data = &empty, .allocator = failing.allocator(), .unlimited = true };
+    defer capture.dynamic.deinit(failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, capture.add("output"));
+    try std.testing.expectEqual(@as(usize, 0), capture.dynamic.items.len);
+    try std.testing.expectEqual(@as(u64, 0), capture.total);
+}
+test "default unlimited capture retains both streams beyond old quota" {
+    var ctx = try TestContext.init();
+    defer ctx.deinit();
+    var cancel: p.Cancellation = .{};
+    var options = test_options;
+    options.output_bytes = null;
+    options.raw_output = true;
+    const result = try run(std.testing.allocator, std.testing.io, ctx.root, "printf '%131072s' ''; printf '%131072s' '' >&2", &ctx.env, options, &cancel);
+    defer freeResult(result);
+    try std.testing.expect(!result.truncated and !result.cleanup_failed);
+    try std.testing.expectEqual(@as(usize, 131072), result.stdout.len);
+    try std.testing.expectEqual(@as(usize, 131072), result.stderr.len);
+}
 test "stdout sink observes pre EOF handshake and exact chunks beyond retention" {
     var ctx = try TestContext.init();
     defer ctx.deinit();
@@ -419,7 +441,7 @@ test "UTF8 and newlines survive arbitrary read splits without terminal escapes" 
     var capture: Capture = .{ .data = try std.testing.allocator.alloc(u8, 128) };
     defer std.testing.allocator.free(capture.data);
     const original = "你好🙂\nline\tend";
-    for (0..original.len) |i| capture.add(original[i..][0..1]);
+    for (0..original.len) |i| try capture.add(original[i..][0..1]);
     const rendered = try capture.render(std.testing.allocator);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings(original, rendered);
@@ -428,7 +450,7 @@ test "UTF8 and newlines survive arbitrary read splits without terminal escapes" 
     for (1..40) |cap| {
         var clipped: Capture = .{ .data = try std.testing.allocator.alloc(u8, cap) };
         defer std.testing.allocator.free(clipped.data);
-        for (0..5) |_| clipped.add(original);
+        for (0..5) |_| try clipped.add(original);
         const output = try clipped.render(std.testing.allocator);
         defer std.testing.allocator.free(output);
         try std.testing.expect(output.len <= cap);
@@ -585,14 +607,14 @@ test "raw output overflow remains bounded and marks whole response truncated" {
     try std.testing.expect(result.truncated and !result.cleanup_failed);
     try std.testing.expectEqual(@as(u64, 100), result.stdout_bytes);
     try std.testing.expectEqual(@as(u64, 100), result.stderr_bytes);
-    try std.testing.expect(result.stdout.len + result.stderr.len <= options.output_bytes);
+    try std.testing.expect(result.stdout.len + result.stderr.len <= options.output_bytes.?);
 }
 test "raw capture exact boundary and tiny overflow never sanitize bytes" {
     const bytes = "\\u4f60中文\x00\xff\x1b";
     for (0..bytes.len + 5) |capacity| {
         var capture: Capture = .{ .data = try std.testing.allocator.alloc(u8, capacity) };
         defer std.testing.allocator.free(capture.data);
-        for (bytes) |byte| capture.add(&.{byte});
+        for (bytes) |byte| try capture.add(&.{byte});
         const output = try capture.rawRender(std.testing.allocator);
         defer std.testing.allocator.free(output);
         try std.testing.expect(output.len <= capacity);
@@ -603,7 +625,7 @@ test "raw capture exact boundary and tiny overflow never sanitize bytes" {
 test "binary output is escaped and rendered byte budget is strict" {
     var capture: Capture = .{ .data = try std.testing.allocator.alloc(u8, 64) };
     defer std.testing.allocator.free(capture.data);
-    capture.add("a\x1b\x00\xff\r\n\\");
+    try capture.add("a\x1b\x00\xff\r\n\\");
     const rendered = try capture.render(std.testing.allocator);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("a\\x1b\\x00\\xff\\x0d\n\\\\", rendered);
@@ -611,7 +633,7 @@ test "binary output is escaped and rendered byte budget is strict" {
     for (0..17) |cap| {
         var small: Capture = .{ .data = try std.testing.allocator.alloc(u8, cap) };
         defer std.testing.allocator.free(small.data);
-        small.add("AB\x1b\xffCDEF\xff\x1bYZ");
+        try small.add("AB\x1b\xffCDEF\xff\x1bYZ");
         const text = try small.render(std.testing.allocator);
         defer std.testing.allocator.free(text);
         try std.testing.expect(text.len <= cap);

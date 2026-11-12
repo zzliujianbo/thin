@@ -586,7 +586,7 @@ async function run(plan) {
       base_url: url, api_key: KEY,
       models: {[MODEL]: {protocol: plan.protocol, context_tokens: 32768, output_tokens: OUTPUT_TOKENS}},
     }}},
-    limits: {low_price_input: false, safety_tokens: 100, request_timeout_ms: 10000, task_timeout_ms: 25000},
+    limits: {low_price_input: false, request_timeout_ms: 10000},
   };
   if (plan.mixed) {
     declaration.llm.providers.response = {

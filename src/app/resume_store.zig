@@ -6,7 +6,6 @@ const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
 const logs = @import("log_store.zig");
 const ids = @import("session_id.zig");
-const codec = @import("resume_codec.zig");
 const Hash = std.crypto.hash.sha2.Sha256;
 
 extern "c" fn fsync(c_int) c_int;
@@ -33,8 +32,9 @@ fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {
     const file = fs.fileFromFd(fd);
     const stat = try file.stat(root.io);
     if (stat.kind != .file) return error.UnsafeResumeFile;
-    if (stat.size == 0 or stat.size > codec.max_file_bytes) return error.InvalidResumeLength;
-    const bytes = try root.allocator.alloc(u8, @intCast(stat.size + 1));
+    if (stat.size == 0) return error.InvalidResumeLength;
+    const size = std.math.cast(usize, stat.size) orelse return error.InvalidResumeLength;
+    const bytes = try root.allocator.alloc(u8, std.math.add(usize, size, 1) catch return error.InvalidResumeLength);
     defer root.allocator.free(bytes);
     const n = try file.readPositionalAll(root.io, bytes, 0);
     if (n != stat.size) return error.FileChanged;
@@ -189,7 +189,7 @@ pub const Lease = struct {
 
     pub fn save(self: *Lease, root: *fs.Root, bytes: []const u8) !void {
         if (!self.writable) return error.ResumeReadOnly;
-        if (bytes.len == 0 or bytes.len > codec.max_file_bytes) return error.InvalidResumeLength;
+        if (bytes.len == 0) return error.InvalidResumeLength;
         const old = try readFile(root, self.directory_fd, self.id);
         defer if (old) |value| root.allocator.free(value);
         if (self.expected) |expected| {

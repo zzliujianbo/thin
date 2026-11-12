@@ -61,7 +61,138 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Value {
     return std.json.parseFromSliceLeaky(Value, a, bytes, .{ .allocate = .alloc_always });
 }
 
-/// 将 Value 序列化为新分配的 JSON 字符串，内存由 a 分配，调用方需用同一 allocator 释放。
+/// Clone without recursing through arbitrary native JSON. Successful trees
+/// remain caller-owned (normally by an arena); failures release every allocation.
+pub fn clone(a: std.mem.Allocator, value: Value) !Value {
+    const Task = struct { source: Value, destination: *Value };
+    const Allocation = union(enum) {
+        text: []u8,
+        array: std.json.Array,
+        object: std.json.ObjectMap,
+
+        fn release(self: *@This(), allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .text => |bytes| allocator.free(bytes),
+                .array => |*items| items.deinit(),
+                .object => |*fields| fields.deinit(allocator),
+            }
+        }
+
+        fn copyText(allocator: std.mem.Allocator, owned: *std.ArrayList(@This()), text: []const u8) ![]u8 {
+            const bytes = try allocator.dupe(u8, text);
+            errdefer allocator.free(bytes);
+            try owned.append(allocator, .{ .text = bytes });
+            return bytes;
+        }
+    };
+    var tasks: std.ArrayList(Task) = .empty;
+    defer tasks.deinit(a);
+    var allocations: std.ArrayList(Allocation) = .empty;
+    defer allocations.deinit(a);
+    errdefer for (allocations.items) |*allocation| allocation.release(a);
+    var result: Value = .null;
+    try tasks.append(a, .{ .source = value, .destination = &result });
+    while (tasks.pop()) |task| {
+        switch (task.source) {
+            .string => |text| task.destination.* = .{ .string = try Allocation.copyText(a, &allocations, text) },
+            .number_string => |text| task.destination.* = .{ .number_string = try Allocation.copyText(a, &allocations, text) },
+            .array => |source| {
+                var items = std.json.Array.init(a);
+                try items.ensureTotalCapacity(source.items.len);
+                allocations.append(a, .{ .array = items }) catch |err| {
+                    items.deinit();
+                    return err;
+                };
+                // Fill before publishing child pointers; no later resize can
+                // invalidate a queued destination.
+                for (source.items) |_| items.appendAssumeCapacity(.null);
+                task.destination.* = .{ .array = items };
+                for (source.items, items.items) |child, *destination|
+                    try tasks.append(a, .{ .source = child, .destination = destination });
+            },
+            .object => |source| {
+                var fields: std.json.ObjectMap = .empty;
+                try fields.ensureTotalCapacity(a, source.count());
+                allocations.append(a, .{ .object = fields }) catch |err| {
+                    fields.deinit(a);
+                    return err;
+                };
+                for (source.keys()) |key|
+                    fields.putAssumeCapacityNoClobber(try Allocation.copyText(a, &allocations, key), .null);
+                task.destination.* = .{ .object = fields };
+                for (source.values(), fields.values()) |child, *destination|
+                    try tasks.append(a, .{ .source = child, .destination = destination });
+            },
+            else => task.destination.* = task.source,
+        }
+    }
+    return result;
+}
+
+/// Encode arbitrary Value containers with an allocator-owned traversal stack.
+/// Scalar formatting/escaping matches std.json; number_string stays byte-exact.
 pub fn encode(a: std.mem.Allocator, value: Value) ![]u8 {
-    return std.json.Stringify.valueAlloc(a, value, .{});
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    encodeInto(a, value, &out.writer) catch |err| return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+    return out.toOwnedSlice();
+}
+
+fn encodeInto(a: std.mem.Allocator, value: Value, writer: *std.Io.Writer) !void {
+    const Frame = struct { value: Value, index: usize = 0, started: bool = false };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(a);
+    try stack.append(a, .{ .value = value });
+    while (stack.items.len != 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        switch (frame.value) {
+            .array => |items| {
+                if (!frame.started) {
+                    try writer.writeByte('[');
+                    frame.started = true;
+                }
+                if (frame.index == items.items.len) {
+                    try writer.writeByte(']');
+                    _ = stack.pop();
+                    continue;
+                }
+                if (frame.index != 0) try writer.writeByte(',');
+                const child = items.items[frame.index];
+                frame.index += 1;
+                try stack.append(a, .{ .value = child });
+            },
+            .object => |fields| {
+                if (!frame.started) {
+                    try writer.writeByte('{');
+                    frame.started = true;
+                }
+                if (frame.index == fields.count()) {
+                    try writer.writeByte('}');
+                    _ = stack.pop();
+                    continue;
+                }
+                if (frame.index != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(fields.keys()[frame.index], .{}, writer);
+                try writer.writeByte(':');
+                const child = fields.values()[frame.index];
+                frame.index += 1;
+                try stack.append(a, .{ .value = child });
+            },
+            .number_string => |text| {
+                try writer.writeAll(text);
+                _ = stack.pop();
+            },
+            .null => {
+                try writer.writeAll("null");
+                _ = stack.pop();
+            },
+            inline else => |scalar| {
+                try std.json.Stringify.value(scalar, .{}, writer);
+                _ = stack.pop();
+            },
+        }
+    }
 }

@@ -17,6 +17,7 @@ const fs = @import("../platform/filesystem.zig");
 const platform_process = @import("../platform/process.zig");
 const interrupt = @import("../platform/interrupt.zig");
 const p = @import("../core/protocol.zig");
+const cfg = @import("../core/config.zig");
 const daemon_protocol = @import("protocol.zig");
 const unix = @import("unix.zig");
 const registry = @import("registry.zig");
@@ -524,7 +525,7 @@ pub const Workers = struct {
             .timeout_ms = settings_probe_ms,
         }) catch return cleanupGraceMs(null, floor_ms);
         defer conn.close();
-        const limits = self.queryCleanupLimits(&conn);
+        const limits: ?CleanupLimits = .{ .grace_ms = cfg.Policy.cleanup_grace_ms, .timeout_ms = cfg.Policy.cleanup_timeout_ms };
         // The ack is advisory: the worker performs its cleanup before replying,
         // so a short correlated read keeps the notification of every worker
         // parallel instead of waiting for each one's cleanup in turn.
@@ -723,8 +724,8 @@ fn workerMain(worker: *Worker) Outcome {
         .timeout_ms = null,
         // Bounded captured stdio, never a PTY.
         .output_bytes = 16 * 1024,
-        .term_grace_ms = 1_000,
-        .cleanup_timeout_ms = 5_000,
+        .term_grace_ms = cfg.Policy.cleanup_grace_ms,
+        .cleanup_timeout_ms = cfg.Policy.cleanup_timeout_ms,
         .cwd_dir = worker.project.dir,
         .on_launch = .{ .context = worker, .notify_fn = launchNotify },
     };

@@ -19,7 +19,9 @@ test "codec strict outer syntax bounds and per-item validation" {
     defer freeCandidates(a, old_extra);
     try std.testing.expectEqual(@as(usize, 1), old_extra.len);
     const many = "{\"items\":[" ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "," ++ test_item ++ "]}";
-    try std.testing.expectError(error.InvalidMemoryCandidate, parse(a, many));
+    const many_items = try parse(a, many);
+    defer freeCandidates(a, many_items);
+    try std.testing.expectEqual(@as(usize, 9), many_items.len);
     const padding = try a.alloc(u8, 33000);
     defer a.free(padding);
     @memset(padding, ' ');

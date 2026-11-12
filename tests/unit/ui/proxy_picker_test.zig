@@ -31,10 +31,12 @@ test "proxy fingerprint binds candidates selection and configured endpoint" {
     try std.testing.expectEqualSlices(u8, &before, &fingerprint(&changed, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?);
     changed[0].name = "login/Family/Other";
     try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&changed, &logged, &.{"login/Family/Proxy"}, true, "10.0.0.1", 8080).?));
-    const too_many: [max_models + 1]cfg.Model = @splat(profiles[0]);
-    try std.testing.expect(fingerprint(&too_many, &logged, &.{}, true, "10.0.0.1", 8080) == null);
-    const too_many_selected: [max_selected + 1][]const u8 = @splat("login/Family/Proxy");
-    try std.testing.expect(fingerprint(&profiles, &logged, &too_many_selected, true, "10.0.0.1", 8080) == null);
+    const many: [4097]cfg.Model = @splat(profiles[0]);
+    try std.testing.expect(fingerprint(&many, &logged, &.{}, true, "10.0.0.1", 8080) != null);
+    try std.testing.expectEqual(@as(usize, 4097), count(&many, &logged, ""));
+    try std.testing.expectEqualStrings(profiles[0].name, candidate(&many, &logged, "", 4096).?);
+    const many_selected: [4097][]const u8 = @splat("login/Family/Proxy");
+    try std.testing.expect(fingerprint(&profiles, &logged, &many_selected, true, "10.0.0.1", 8080) != null);
     const long_name: [max_name_bytes + 1]u8 = @splat('a');
     try std.testing.expect(fingerprint(&profiles, &logged, &.{&long_name}, true, "10.0.0.1", 8080) == null);
     const long_address: [cfg.max_proxy_endpoint_bytes + 1]u8 = @splat('a');

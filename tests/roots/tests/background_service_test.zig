@@ -75,22 +75,21 @@ const Fixture = struct {
     }
 };
 
-fn startArgs(command: []const u8, timeout_ms: u32, log_bytes: u32) bg.Start {
+fn startArgs(command: []const u8, timeout_ms: u32) bg.Start {
     return .{
         .command = command,
         .startup_timeout_ms = timeout_ms,
-        .log_bytes = log_bytes,
         .term_grace_ms = 500,
         .cleanup_timeout_ms = 5000,
     };
 }
 
-fn startText(f: *Fixture, a: std.mem.Allocator, command: []const u8, timeout_ms: u32, log_bytes: u32, cancel: *const p.Cancellation) !bg.Result {
-    return f.service.service().start(a, startArgs(command, timeout_ms, log_bytes), cancel);
+fn startText(f: *Fixture, a: std.mem.Allocator, command: []const u8, timeout_ms: u32, cancel: *const p.Cancellation) !bg.Result {
+    return f.service.service().start(a, startArgs(command, timeout_ms), cancel);
 }
 
-fn startJson(f: *Fixture, a: std.mem.Allocator, command: []const u8, timeout_ms: u32, log_bytes: u32, cancel: *const p.Cancellation) !std.json.Value {
-    const result = try startText(f, a, command, timeout_ms, log_bytes, cancel);
+fn startJson(f: *Fixture, a: std.mem.Allocator, command: []const u8, timeout_ms: u32, cancel: *const p.Cancellation) !std.json.Value {
+    const result = try startText(f, a, command, timeout_ms, cancel);
     if (result.is_error) return error.StartFailed;
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, result.text, .{ .allocate = .alloc_always });
     if (parsed != .object) return error.InvalidManagerJson;

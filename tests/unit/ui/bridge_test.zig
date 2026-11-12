@@ -1,4 +1,4 @@
-test "subagent tool progress is bounded and owned independently of producer" {
+test "subagent tool progress is complete and owned independently of producer" {
     const t = std.testing;
     var cancel: p.Cancellation = .{};
     var bridge = Bridge.init(t.allocator, t.io, &cancel);
@@ -24,8 +24,9 @@ test "subagent tool progress is bounded and owned independently of producer" {
     try t.expectEqual(@as(usize, 7), view.key.index);
     try t.expectEqualStrings("job-9", view.fields.id.?.text);
     const text = view.subagent_progress.?;
-    try t.expectEqual(@as(usize, 2046), text.len);
-    try t.expect(item.display_truncated and std.unicode.utf8ValidateSlice(text));
+    try t.expectEqual(@as(usize, 3000), text.len);
+    try t.expect(!item.display_truncated and std.unicode.utf8ValidateSlice(text));
+    try t.expectEqualStrings("字", text[2046..2049]);
     try t.expectEqual(@as(u8, 'a'), text[0]);
     try t.expect(@intFromPtr(text.ptr) >= @intFromPtr(item.storage.ptr));
     try t.expect(@intFromPtr(text.ptr) + text.len <= @intFromPtr(item.storage.ptr) + item.storage.len);
@@ -114,7 +115,7 @@ test "tool view copy owns all six snapshot fields after producer storage is free
     try t.expect(view.fields.id.?.truncated);
     try t.expect(!view.fields.task.?.truncated);
 }
-test "task snapshot clipping stops on a utf8 boundary inside the shared item cap" {
+test "task snapshot retains full UTF8 content beyond former item cap" {
     const t = std.testing;
     var cancel: p.Cancellation = .{};
     var bridge = Bridge.init(t.allocator, std.testing.io, &cancel);
@@ -134,9 +135,9 @@ test "task snapshot clipping stops on a utf8 boundary inside the shared item cap
     var item = bridge.pop().?;
     defer item.deinit();
     const task = item.event.tool_view.fields.task.?;
-    try t.expectEqual(item_budget - 1, task.text.len);
-    try t.expectEqual(item_budget - 1, item.storage.len);
-    try t.expect(task.truncated and item.display_truncated);
+    try t.expectEqual(huge.len, task.text.len);
+    try t.expectEqualSlices(u8, huge, task.text);
+    try t.expect(!task.truncated and !item.display_truncated);
     try t.expect(std.unicode.utf8ValidateSlice(task.text));
 }
 test "multibyte text body above the item cap streams as ordered untruncated slices" {
@@ -216,7 +217,7 @@ test "empty and exact-bound bodies stay one event while one byte more splits" {
     try t.expectEqual(@as(usize, 2), drained.parts);
     try t.expectEqual(over.len, drained.bytes);
 }
-test "body larger than the shared byte budget streams under consumer backpressure" {
+test "body larger than former byte budget retains every chunk" {
     const t = std.testing;
     var cancel: p.Cancellation = .{};
     // 与既有 bridge 测试相同的做法：专用线程化后端跑生产者，主线程当消费者。
@@ -226,7 +227,7 @@ test "body larger than the shared byte budget streams under consumer backpressur
     defer bridge.deinit();
 
     // 1 MiB 正文是整桥预算的 4 倍：只有逐段预留、逐段被消费者回收才可能完成。
-    const body = try t.allocator.alloc(u8, 4 * data_budget);
+    const body = try t.allocator.alloc(u8, 1024 * 1024 + 123);
     defer t.allocator.free(body);
     for (body, 0..) |*byte, i| byte.* = @truncate(i % 251);
     const got = try t.allocator.alloc(u8, body.len);
@@ -268,12 +269,12 @@ test "body larger than the shared byte budget streams under consumer backpressur
     try t.expect(!oversize and !clipped);
     try t.expectEqual(body.len, seen);
     try t.expect(std.mem.eql(u8, got, body));
-    try t.expect(parts >= 4 * data_budget / item_budget);
+    try t.expect(parts >= body.len / item_budget);
     // 全部切片都已归还预算，1 MiB 从未被整体预留。
     try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
     try t.expectEqual(@as(usize, 0), progress(&bridge).outstanding);
 }
-test "cancel while a split body is blocked keeps only the truthful emitted prefix" {
+test "cancel after delivered split chunks keeps only the truthful emitted prefix" {
     const t = std.testing;
     var cancel: p.Cancellation = .{};
     var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
@@ -294,26 +295,19 @@ test "cancel while a split body is blocked keeps only the truthful emitted prefi
     defer t.allocator.free(body);
     @memset(body, 'b');
 
-    var producer = BodyProducer{ .host_ = host_, .cancel = &cancel, .body = body };
-    var worker = try Io.concurrent(bridge.io, BodyProducer.run, .{&producer});
-    defer worker.cancel(bridge.io) catch {};
-
-    // 第三段需要的 64 KiB 已无预算：生产者必须阻塞在预留循环里。
-    var blocked = false;
-    for (0..5_000) |_| {
-        const state = progress(&bridge);
-        if (state.len == 4 and state.bytes == data_budget) {
-            blocked = true;
-            break;
+    const CancelAfterTwo = struct {
+        cancel: *p.Cancellation,
+        count: usize = 0,
+        fn notify(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+            if (self.count == 2) self.cancel.cancel();
         }
-        if (producer.done.load(.acquire)) break;
-        try Io.sleep(bridge.io, .fromMilliseconds(1), .awake);
-    }
-    cancel.cancel();
-    try worker.await(bridge.io);
-
-    try t.expect(blocked);
-    try t.expectEqual(@as(?anyerror, error.Canceled), producer.err);
+    };
+    var delivered: CancelAfterTwo = .{ .cancel = &cancel };
+    bridge.notification = .{ .context = &delivered, .notify_fn = CancelAfterTwo.notify };
+    try t.expectError(error.Canceled, host_.emit_fn(host_.context, .{ .text = body }, &cancel));
+    try t.expectEqual(@as(usize, 2), delivered.count);
 
     for (0..2) |_| {
         var item = bridge.pop().?;
@@ -360,7 +354,7 @@ test "allocation failure mid-body keeps the emitted prefix and returns the reser
     const t = std.testing;
     var cancel: p.Cancellation = .{};
     // 第二段的分配失败：第一段已入队，失败段的预留预算必须原额归还。
-    var backing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
+    var backing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 2 });
     var bridge = Bridge.init(backing.allocator(), std.testing.io, &cancel);
     defer bridge.deinit();
     const host_ = bridge.host();

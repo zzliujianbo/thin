@@ -74,63 +74,32 @@ pub const Model = struct {
     }
 };
 
-/// Implementation defaults are adjustable; only the agreed timeout, read/output
-/// sizes and compaction percentages are product requirements.
-/// 中文：下面的默认值是实现层的可调参数；只有超时、读取/输出大小与压缩百分比是产品需求。
-/// 所有显式数值在校验时都不能为 0（见 validate）；max_rounds 可为 null。
+pub const Policy = struct {
+    pub const input_margin_tokens = 5000;
+    pub const safety_tokens = 4096;
+
+    /// Preserve the normal reserve without excluding smaller verified windows.
+    pub fn safetyTokens(context_tokens: u32) u32 {
+        return @min(safety_tokens, context_tokens / 8);
+    }
+    pub const model_refresh_ttl_ms = 14400000;
+    pub const model_refresh_cooldown_ms = 300000;
+    pub const cleanup_grace_ms = 1000;
+    pub const cleanup_timeout_ms = 5000;
+    pub const compaction_trigger_percent = 80;
+    pub const compaction_target_percent = 50;
+};
+
 pub const Limits = struct {
     /// 单条命令的默认超时（毫秒）。
     command_timeout_ms: u32 = 300000,
-    /// 单条命令允许的最大超时（毫秒），命令超时不能超过它。
-    command_max_timeout_ms: u32 = 3600000,
-    /// 单次文件读取的字节上限。
-    read_bytes: u32 = 65536,
-    /// 单次工具输出的字节上限。
-    output_bytes: u32 = 32768,
-    /// Optional estimated-input ceiling, independent of the real model window.
-    max_input_tokens: ?u32 = null,
     /// Enabled by default; explicit false opts out of the first known price step.
     /// Unknown metadata fails closed before any inference, never guesses 100K.
     low_price_input: bool = true,
-    /// Additional headroom below an enabled input ceiling. Estimates are NOT
-    /// an authoritative tokenizer or a guarantee about provider billing.
-    input_margin_tokens: u32 = 5000,
-    /// 预留的安全余量 token 数，从输入预算中扣除。
-    safety_tokens: u32 = 4096,
-    /// Model turns per user submission; missing/null means unlimited.
-    /// Explicit positive values retain their limit, including legacy 50.
-    /// Compaction is not counted. Independent safety limits still apply.
-    max_rounds: ?u16 = null,
-    /// 单个任务允许的最大工具调用次数。
-    max_tool_calls: u16 = 128,
-    /// 整个任务的超时（毫秒）。
-    task_timeout_ms: u32 = 1800000,
     /// 单次模型请求的超时（毫秒）。
     request_timeout_ms: u32 = 300000,
-    /// Successful model metadata remains fresh for four hours; failures and
-    /// in-flight claims wait five minutes before another automatic attempt.
-    model_refresh_ttl_ms: u32 = 14400000,
-    model_refresh_cooldown_ms: u32 = 300000,
-    /// 取消时先发送 TERM 后等待的宽限时间（毫秒）。
-    cleanup_grace_ms: u32 = 1000,
-    /// 清理子进程的总超时（毫秒），超过后强制结束。
-    cleanup_timeout_ms: u32 = 5000,
-    /// 核心记忆文件的大小上限。
-    core_bytes: u32 = 2048,
-    /// Deprecated compatibility field; Memory no longer enforces a total index budget.
-    index_bytes: u32 = 8192,
-    /// 单个分片文件的大小上限。
-    shard_bytes: u32 = 32768,
     /// Disable only automatic compaction; manual /compact and hard preflight remain.
     compaction_enabled: bool = true,
-    /// 触发压缩的上下文占用百分比。
-    compaction_trigger_percent: u8 = 80,
-    /// 压缩后希望达到的上下文占用百分比（必须小于触发阈值）。
-    compaction_target_percent: u8 = 50,
-    /// 单次模型响应的最大字节数。
-    max_response_bytes: u32 = 8388608,
-    /// 单个流式事件的最大字节数（不能超过 max_response_bytes）。
-    max_event_bytes: u32 = 1048576,
 };
 
 /// Sparse user declarations under llm.providers.<alias>.models.<raw-id>.
@@ -273,7 +242,6 @@ fn validateProxyAddress(address: []const u8) !void {
 fn validateProxy(proxy: ProxyConfig, registry: ?Registry) !void {
     try validateProxyAddress(proxy.address);
     if (proxy.port == 0) return error.InvalidProxyPort;
-    if (proxy.models.len > 128) return error.TooManyProxyModels;
     for (proxy.models, 0..) |name, i| {
         const selection = splitDefault(name) catch return error.InvalidProxyModel;
         for (name) |c| if (c == '*' or c == '?' or c == '[' or c == ']') return error.InvalidProxyModel;
@@ -286,23 +254,10 @@ fn validateProxy(proxy: ProxyConfig, registry: ?Registry) !void {
 pub const DecisionConfig = struct {
     model: []const u8,
     enabled: bool = true,
-    /// Generative protocols only; SystemOne has no max_tokens/message context API.
-    max_input_tokens: u32 = 8192,
-    /// Local SystemOne state bound, not a claim about supplier context capacity.
-    max_state_bytes: u32 = 16384,
-
     /// Shared by generic auxiliary resolution and its local model picker.
     /// Never use primary price policy or command limits to resolve a reviewer.
-    pub fn modelLimits(self: DecisionConfig, shared_request_timeout_ms: u32) Limits {
-        return .{
-            .low_price_input = false,
-            .input_margin_tokens = 1,
-            .safety_tokens = 256,
-            .max_input_tokens = self.max_input_tokens,
-            .request_timeout_ms = shared_request_timeout_ms,
-            .max_response_bytes = 128 * 1024,
-            .max_event_bytes = 64 * 1024,
-        };
+    pub fn modelLimits(_: DecisionConfig, shared_request_timeout_ms: u32) Limits {
+        return .{ .low_price_input = false, .request_timeout_ms = shared_request_timeout_ms };
     }
 };
 
@@ -353,13 +308,10 @@ pub const Config = struct {
     }
 };
 
-/// 配置文件的大小上限（64 KiB），超过则直接拒绝，防止占用过多内存。
-pub const max_config_bytes = 64 * 1024;
-
 /// Every string is owned by the returned arena, never by `bytes`.
 /// 中文：解析后的字符串复制到 allocator 中，因此调用方可以擦除 bytes；结果需调用 release 释放。
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Config) {
-    return parseBounded(allocator, bytes, max_config_bytes, true, false);
+    return parseBounded(allocator, bytes, true, false);
 }
 
 // No secret is needed to select an image helper; provider credentials are
@@ -378,7 +330,6 @@ pub fn clonePendingSettings(allocator: std.mem.Allocator, config: Config) !std.j
 }
 
 fn cloneConfig(allocator: std.mem.Allocator, config: Config, comptime unresolved: bool) !std.json.Parsed(Config) {
-    if (config.provider.base_url.len > max_config_bytes) return error.ConfigTooLarge;
     if (unresolved) try validatePendingSettings(config) else try validate(config);
     var wiping = WipingAllocator{ .backing = allocator };
     const bytes = try std.json.Stringify.valueAlloc(wiping.allocator(), config, .{ .emit_null_optional_fields = false });
@@ -386,12 +337,10 @@ fn cloneConfig(allocator: std.mem.Allocator, config: Config, comptime unresolved
     // Keep the wiping wrapper at the final free boundary, just as for the
     // stringify writer's intermediate buffers and the parsed arena's release.
     defer wiping.allocator().free(bytes);
-    return parseBounded(allocator, bytes, 512 * 1024, false, unresolved);
+    return parseBounded(allocator, bytes, false, unresolved);
 }
 
-fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, limit: usize, disk: bool, comptime unresolved: bool) !std.json.Parsed(Config) {
-    if (bytes.len > limit) return error.ConfigTooLarge;
-
+fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, disk: bool, comptime unresolved: bool) !std.json.Parsed(Config) {
     if (disk) return parseDisk(allocator, bytes);
 
     // 包装底层分配器：即使 JSON 在读完 key 后才失败，也擦除所有中间分配。
@@ -444,8 +393,12 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
                 const known = inline for (@typeInfo(T).@"struct".field_names) |field| {
                     if (std.mem.eql(u8, entry.key_ptr.*, field)) break true;
                 } else false;
-                if (!known) return error.UnknownField;
+                if (!known and !(T == DecisionConfig and (std.mem.eql(u8, entry.key_ptr.*, "max_input_tokens") or std.mem.eql(u8, entry.key_ptr.*, "max_state_bytes")))) return error.UnknownField;
             }
+            // Removed policy fields are inert migration input, regardless of
+            // their former value. Current fields retain strict type validation.
+            if (T == Limits and isRetiredLimit(entry.key_ptr.*)) continue;
+            if (T == DecisionConfig and (std.mem.eql(u8, entry.key_ptr.*, "max_input_tokens") or std.mem.eql(u8, entry.key_ptr.*, "max_state_bytes"))) continue;
             if (entry.value_ptr.* == .float or entry.value_ptr.* == .number_string) return error.InvalidNumber;
             inline for (@typeInfo(T).@"struct".field_names) |field| {
                 if (std.mem.eql(u8, entry.key_ptr.*, field)) {
@@ -461,7 +414,23 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
             }
         }
     }
+    if (T == Limits or T == DecisionConfig) {
+        const original = try object(value);
+        var migrated: std.json.ObjectMap = .{};
+        var it = original.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const retired = if (T == Limits) isRetiredLimit(key) else std.mem.eql(u8, key, "max_input_tokens") or std.mem.eql(u8, key, "max_state_bytes");
+            if (!retired) try migrated.put(a, key, entry.value_ptr.*);
+        }
+        return std.json.parseFromValueLeaky(T, a, .{ .object = migrated }, json_options);
+    }
     return std.json.parseFromValueLeaky(T, a, value, json_options);
+}
+fn isRetiredLimit(key: []const u8) bool {
+    const names = [_][]const u8{ "command_max_timeout_ms", "read_bytes", "output_bytes", "max_input_tokens", "input_margin_tokens", "safety_tokens", "max_rounds", "max_tool_calls", "task_timeout_ms", "model_refresh_ttl_ms", "model_refresh_cooldown_ms", "cleanup_grace_ms", "cleanup_timeout_ms", "core_bytes", "index_bytes", "shard_bytes", "compaction_trigger_percent", "compaction_target_percent", "max_response_bytes", "max_event_bytes" };
+    for (names) |name| if (std.mem.eql(u8, key, name)) return true;
+    return false;
 }
 fn object(value: std.json.Value) !std.json.ObjectMap {
     if (value != .object) return error.UnexpectedToken;
@@ -495,11 +464,9 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const default = try string(llm.get("default") orelse return error.MissingField);
         const selection = try splitDefault(default);
         const provider_map = try object(llm.get("providers") orelse return error.MissingField);
-        if (provider_map.count() > 16) return error.TooManyProviders;
         const list = try a.alloc(NamedProvider, provider_map.count());
         var entries = provider_map.iterator();
         var index: usize = 0;
-        var total: usize = 0;
         while (entries.next()) |entry| : (index += 1) {
             if (!validAlias(entry.key_ptr.*)) return error.InvalidProviderName;
             var fields = try object(entry.value_ptr.*);
@@ -514,8 +481,6 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
             var models: []const NamedModel = &.{};
             if (models_value) |mv| {
                 const mm = try object(mv);
-                total += mm.count();
-                if (total > 64) return error.TooManyModels;
                 const mutable = try a.alloc(NamedModel, mm.count());
                 var mi = mm.iterator();
                 var n: usize = 0;
@@ -528,8 +493,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const registry: Registry = .{ .default = default, .reasoning_effort = effort, .providers = list };
         const chosen = registry.find(selection.provider) orelse return error.UnknownProvider;
         const limits = if (root.get("limits")) |v| try decode(Limits, a, v) else Limits{};
-        if (limits.safety_tokens > 1024 * 1024) return error.InvalidBudget;
-        const context: u32 = @max(32768, limits.safety_tokens + 2);
+        const context: u32 = 32768;
         const decision = if (root.get("decision")) |v| if (v == .null) null else try decode(DecisionConfig, a, v) else null;
         const proxy = if (root.get("proxy")) |v| if (v == .null) null else try decode(ProxyConfig, a, v) else null;
         const image = if (root.get("image")) |v| try decode(ImageConfig, a, v) else ImageConfig{};
@@ -790,7 +754,7 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
             if (declared != actual) return error.ProviderEndpointMismatch;
         };
     }
-    if (config.registry) |registry| try validateRegistry(registry, config.limits);
+    if (config.registry) |registry| try validateRegistry(registry);
     if (config.proxy) |proxy| try validateProxy(proxy, config.registry);
     if (config.image.model) |model| {
         const selection = try splitDefault(model);
@@ -802,56 +766,18 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
         const selection = try splitDefault(decision.model);
         const registry = config.registry orelse return error.MissingRegistry;
         _ = registry.find(selection.provider) orelse return error.UnknownProvider;
-        if (decision.max_state_bytes < 2 or decision.max_state_bytes > 65536) return error.InvalidLimit;
-        if (decision.max_input_tokens < 2 or decision.max_input_tokens > 16 * 1024 * 1024) return error.InvalidLimit;
     }
 
     const l = config.limits;
-    // Null means unlimited rounds; explicit limits are positive.
-    inline for (@typeInfo(Limits).@"struct".field_names) |field| {
-        if (comptime std.mem.eql(u8, field, "max_rounds")) {
-            if (l.max_rounds) |rounds| {
-                if (rounds == 0 or rounds > 4096) return error.InvalidLimit;
-            }
-        } else if (comptime std.mem.eql(u8, field, "index_bytes")) {
-            // Deprecated compatibility field; Memory has no total index budget.
-        } else if (@TypeOf(@field(l, field)) == bool) {
-            // false is an intentional policy, not a zero numeric limit.
-        } else if (@field(l, field) == 0) return error.InvalidLimit;
-    }
-
-    try validateInputLimits(l);
-
-    // Hard ceilings are implementation safeguards, not provider capabilities.
-    // 中文：以下上限是实现层的安全保护，与提供方能力无关。
-    const mib = 1024 * 1024;
-    if (l.read_bytes > 16 * mib or l.output_bytes > 16 * mib or
-        l.core_bytes > mib or l.shard_bytes > 16 * mib or
-        l.max_response_bytes > 64 * mib or l.max_event_bytes > 16 * mib or
-        l.max_event_bytes > l.max_response_bytes) return error.InvalidLimit;
-
-    const day_ms = 24 * 60 * 60 * 1000;
-    if (l.model_refresh_ttl_ms > 7 * day_ms or l.model_refresh_cooldown_ms > 7 * day_ms) return error.InvalidLimit;
-
-    // 超时之间的大小关系与上限：清理宽限不能超过清理总超时，且总超时不超过 60 秒。
-    if (l.command_timeout_ms > l.command_max_timeout_ms or l.command_max_timeout_ms > day_ms or
-        l.request_timeout_ms > day_ms or l.task_timeout_ms > day_ms or l.cleanup_grace_ms > l.cleanup_timeout_ms or
-        l.cleanup_timeout_ms > 60000 or l.max_tool_calls > 4096) return error.InvalidLimit;
-
-    // 窗口须留出输入与至少一个输出 token；输出上限按每次请求剩余空间收缩，摘要仍遵守显式上限。
-    try validateModel(config.model, l);
+    if (l.command_timeout_ms == 0 or l.request_timeout_ms == 0) return error.InvalidLimit;
+    try validateModel(config.model);
     if (!unresolved) try validateReasoningProtocol(config.provider.base_url, config.model);
-
-    // 压缩目标必须低于触发阈值，且触发阈值必须小于 100%，否则压缩永远无法生效或立即触发。
-    if (!(l.compaction_target_percent < l.compaction_trigger_percent and l.compaction_trigger_percent < 100)) return error.InvalidCompactionRatio;
 }
 
-fn validateRegistry(registry: Registry, limits: Limits) !void {
+fn validateRegistry(registry: Registry) !void {
     if (registry.reasoning_effort) |effort| try validateRegistryReasoningEffort(effort);
     const selection = try splitDefault(registry.default);
     if (registry.find(selection.provider) == null) return error.UnknownProvider;
-    if (registry.providers.len > 16) return error.TooManyProviders;
-    var total: usize = 0;
     for (registry.providers, 0..) |p, i| {
         if (!validAlias(p.name)) return error.InvalidProviderName;
         for (registry.providers[0..i]) |previous| if (std.mem.eql(u8, previous.name, p.name)) return error.DuplicateProvider;
@@ -860,12 +786,10 @@ fn validateRegistry(registry: Registry, limits: Limits) !void {
         if (p.connection.kind) |declared| if (providers.Id.fromUrl(p.connection.base_url) orelse providers.Id.fromSystemOneUrl(p.connection.base_url)) |actual| {
             if (declared != actual) return error.ProviderEndpointMismatch;
         };
-        total += p.models.len;
-        if (total > 64) return error.TooManyModels;
         for (p.models, 0..) |m, j| {
             for (p.models[0..j]) |previous| if (std.mem.eql(u8, previous.name, m.name)) return error.DuplicateModel;
             const patch = m.patch;
-            var model = patch.apply(.{ .name = m.name, .context_tokens = @max(32768, @min(limits.safety_tokens, 1024 * 1024) + 2) });
+            var model = patch.apply(.{ .name = m.name, .context_tokens = 32768 });
             // A missing protocol is not explicit auto authority. Validate the
             // declaration now, defer its protocol union until cache resolution.
             if (patch.protocol == null) {
@@ -874,7 +798,7 @@ fn validateRegistry(registry: Registry, limits: Limits) !void {
                 model.reasoning_effort = null;
                 if (patch.reasoning_effort) |effort| if (!validText(effort, 128)) return error.InvalidReasoningEffort;
             }
-            try validateModel(model, limits);
+            try validateModel(model);
             if (patch.protocol != null) try validateReasoningProtocol(p.connection.base_url, model);
         }
     }
@@ -892,17 +816,8 @@ fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
     if ((model.protocol == .responses or model.protocol == .anthropic) and chatOnly(base_url, model)) return error.IncompatibleReasoningProtocol;
 }
 
-/// Validate user input policy without requiring price metadata at parse time.
-pub fn validateInputLimits(l: Limits) !void {
-    const maximum = 16 * 1024 * 1024;
-    if (l.input_margin_tokens == 0 or l.input_margin_tokens > maximum) return error.InvalidBudget;
-    if (l.max_input_tokens) |tokens| {
-        if (tokens == 0 or tokens > maximum or tokens <= l.input_margin_tokens) return error.InvalidBudget;
-    }
-}
-
-/// Shared profile validation uses the same limits as the selected model.
-pub fn validateModel(model: Model, l: Limits) !void {
+/// Validate a model profile independently of request limits.
+pub fn validateModel(model: Model) !void {
     if (!validText(model.name, 1024)) return error.InvalidModel;
     if (model.protocol == .systemone and (model.reasoning_effort != null or model.reasoning != null)) return error.IncompatibleReasoningProtocol;
     if (model.reasoning_effort) |effort| {
@@ -916,15 +831,12 @@ pub fn validateModel(model: Model, l: Limits) !void {
     }
     // An Anthropic effort requires an explicitly verified Anthropic wire map.
     if (model.protocol == .anthropic and model.reasoning_effort != null and model.reasoning == null) return error.UnsupportedAnthropicReasoning;
-    const mib = 1024 * 1024;
     if (model.output_tokens) |tokens| {
-        if (tokens == 0 or tokens > mib) return error.InvalidBudget;
+        if (tokens == 0) return error.InvalidBudget;
     }
-    if (model.context_tokens > 16 * mib or l.safety_tokens > mib) return error.InvalidBudget;
-    if (model.protocol != .systemone and
-        (model.context_tokens == 0 or @as(u64, l.safety_tokens) + 1 >= model.context_tokens)) return error.InvalidBudget;
-    if (model.input_price_threshold) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
-    if (model.input_price_flat_limit) |tokens| if (tokens == 0 or tokens > 16 * mib) return error.InvalidBudget;
+    if (model.protocol != .systemone and model.context_tokens < 2) return error.InvalidBudget;
+    if (model.input_price_threshold) |tokens| if (tokens == 0) return error.InvalidBudget;
+    if (model.input_price_flat_limit) |tokens| if (tokens == 0) return error.InvalidBudget;
 }
 
 /// Reads only the explicit file; never consults environment variables.
@@ -933,14 +845,16 @@ pub fn validateModel(model: Model, l: Limits) !void {
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Config) {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-    const bytes = try allocator.alloc(u8, max_config_bytes + 1);
+    const stat = try file.stat(io);
+    const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+    const bytes = try allocator.alloc(u8, try std.math.add(usize, size, 1));
     // 字节缓冲区在解析后即可释放，因为 parse 会把字符串复制到独立的内存中。
     defer {
         std.crypto.secureZero(u8, bytes);
         allocator.free(bytes);
     }
     const n = try file.readPositionalAll(io, bytes, 0);
-    if (n > max_config_bytes) return error.ConfigTooLarge;
+    if (n != size) return error.FileChanged;
     return parse(allocator, bytes[0..n]);
 }
 

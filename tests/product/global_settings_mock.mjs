@@ -146,7 +146,7 @@ async function proxyFixture(name, url, configured) {
       }},
     }},
     ...(configured ? {proxy:{address, port, models}} : {}),
-    limits:{low_price_input:true, safety_tokens:100, request_timeout_ms:3000, task_timeout_ms:5000},
+    limits:{low_price_input:true, request_timeout_ms:3000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
   await writeFile(configPath, config, {mode:0o600});
@@ -169,7 +169,7 @@ async function fixture(name, decision, url) {
     }},
     }},
     ...(decision ? {decision:{model:'native/family/native-review'}} : {}),
-    limits:{low_price_input:true, safety_tokens:100, request_timeout_ms:3000, task_timeout_ms:5000},
+    limits:{low_price_input:true, request_timeout_ms:3000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
   await writeFile(configPath, config, {mode:0o600});
@@ -188,16 +188,8 @@ async function unchanged(f) {
 // Canonical defaults materialized by core/config.zig writeDisk. Each value is
 // an authored expectation, never derived from the file under test.
 const limitsDefaults = {
-  command_timeout_ms:300000, command_max_timeout_ms:3600000,
-  read_bytes:65536, output_bytes:32768,
-  low_price_input:true, input_margin_tokens:5000, safety_tokens:4096,
-  max_tool_calls:128, task_timeout_ms:1800000, request_timeout_ms:300000,
-  model_refresh_ttl_ms:14400000, model_refresh_cooldown_ms:300000,
-  cleanup_grace_ms:1000, cleanup_timeout_ms:5000,
-  core_bytes:2048, index_bytes:8192, shard_bytes:32768,
-  compaction_enabled:true, compaction_trigger_percent:80,
-  compaction_target_percent:50, max_response_bytes:8388608,
-  max_event_bytes:1048576,
+  command_timeout_ms:300000, low_price_input:true,
+  request_timeout_ms:300000, compaction_enabled:true,
 };
 
 async function values(f, low, decision, newlySelected = false) {
@@ -213,7 +205,6 @@ async function values(f, low, decision, newlySelected = false) {
   expected.limits = {...limitsDefaults, ...expected.limits, low_price_input:low};
   expected.decision = {
     enabled:true,
-    max_input_tokens:8192, max_state_bytes:16384,
     ...expected.decision,
     enabled:decision,
   };
@@ -231,7 +222,7 @@ function canonicalConfig(f, proxy) {
     Object.assign(provider, {api_key:null, api_key_env:'', chat_max_tokens:false, kind:null, ...provider});
   }
   expected.limits = {...limitsDefaults, ...expected.limits};
-  if (expected.decision) expected.decision = {enabled:true, max_input_tokens:8192, max_state_bytes:16384, ...expected.decision};
+  if (expected.decision) expected.decision = {enabled:true, ...expected.decision};
   if (proxy !== undefined) expected.proxy = proxy;
   return expected;
 }

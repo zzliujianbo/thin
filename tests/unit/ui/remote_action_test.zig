@@ -1,3 +1,14 @@
+test "large submitted input is owned without an ingress quota" {
+    const a = std.testing.allocator;
+    const draft = try a.alloc(u8, 65537);
+    defer a.free(draft);
+    @memset(draft, 'x');
+    const request = try Owned.create(a, 1, 2, 3, .{ .submit = .{ .kind = .prompt, .text = draft } });
+    defer request.deinit();
+    @memset(draft, 'y');
+    try std.testing.expectEqual(@as(usize, 65537), request.action.submit.text.len);
+    try std.testing.expectEqual(@as(u8, 'x'), request.action.submit.text[65536]);
+}
 test "resume management request owns its selected id" {
     var id = "0123456789abcdef0123456789abcdef".*;
     const request = try Owned.create(std.testing.allocator, 1, 2, 3, .{ .manage = .{ .@"resume" = &id } });

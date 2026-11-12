@@ -40,8 +40,6 @@ const CloseoutProducers = struct {
     }
 
     fn run(self: *CloseoutProducers) void {
-        // The primary thread holds producer_mutex throughout this call.
-        self.sink.emit(.{ .stage = .memory_finalize });
         self.dropped.store(true, .release);
         if (!wait(&self.go, self.journal.root.io)) return;
         for (&self.ids, 0..) |*id, i| {

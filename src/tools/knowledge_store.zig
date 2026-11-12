@@ -36,7 +36,7 @@ pub const Repository = struct {
     }
     pub fn apply(self: *Repository, a: std.mem.Allocator, material: knowledge.Material, candidate: knowledge.Candidate) !Apply {
         try mem.validTopic(candidate.topic);
-        if (candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.indexOf(u8, candidate.topic, "--") != null or candidate.content.len > knowledge.max_content_bytes) return error.InvalidMemoryCandidate;
+        if (candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.indexOf(u8, candidate.topic, "--") != null) return error.InvalidMemoryCandidate;
         try fs.validateText(candidate.content);
         if (!validId(material.id)) return error.InvalidMaterial;
         const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.store.root.io).toMilliseconds()));
@@ -80,32 +80,34 @@ pub const Repository = struct {
         const temp = arena.allocator();
         const hits = try self.collect(temp, query, now_ms);
         var out: std.ArrayList(knowledge.Related) = .empty;
-        var bytes: usize = 0;
+        errdefer {
+            for (out.items) |entry| {
+                a.free(entry.topic);
+                a.free(entry.content);
+                a.free(entry.version);
+            }
+            out.deinit(a);
+        }
         for (hits) |hit| {
             const r = hit.record orelse continue;
-            if (out.items.len == knowledge.max_candidates) break;
-            // Match the extractor codec's complete-related-material budget,
-            // including topic and CAS version. Skip whole non-fitting entries;
-            // later smaller records can still fit without losing conditions.
-            const size = r.topic.len + hit.body.len + hit.version.len;
-            if (size > knowledge.max_retrieval_bytes - bytes) continue;
-            try out.append(a, .{ .category = r.category, .topic = try a.dupe(u8, r.topic), .content = try a.dupe(u8, hit.body), .version = try a.dupe(u8, hit.version) });
-            bytes += size;
+            const topic = try a.dupe(u8, r.topic);
+            errdefer a.free(topic);
+            const content = try a.dupe(u8, hit.body);
+            errdefer a.free(content);
+            const version = try a.dupe(u8, hit.version);
+            errdefer a.free(version);
+            try out.append(a, .{ .category = r.category, .topic = topic, .content = content, .version = version });
         }
         return out.toOwnedSlice(a);
     }
-    pub fn retrieve(self: *Repository, a: std.mem.Allocator, query: []const u8, now_ms: u64, max_bytes: usize) ![]u8 {
+    pub fn retrieve(self: *Repository, a: std.mem.Allocator, query: []const u8, now_ms: u64) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const temp = arena.allocator();
         const hits = try self.collect(temp, query, now_ms);
-        const limit = @min(max_bytes, knowledge.max_retrieval_bytes);
         var out: std.ArrayList(u8) = .empty;
         for (hits) |hit| {
             const prefix = try std.fmt.allocPrint(temp, "[Untrusted current local reference: {s}]\n", .{hit.key});
-            // Conditions/exceptions are part of a fact. Never turn a clipped
-            // prefix into an apparently complete memory; skip whole entries.
-            if (prefix.len + hit.body.len + 1 > limit - out.items.len) continue;
             try out.appendSlice(temp, prefix);
             try out.appendSlice(temp, hit.body);
             try out.append(temp, '\n');
@@ -114,7 +116,7 @@ pub const Repository = struct {
     }
     const Hit = struct { key: []const u8, body: []const u8, version: []const u8, record: ?Record, score: usize };
     fn collect(self: *Repository, a: std.mem.Allocator, query: []const u8, now: u64) ![]Hit {
-        if (!std.unicode.utf8ValidateSlice(query) or query.len > knowledge.max_material_bytes) return error.InvalidQuery;
+        if (!std.unicode.utf8ValidateSlice(query)) return error.InvalidQuery;
         var hits: std.ArrayList(Hit) = .empty;
         // Small core is always the first reference, independent of lexical rank.
         const core = self.store.read(a, "core") catch |err| switch (err) {
@@ -130,34 +132,10 @@ pub const Repository = struct {
             a: std.mem.Allocator,
             query: []const u8,
             selected: *std.ArrayList(Selection),
-            const max_selected = 15;
-
-            fn better(x: Selection, y: Selection) bool {
-                if (x.rank != y.rank) return x.rank > y.rank;
-                return std.mem.order(u8, x.key, y.key) == .lt;
-            }
-
-            fn worse(x: Selection, y: Selection) bool {
-                if (x.rank != y.rank) return x.rank < y.rank;
-                return std.mem.order(u8, x.key, y.key) == .gt;
-            }
-
             fn visit(ctx: ?*anyopaque, key: []const u8, title: []const u8) anyerror!void {
                 const state: *@This() = @ptrCast(@alignCast(ctx.?));
                 const rank = score(state.query, key, title);
-                if (rank == 0) return;
-                if (state.selected.items.len < max_selected) {
-                    try state.selected.append(state.a, .{ .key = try state.a.dupe(u8, key), .rank = rank });
-                    return;
-                }
-                var worst: usize = 0;
-                for (state.selected.items, 0..) |item, index| {
-                    if (worse(item, state.selected.items[worst])) worst = index;
-                }
-                const candidate: Selection = .{ .key = key, .rank = rank };
-                if (!better(candidate, state.selected.items[worst])) return;
-                state.a.free(state.selected.items[worst].key);
-                state.selected.items[worst] = .{ .key = try state.a.dupe(u8, key), .rank = rank };
+                try state.selected.append(state.a, .{ .key = try state.a.dupe(u8, key), .rank = rank });
             }
         };
         var visitor = Visitor{ .a = a, .query = query, .selected = &selected };
@@ -168,8 +146,7 @@ pub const Repository = struct {
                 return std.mem.order(u8, x.key, y.key) == .lt;
             }
         }.less);
-        // Never load more than 16 full contents, including the core read above.
-        for (selected.items[0..@min(selected.items.len, 15)]) |selection| {
+        for (selected.items) |selection| {
             const key = selection.key;
             const entry = self.store.read(a, key) catch |err| switch (err) {
                 error.FileNotFound => continue,
@@ -202,7 +179,8 @@ fn decode(a: std.mem.Allocator, key: []const u8, text: []const u8) !?Record {
     if (pos_v2 == null and pos_v1 == null) return null;
     if (pos_v2 != null and pos_v1 != null) return error.InvalidKnowledgeRecord;
     const pos = pos_v2 orelse pos_v1.?;
-    if (pos > 400 or text.len > 16384) return error.InvalidKnowledgeRecord;
+    // The prefix is a preview, not the authoritative record; accept complete
+    // valid records regardless of the length of that untrusted preview.
     const r: Record = if (pos_v2 != null) blk: {
         const parsed = std.json.parseFromSlice(Record, a, text[pos + marker.len ..], .{ .allocate = .alloc_always }) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -221,7 +199,7 @@ fn decode(a: std.mem.Allocator, key: []const u8, text: []const u8) !?Record {
         break :blk .{ .source = old.source, .generation = old.generation, .created_ms = old.created_ms, .expires_at_ms = old.expires_at_ms, .category = old.category, .topic = old.topic, .content = old.content };
     };
     const expected = try std.fmt.allocPrint(a, "{s}-{s}", .{ @tagName(r.category), r.topic });
-    if (!validId(r.source) or !std.mem.eql(u8, key, expected) or r.content.len == 0 or r.content.len > knowledge.max_content_bytes) return error.InvalidKnowledgeRecord;
+    if (!validId(r.source) or !std.mem.eql(u8, key, expected) or r.content.len == 0) return error.InvalidKnowledgeRecord;
     try mem.validTopic(r.topic);
     if (r.topic.len > 40) return error.InvalidKnowledgeRecord;
     try fs.validateText(r.content);
@@ -231,12 +209,9 @@ fn decode(a: std.mem.Allocator, key: []const u8, text: []const u8) !?Record {
 fn score(query: []const u8, key: []const u8, body: []const u8) usize {
     var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n,.;:!?/\\-_");
     var rank: usize = 0;
-    var count: usize = 0;
     while (tokens.next()) |token| {
-        count += 1;
-        if (count > 64) break;
-        if (contains(key, token)) rank += 2;
-        if (contains(body, token)) rank += 1;
+        if (contains(key, token)) rank +|= 2;
+        if (contains(body, token)) rank +|= 1;
         // Chinese prose often has no spaces. Match bounded two-codepoint
         // substrings as well as whole tokens, retaining UTF-8 boundaries.
         var i: usize = 0;
@@ -245,10 +220,10 @@ fn score(query: []const u8, key: []const u8, body: []const u8) usize {
             const next = i + n;
             if (n >= 3 and next < token.len) {
                 const m = std.unicode.utf8ByteSequenceLength(token[next]) catch break;
-                if (m >= 3 and next + m <= token.len) {
+                if (m >= 3 and m <= token.len - next) {
                     const pair = token[i .. next + m];
-                    if (contains(key, pair)) rank += 2;
-                    if (contains(body, pair)) rank += 1;
+                    if (contains(key, pair)) rank +|= 2;
+                    if (contains(body, pair)) rank +|= 1;
                 }
             }
             i = next;

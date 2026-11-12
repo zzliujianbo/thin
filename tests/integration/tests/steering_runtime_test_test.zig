@@ -30,43 +30,47 @@ test "steering safe points complete batch before injected user and preserve orig
         try std.testing.expect(!box.snapshot().active);
     }
 }
-test "steering input limit restores lease and pauses without implicit resume" {
+test "steering larger than former response cap commits once and completes" {
     var box: r.Inbox = .{};
     defer box.deinit();
-    var fake = Fake{ .box = &box, .stage = .stop, .payload = "this exceeds limit" };
+    const payload: [4096]u8 = @splat('x');
+    var fake = Fake{ .box = &box, .stage = .stop, .payload = &payload };
     var config = configValue();
-    config.limits.max_response_bytes = 16;
-    config.limits.max_event_bytes = 16;
     var runtime = try fake.init(&config);
     defer runtime.deinit();
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run("goal", &cancel);
-    try std.testing.expectEqual(r.Status.failed, terminal.status);
-    try std.testing.expectEqual(error.InputTooLarge, terminal.detail.?);
-    try std.testing.expect(box.snapshot().paused);
-    try std.testing.expectEqual(@as(usize, 1), box.snapshot().steering);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.users);
+    try std.testing.expectEqual(@as(usize, 0), box.snapshot().steering);
+    try std.testing.expect(!box.snapshot().paused);
+    var found = false;
+    for (runtime.messages()) |message| for (message.blocks) |block| {
+        if (message.role == .user and block == .text and std.mem.eql(u8, block.text, &payload)) found = true;
+    };
+    try std.testing.expect(found);
     fake.stage = .none;
     const next = try runtime.run("new goal", &cancel);
     try std.testing.expectEqual(r.Status.success, next.status);
-    try std.testing.expectEqual(@as(usize, 0), fake.users);
-    try std.testing.expect(box.snapshot().paused);
+    try std.testing.expectEqual(@as(usize, 1), fake.users);
     try std.testing.expect(box.claimNext() == null);
 }
-test "steering round pause preserves queue and original budget" {
+test "steering skips pending tools and completes without round quota" {
     var box: r.Inbox = .{};
     defer box.deinit();
     var fake = Fake{ .box = &box, .stage = .model };
     var config = configValue();
-    config.limits.max_rounds = 1;
     var runtime = try fake.init(&config);
     defer runtime.deinit();
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run("goal", &cancel);
-    try std.testing.expectEqual(r.Status.paused, terminal.status);
-    try std.testing.expectEqual(error.RoundLimit, terminal.detail.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), fake.executions);
-    try std.testing.expect(box.snapshot().paused);
+    try std.testing.expectEqual(@as(usize, 1), fake.users);
+    try std.testing.expectEqual(@as(usize, 2), fake.results);
+    try std.testing.expect(!box.snapshot().paused);
 }
 test "steering pre-send event does not spend a round and late seal stays pending" {
     for ([_]Stage{ .request, .late }) |stage| {
@@ -74,7 +78,6 @@ test "steering pre-send event does not spend a round and late seal stays pending
         defer box.deinit();
         var fake = Fake{ .box = &box, .stage = stage };
         var config = configValue();
-        config.limits.max_rounds = 2;
         var runtime = try fake.init(&config);
         defer runtime.deinit();
         var cancel: p.Cancellation = .{};

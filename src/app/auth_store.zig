@@ -157,35 +157,28 @@ pub const Store = struct {
         const file = fs.fileFromFd(fd);
         const stat = try file.stat(self.root.io);
         if (stat.kind != .file) return error.NotRegularFile;
-        if (stat.size > cfg.max_config_bytes) return error.ConfigTooLarge;
+        const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
         var bytes = Bytes{
             .allocator = self.root.allocator,
-            .buffer = try self.root.allocator.alloc(u8, cfg.max_config_bytes + 1),
+            .buffer = try self.root.allocator.alloc(u8, try std.math.add(usize, size, 1)),
             .len = 0,
         };
         errdefer bytes.deinit();
         bytes.len = try file.readPositionalAll(self.root.io, bytes.buffer, 0);
-        if (bytes.len > cfg.max_config_bytes) return error.ConfigTooLarge;
         if (bytes.len != stat.size) return error.FileChanged;
         return bytes;
     }
 
     fn serialize(self: *Store, config: cfg.Config) !Bytes {
         try cfg.validate(config);
-        var bytes = Bytes{
-            .allocator = self.root.allocator,
-            .buffer = try self.root.allocator.alloc(u8, cfg.max_config_bytes),
-            .len = 0,
-        };
-        errdefer bytes.deinit();
-        var writer = std.Io.Writer.fixed(bytes.buffer);
-        cfg.writeDisk(config, &writer) catch |err| switch (err) {
-            error.WriteFailed => return error.ConfigTooLarge,
-            else => return err,
-        };
-        writer.writeByte('\n') catch return error.ConfigTooLarge;
-        bytes.len = writer.end;
-        return bytes;
+        var wiping = cfg.WipingAllocator{ .backing = self.root.allocator };
+        var writer: std.Io.Writer.Allocating = .init(wiping.allocator());
+        defer writer.deinit();
+        // This writer has no I/O backend: WriteFailed is allocation failure.
+        cfg.writeDisk(config, &writer.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+        writer.writer.writeByte('\n') catch return error.OutOfMemory;
+        const buffer = try writer.toOwnedSlice();
+        return .{ .allocator = self.root.allocator, .buffer = buffer, .len = buffer.len };
     }
 
     /// Restore path: load an existing valid configuration, never initialize it.

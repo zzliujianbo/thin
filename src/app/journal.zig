@@ -1,4 +1,4 @@
-//! 有界本地诊断日志；不参与模型历史、授权或终态决策。
+//! 本地诊断日志；不参与模型历史、授权或终态决策。
 //! 明文日志只替换当前已知 key，不是 vault，也不扫描其他秘密。
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
@@ -16,9 +16,14 @@ fn safeDiagnosticCause(d: *const decision.Diagnostic) ?[]const u8 {
     return name;
 }
 
-const text_limit = 1 * 1024 * 1024;
-const record_limit = 5 * 1024 * 1024;
 const omitted = "[omitted]";
+
+const RawJson = struct {
+    bytes: []const u8,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.print("{s}", .{self.bytes});
+    }
+};
 
 const SelectionEvent = struct {
     snapshot: selections.Snapshot,
@@ -44,18 +49,11 @@ const Item = union(enum) {
 };
 
 pub const Journal = struct {
-    const queue_limit = 128;
-    const diagnostic_limit = 64;
-    const physical_limit = queue_limit + diagnostic_limit;
-    const byte_limit = 8 * 1024 * 1024;
-
     allocator: std.mem.Allocator,
     root: *fs.Root,
     key: []u8,
     /// Retain previous/other configured keys for this session's redaction.
-    /// At most 16 additional 16-KiB keys; owner changes these only while joined.
-    known_keys: [16][]u8 = undefined,
-    known_key_count: usize = 0,
+    known_keys: std.ArrayList([]u8) = .empty,
     store: logs.Store,
     protocol: p.Protocol = .auto,
     /// Owned metadata; never borrows old configuration strings.
@@ -76,12 +74,11 @@ pub const Journal = struct {
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     key_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     wake: std.Io.Event = .unset,
-    queue: [physical_limit]Item = undefined,
+    queue: std.ArrayList(Item) = .empty,
     diagnostic_outstanding: usize = 0,
     diagnostic_dropped: std.atomic.Value(u64) = .init(0),
     diagnostic_span: std.atomic.Value(u64) = .init(0),
     diagnostic_ready: std.atomic.Value(bool) = .init(false),
-    head: usize = 0,
     count: usize = 0,
     outstanding: usize = 0,
     bytes: usize = 0,
@@ -138,8 +135,7 @@ pub const Journal = struct {
             self.wake.reset();
             return null;
         }
-        const data = self.queue[self.head];
-        self.head = (self.head + 1) % physical_limit;
+        const data = self.queue.orderedRemove(0);
         self.count -= 1;
         return data;
     }
@@ -150,15 +146,22 @@ pub const Journal = struct {
 
     fn enqueueItem(self: *Journal, data: Item) !void {
         self.lock();
-        if (self.stopping or self.outstanding - self.diagnostic_outstanding == queue_limit or data.size() > byte_limit - self.bytes) {
-            const stopped = self.stopping;
+        if (self.stopping) {
             self.unlock();
-            return if (stopped) error.LogStopped else error.LogQueueFull;
+            return error.LogStopped;
         }
-        self.queue[(self.head + self.count) % physical_limit] = data;
+        const bytes = std.math.add(usize, self.bytes, data.size()) catch |err| {
+            self.unlock();
+            return err;
+        };
+        self.queue.append(self.allocator, data) catch |err| {
+            self.unlock();
+            return err;
+        };
         self.count += 1;
         self.outstanding += 1;
-        self.bytes += data.size();
+        self.bytes = bytes;
+        if (data == .diagnostic) self.diagnostic_outstanding += 1;
         self.unlock();
         self.wake.set(self.root.io);
     }
@@ -180,10 +183,13 @@ pub const Journal = struct {
         switch (item) {
             .record => |data| try self.writeRecord(data),
             .diagnostic => |event| {
-                var buffer: [8192]u8 = undefined;
-                var writer = std.Io.Writer.fixed(&buffer);
+                var writer: std.Io.Writer.Allocating = .init(self.allocator);
+                defer {
+                    std.crypto.secureZero(u8, writer.written());
+                    writer.deinit();
+                }
                 const v = event.record;
-                try std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "diagnostic", .data = .{
+                std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "diagnostic", .data = .{
                     .stage = v.stage,
                     .phase = v.phase,
                     .span_id = v.span_id,
@@ -202,14 +208,17 @@ pub const Journal = struct {
                     .decision_failure = if (v.decision_failure) |*d| .{ .stage = d.stage, .backend = d.backend, .operation = d.operation, .cause = safeDiagnosticCause(d), .http_status = d.http_status, .model_failure = d.model_failure } else null,
                     .candidate_index = v.candidate_index,
                     .count = v.count,
-                }, .dropped_total = event.dropped_total }, .{}, &writer);
-                try self.writeRecord(writer.buffered());
+                }, .dropped_total = event.dropped_total }, .{}, &writer.writer) catch return error.OutOfMemory;
+                try self.writeRecord(writer.written());
             },
             .selection => |event| {
-                var buffer: [selections.max_bytes]u8 = undefined;
-                var writer = std.Io.Writer.fixed(&buffer);
-                try std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "selection", .data = event.snapshot.view() }, .{}, &writer);
-                try self.writeRecord(writer.buffered());
+                var writer: std.Io.Writer.Allocating = .init(self.allocator);
+                defer {
+                    std.crypto.secureZero(u8, writer.written());
+                    writer.deinit();
+                }
+                std.json.Stringify.value(.{ .schema = 1, .seq = event.seq, .turn = event.turn, .timestamp_ms = event.timestamp_ms, .elapsed_ms = event.elapsed_ms, .event = "selection", .data = event.snapshot.view() }, .{}, &writer.writer) catch return error.OutOfMemory;
+                try self.writeRecord(writer.written());
             },
         }
     }
@@ -291,20 +300,22 @@ pub const Journal = struct {
 
     /// 不进行 I/O；key 独立持有，root 的生命周期必须覆盖 Journal。
     pub fn init(a: std.mem.Allocator, root: *fs.Root, key: []const u8) !Journal {
-        return .{ .allocator = a, .root = root, .key = try a.dupe(u8, key), .store = logs.Store.init(a, root, .{}) };
+        return .{ .allocator = a, .root = root, .key = try a.dupe(u8, key), .store = logs.Store.init(a, root) };
     }
 
     /// Thread-safe registration; never forget an earlier credential.
     pub fn rememberKey(self: *Journal, key: []const u8) !void {
-        if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
+        if (key.len == 0) return error.InvalidApiKey;
         for (key) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidApiKey;
         std.debug.assert(std.c.pthread_mutex_lock(&self.key_mutex) == .SUCCESS);
         defer std.debug.assert(std.c.pthread_mutex_unlock(&self.key_mutex) == .SUCCESS);
         if (self.isKeyUnlocked(key)) return;
-        if (self.known_key_count == self.known_keys.len) return error.TooManySessionCredentials;
         const owned = try self.allocator.dupe(u8, key);
-        self.known_keys[self.known_key_count] = owned;
-        self.known_key_count += 1;
+        errdefer {
+            std.crypto.secureZero(u8, owned);
+            self.allocator.free(owned);
+        }
+        try self.known_keys.append(self.allocator, owned);
     }
 
     /// Read-only while Runtime owns an accepted task. Reject entire memory
@@ -322,7 +333,7 @@ pub const Journal = struct {
 
     fn isKeyUnlocked(self: *const Journal, value: []const u8) bool {
         if (self.key.len != 0 and std.mem.eql(u8, self.key, value)) return true;
-        for (self.known_keys[0..self.known_key_count]) |key| if (std.mem.eql(u8, key, value)) return true;
+        for (self.known_keys.items) |key| if (std.mem.eql(u8, key, value)) return true;
         return false;
     }
     const SecretMatch = struct { at: usize, len: usize };
@@ -331,8 +342,8 @@ pub const Journal = struct {
         std.debug.assert(std.c.pthread_mutex_lock(mutex) == .SUCCESS);
         defer std.debug.assert(std.c.pthread_mutex_unlock(mutex) == .SUCCESS);
         var found: ?SecretMatch = null;
-        for (0..self.known_key_count + 1) |index| {
-            const key = if (index == 0) self.key else self.known_keys[index - 1];
+        for (0..self.known_keys.items.len + 1) |index| {
+            const key = if (index == 0) self.key else self.known_keys.items[index - 1];
             if (key.len == 0) continue;
             if (std.mem.find(u8, value, key)) |at| {
                 if (found == null or at < found.?.at or (at == found.?.at and key.len > found.?.len)) found = .{ .at = at, .len = key.len };
@@ -351,11 +362,12 @@ pub const Journal = struct {
         std.crypto.secureZero(u8, self.key);
         self.allocator.free(self.key);
         self.key = &.{};
-        for (self.known_keys[0..self.known_key_count]) |key| {
+        for (self.known_keys.items) |key| {
             std.crypto.secureZero(u8, key);
             self.allocator.free(key);
         }
-        self.known_key_count = 0;
+        self.known_keys.deinit(self.allocator);
+        self.queue.deinit(self.allocator);
     }
 
     /// Lifecycle owner only, before any producer/writer starts. No storage I/O.
@@ -437,36 +449,37 @@ pub const Journal = struct {
     fn diagnosticEmit(ctx: ?*anyopaque, record_: diagnostics.Record) void {
         const self: *Journal = @ptrCast(@alignCast(ctx.?));
         if (!self.diagnosticActive()) return;
-        if (std.c.pthread_mutex_trylock(&self.producer_mutex) != .SUCCESS) {
-            _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
-            return;
+        // Diagnostics cannot silently disappear under contention, but must not
+        // wait indefinitely behind a producer formatting a large record.
+        const started = std.Io.Clock.awake.now(self.root.io);
+        while (std.c.pthread_mutex_trylock(&self.producer_mutex) != .SUCCESS) {
+            if (started.untilNow(self.root.io, .awake).toMilliseconds() >= self.test_flush_timeout_ms) {
+                self.fail(error.LogProducerTimeout);
+                return;
+            }
+            std.Io.sleep(self.root.io, .fromMilliseconds(2), .awake) catch |err| {
+                self.fail(err);
+                return;
+            };
         }
         defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
-        if (std.c.pthread_mutex_trylock(&self.mutex) != .SUCCESS) {
-            _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
+        const next = std.math.add(u64, self.seq, 1) catch |err| {
+            self.fail(err);
             return;
-        }
-        if (self.stopping or self.diagnostic_outstanding == diagnostic_limit or self.seq == std.math.maxInt(u64)) {
-            self.unlock();
-            _ = self.diagnostic_dropped.fetchAdd(1, .monotonic);
-            return;
-        }
-        const next = self.seq + 1;
+        };
         const origin = record_.origin orelse diagnostics.Origin{ .turn = self.turn, .began_ms = self.began_ms };
-        self.queue[(self.head + self.count) % physical_limit] = .{ .diagnostic = .{
+        self.enqueueItem(.{ .diagnostic = .{
             .record = record_,
             .seq = next,
             .turn = origin.turn,
             .timestamp_ms = std.Io.Clock.real.now(self.root.io).toMilliseconds(),
             .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() -| origin.began_ms),
             .dropped_total = self.diagnostic_dropped.load(.monotonic),
-        } };
+        } }) catch |err| {
+            self.fail(err);
+            return;
+        };
         self.seq = next;
-        self.count += 1;
-        self.outstanding += 1;
-        self.diagnostic_outstanding += 1;
-        self.unlock();
-        self.wake.set(self.root.io);
     }
 
     pub fn observer(self: *Journal) r.Observer {
@@ -487,27 +500,14 @@ pub const Journal = struct {
     fn record(self: *Journal, a: std.mem.Allocator, event: []const u8, data: anytype) !void {
         std.debug.assert(std.c.pthread_mutex_lock(&self.producer_mutex) == .SUCCESS);
         defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
-        var small: [4096]u8 = undefined;
-        defer std.crypto.secureZero(u8, &small);
-        var large: ?[]u8 = null;
-        defer if (large) |buffer| a.free(buffer);
-        var writer = std.Io.Writer.fixed(&small);
+        var writer: std.Io.Writer.Allocating = .init(a);
+        defer writer.deinit();
         const timestamp = std.Io.Clock.real.now(self.root.io).toMilliseconds();
         const elapsed = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() - self.began_ms);
         const next = try std.math.add(u64, self.seq, 1);
         const envelope = .{ .schema = 1, .seq = next, .turn = self.turn, .timestamp_ms = timestamp, .elapsed_ms = elapsed, .event = event, .data = data };
-        std.json.Stringify.value(envelope, .{}, &writer) catch {
-            // Fixed writers only fail when full. Retry once at the original cap;
-            // the observation's wiping arena owns this uncommon allocation.
-            large = try a.alloc(u8, record_limit - 64);
-            writer = std.Io.Writer.fixed(large.?);
-            std.json.Stringify.value(envelope, .{}, &writer) catch {
-                // 固定缓冲写满不产生半行，也不终止日志；保留 envelope 与省略原因。
-                writer = std.Io.Writer.fixed(large.?);
-                try std.json.Stringify.value(.{ .schema = 1, .seq = next, .turn = self.turn, .timestamp_ms = timestamp, .elapsed_ms = elapsed, .event = event, .data = .{ .omitted = true, .reason = "record_limit" } }, .{}, &writer);
-            };
-        };
-        const owned = try self.allocator.dupe(u8, writer.buffered());
+        std.json.Stringify.value(envelope, .{}, &writer.writer) catch return error.OutOfMemory;
+        const owned = try self.allocator.dupe(u8, writer.written());
         errdefer {
             std.crypto.secureZero(u8, owned);
             self.allocator.free(owned);
@@ -531,7 +531,7 @@ pub const Journal = struct {
             if (!self.started) {
                 self.started = true;
                 const selection_view: ?selections.Snapshot.View = if (self.selection) |*snapshot| snapshot.view() else null;
-                try self.record(a, "session", .{ .protocol = self.protocol, .selection = selection_view, .format = "jsonl", .text_bytes = text_limit, .record_bytes = record_limit, .plaintext = true, .redaction = "known_key_only" });
+                try self.record(a, "session", .{ .protocol = self.protocol, .selection = selection_view, .format = "jsonl", .plaintext = true, .redaction = "known_key_only" });
                 try self.enqueueSelection();
             }
             const t = try self.jsonText(a, observation.submitted);
@@ -578,7 +578,8 @@ pub const Journal = struct {
                         },
                         .tool_call => |v| {
                             const args = try self.jsonValue(a, v.arguments);
-                            try self.record(a, "tool_call", .{ .call_id = (try self.jsonText(a, v.id)).text, .name = (try self.jsonText(a, v.name)).text, .arguments = args.value, .source_bytes = v.arguments.len, .omitted = args.dropped, .truncated = args.dropped, .message_index = self.message_index, .block_index = index });
+                            const encoded_args = try encodeJson(a, args.value);
+                            try self.record(a, "tool_call", .{ .call_id = (try self.jsonText(a, v.id)).text, .name = (try self.jsonText(a, v.name)).text, .arguments = RawJson{ .bytes = encoded_args }, .source_bytes = v.arguments.len, .omitted = args.dropped, .truncated = args.dropped, .message_index = self.message_index, .block_index = index });
                         },
                         .reasoning, .tool_result => {},
                     };
@@ -630,113 +631,160 @@ pub const Journal = struct {
         return .{ .text = value, .source_bytes = input.len, .truncated = dropped, .omitted = dropped };
     }
 
-    /// 超大/非法 UTF-8 整体省略，避免截断横跨边界的 key 或多字节字符。
+    /// Redact every known key without clipping; invalid UTF-8 is an error.
     fn safe(self: *Journal, a: std.mem.Allocator, input: []const u8) ![]const u8 {
-        if (input.len > text_limit or !std.unicode.utf8ValidateSlice(input)) return omitted;
+        if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
         if (self.nextSecret(input) == null) return input;
         const replacement = "[redacted]";
         var out: std.Io.Writer.Allocating = .init(a);
         defer out.deinit();
         var rest = input;
         while (self.nextSecret(rest)) |match| {
-            if (out.written().len + match.at + replacement.len > text_limit) return omitted;
-            try out.writer.writeAll(rest[0..match.at]);
-            try out.writer.writeAll(replacement);
+            out.writer.writeAll(rest[0..match.at]) catch return error.OutOfMemory;
+            out.writer.writeAll(replacement) catch return error.OutOfMemory;
             rest = rest[match.at + match.len ..];
         }
-        if (out.written().len + rest.len > text_limit) return omitted;
-        try out.writer.writeAll(rest);
+        out.writer.writeAll(rest) catch return error.OutOfMemory;
         return try a.dupe(u8, out.written());
     }
 
     const Json = struct { value: std.json.Value, dropped: bool = false, parsed: bool = false, changed: bool = false };
 
-    fn jsonValue(self: *Journal, a: std.mem.Allocator, input: []const u8) !Json {
-        return self.jsonValueAt(a, input, 0);
-    }
+    const Pair = struct { key: std.json.Value, value: std.json.Value };
+    const RedactWork = union(enum) {
+        visit: *std.json.Value,
+        finish_string: struct { target: *std.json.Value, nested: *std.json.Value, original: []const u8, plain: Text, before: usize },
+        finish_object: struct { target: *std.json.Value, pairs: []Pair },
+    };
 
-    fn jsonValueAt(self: *Journal, a: std.mem.Allocator, input: []const u8, depth: usize) anyerror!Json {
-        if (depth >= 64 or input.len > text_limit or !std.unicode.utf8ValidateSlice(input)) return .{ .value = .{ .string = omitted }, .dropped = true, .changed = true };
+    fn jsonValue(self: *Journal, a: std.mem.Allocator, input: []const u8) !Json {
+        if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
         const parsed = std.json.parseFromSlice(std.json.Value, a, input, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| {
-            if (err == error.OutOfMemory) return err;
+            if (err == error.OutOfMemory or err == error.DuplicateField) return err;
             const t = try self.text(a, input);
             return .{ .value = .{ .string = t.text }, .dropped = t.omitted, .changed = !std.mem.eql(u8, t.text, input) };
         };
-        // arena 统一拥有解析树；对象字段名也可能来自不可信工具参数。
+        const root = try a.create(std.json.Value);
+        root.* = parsed.value;
+        var work: std.ArrayList(RedactWork) = .empty;
+        defer work.deinit(a);
+        try work.append(a, .{ .visit = root });
+        var changes: usize = 0;
         var dropped = false;
-        var changed = false;
-        const value = try self.redactValue(a, parsed.value, depth, &dropped, &changed);
-        return .{ .value = value, .dropped = dropped, .parsed = true, .changed = changed };
-    }
-
-    fn redactValue(self: *Journal, a: std.mem.Allocator, value: std.json.Value, depth: usize, dropped: *bool, changed: *bool) anyerror!std.json.Value {
-        if (depth >= 64) {
-            dropped.* = true;
-            changed.* = true;
-            return .{ .string = omitted };
-        }
-        var result = value;
-        switch (value) {
-            .string => |s| {
-                // read_file 的 content / write_file 的 content 本身也可能是 JSON。
-                // 逐层解码后再脱敏；未改变的字符串保留原始空白与编码形式。
-                const nested = try self.jsonValueAt(a, s, depth + 1);
-                const plain = try self.text(a, s);
-                var clean = plain.text;
-                if (nested.parsed and nested.changed) {
-                    clean = (try encodeJson(a, nested.value, s.len)) orelse omitted;
-                    if (std.mem.eql(u8, clean, omitted)) dropped.* = true;
-                } else if (nested.dropped) clean = omitted;
-                dropped.* = dropped.* or plain.omitted or nested.dropped;
-                changed.* = changed.* or nested.changed or !std.mem.eql(u8, clean, s);
-                result = .{ .string = clean };
+        while (work.pop()) |entry| switch (entry) {
+            .visit => |target| switch (target.*) {
+                .string => |s| {
+                    const plain = try self.text(a, s);
+                    const nested = std.json.parseFromSlice(std.json.Value, a, s, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| {
+                        if (err == error.OutOfMemory or err == error.DuplicateField) return err;
+                        if (!std.mem.eql(u8, plain.text, s)) changes += 1;
+                        dropped = dropped or plain.omitted;
+                        target.* = .{ .string = plain.text };
+                        continue;
+                    };
+                    const child = try a.create(std.json.Value);
+                    child.* = nested.value;
+                    try work.append(a, .{ .finish_string = .{ .target = target, .nested = child, .original = s, .plain = plain, .before = changes } });
+                    try work.append(a, .{ .visit = child });
+                },
+                .number_string => |s| if (self.nextSecret(s) != null) {
+                    target.* = .{ .string = "[redacted]" };
+                    changes += 1;
+                },
+                .array => |array| {
+                    var i = array.items.len;
+                    while (i != 0) {
+                        i -= 1;
+                        try work.append(a, .{ .visit = &array.items[i] });
+                    }
+                },
+                .object => |object| {
+                    const pairs = try a.alloc(Pair, object.count());
+                    var iter = object.iterator();
+                    var i: usize = 0;
+                    while (iter.next()) |item| : (i += 1) pairs[i] = .{ .key = .{ .string = item.key_ptr.* }, .value = item.value_ptr.* };
+                    try work.append(a, .{ .finish_object = .{ .target = target, .pairs = pairs } });
+                    while (i != 0) {
+                        i -= 1;
+                        try work.append(a, .{ .visit = &pairs[i].value });
+                        try work.append(a, .{ .visit = &pairs[i].key });
+                    }
+                },
+                else => {},
             },
-            .number_string => |s| {
-                if (self.nextSecret(s) != null) {
-                    result = .{ .string = "[redacted]" };
-                    changed.* = true;
-                }
+            .finish_string => |state| {
+                const clean = if (changes != state.before) try encodeJson(a, state.nested.*) else state.plain.text;
+                if (!std.mem.eql(u8, clean, state.original)) changes += 1;
+                dropped = dropped or state.plain.omitted;
+                state.target.* = .{ .string = clean };
             },
-            .array => |array| for (array.items) |*item| {
-                item.* = try self.redactValue(a, item.*, depth + 1, dropped, changed);
-            },
-            .object => |object| {
+            .finish_object => |state| {
                 var clean: std.json.ObjectMap = .{};
-                var it = object.iterator();
-                while (it.next()) |entry| {
-                    const key = (try self.redactValue(a, .{ .string = entry.key_ptr.* }, depth + 1, dropped, changed)).string;
-                    dropped.* = dropped.* or clean.contains(key);
-                    try clean.put(a, key, try self.redactValue(a, entry.value_ptr.*, depth + 1, dropped, changed));
+                for (state.pairs) |pair| {
+                    const key = pair.key.string;
+                    if (clean.contains(key)) return error.RedactedKeyCollision;
+                    try clean.put(a, key, pair.value);
                 }
-                result = .{ .object = clean };
+                state.target.* = .{ .object = clean };
             },
-            else => {},
-        }
-        return result;
+        };
+        return .{ .value = root.*, .dropped = dropped, .parsed = true, .changed = changes != 0 };
     }
 
-    /// 小字符串不预分配 1 MiB；扩容有硬上限，失败不会产生半个 JSON 字符串。
-    fn encodeJson(a: std.mem.Allocator, value: std.json.Value, hint: usize) !?[]const u8 {
-        var capacity = @min(text_limit, @max(@as(usize, 128), hint));
-        while (true) {
-            const buffer = try a.alloc(u8, capacity);
-            var writer = std.Io.Writer.fixed(buffer);
-            std.json.Stringify.value(value, .{}, &writer) catch {
-                a.free(buffer);
-                if (capacity == text_limit) return null;
-                capacity = @min(text_limit, capacity * 2);
-                continue;
-            };
-            return writer.buffered();
-        }
+    const EncodeWork = union(enum) { value: std.json.Value, raw: []const u8, string: []const u8 };
+    fn encodeJson(a: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        encodeJsonInto(a, value, &out) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+        return try a.dupe(u8, out.written());
+    }
+
+    fn encodeJsonInto(a: std.mem.Allocator, value: std.json.Value, out: *std.Io.Writer.Allocating) !void {
+        var work: std.ArrayList(EncodeWork) = .empty;
+        defer work.deinit(a);
+        try work.append(a, .{ .value = value });
+        while (work.pop()) |entry| switch (entry) {
+            .raw => |bytes| try out.writer.writeAll(bytes),
+            .string => |bytes| try std.json.Stringify.value(bytes, .{}, &out.writer),
+            .value => |v| switch (v) {
+                .array => |array| {
+                    try out.writer.writeByte('[');
+                    try work.append(a, .{ .raw = "]" });
+                    var i = array.items.len;
+                    while (i != 0) {
+                        i -= 1;
+                        try work.append(a, .{ .value = array.items[i] });
+                        if (i != 0) try work.append(a, .{ .raw = "," });
+                    }
+                },
+                .object => |object| {
+                    try out.writer.writeByte('{');
+                    try work.append(a, .{ .raw = "}" });
+                    var i = object.count();
+                    while (i != 0) {
+                        i -= 1;
+                        try work.append(a, .{ .value = object.values()[i] });
+                        try work.append(a, .{ .raw = ":" });
+                        try work.append(a, .{ .string = object.keys()[i] });
+                        if (i != 0) try work.append(a, .{ .raw = "," });
+                    }
+                },
+                .number_string => |s| try out.writer.writeAll(s),
+                .string => |s| try std.json.Stringify.value(s, .{}, &out.writer),
+                .null => try out.writer.writeAll("null"),
+                .bool => |v2| try std.json.Stringify.value(v2, .{}, &out.writer),
+                .integer => |v2| try std.json.Stringify.value(v2, .{}, &out.writer),
+                .float => |v2| try std.json.Stringify.value(v2, .{}, &out.writer),
+            },
+        };
     }
 
     fn jsonText(self: *Journal, a: std.mem.Allocator, input: []const u8) !Text {
-        if (input.len > text_limit or self.isKey(input)) return self.text(a, input);
+        if (self.isKey(input)) return self.text(a, input);
         const json = try self.jsonValue(a, input);
         if (!json.parsed) return .{ .text = json.value.string, .source_bytes = input.len, .truncated = json.dropped, .omitted = json.dropped };
         if (!json.changed) return .{ .text = input, .source_bytes = input.len, .truncated = json.dropped, .omitted = json.dropped };
-        const encoded = (try encodeJson(a, json.value, input.len)) orelse return .{ .text = omitted, .source_bytes = input.len, .truncated = true, .omitted = true };
+        const encoded = try encodeJson(a, json.value);
         return .{ .text = encoded, .source_bytes = input.len, .truncated = json.dropped, .omitted = json.dropped };
     }
 };

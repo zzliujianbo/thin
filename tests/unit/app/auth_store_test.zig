@@ -183,7 +183,7 @@ test "auth store explicit save mode and version conflict" {
     try one.root.dir.deleteFile(std.testing.io, cfg.file_name);
     try std.testing.expectError(error.AuthVersionConflict, one.save(changed.value));
 }
-test "auth store rejects symlink directory FIFO and oversize config" {
+test "auth store rejects symlink directory FIFO and accepts large valid config" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try testOpen(tmp.dir);
@@ -198,11 +198,23 @@ test "auth store rejects symlink directory FIFO and oversize config" {
     try std.testing.expectEqual(@as(c_int, 0), mkfifoat(fd, cfg.file_name, 0o600));
     try std.testing.expectError(error.NotRegularFile, store.loadOrInitialize());
     try store.root.dir.deleteFile(std.testing.io, cfg.file_name);
-    const big = try std.testing.allocator.alloc(u8, cfg.max_config_bytes + 1);
+    const valid =
+        \\{"llm":{"default":"local/m","providers":{"local":{"base_url":"https://fixture.invalid/v1","models":{"m":{"protocol":"chat","context_tokens":32768}}}}}}
+    ;
+    const big = try std.testing.allocator.alloc(u8, 64 * 1024 + 1 + valid.len);
     defer std.testing.allocator.free(big);
-    @memset(big, ' ');
+    @memset(big[0 .. big.len - valid.len], ' ');
+    @memcpy(big[big.len - valid.len ..], valid);
     try store.root.dir.writeFile(std.testing.io, .{ .sub_path = cfg.file_name, .data = big });
-    try std.testing.expectError(error.ConfigTooLarge, store.loadOrInitialize());
+    var loaded = try store.loadOrInitialize();
+    defer cfg.release(&loaded);
+    try std.testing.expectEqualStrings("local/m", loaded.value.registry.?.default);
+    try std.testing.expectEqual(@as(u32, 32768), loaded.value.registry.?.find("local").?.patchFor("m").?.context_tokens.?);
+    const stat = try store.root.dir.statFile(std.testing.io, cfg.file_name, .{});
+    try std.testing.expectEqual(@as(u64, big.len), stat.size);
+    const unchanged = try store.root.dir.readFileAlloc(std.testing.io, cfg.file_name, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualSlices(u8, big, unchanged);
 }
 test "auth store rejects linked thin directory" {
     var tmp = std.testing.tmpDir(.{});

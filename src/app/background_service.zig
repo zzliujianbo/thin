@@ -1,4 +1,4 @@
-//! 实例内后台命令管理器：Job 所有权、有界日志环、状态/停止与退出收敛。
+//! 实例内后台命令管理器：Job 所有权、完整日志、状态/停止与退出收敛。
 //!
 //! 每个 Job 独立持有 root 目录描述符、精简环境副本、命令、自有取消令牌、
 //! 日志环与 worker Future；worker 不访问父配置、Runtime 或注册表。数量不设
@@ -59,27 +59,17 @@ const Spin = struct {
     }
 };
 
-/// 覆盖旧数据时准确推进 `available_from` 的原始字节环。
+/// 按需增长、按原始字节游标读取的日志。
 const Ring = struct {
-    buf: []u8,
-    /// 下一次写入位置。
-    next: usize = 0,
-    /// 当前保留字节数，上限为容量。
-    len: usize = 0,
+    buf: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
     /// 收到过的原始字节总数（饱和累加）。
     total: u64 = 0,
 
-    fn append(self: *Ring, bytes: []const u8) void {
-        self.total +|= bytes.len;
-        if (self.buf.len == 0) return;
-        var rest = bytes;
-        while (rest.len != 0) {
-            const take = @min(self.buf.len - self.next, rest.len);
-            @memcpy(self.buf[self.next..][0..take], rest[0..take]);
-            self.next = (self.next + take) % self.buf.len;
-            rest = rest[take..];
-        }
-        self.len = @min(self.len + bytes.len, self.buf.len);
+    fn append(self: *Ring, bytes: []const u8) !void {
+        const total = std.math.add(u64, self.total, bytes.len) catch return error.OutputTooLarge;
+        try self.buf.appendSlice(self.allocator, bytes);
+        self.total = total;
     }
 
     const Read = struct {
@@ -96,28 +86,18 @@ const Ring = struct {
     /// 的部分记为 lost，并以 available_from 为真实起点。
     fn readInto(self: *const Ring, offset: u64, dst: []u8) Read {
         const total = self.total;
-        const from = total - self.len;
-        const lost: u64 = if (offset < from) from - offset else 0;
-        const start = @max(offset, from);
-        if (start >= total or dst.len == 0 or self.buf.len == 0)
-            return .{ .start = start, .end = start, .lost = lost, .total_bytes = total, .available_from = from };
+        const start = offset;
+        if (start >= total or dst.len == 0)
+            return .{ .start = start, .end = start, .total_bytes = total };
         const len: usize = @intCast(@min(total - start, dst.len));
-        // 绝对位置 p 对应环内下标 (next + p - total) mod cap。
-        const delta: usize = @intCast(total - start);
-        var index = (self.next + self.buf.len - (delta % self.buf.len)) % self.buf.len;
-        var copied: usize = 0;
-        while (copied < len) {
-            const take = @min(self.buf.len - index, len - copied);
-            @memcpy(dst[copied..][0..take], self.buf[index..][0..take]);
-            copied += take;
-            index = (index + take) % self.buf.len;
-        }
-        return .{ .start = start, .end = start + len, .lost = lost, .len = len, .total_bytes = total, .available_from = from };
+        const index: usize = @intCast(start);
+        @memcpy(dst[0..len], self.buf.items[index..][0..len]);
+        return .{ .start = start, .end = start + len, .len = len, .total_bytes = total };
     }
 
     fn deinitWiped(self: *Ring, a: std.mem.Allocator) void {
-        wipe(self.buf);
-        a.free(self.buf);
+        wipe(self.buf.items);
+        self.buf.deinit(a);
         self.* = undefined;
     }
 };
@@ -126,18 +106,15 @@ const Logs = struct {
     mutex: Spin = .{},
     streams: [2]Ring,
 
-    /// stdout 取上取整、stderr 取下取整，两路合计不超过给定预算。
-    fn init(a: std.mem.Allocator, budget: u32) !Logs {
-        const out_buf = try a.alloc(u8, (budget + 1) / 2);
-        errdefer a.free(out_buf);
-        const err_buf = try a.alloc(u8, budget / 2);
-        return .{ .streams = .{ .{ .buf = out_buf }, .{ .buf = err_buf } } };
+    /// 每路独立保存完整输出。
+    fn init(a: std.mem.Allocator) Logs {
+        return .{ .streams = .{ .{ .allocator = a }, .{ .allocator = a } } };
     }
 
-    fn append(self: *Logs, which: usize, bytes: []const u8) void {
+    fn append(self: *Logs, which: usize, bytes: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.streams[which].append(bytes);
+        try self.streams[which].append(bytes);
     }
 
     fn read(self: *Logs, which: usize, offset: u64, dst: []u8) Ring.Read {
@@ -257,9 +234,6 @@ pub const BackgroundService = struct {
     test_hold_handshake_ms: u64 = 0,
 
     /// 单个 Job 日志环总量上限（内存合理边界，不是任务数量配额）。
-    pub const max_log_bytes: u32 = 64 * 1024 * 1024;
-    pub const max_command_bytes: usize = 32768;
-
     pub fn service(self: *BackgroundService) bg.Service {
         return .{ .context = self, .start_fn = startFn, .control_fn = controlFn, .check_fn = checkFn, .command_fn = commandFn, .caption_fn = captionFn };
     }
@@ -369,14 +343,13 @@ pub const BackgroundService = struct {
         if (job.handed_off and job.done.load(.acquire)) job.ui_notified = true;
     }
 
-    /// 启动预算校验：拒绝 0 启动窗口、0 清理预算、非法命令与超限日志。
+    /// 启动校验：拒绝 0 启动窗口、0 清理预算与非法命令。
     pub fn validateStart(args: bg.Start) !void {
-        if (args.command.len == 0 or args.command.len > max_command_bytes) return error.InvalidCommand;
+        if (args.command.len == 0) return error.InvalidCommand;
         if (std.mem.indexOfScalar(u8, args.command, 0) != null) return error.InvalidCommand;
         if (!std.unicode.utf8ValidateSlice(args.command)) return error.InvalidCommand;
         if (args.startup_timeout_ms == 0) return error.InvalidStartupTimeout;
         if (args.cleanup_timeout_ms == 0) return error.InvalidCleanupTimeout;
-        if (args.log_bytes > max_log_bytes) return error.InvalidLogBudget;
     }
 
     fn depsOrFail(self: *BackgroundService) !Dependencies {
@@ -457,7 +430,7 @@ pub const BackgroundService = struct {
         }
         var root = try deps.root.duplicate();
         errdefer root.deinit();
-        var logs = try Logs.init(a, args.log_bytes);
+        var logs = Logs.init(a);
         errdefer logs.deinitWiped(a);
         job.* = .{
             .allocator = a,
@@ -653,13 +626,16 @@ pub const BackgroundService = struct {
 
     /// 每路的 total_bytes/available_from/游标都来自同一临界区快照。
     fn logsResult(a: std.mem.Allocator, job: *Job, query: bg.Query) !bg.Result {
-        const budget: u32 = bg.logBudget(query);
-        const out_budget: usize = @min((budget + 1) / 2, bg.max_log_budget);
-        const err_budget: usize = @min(budget / 2, bg.max_log_budget);
-        var raw_out: [bg.max_log_budget]u8 = undefined;
-        var raw_err: [bg.max_log_budget]u8 = undefined;
+        const budget = bg.logBudget(query);
         const out_offset = query.stdout_offset orelse 0;
         const err_offset = query.stderr_offset orelse 0;
+        const totals = job.logs.totals();
+        const out_budget: usize = @intCast(@min(budget / 2 + budget % 2, totals[0] - @min(totals[0], out_offset)));
+        const err_budget: usize = @intCast(@min(budget / 2, totals[1] - @min(totals[1], err_offset)));
+        const raw_out = try a.alloc(u8, out_budget);
+        defer a.free(raw_out);
+        const raw_err = try a.alloc(u8, err_budget);
+        defer a.free(raw_err);
         const out_read = job.logs.read(0, out_offset, raw_out[0..out_budget]);
         const err_read = job.logs.read(1, err_offset, raw_err[0..err_budget]);
         if (out_offset > out_read.total_bytes or err_offset > err_read.total_bytes)
@@ -755,12 +731,12 @@ fn worker(job: *Job) Outcome {
 
 fn stdoutSink(context: *anyopaque, bytes: []const u8) anyerror!void {
     const job: *Job = @ptrCast(@alignCast(context));
-    job.logs.append(0, bytes);
+    try job.logs.append(0, bytes);
 }
 
 fn stderrSink(context: *anyopaque, bytes: []const u8) anyerror!void {
     const job: *Job = @ptrCast(@alignCast(context));
-    job.logs.append(1, bytes);
+    try job.logs.append(1, bytes);
 }
 
 /// 只有 exec 成功且确认进程组归属，才算可交接的启动。

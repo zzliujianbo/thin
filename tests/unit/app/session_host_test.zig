@@ -1,19 +1,45 @@
-test "live ring retains bounded events until explicitly reclaimed" {
+test "live ring retains events until explicitly reclaimed" {
     const a = std.testing.allocator;
-    var ring = LiveRing{ .allocator = a, .max_count = 2, .budget = 4 };
+    var ring = LiveRing{ .allocator = a };
     defer ring.deinit();
     try ring.push(1, try a.dupe(u8, "ab"));
     try ring.push(3, try a.dupe(u8, "cd"));
-    const pending = try a.dupe(u8, "e");
-    try std.testing.expectError(error.RingFull, ring.push(4, pending));
-    try std.testing.expectEqual(@as(usize, 2), ring.items.items.len);
+    try ring.push(4, try a.dupe(u8, "e"));
+    try std.testing.expectEqual(@as(usize, 3), ring.items.items.len);
     try std.testing.expectEqualStrings("ab", ring.items.items[0].json);
     try ring.acknowledgeRange(2, 2, 0, 2, 4);
     try std.testing.expectEqual(@as(u64, 2), ring.reclaimed_through);
-    try ring.push(4, pending);
     try ring.acknowledgeRange(2, 2, 0, 4, 4);
     try std.testing.expectEqual(@as(usize, 0), ring.items.items.len);
     try std.testing.expectEqual(@as(usize, 0), ring.bytes);
+}
+test "live ring and canonical ring retain beyond old count and byte bounds" {
+    const a = std.testing.allocator;
+    var live = LiveRing{ .allocator = a };
+    defer live.deinit();
+    var history = Ring{ .allocator = a };
+    defer history.deinit();
+    const payload: [2049]u8 = @splat('x');
+    for (1..1101) |seq| {
+        try live.push(seq, try a.dupe(u8, &payload));
+        try history.push(seq, try a.dupe(u8, &payload));
+    }
+    try std.testing.expectEqual(@as(usize, 1100), live.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1100), history.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1100 * payload.len), live.bytes);
+    try std.testing.expectEqual(@as(u64, 0), history.evicted_through);
+    for (live.items.items, history.items.items, 1..) |left, right, seq| {
+        try std.testing.expectEqual(@as(u64, seq), left.seq);
+        try std.testing.expectEqual(left.seq, right.seq);
+        try std.testing.expectEqualSlices(u8, &payload, left.json);
+        try std.testing.expectEqualSlices(u8, &payload, right.json);
+    }
+    try live.acknowledgeRange(7, 7, 501, 1100, 1100);
+    try std.testing.expectEqual(@as(usize, 500), live.items.items.len);
+    try std.testing.expectEqual(@as(u64, 0), live.reclaimed_through);
+    try live.acknowledge(7, 7, 500, 1100);
+    try std.testing.expectEqual(@as(usize, 0), live.items.items.len);
+    try std.testing.expectEqual(@as(u64, 1100), live.reclaimed_through);
 }
 test "live ring acknowledgement validates authority and future watermark" {
     const a = std.testing.allocator;
@@ -31,7 +57,7 @@ test "live ring acknowledgement validates authority and future watermark" {
 }
 test "live ring retires only proven ranges and keeps an earlier hole" {
     const a = std.testing.allocator;
-    var ring = LiveRing{ .allocator = a, .max_count = 5 };
+    var ring = LiveRing{ .allocator = a };
     defer ring.deinit();
     for (1..6) |seq| try ring.push(seq, try a.dupe(u8, "e"));
     try std.testing.expectError(error.StaleControl, ring.acknowledgeRange(2, 1, 2, 3, 5));
@@ -104,25 +130,24 @@ test "host live thinking crosses two real task requests and merges only after jo
     app.config.value.model.reasoning_effort = "low";
     app.runtime.model = .{ .context = &fake, .call_fn = ThinkingTaskFixture.call };
     host.refreshConnection();
-    const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
     a.free(attached);
     _ = try host.startTask(.prompt, "read the fixture");
     try std.testing.expect(host.session.owner_task_active);
     try waitThinkingFlag(host, &fake.entered, true);
-    const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"effort\",\"epoch\":2,\"value\":\"high\"}", 7);
+    const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"effort\",\"epoch\":2,\"value\":\"high\"}", 7);
     defer a.free(stale);
     try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
-    const foreign = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"cycle_effort\",\"epoch\":1}", 8);
+    const foreign = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"cycle_effort\",\"epoch\":1}", 8);
     defer a.free(foreign);
     try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
     try std.testing.expect(app.thinking_control.get() == null);
-    const changed = try dispatchJson(host, a, "{\"v\":4,\"id\":4,\"op\":\"effort\",\"epoch\":1,\"value\":\"high\"}", 7);
+    const changed = try dispatchJson(host, a, "{\"v\":5,\"id\":4,\"op\":\"effort\",\"epoch\":1,\"value\":\"high\"}", 7);
     defer a.free(changed);
     try std.testing.expect(std.mem.indexOf(u8, changed, "\"ok\":true") != null);
     try std.testing.expectEqualStrings("high", app.thinking_control.get().?.reasoning_effort.?);
     try std.testing.expectEqualStrings("low", app.config.value.model.reasoning_effort.?);
     fake.release.store(true, .release);
-    // The bridge is bounded at 64 events; this two-round fixture emits far fewer.
     // Do not pump here: retain the genuine completed but unjoined task.
     try waitThinkingFlag(host, &host.task.?.job.done, false);
     try std.testing.expect(!app.runtime.busy.load(.acquire));
@@ -131,17 +156,23 @@ test "host live thinking crosses two real task requests and merges only after jo
     try std.testing.expect(fake.second_new.load(.acquire));
     try std.testing.expect(fake.read_ok.load(.acquire));
     try std.testing.expectEqual(@as(u32, 2), fake.calls.load(.acquire));
-    host.events.max_count = 0;
-    host.pump(0);
+    // Hold publication after the real join, not via an artificial ring quota.
+    host.task.?.future.await(io);
+    host.task.?.joined = true;
     try std.testing.expect(host.task != null and host.task.?.joined);
-    const late = try dispatchJson(host, a, "{\"v\":4,\"id\":5,\"op\":\"effort\",\"epoch\":1,\"value\":\"high\"}", 7);
+    // dispatch pumps first and would finish this task. Exercise the effort
+    // handler directly at the joined-but-not-finalized owner boundary instead.
+    var late_request = try protocol.parseRequest(a, "{\"v\":5,\"id\":5,\"op\":\"effort\",\"epoch\":1,\"value\":\"high\"}");
+    defer late_request.deinit();
+    const late = try host.handleEffort(a, &late_request, 7);
     defer a.free(late);
+    try std.testing.expect(host.session.owner_task_active);
+    try std.testing.expect(host.task != null and host.task.?.joined);
     try std.testing.expect(std.mem.indexOf(u8, late, "\"ok\":true") != null);
     try std.testing.expectEqualStrings("low", app.config.value.model.reasoning_effort.?);
     try std.testing.expectEqualStrings("high", app.thinking_control.get().?.reasoning_effort.?);
     host.inbox.pause();
     _ = try host.inbox.enqueue(a, .follow_up, "follow up");
-    host.events.max_count = 1024;
     host.pump(0);
     try std.testing.expect(host.task == null and !host.session.owner_task_active);
     try std.testing.expect(app.thinking_control.get() == null);
@@ -201,11 +232,6 @@ test "background completion retains exact id across backpressure and acknowledge
         .first = .{ .id = background_status.Id.from("first"), .command = background_status.Command.from("one"), .result = .failed, .duration_ms = 42, .failure = .exit, .exit_code = 2 },
         .second = .{ .id = background_status.Id.from("second"), .command = background_status.Command.from("two"), .result = .success, .duration_ms = 1 },
     };
-    host.events.max_count = 0;
-    try std.testing.expectEqual(SessionHost.MemoryAdmission.blocked, host.admitBackgroundCompletion(&source));
-    try std.testing.expect(source.taken == null and source.first_pending and source.second_pending);
-    try std.testing.expectEqual(@as(u64, 1), host.next_seq);
-    host.events.max_count = 1;
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     host.allocator = failing.allocator();
     const allocation = host.admitBackgroundCompletion(&source);
@@ -327,8 +353,8 @@ test "memory completions remain ordered in one watch page without affecting prim
 
     // Defense in depth: admission itself never mutates drafts or approvals,
     // even if a caller supplies preexisting state at an idle boundary.
-    host.partial_text.append("retained body");
-    host.partial_reasoning.append("retained reasoning");
+    try host.partial_text.append("retained body");
+    try host.partial_reasoning.append("retained reasoning");
     host.setPending(45, "bash", "retained permission", false);
     var another: MemoryQueueFixture = .{ .values = values[0..1] };
     try std.testing.expectEqual(SessionHost.MemoryAdmission.admitted, host.admitMemoryCompletion(&another));
@@ -341,7 +367,7 @@ test "memory completions remain ordered in one watch page without affecting prim
     try std.testing.expectEqual(prior_seq, try host.watchResume(1, prior_seq));
     try std.testing.expect(host.fatal == null);
 }
-test "memory completion retains FIFO head on ring full and encoding or ring allocation OOM" {
+test "memory completion retains FIFO head on encoding or ring allocation OOM" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -354,7 +380,6 @@ test "memory completion retains FIFO head on ring full and encoding or ring allo
     const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     host.controller = .{ .epoch = 1, .connection = 7 };
-    host.events.max_count = 1;
     const memory = @import("../core/memory_status.zig");
     const values = [_]memory.Terminal{ .{ .id = 0, .result = .saved }, .{ .id = 0, .result = .skipped } };
     var source: MemoryQueueFixture = .{ .values = &values };
@@ -376,17 +401,25 @@ test "memory completion retains FIFO head on ring full and encoding or ring allo
     try std.testing.expect(host.fatal == null);
 
     host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 1), source.cursor);
-    try std.testing.expectEqual(@as(u64, 2), host.next_seq);
+    try std.testing.expectEqual(@as(usize, 2), source.cursor);
+    try std.testing.expectEqual(@as(u64, 3), host.next_seq);
     host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 1), source.cursor);
-    try std.testing.expectEqual(@as(u64, 2), host.next_seq);
+    try std.testing.expectEqual(@as(usize, 2), source.cursor);
+    try std.testing.expectEqual(@as(u64, 3), host.next_seq);
     try std.testing.expect(host.fatal == null);
     const first_page = (try host.watchEvents(a, 1, 1, 0)).?;
     defer a.free(first_page.frame);
-    try std.testing.expectEqual(@as(u64, 1), first_page.through);
+    try std.testing.expectEqual(@as(u64, 2), first_page.through);
+    var first_doc = try parseJson(a, first_page.frame);
+    defer first_doc.deinit();
+    const completions = first_doc.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), completions.len);
+    try std.testing.expectEqualStrings("saved", completions[0].object.get("result").?.string);
+    try std.testing.expectEqualStrings("skipped", completions[1].object.get("result").?.string);
     try host.watchOffered(1, first_page.through);
     try std.testing.expectEqual(@as(u64, 1), try host.watchResume(1, 1));
+    // Prove only the first completion. The second must remain available to a
+    // reconnect, even though both were offered together on the first page.
     _ = try host.watchAcknowledge(1, 1);
     host.pumpFrom(0, &source);
     try std.testing.expectEqual(@as(usize, 2), source.cursor);
@@ -401,6 +434,8 @@ test "memory completion retains FIFO head on ring full and encoding or ring allo
     host.pumpFrom(0, &source);
     try std.testing.expectEqual(@as(usize, 0), host.events.items.items.len);
     try std.testing.expectEqual(@as(u64, 3), host.next_seq);
+    try std.testing.expectError(error.InvalidSequence, host.watchResume(1, 1));
+    try std.testing.expectEqual(@as(u64, 2), try host.watchResume(1, 2));
     try std.testing.expect((try host.watchEvents(a, 1, 1, 2)) == null);
     try std.testing.expect(host.fatal == null);
 }
@@ -414,7 +449,7 @@ test "idle refresh publishes restored context after login without requests" {
         }
         fn expectSnapshot(host: *SessionHost, expected: r.ContextSnapshot) !void {
             const a = std.testing.allocator;
-            const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":9,\"op\":\"snapshot\"}", 7);
+            const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":9,\"op\":\"snapshot\"}", 7);
             defer a.free(frame);
             var doc = try parseJson(a, frame);
             defer doc.deinit();
@@ -467,7 +502,7 @@ test "idle refresh publishes restored context after login without requests" {
         defer host.deinit();
         try std.testing.expect(host.session.app == null and host.session.loaded_checkpoint != null);
         try std.testing.expectError(error.Unavailable, host.startTask(.prompt, "not sent"));
-        const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(attached);
         try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
         const expected = r.ContextSnapshot{ .tokens = reported orelse 0, .limit = 131072, .known = reported != null };
@@ -480,7 +515,7 @@ test "idle refresh publishes restored context after login without requests" {
         try Spy.expectSnapshot(host, expected);
         // Simulate an older cached host value to prove login really refreshes it.
         host.context = .{ .tokens = 999, .limit = 1 };
-        const login = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"login\",\"epoch\":1,\"key\":\"fake-login-key\"}", 7);
+        const login = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"login\",\"epoch\":1,\"key\":\"fake-login-key\"}", 7);
         defer a.free(login);
         try std.testing.expect(std.mem.indexOf(u8, login, "\"ok\":true") != null);
         const app = host.session.app.?;
@@ -508,7 +543,7 @@ test "idle refresh publishes restored context after login without requests" {
         try Spy.expectSnapshot(host, latest);
         // Disabling an already-disabled image model is an unrelated settings
         // no-op: it does not update Session.initial_context itself.
-        const setting = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"image_model\",\"epoch\":1,\"off\":true}", 7);
+        const setting = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"image_model\",\"epoch\":1,\"off\":true}", 7);
         defer a.free(setting);
         try std.testing.expect(std.mem.indexOf(u8, setting, "\"ok\":true") != null);
         try std.testing.expectEqualDeep(expected, host.session.initial_context.?);
@@ -566,7 +601,7 @@ test "metadata owner idle is independent of client wait field" {
     try env.put("HOME", home);
     const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
-    const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
     defer a.free(attached);
     try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
 
@@ -580,9 +615,9 @@ test "metadata owner idle is independent of client wait field" {
     host.connection.context = &spy;
     host.connection.poll_models_fn = MetadataOwnerIdleSpy.poll;
     for ([_][]const u8{
-        "{\"v\":4,\"id\":2,\"op\":\"poll_metadata\",\"wait\":false}",
-        "{\"v\":4,\"id\":3,\"op\":\"poll_metadata\"}",
-        "{\"v\":4,\"id\":4,\"op\":\"poll_metadata\",\"wait\":true}",
+        "{\"v\":5,\"id\":2,\"op\":\"poll_metadata\",\"wait\":false}",
+        "{\"v\":5,\"id\":3,\"op\":\"poll_metadata\"}",
+        "{\"v\":5,\"id\":4,\"op\":\"poll_metadata\",\"wait\":true}",
     }) |json| {
         const frame = try dispatchJson(host, a, json, 7);
         defer a.free(frame);
@@ -603,7 +638,7 @@ test "metadata owner idle rejects malformed wait and pending terminal" {
     try env.put("HOME", home);
     const host = try SessionHost.init(a, io, &env, .{ .project = home, .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
-    const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
     defer a.free(attached);
     try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
 
@@ -616,10 +651,10 @@ test "metadata owner idle rejects malformed wait and pending terminal" {
     }
     host.connection.context = &spy;
     host.connection.poll_models_fn = MetadataOwnerIdleSpy.poll;
-    const malformed = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"poll_metadata\",\"wait\":\"true\"}", 7);
+    const malformed = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"poll_metadata\",\"wait\":\"true\"}", 7);
     defer a.free(malformed);
     try std.testing.expect(std.mem.indexOf(u8, malformed, "\"ok\":false") != null);
-    const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"poll_metadata\",\"wait\":true}", 8);
+    const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"poll_metadata\",\"wait\":true}", 8);
     defer a.free(stale);
     try std.testing.expect(std.mem.indexOf(u8, stale, "\"ok\":false") != null);
     host.pending_terminal = .{ .terminal = .{ .status = .success }, .json = try a.dupe(u8, "pending") };
@@ -627,7 +662,7 @@ test "metadata owner idle rejects malformed wait and pending terminal" {
         if (host.pending_terminal) |pending| a.free(pending.json);
         host.pending_terminal = null;
     }
-    const busy = try dispatchJson(host, a, "{\"v\":4,\"id\":4,\"op\":\"poll_metadata\",\"wait\":true}", 7);
+    const busy = try dispatchJson(host, a, "{\"v\":5,\"id\":4,\"op\":\"poll_metadata\",\"wait\":true}", 7);
     defer a.free(busy);
     try std.testing.expect(std.mem.indexOf(u8, busy, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, busy, "busy") != null);
@@ -671,13 +706,13 @@ test "metadata owner idle publishes real session capabilities on nonblocking pol
     defer host.deinit();
     host.session.metadata_fetch = Fixture.official;
     host.session.metadata_dev_fetch = Fixture.dev;
-    const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
     defer a.free(attached);
     try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
     try host.connection.configureProvider(.deepseek, "fake-metadata-key");
     host.refreshConnection();
     try std.testing.expect(host.session.initial_default_pending);
-    const poll = "{\"v\":4,\"id\":2,\"op\":\"poll_metadata\",\"wait\":false}";
+    const poll = "{\"v\":5,\"id\":2,\"op\":\"poll_metadata\",\"wait\":false}";
     const first = try dispatchJson(host, a, poll, 7);
     defer a.free(first);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"ok\":true") != null);
@@ -700,7 +735,7 @@ test "metadata owner idle publishes real session capabilities on nonblocking pol
     try std.testing.expect(host.task == null);
     try std.testing.expectEqual(@as(usize, 0), host.history.items.items.len);
     try std.testing.expect(!host.session.app.?.journal.started);
-    const cycle = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"cycle_effort\",\"epoch\":1}", 7);
+    const cycle = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"cycle_effort\",\"epoch\":1}", 7);
     defer a.free(cycle);
     try std.testing.expect(std.mem.indexOf(u8, cycle, "\"ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, cycle, "\"value\":\"max\"") != null);
@@ -720,13 +755,13 @@ test "codex control rejects invalid and stale actions without starting login" {
     try env.put("HOME", path[0..n]);
     const host = try SessionHost.init(a, io, &env, .{ .project = path[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
-    const attach = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\"}", 7);
+    const attach = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\"}", 7);
     defer a.free(attach);
     const before = host.watchStamp();
-    const invalid = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"codex_login\",\"epoch\":1,\"action\":\"bogus\",\"generation\":0}", 7);
+    const invalid = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"codex_login\",\"epoch\":1,\"action\":\"bogus\",\"generation\":0}", 7);
     defer a.free(invalid);
     try std.testing.expect(std.mem.indexOf(u8, invalid, "\"ok\":false") != null);
-    const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"codex_login\",\"epoch\":1,\"action\":\"cancel\",\"generation\":99}", 7);
+    const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"codex_login\",\"epoch\":1,\"action\":\"cancel\",\"generation\":99}", 7);
     defer a.free(stale);
     try std.testing.expect(std.mem.indexOf(u8, stale, "\"ok\":false") != null);
     const after = host.watchStamp();
@@ -755,7 +790,7 @@ test "watch coverage, bounded admission and epoch bound acknowledgements" {
     const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
     try std.testing.expectError(error.StaleControl, host.watchOwner(1));
-    const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\"}", 7);
+    const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\"}", 7);
     defer a.free(attached);
     try std.testing.expectEqual(@as(u64, 7), try host.watchOwner(1));
     _ = host.noteSubmittedUser("first canonical input");
@@ -796,21 +831,20 @@ test "watch coverage, bounded admission and epoch bound acknowledgements" {
     try std.testing.expectEqual(false, next_doc.value.object.get("incomplete").?.bool);
     try std.testing.expectEqual(high + 3, next.through);
     try std.testing.expect((try host.watchEvents(a, 9, 1, next.through)) == null);
-    host.events.max_count = 2;
     const producer = host.bridge.host();
     try producer.emit_fn(producer.context, .{ .text = "held中" }, &host.cancel);
     host.pump(0);
-    try std.testing.expect(host.pending_event != null);
-    try std.testing.expectEqual(@as(usize, 2), host.events.items.items.len);
-    try std.testing.expectEqual(high + 3, host.watchStamp().sequence);
+    try std.testing.expect(host.pending_event == null);
+    try std.testing.expectEqual(@as(usize, 3), host.events.items.items.len);
+    try std.testing.expectEqual(high + 4, host.watchStamp().sequence);
     try host.watchOffered(1, next.through);
-    const future = try dispatchJson(host, a, "{\"v\":4,\"id\":4,\"op\":\"ack\",\"epoch\":1,\"sequence\":999}", 7);
+    const future = try dispatchJson(host, a, "{\"v\":5,\"id\":4,\"op\":\"ack\",\"epoch\":1,\"sequence\":999}", 7);
     defer a.free(future);
     try std.testing.expect(std.mem.indexOf(u8, future, "invalid_input") != null);
-    const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":5,\"op\":\"ack\",\"epoch\":2,\"sequence\":1}", 7);
+    const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":5,\"op\":\"ack\",\"epoch\":2,\"sequence\":1}", 7);
     defer a.free(stale);
     try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
-    const ack = try dispatchJson(host, a, "{\"v\":4,\"id\":6,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", 7);
+    const ack = try dispatchJson(host, a, "{\"v\":5,\"id\":6,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", 7);
     defer a.free(ack);
     try std.testing.expect(std.mem.indexOf(u8, ack, "\"ok\":true") != null);
     host.pump(0);
@@ -823,7 +857,7 @@ test "watch coverage, bounded admission and epoch bound acknowledgements" {
     defer a.free(resumed_page.frame);
     try std.testing.expect(std.mem.indexOf(u8, resumed_page.frame, "held中") != null);
     try host.watchOffered(1, resumed_page.through);
-    const ack_all = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":7,\"op\":\"ack\",\"epoch\":1,\"sequence\":{d}}}", .{resumed_page.through});
+    const ack_all = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":7,\"op\":\"ack\",\"epoch\":1,\"sequence\":{d}}}", .{resumed_page.through});
     defer a.free(ack_all);
     const ack_result = try dispatchJson(host, a, ack_all, 7);
     defer a.free(ack_result);
@@ -831,7 +865,7 @@ test "watch coverage, bounded admission and epoch bound acknowledgements" {
     const before_state = host.watchStamp();
     host.observe(.{ .state = .calling_model }, false, true);
     try std.testing.expect(!before_state.eql(host.watchStamp()));
-    const takeover = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"attach\",\"takeover\":true}", 8);
+    const takeover = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"attach\",\"takeover\":true}", 8);
     defer a.free(takeover);
     try std.testing.expectError(error.StaleControl, host.watchEvents(a, 9, 1, next.through));
     try std.testing.expectEqual(@as(u64, 8), try host.watchOwner(2));
@@ -848,7 +882,7 @@ test "fresh baseline and live pages form one ordered union without duplicate dra
     try env.put("HOME", path_buffer[0..n]);
     const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
     defer host.deinit();
-    const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\"}", 7);
+    const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\"}", 7);
     defer a.free(attached);
 
     _ = host.noteSubmittedUser("hello");
@@ -959,7 +993,7 @@ test "fresh baseline and live pages form one ordered union without duplicate dra
     }
     // A replacement controller has no local echo to suppress: its baseline and
     // pages carry the canonical row in sequence order.
-    const takeover = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"attach\",\"takeover\":true}", 8);
+    const takeover = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"attach\",\"takeover\":true}", 8);
     defer a.free(takeover);
     try std.testing.expectEqual(@as(u64, 0), host.controller.?.suppressed_history_through);
     {
@@ -1010,7 +1044,7 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     defer host.deinit();
 
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"hello\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"hello\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         var hello = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
@@ -1019,13 +1053,13 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"owner\":\"foreground\"") != null);
     }
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"snapshot\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"snapshot\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"busy\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"read_only\":false") != null);
     }
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"effort\":null") != null);
@@ -1034,39 +1068,39 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     }
     // Attach assigns an epoch bound to this connection.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":4,\"op\":\"attach\",\"write\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":4,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":1") != null);
     }
     // A second controller is refused without takeover.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "busy") != null);
     }
     // Another connection cannot act with the first connection's epoch.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":6,\"op\":\"submit\",\"epoch\":1,\"req\":10,\"kind\":\"prompt\",\"text\":\"hi\"}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":6,\"op\":\"submit\",\"epoch\":1,\"req\":10,\"kind\":\"prompt\",\"text\":\"hi\"}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
     }
     // Queue enqueue/withdraw uses its own field name and is connection bound.
     var queued_id: u64 = 0;
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":7,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"more\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":7,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"more\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         const at = std.mem.indexOf(u8, frame, "\"queue\":").?;
         queued_id = try std.fmt.parseInt(u64, frame[at + 8 .. std.mem.indexOfScalarPos(u8, frame, at, '}').?], 10);
     }
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":8,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":9,\"text\":\"x\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":8,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":9,\"text\":\"x\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
     }
     {
-        const buf = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":9,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":{d}}}", .{queued_id});
+        const buf = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":9,\"op\":\"withdraw\",\"epoch\":1,\"queue_id\":{d}}}", .{queued_id});
         defer a.free(buf);
         const frame = try dispatchJson(host, a, buf, 7);
         defer a.free(frame);
@@ -1074,13 +1108,13 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     }
     // Approvals for an id that is not pending are rejected by the Bridge.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":10,\"op\":\"approve\",\"epoch\":1,\"permission_id\":3,\"allow\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":10,\"op\":\"approve\",\"epoch\":1,\"permission_id\":3,\"allow\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "permission_expired") != null);
     }
     // History base is the last represented sequence and includes current state.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":11,\"op\":\"history\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":11,\"op\":\"history\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"entries\":[") != null);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"base\":") != null);
@@ -1088,7 +1122,7 @@ test "host lifecycle: attach snapshot settings queue and rejection paths" {
     // Disconnect revokes the controller but keeps the host usable.
     host.disconnected(7);
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":12,\"op\":\"attach\",\"write\":true}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":12,\"op\":\"attach\",\"write\":true}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":2") != null);
     }
@@ -1112,13 +1146,13 @@ test "confirming barrier is controller-bound and released with its view" {
     const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .owner = .foreground });
     defer host.deinit();
 
-    const first = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+    const first = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
     defer a.free(first);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"epoch\":1") != null);
     const base_rev = host.inbox.snapshot().revision;
 
     // Pausing claims moves the real revision and the reply already carries it.
-    const paused = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
+    const paused = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
     defer a.free(paused);
     try std.testing.expect(std.mem.indexOf(u8, paused, "\"ok\":true") != null);
     try std.testing.expect(host.inbox.snapshot().confirming);
@@ -1127,43 +1161,43 @@ test "confirming barrier is controller-bound and released with its view" {
     try std.testing.expectEqual(paused_rev, host.inbox.snapshot().revision);
 
     // A foreign socket and a stale epoch can neither read nor release it.
-    const foreign = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 8);
+    const foreign = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 8);
     defer a.free(foreign);
     try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
-    const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":4,\"op\":\"confirming\",\"epoch\":9,\"active\":false}", 7);
+    const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":4,\"op\":\"confirming\",\"epoch\":9,\"active\":false}", 7);
     defer a.free(stale);
     try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
     try std.testing.expect(host.inbox.snapshot().confirming);
     try std.testing.expectEqual(paused_rev, host.inbox.snapshot().revision);
 
     // A refused takeover leaves the owner's barrier alone.
-    const refused = try dispatchJson(host, a, "{\"v\":4,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
+    const refused = try dispatchJson(host, a, "{\"v\":5,\"id\":5,\"op\":\"attach\",\"write\":true}", 8);
     defer a.free(refused);
     try std.testing.expect(std.mem.indexOf(u8, refused, "busy") != null);
     try std.testing.expect(host.inbox.snapshot().confirming);
 
     // An explicit resume is real: the flag drops and the revision moves again.
-    const resumed = try dispatchJson(host, a, "{\"v\":4,\"id\":6,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 7);
+    const resumed = try dispatchJson(host, a, "{\"v\":5,\"id\":6,\"op\":\"confirming\",\"epoch\":1,\"active\":false}", 7);
     defer a.free(resumed);
     try std.testing.expect(!host.inbox.snapshot().confirming);
     try std.testing.expect((try snapshotRevision(a, resumed)) != paused_rev);
 
     // A granted takeover retires the previous owner's barrier.
-    const again = try dispatchJson(host, a, "{\"v\":4,\"id\":7,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
+    const again = try dispatchJson(host, a, "{\"v\":5,\"id\":7,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
     defer a.free(again);
     try std.testing.expect(host.inbox.snapshot().confirming);
-    const takeover = try dispatchJson(host, a, "{\"v\":4,\"id\":8,\"op\":\"attach\",\"write\":true,\"takeover\":true}", 8);
+    const takeover = try dispatchJson(host, a, "{\"v\":5,\"id\":8,\"op\":\"attach\",\"write\":true,\"takeover\":true}", 8);
     defer a.free(takeover);
     try std.testing.expect(std.mem.indexOf(u8, takeover, "\"epoch\":2") != null);
     try std.testing.expect(!host.inbox.snapshot().confirming);
     // The old socket's epoch is dead, so it cannot re-open the barrier.
-    const old = try dispatchJson(host, a, "{\"v\":4,\"id\":9,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
+    const old = try dispatchJson(host, a, "{\"v\":5,\"id\":9,\"op\":\"confirming\",\"epoch\":1,\"active\":true}", 7);
     defer a.free(old);
     try std.testing.expect(std.mem.indexOf(u8, old, "stale_control") != null);
     try std.testing.expect(!host.inbox.snapshot().confirming);
 
     // EOF releases the controlling socket only; a non-owner EOF changes nothing.
-    const paused_new = try dispatchJson(host, a, "{\"v\":4,\"id\":10,\"op\":\"confirming\",\"epoch\":2,\"active\":true}", 8);
+    const paused_new = try dispatchJson(host, a, "{\"v\":5,\"id\":10,\"op\":\"confirming\",\"epoch\":2,\"active\":true}", 8);
     defer a.free(paused_new);
     try std.testing.expect(host.inbox.snapshot().confirming);
     host.disconnected(7);
@@ -1172,15 +1206,15 @@ test "confirming barrier is controller-bound and released with its view" {
     try std.testing.expect(!host.inbox.snapshot().confirming);
 
     // A stale detach does not release; the live epoch does.
-    const third = try dispatchJson(host, a, "{\"v\":4,\"id\":11,\"op\":\"attach\",\"write\":true}", 9);
+    const third = try dispatchJson(host, a, "{\"v\":5,\"id\":11,\"op\":\"attach\",\"write\":true}", 9);
     defer a.free(third);
     try std.testing.expect(std.mem.indexOf(u8, third, "\"epoch\":3") != null);
-    const paused_third = try dispatchJson(host, a, "{\"v\":4,\"id\":12,\"op\":\"confirming\",\"epoch\":3,\"active\":true}", 9);
+    const paused_third = try dispatchJson(host, a, "{\"v\":5,\"id\":12,\"op\":\"confirming\",\"epoch\":3,\"active\":true}", 9);
     defer a.free(paused_third);
-    const stale_detach = try dispatchJson(host, a, "{\"v\":4,\"id\":13,\"op\":\"detach\",\"epoch\":3}", 7);
+    const stale_detach = try dispatchJson(host, a, "{\"v\":5,\"id\":13,\"op\":\"detach\",\"epoch\":3}", 7);
     defer a.free(stale_detach);
     try std.testing.expect(host.inbox.snapshot().confirming);
-    const detach = try dispatchJson(host, a, "{\"v\":4,\"id\":14,\"op\":\"detach\",\"epoch\":3}", 9);
+    const detach = try dispatchJson(host, a, "{\"v\":5,\"id\":14,\"op\":\"detach\",\"epoch\":3}", 9);
     defer a.free(detach);
     try std.testing.expect(!host.inbox.snapshot().confirming);
 
@@ -1211,7 +1245,7 @@ test "history reply is valid JSON with truncated outside the entries array" {
     host.seedHistory(&messages);
     try std.testing.expect(host.history.items.items.len == 2);
 
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":21,\"op\":\"history\",\"limit\":4}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":21,\"op\":\"history\",\"limit\":4}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -1258,7 +1292,7 @@ test "bridge display metadata is stored and the approval detail survives reconne
     defer host.deinit();
 
     // A truncated canonical array must keep both flags in the stored ring.
-    const blocks = try a.alloc(p.Block, protocol.max_blocks + 1);
+    const blocks = try a.alloc(p.Block, 257);
     defer a.free(blocks);
     for (blocks) |*block| block.* = .{ .text = "x" };
     host.observe(.{ .assistant_committed = blocks }, true, false);
@@ -1269,7 +1303,7 @@ test "bridge display metadata is stored and the approval detail survives reconne
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"epoch\":0") != null);
 
     host.setPending(9, "bash", "rm -rf /var/tmp/x", false);
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":22,\"op\":\"history\"}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":22,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -1302,7 +1336,7 @@ test "long approval detail survives reconnect whole and stays approvable" {
 
     // 12 KiB of a real destructive command: far past the old 4096 display
     // bound but inside the Bridge's 64 KiB per-event budget.
-    const command = try a.alloc(u8, 12 * 1024);
+    const command = try a.alloc(u8, 1024 * 1024 + 123);
     defer a.free(command);
     @memset(command, 'x');
     @memcpy(command[0.."rm -rf /".len], "rm -rf /");
@@ -1316,7 +1350,7 @@ test "long approval detail survives reconnect whole and stays approvable" {
     try std.testing.expectEqual(command.len, host.pending_desc.?.len);
 
     // A reconnected viewer sees the whole command and no clipping marker.
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":80,\"op\":\"history\"}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":80,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -1332,9 +1366,9 @@ test "long approval detail survives reconnect whole and stays approvable" {
     try std.testing.expect(seen);
 
     // Offline approval of an untruncated dangerous request still works.
-    const attach = try dispatchJson(host, a, "{\"v\":4,\"id\":81,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":5,\"id\":81,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
-    const granted = try dispatchJson(host, a, "{\"v\":4,\"id\":82,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
+    const granted = try dispatchJson(host, a, "{\"v\":5,\"id\":82,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
     defer a.free(granted);
     try std.testing.expect(std.mem.indexOf(u8, granted, "\"ok\":true") != null);
 }
@@ -1354,8 +1388,9 @@ test "a clipped approval detail is never silently allowed" {
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
-    // Above the Bridge's single-event text budget: the display copy is a prefix.
-    const command = try a.alloc(u8, bridge_mod.item_budget + 1024);
+    // Explicit incomplete presentation metadata remains fail-closed even though
+    // the bridge no longer clips the source to a capacity quota.
+    const command = try a.alloc(u8, 64 * 1024 + 1024);
     defer a.free(command);
     @memset(command, 'y');
 
@@ -1363,32 +1398,33 @@ test "a clipped approval detail is never silently allowed" {
     try runtime_host.emit_fn(runtime_host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = command } }, &host.cancel);
     host.pump(0);
     try std.testing.expectEqual(@as(?u64, 1), host.pending_permission);
+    try std.testing.expect(!host.pending_detail_incomplete);
+    try std.testing.expectEqualStrings(command, host.pending_desc.?);
+    host.setPending(1, "bash", command, true);
     try std.testing.expect(host.pending_detail_incomplete);
-    // The name is copied first, so the detail keeps the remaining budget.
-    try std.testing.expectEqual(bridge_mod.item_budget - "bash".len, host.pending_desc.?.len);
 
     // The rebuilt row carries the clipping flag instead of looking complete.
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":90,\"op\":\"history\"}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":90,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
     var seen = false;
     for (parsed.value.object.get("entries").?.array.items) |entry| {
         if (!std.mem.eql(u8, entry.object.get("t").?.string, "permission")) continue;
-        try std.testing.expectEqual(bridge_mod.item_budget - "bash".len, entry.object.get("desc").?.string.len);
+        try std.testing.expectEqualStrings(command, entry.object.get("desc").?.string);
         try std.testing.expectEqual(std.json.Value{ .bool = true }, entry.object.get("disp_trunc").?);
         seen = true;
     }
     try std.testing.expect(seen);
 
-    const attach = try dispatchJson(host, a, "{\"v\":4,\"id\":91,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":5,\"id\":91,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
     // Allowing what the viewer cannot fully see is refused, not applied.
-    const refused = try dispatchJson(host, a, "{\"v\":4,\"id\":92,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
+    const refused = try dispatchJson(host, a, "{\"v\":5,\"id\":92,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
     defer a.free(refused);
     try std.testing.expect(std.mem.indexOf(u8, refused, "input_too_large") != null);
     // Nothing was answered: a deny for the same id is still a live decision.
-    const denied = try dispatchJson(host, a, "{\"v\":4,\"id\":93,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":false}", 1);
+    const denied = try dispatchJson(host, a, "{\"v\":5,\"id\":93,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":false}", 1);
     defer a.free(denied);
     try std.testing.expect(std.mem.indexOf(u8, denied, "\"ok\":true") != null);
 }
@@ -1410,10 +1446,10 @@ test "submit receipt nonce is bound to kind and exact content" {
 
     // Attach a controller epoch on connection 1.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":30,\"op\":\"attach\",\"write\":true}", 1);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":30,\"op\":\"attach\",\"write\":true}", 1);
         defer a.free(frame);
     }
-    const zero = try dispatchJson(host, a, "{\"v\":4,\"id\":35,\"op\":\"submit\",\"epoch\":1,\"req\":0,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
+    const zero = try dispatchJson(host, a, "{\"v\":5,\"id\":35,\"op\":\"submit\",\"epoch\":1,\"req\":0,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
     defer a.free(zero);
     var parsed_zero = try parseJson(a, zero);
     defer parsed_zero.deinit();
@@ -1422,12 +1458,12 @@ test "submit receipt nonce is bound to kind and exact content" {
     try std.testing.expectEqual(@as(usize, 0), host.receipt_next);
     try std.testing.expect(host.task == null);
 
-    const first = try dispatchJson(host, a, "{\"v\":4,\"id\":31,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
+    const first = try dispatchJson(host, a, "{\"v\":5,\"id\":31,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
     defer a.free(first);
     // No credentials: the task is rejected but the rejection is recorded.
     try std.testing.expect(std.mem.indexOf(u8, first, "\"ok\":false") != null);
 
-    const replay = try dispatchJson(host, a, "{\"v\":4,\"id\":32,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
+    const replay = try dispatchJson(host, a, "{\"v\":5,\"id\":32,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"alpha\"}", 1);
     defer a.free(replay);
     var parsed_replay = try parseJson(a, replay);
     defer parsed_replay.deinit();
@@ -1436,14 +1472,14 @@ test "submit receipt nonce is bound to kind and exact content" {
     try std.testing.expect(parsed_replay.value.object.get("duplicate").?.bool);
 
     // Same nonce, different content/kind: rejected instead of "already accepted".
-    const other_text = try dispatchJson(host, a, "{\"v\":4,\"id\":33,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"beta\"}", 1);
+    const other_text = try dispatchJson(host, a, "{\"v\":5,\"id\":33,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"prompt\",\"text\":\"beta\"}", 1);
     defer a.free(other_text);
     try std.testing.expect(std.mem.indexOf(u8, other_text, "invalid_input") != null);
-    const other_kind = try dispatchJson(host, a, "{\"v\":4,\"id\":34,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"compact\",\"text\":\"alpha\"}", 1);
+    const other_kind = try dispatchJson(host, a, "{\"v\":5,\"id\":34,\"op\":\"submit\",\"epoch\":1,\"req\":77,\"kind\":\"compact\",\"text\":\"alpha\"}", 1);
     defer a.free(other_kind);
     try std.testing.expect(std.mem.indexOf(u8, other_kind, "invalid_input") != null);
 }
-test "history and event replies are clipped by encoded bytes not ring capacity" {
+test "history retains full multi MiB content and live pages preserve exact continuation" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1459,8 +1495,6 @@ test "history and event replies are clipped by encoded bytes not ring capacity" 
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
-    // This fixture isolates per-frame clipping from the live-retention bound.
-    host.events.budget = 4 * 1024 * 1024;
     const chunk = try a.alloc(u8, 60 * 1024);
     defer a.free(chunk);
     @memset(chunk, 'a');
@@ -1471,20 +1505,37 @@ test "history and event replies are clipped by encoded bytes not ring capacity" 
         try host.events.push(host.takeSeq(), text_json);
     }
 
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":40,\"op\":\"history\",\"limit\":32}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":40,\"op\":\"history\",\"limit\":32}", 1);
     defer a.free(frame);
     try std.testing.expect(frame.len <= protocol.max_response);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+    try std.testing.expect(!parsed.value.object.get("truncated").?.bool);
+    try std.testing.expect(frame.len > 1024 * 1024);
+    const history_entries = parsed.value.object.get("entries").?.array.items;
+    try std.testing.expectEqual(@as(usize, 40), history_entries.len);
+    for (history_entries) |entry| try std.testing.expectEqualStrings(chunk, entry.object.get("v").?.string);
 
-    const events = try dispatchJson(host, a, "{\"v\":4,\"id\":41,\"op\":\"events\",\"since\":0,\"max\":32}", 1);
+    const events = try dispatchJson(host, a, "{\"v\":5,\"id\":41,\"op\":\"events\",\"since\":0,\"max\":32}", 1);
     defer a.free(events);
     try std.testing.expect(events.len <= protocol.max_response);
     var events_parsed = try parseJson(a, events);
     defer events_parsed.deinit();
     try std.testing.expect(events_parsed.value.object.get("truncated").?.bool);
-    try std.testing.expect(events_parsed.value.object.get("next").?.integer > 0);
+    const page_entries = events_parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 32), page_entries.len);
+    for (page_entries) |entry| try std.testing.expectEqualStrings(chunk, entry.object.get("v").?.string);
+    const next = events_parsed.value.object.get("next").?.integer;
+    try std.testing.expect(next > 0);
+    const followup_request = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":42,\"op\":\"events\",\"since\":{d},\"max\":32}}", .{next});
+    defer a.free(followup_request);
+    const followup = try dispatchJson(host, a, followup_request, 1);
+    defer a.free(followup);
+    var tail = try parseJson(a, followup);
+    defer tail.deinit();
+    try std.testing.expect(!tail.value.object.get("truncated").?.bool);
+    try std.testing.expectEqual(@as(usize, 8), tail.value.object.get("events").?.array.items.len);
+    for (tail.value.object.get("events").?.array.items) |entry| try std.testing.expectEqualStrings(chunk, entry.object.get("v").?.string);
 }
 test "direct input is history-only while queued input is rendered exactly once" {
     const a = std.testing.allocator;
@@ -1521,7 +1572,7 @@ test "direct input is history-only while queued input is rendered exactly once" 
     };
     try std.testing.expectEqual(@as(usize, 1), queued_events);
 
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":50,\"op\":\"history\",\"limit\":8}", 1);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":50,\"op\":\"history\",\"limit\":8}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
@@ -1555,9 +1606,9 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
-    const attach = try dispatchJson(host, a, "{\"v\":4,\"id\":60,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":5,\"id\":60,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
-    const queued = try dispatchJson(host, a, "{\"v\":4,\"id\":61,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"next step\"}", 1);
+    const queued = try dispatchJson(host, a, "{\"v\":5,\"id\":61,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"next step\"}", 1);
     defer a.free(queued);
     try std.testing.expect(std.mem.indexOf(u8, queued, "\"ok\":true") != null);
     try std.testing.expectEqual(@as(usize, 1), host.inbox.snapshot().follow_up);
@@ -1568,7 +1619,7 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     try std.testing.expect(host.task == null);
 
     // An explicit resume while still unavailable also keeps the message.
-    const resumed = try dispatchJson(host, a, "{\"v\":4,\"id\":62,\"op\":\"queue_resume\",\"epoch\":1}", 1);
+    const resumed = try dispatchJson(host, a, "{\"v\":5,\"id\":62,\"op\":\"queue_resume\",\"epoch\":1}", 1);
     defer a.free(resumed);
     host.pump(0);
     try std.testing.expectEqual(@as(usize, 1), host.inbox.snapshot().follow_up);
@@ -1621,7 +1672,7 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
-    const attach = try dispatchJson(host, a, "{\"v\":4,\"id\":80,\"op\":\"attach\",\"write\":true}", 1);
+    const attach = try dispatchJson(host, a, "{\"v\":5,\"id\":80,\"op\":\"attach\",\"write\":true}", 1);
     defer a.free(attach);
     var attach_parsed = try parseJson(a, attach);
     defer attach_parsed.deinit();
@@ -1629,8 +1680,8 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
 
     const expected = [_][]const u8{ "第一条 \"引号\" 预览", "第二条 中文 \"quotes\" 预览" };
     const enqueued = [_][]const u8{
-        "{\"v\":4,\"id\":81,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"第一条 \\\"引号\\\" 预览\"}",
-        "{\"v\":4,\"id\":82,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"第二条 中文 \\\"quotes\\\" 预览\"}",
+        "{\"v\":5,\"id\":81,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"steering\",\"text\":\"第一条 \\\"引号\\\" 预览\"}",
+        "{\"v\":5,\"id\":82,\"op\":\"enqueue\",\"epoch\":1,\"kind\":\"follow_up\",\"text\":\"第二条 中文 \\\"quotes\\\" 预览\"}",
     };
     for (enqueued) |request| {
         const reply = try dispatchJson(host, a, request, 1);
@@ -1645,8 +1696,8 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
         // Stack churn between rounds: sibling replies reuse the frames that held
         // the previous projection. Only caller-owned storage survives this.
         const churn_requests = [_][]const u8{
-            "{\"v\":4,\"id\":83,\"op\":\"history\",\"limit\":8}",
-            "{\"v\":4,\"id\":84,\"op\":\"events\",\"since\":0,\"max\":8}",
+            "{\"v\":5,\"id\":83,\"op\":\"history\",\"limit\":8}",
+            "{\"v\":5,\"id\":84,\"op\":\"events\",\"since\":0,\"max\":8}",
         };
         for (churn_requests) |request| {
             const churn = try dispatchJson(host, a, request, 1);
@@ -1655,7 +1706,7 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
             a.free(churn);
         }
 
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":90,\"op\":\"snapshot\"}", 1);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":90,\"op\":\"snapshot\"}", 1);
         var parsed = try parseJson(a, frame);
         a.free(frame);
         defer parsed.deinit();
@@ -1747,7 +1798,7 @@ test "snapshot receipt query is read-only and reports known accepted rejected un
         .{ .id = 777, .known = false, .accepted = false, .task = 0 },
     };
     for (cases) |case| {
-        const request = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":70,\"op\":\"snapshot\",\"receipt\":{d}}}", .{case.id});
+        const request = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":70,\"op\":\"snapshot\",\"receipt\":{d}}}", .{case.id});
         defer a.free(request);
         const frame = try dispatchJson(host, a, request, 1);
         defer a.free(frame);
@@ -1764,12 +1815,12 @@ test "snapshot receipt query is read-only and reports known accepted rejected un
     }
 
     // A malformed nonce is rejected; it never starts work either.
-    const bad = try dispatchJson(host, a, "{\"v\":4,\"id\":71,\"op\":\"snapshot\",\"receipt\":\"abc\"}", 1);
+    const bad = try dispatchJson(host, a, "{\"v\":5,\"id\":71,\"op\":\"snapshot\",\"receipt\":\"abc\"}", 1);
     defer a.free(bad);
     try std.testing.expect(std.mem.indexOf(u8, bad, "\"ok\":false") != null);
     try std.testing.expect(host.task == null);
 }
-test "settings reply publishes the configured cleanup budgets" {
+test "settings reply publishes only the four user limits and never internal cleanup policy" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1785,13 +1836,12 @@ test "settings reply publishes the configured cleanup budgets" {
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
 
-    // A spawning owner reads these two numbers from the public projection; they
-    // must be the configured budgets instead of a fixed 30s fallback.
+    // Owner settings remain state-backed; static cleanup policy is not a DTO.
     {
         var fake = FakeLimitsView{
             .prev_fn = host.connection.current_fn,
             .prev_context = host.connection.context,
-            .limits = .{ .cleanup_grace_ms = 4_000, .cleanup_timeout_ms = 12_000 },
+            .limits = .{ .command_timeout_ms = 4_000, .request_timeout_ms = 12_000, .low_price_input = false, .compaction_enabled = false },
         };
         defer {
             host.connection.current_fn = fake.prev_fn;
@@ -1799,29 +1849,32 @@ test "settings reply publishes the configured cleanup budgets" {
         }
         host.connection.current_fn = FakeLimitsView.current;
         host.connection.context = &fake;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":30,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":30,\"op\":\"settings\"}", 7);
         defer a.free(frame);
-        try std.testing.expect(try settingsFieldIs(frame, "cleanup_grace_ms", 4_000));
-        try std.testing.expect(try settingsFieldIs(frame, "cleanup_timeout_ms", 12_000));
-        // The defaults are not what this projection reports, so the two fields
-        // are owner state and not literals in the encoder.
-        try std.testing.expect(!try settingsFieldIs(frame, "cleanup_grace_ms", 1_000));
-        try std.testing.expect(!try settingsFieldIs(frame, "cleanup_timeout_ms", 5_000));
+        try std.testing.expect(try settingsFieldIs(frame, "command_timeout_ms", 4_000));
+        try std.testing.expect(try settingsFieldIs(frame, "request_timeout_ms", 12_000));
+        var doc = try parseJson(a, frame);
+        defer doc.deinit();
+        const limits = doc.value.object.get("limits").?.object;
+        try std.testing.expectEqual(@as(usize, 4), limits.count());
+        try std.testing.expect(!limits.get("low_price_input").?.bool);
+        try std.testing.expect(!limits.get("compaction_enabled").?.bool);
+        try std.testing.expect(limits.get("cleanup_grace_ms") == null);
+        try std.testing.expect(limits.get("cleanup_timeout_ms") == null);
     }
 
     // The restored real projection reports its own defaults, so both fields are
     // wired to owner state rather than written as literals in the encoder.
     {
         const defaults: cfg.Limits = .{};
-        try std.testing.expectEqual(@as(u32, 1_000), defaults.cleanup_grace_ms);
-        try std.testing.expectEqual(@as(u32, 5_000), defaults.cleanup_timeout_ms);
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":31,\"op\":\"settings\"}", 7);
+        try std.testing.expectEqual(@as(u32, 300_000), defaults.command_timeout_ms);
+        try std.testing.expectEqual(@as(u32, 300_000), defaults.request_timeout_ms);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":31,\"op\":\"settings\"}", 7);
         defer a.free(frame);
-        try std.testing.expect(try settingsFieldIs(frame, "cleanup_grace_ms", 1_000));
-        try std.testing.expect(try settingsFieldIs(frame, "cleanup_timeout_ms", 5_000));
-        // And the fake never leaks into the restored real projection.
-        try std.testing.expect(!try settingsFieldIs(frame, "cleanup_grace_ms", 4_000));
-        try std.testing.expect(!try settingsFieldIs(frame, "cleanup_timeout_ms", 12_000));
+        try std.testing.expect(try settingsFieldIs(frame, "command_timeout_ms", defaults.command_timeout_ms));
+        try std.testing.expect(try settingsFieldIs(frame, "request_timeout_ms", defaults.request_timeout_ms));
+        try std.testing.expect(!try settingsFieldIs(frame, "command_timeout_ms", 4_000));
+        try std.testing.expect(!try settingsFieldIs(frame, "request_timeout_ms", 12_000));
     }
 }
 test "a re-attach on the same socket invalidates cached settings frames by epoch" {
@@ -1841,13 +1894,13 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     defer host.deinit();
 
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":40,\"op\":\"attach\",\"write\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":40,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":1") != null);
     }
     // The same owner and socket attach again: this is a real new epoch.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":41,\"op\":\"attach\",\"write\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":41,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":2") != null);
     }
@@ -1858,7 +1911,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":42,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":42,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
         try std.testing.expectEqual(@as(usize, 0), sink.calls);
@@ -1867,7 +1920,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":43,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":43,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") == null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -1878,7 +1931,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":44,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":false}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":44,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":false}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -1887,7 +1940,7 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
     {
         host.connection.setting_fn = SettingSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":45,\"op\":\"setting\",\"key\":\"low_price_input\",\"value\":false}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":45,\"op\":\"setting\",\"key\":\"low_price_input\",\"value\":false}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -1910,7 +1963,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     defer host.deinit();
 
     {
-        const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(attached);
         try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
     }
@@ -1923,7 +1976,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.connection.proxy_fn = ProxySink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -1934,7 +1987,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.connection.proxy_fn = ProxySink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":false}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"opencode-go/deepseek-v3\",\"enabled\":false}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -1946,27 +1999,27 @@ test "proxy mutations require the live epoch and one exact model id" {
     // A stale epoch and a foreign socket both fail with stale_control; a
     // missing epoch is a bad request. None of them reaches the callback.
     {
-        const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":4,\"op\":\"proxy_model\",\"epoch\":9,\"name\":\"p/m\",\"enabled\":true}", 7);
+        const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":4,\"op\":\"proxy_model\",\"epoch\":9,\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(stale);
         try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
     }
     {
-        const foreign = try dispatchJson(host, a, "{\"v\":4,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 8);
+        const foreign = try dispatchJson(host, a, "{\"v\":5,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 8);
         defer a.free(foreign);
         try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
     }
     {
-        const bare = try dispatchJson(host, a, "{\"v\":4,\"id\":6,\"op\":\"proxy_model\",\"name\":\"p/m\",\"enabled\":true}", 7);
+        const bare = try dispatchJson(host, a, "{\"v\":5,\"id\":6,\"op\":\"proxy_model\",\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(bare);
         try std.testing.expect(std.mem.indexOf(u8, bare, "\"ok\":false") != null);
     }
     try std.testing.expectEqual(@as(usize, 2), sink.calls);
     // Loose parameter shapes are rejected instead of defaulted.
     for ([_][]const u8{
-        "{\"v\":4,\"id\":7,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}",
-        "{\"v\":4,\"id\":8,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}",
-        "{\"v\":4,\"id\":9,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"\",\"enabled\":true}",
-        "{\"v\":4,\"id\":10,\"op\":\"proxy_model\",\"epoch\":1,\"enabled\":true}",
+        "{\"v\":5,\"id\":7,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}",
+        "{\"v\":5,\"id\":8,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}",
+        "{\"v\":5,\"id\":9,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"\",\"enabled\":true}",
+        "{\"v\":5,\"id\":10,\"op\":\"proxy_model\",\"epoch\":1,\"enabled\":true}",
     }) |json| {
         const frame = try dispatchJson(host, a, json, 7);
         defer a.free(frame);
@@ -1977,7 +2030,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.reset_failed = error.ResetFailed;
         defer host.reset_failed = null;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":11,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":11,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "busy") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -1986,7 +2039,7 @@ test "proxy mutations require the live epoch and one exact model id" {
     {
         host.connection.proxy_fn = null;
         defer host.connection.proxy_fn = ProxySink.set;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":12,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":12,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":true}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -2008,7 +2061,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
     defer host.deinit();
     {
-        const attached = try dispatchJson(host, a, "{\"v\":4,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
+        const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(attached);
         try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
     }
@@ -2038,7 +2091,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
         host.connection.context = &proxy;
         host.connection.proxy_address_fn = ProxyViewSink.set;
         defer host.refreshConnection();
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":2,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"[2001:db8::1]:8080\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":2,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"[2001:db8::1]:8080\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
@@ -2050,7 +2103,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     {
         host.connection.proxy_address_fn = ProxyAddressSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":3,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":true") != null);
         try std.testing.expectEqual(@as(usize, 2), sink.calls);
@@ -2061,14 +2114,14 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     host.connection.proxy_address_fn = ProxyAddressSink.set;
     host.connection.context = &sink;
     for ([_][]const u8{
-        "{\"v\":4,\"id\":4,\"op\":\"proxy_address\",\"epoch\":1}",
-        "{\"v\":4,\"id\":5,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
-        "{\"v\":4,\"id\":6,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
-        "{\"v\":4,\"id\":7,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"2001:db8::1\"}",
-        "{\"v\":4,\"id\":8,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:0\"}",
-        "{\"v\":4,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:70000\"}",
-        "{\"v\":4,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"user@host:8080\"}",
-        "{\"v\":4,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"http://host:8080\"}",
+        "{\"v\":5,\"id\":4,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":5,\"id\":5,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":5,\"id\":6,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":5,\"id\":7,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"2001:db8::1\"}",
+        "{\"v\":5,\"id\":8,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:0\"}",
+        "{\"v\":5,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:70000\"}",
+        "{\"v\":5,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"user@host:8080\"}",
+        "{\"v\":5,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"http://host:8080\"}",
     }) |json| {
         const frame = try dispatchJson(host, a, json, 7);
         defer a.free(frame);
@@ -2079,7 +2132,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     {
         var long_value: [cfg.max_proxy_endpoint_bytes + 1]u8 = undefined;
         @memset(&long_value, 'a');
-        const too_long = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"{s}\"}}", .{long_value[0..]});
+        const too_long = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"{s}\"}}", .{long_value[0..]});
         defer a.free(too_long);
         const frame = try dispatchJson(host, a, too_long, 7);
         defer a.free(frame);
@@ -2089,19 +2142,19 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
 
     // Socket and epoch binding, then the idle guard: none reach the callback.
     {
-        const stale = try dispatchJson(host, a, "{\"v\":4,\"id\":13,\"op\":\"proxy_address\",\"epoch\":9,\"value\":\"host:8080\"}", 7);
+        const stale = try dispatchJson(host, a, "{\"v\":5,\"id\":13,\"op\":\"proxy_address\",\"epoch\":9,\"value\":\"host:8080\"}", 7);
         defer a.free(stale);
         try std.testing.expect(std.mem.indexOf(u8, stale, "stale_control") != null);
     }
     {
-        const foreign = try dispatchJson(host, a, "{\"v\":4,\"id\":14,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 8);
+        const foreign = try dispatchJson(host, a, "{\"v\":5,\"id\":14,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 8);
         defer a.free(foreign);
         try std.testing.expect(std.mem.indexOf(u8, foreign, "stale_control") != null);
     }
     {
         host.reset_failed = error.ResetFailed;
         defer host.reset_failed = null;
-        const busy = try dispatchJson(host, a, "{\"v\":4,\"id\":15,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        const busy = try dispatchJson(host, a, "{\"v\":5,\"id\":15,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
         defer a.free(busy);
         try std.testing.expect(std.mem.indexOf(u8, busy, "busy") != null);
     }
@@ -2128,7 +2181,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
         sink.fail = true;
         defer sink.fail = false;
         defer host.refreshConnection();
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":16,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":16,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expectEqual(@as(usize, 3), sink.calls);
@@ -2139,7 +2192,7 @@ test "proxy endpoint mutation is strict, epoch-bound and publishes only on succe
     {
         host.connection.context = session_ctx;
         host.connection.proxy_address_fn = null;
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":17,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":17,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"host:8080\"}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "unsupported") != null);
         try std.testing.expectEqual(@as(usize, 3), sink.calls);
@@ -2177,7 +2230,7 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
             host.connection.current_fn = fake.prev_fn;
             host.connection.context = fake.prev_context;
         }
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":20,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":20,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         var doc = try parseWholeReply(a, frame);
         defer doc.deinit();
@@ -2214,18 +2267,19 @@ test "settings reply publishes the proxy allowlist without addresses or secrets"
             host.connection.current_fn = fake.prev_fn;
             host.connection.context = fake.prev_context;
         }
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":21,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":21,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         var doc = try parseWholeReply(a, frame);
         defer doc.deinit();
         const root = doc.value.object;
-        try std.testing.expectEqual(@as(usize, max_proxy_models), root.get("proxy_models").?.array.items.len);
-        try std.testing.expectEqual(true, root.get("proxy_models_truncated").?.bool);
+        try std.testing.expectEqual(many.len, root.get("proxy_models").?.array.items.len);
+        for (root.get("proxy_models").?.array.items) |entry| try std.testing.expectEqualStrings("p/m", entry.string);
+        try std.testing.expectEqual(false, root.get("proxy_models_truncated").?.bool);
     }
 
     // The real projection stays unconfigured with a real empty array.
     {
-        const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":22,\"op\":\"settings\"}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":22,\"op\":\"settings\"}", 7);
         defer a.free(frame);
         var doc = try parseWholeReply(a, frame);
         defer doc.deinit();
@@ -2277,7 +2331,7 @@ test "settings reply is one parseable JSON object with complete array elements" 
     host.connection.current_fn = FakeCatalogView.current;
     host.connection.context = &fake;
 
-    const frame = try dispatchJson(host, a, "{\"v\":4,\"id\":50,\"op\":\"settings\"}", 7);
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":50,\"op\":\"settings\"}", 7);
     defer a.free(frame);
 
     var doc = try parseWholeReply(a, frame);

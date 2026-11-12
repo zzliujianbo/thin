@@ -96,6 +96,9 @@ test "SystemOne owned failures never retry redirect or silently fallback" {
     for ([_][]const u8{ "invalid-json", "invalid-score", "missing-answers", "forbidden", "server-error", "redirect", "oversized", "truncated", "stalled", "cancel" }) |scenario| {
         const is_cancel = std.mem.eql(u8, scenario, "cancel");
         const is_stall = std.mem.eql(u8, scenario, "stalled");
+        // The legacy "oversized" fixture is whitespace-only, not valid JSON:
+        // its size is accepted by transport and rejected by semantic decoding.
+        const invalid_output = std.mem.startsWith(u8, scenario, "invalid") or std.mem.eql(u8, scenario, "missing-answers") or std.mem.eql(u8, scenario, "oversized");
         const client = try makeClient(a, io, scenario, if (is_stall) 350 else if (is_cancel) 8000 else 3000, .direct);
         defer client.deinit();
         var cancel = p.Cancellation{};
@@ -111,7 +114,7 @@ test "SystemOne owned failures never retry redirect or silently fallback" {
             return error.ExpectedFailClosed;
         } else |err| {
             if (is_cancel) try t.expectEqual(error.Canceled, err);
-            if (std.mem.startsWith(u8, scenario, "invalid") or std.mem.eql(u8, scenario, "missing-answers")) try t.expectEqual(error.InvalidDecisionOutput, err);
+            if (invalid_output) try t.expectEqual(error.InvalidDecisionOutput, err);
         }
         if (future) |*f| try f.await(io);
         try t.expect(start.untilNow(io, .awake).toMilliseconds() < 6000);
@@ -127,7 +130,7 @@ test "SystemOne owned failures never retry redirect or silently fallback" {
             try t.expectEqual(decision.Diagnostic.Operation.command, diagnostic.operation);
             try t.expectEqual(client.last_http_status, diagnostic.http_status);
             try t.expect(diagnostic.causeName().len != 0);
-            if (std.mem.startsWith(u8, scenario, "invalid") or std.mem.eql(u8, scenario, "missing-answers")) {
+            if (invalid_output) {
                 try t.expectEqual(decision.Diagnostic.Stage.decode, diagnostic.stage);
                 try t.expectEqualStrings("InvalidDecisionOutput", diagnostic.causeName());
             }

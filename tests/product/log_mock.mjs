@@ -123,8 +123,22 @@ async function records(project, began, ended, key) {
     elapsed = row.elapsed_ms;
     assert(typeof row.event === 'string' && row.data && typeof row.data === 'object', 'invalid event/data');
     if (row.event === 'session') {
-      assert.equal(row.data.text_bytes, 1024*1024, 'invalid session text limit');
-      assert.equal(row.data.record_bytes, 5*1024*1024, 'invalid session record limit');
+      assert(!Object.hasOwn(row.data,'text_bytes') && !Object.hasOwn(row.data,'record_bytes'), 'retired session byte limits persisted');
+      assert.deepEqual(Object.keys(row.data).sort(), ['format','plaintext','protocol','redaction','selection']);
+      assert.equal(row.data.protocol, 'chat', 'invalid session protocol');
+      assert.equal(row.data.format, 'jsonl', 'invalid session format');
+      assert.equal(row.data.plaintext, true, 'invalid session plaintext policy');
+      assert.equal(row.data.redaction, 'known_key_only', 'invalid session redaction policy');
+      const selection = row.data.selection;
+      assert(selection && typeof selection === 'object' && !Array.isArray(selection), 'missing session selection');
+      assert.deepEqual(Object.keys(selection).sort(), ['effort','effort_hash','endpoint','model','protocol','provider','provider_name']);
+      assert.equal(selection.protocol, row.data.protocol, 'selection protocol mismatch');
+      assert(typeof selection.model === 'string' && selection.model.length > 0, 'invalid selection model');
+      assert(selection.provider_name === null || typeof selection.provider_name === 'string', 'invalid selection provider name');
+      assert(selection.provider === null || typeof selection.provider === 'string', 'invalid selection provider');
+      assert(typeof selection.endpoint === 'string' && /^[0-9a-f]{64}$/.test(selection.endpoint), 'invalid selection endpoint hash');
+      assert(selection.effort === null || ['off','minimal','low','medium','high','xhigh','max'].includes(selection.effort), 'invalid selection effort');
+      assert(selection.effort_hash === null || (typeof selection.effort_hash === 'string' && /^[0-9a-f]{64}$/.test(selection.effort_hash)), 'invalid selection effort hash');
     }
     assert(!['reasoning','native','text_delta'].includes(row.event), 'private event persisted');
     if (row.event === 'first_response') assert(!('text' in row.data) && !('content' in row.data), 'first response contains content');
@@ -224,7 +238,7 @@ async function scenario(app, pty, kind) {
     await mkdir(home); await mkdir(project); await mkdir(join(home,'.thin'));
     await new Promise((resolve,reject) => { server.once('error',reject); server.listen(0,'127.0.0.1',resolve); });
     const url = `http://127.0.0.1:${server.address().port}/v1`;
-    await writeFile(join(home,'.thin/config.json'), JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,request_timeout_ms:5000,task_timeout_ms:15000}}));
+    await writeFile(join(home,'.thin/config.json'), JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,request_timeout_ms:5000}}));
     if (redact) await writeFile(join(project,`secret-${key}.json`), JSON.stringify({secret:key, [key]:key}));
     if (kind === 'failure' || kind === 'failure-pty') { await mkdir(join(project,'.thin')); await writeFile(join(project,'.thin/sessions'),'occupied'); }
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:key,
@@ -316,7 +330,9 @@ async function scenario(app, pty, kind) {
     // 本文件的 assert 只使用固定标签；不传播 actual/expected、捕获输出或 JSON 错误正文。
     const failure = new Error('offline log acceptance failed');
     failure.fixtureCase = `log/${kind}`;
-    failure.fixtureCheck = error.fixtureCheck ?? (error.code === 'ERR_ASSERTION' ? error.message : 'execution-or-json');
+    failure.fixtureCheck = error.fixtureCheck ?? (error.code === 'ERR_ASSERTION' ? 'assertion' : 'execution-or-json');
+    const frame = /^\s+at .*\/tests\/product\/([a-zA-Z0-9_-]+\.mjs):(\d+):\d+\)?$/m.exec(error.stack ?? '');
+    if (frame) failure.fixtureLocation = `${frame[1]}:${frame[2]}`;
     throw failure;
   } finally {
     for (const socket of sockets) socket.destroy();

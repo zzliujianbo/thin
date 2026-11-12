@@ -15,7 +15,6 @@ const Fake = struct {
     retrieval_error: bool = false,
     retrieval_poison: ?anyerror = null,
     invalid_return: bool = false,
-    maxbytes: usize = 0,
     tool: bool = false,
     output: r.Execution = .{ .text = "verified tool fact" },
     fail: bool = false,
@@ -28,14 +27,13 @@ const Fake = struct {
     source_text: [8192]u8 = undefined,
     source_len: usize = 0,
     incomplete: bool = false,
-    fn retrieve(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, maxbytes: usize) ![]const u8 {
+    fn retrieve(raw: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]const u8 {
         const self: *Fake = @ptrCast(@alignCast(raw));
         self.retrieves += 1;
-        self.maxbytes = maxbytes;
         if (self.retrieval_poison) |err| return err;
         if (self.retrieval_error) return error.OfflineUnavailable;
-        if (self.invalid_return) return &@as([8193]u8, @splat('x'));
-        return if (self.reference.len <= maxbytes) self.reference else "";
+        if (self.invalid_return) return "invalid\x00reference";
+        return self.reference;
     }
     fn finalize(raw: *anyopaque, capture: *const k.Capture, _: p.Protocol) void {
         const self: *Fake = @ptrCast(@alignCast(raw));

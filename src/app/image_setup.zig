@@ -19,6 +19,7 @@ pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const 
     const cache = try a.create(metadata.Cache);
     defer a.destroy(cache);
     cache.* = .{};
+    defer cache.deinit(a);
     if (env.get("HOME")) |home| {
         if (Store.openExisting(a, io, home)) |opened| {
             var store = opened;

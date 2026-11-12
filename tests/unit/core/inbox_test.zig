@@ -66,11 +66,35 @@ test "steering inbox slots remain reserved and snapshot owns previews" {
     box.beginRun();
     const lease = box.claimSteering().?;
     for (0..15) |_| _ = try box.enqueue(a, .follow_up, "pending");
-    try std.testing.expectError(error.InboxFull, box.enqueue(a, .follow_up, "overflow"));
+    _ = try box.enqueue(a, .follow_up, "overflow");
+    try std.testing.expectEqual(@as(usize, 16), box.snapshot().follow_up);
     box.restore(lease);
     var entry = box.withdraw(id).?;
     entry.deinit();
     try std.testing.expectEqualStrings("hello", snap.previews[0].text());
+}
+test "inbox grows beyond former count and byte limits with lease ordering" {
+    const a = std.testing.allocator;
+    var box: Inbox = .{};
+    defer box.deinit();
+    const text = try a.alloc(u8, 70000);
+    defer a.free(text);
+    @memset(text, 'x');
+    var ids: [40]u64 = undefined;
+    for (&ids) |*id| id.* = try box.enqueue(a, .steering, text);
+    try std.testing.expectEqual(@as(usize, 40), box.snapshot().steering);
+    box.beginRun();
+    const first = box.claimSteering().?;
+    try std.testing.expectEqual(ids[0], first.id);
+    box.restore(first);
+    for (ids) |id| {
+        const lease = box.claimSteering().?;
+        try std.testing.expectEqual(id, lease.id);
+        try std.testing.expectEqualStrings(text, lease.text);
+        var entry = box.commit(lease).?;
+        entry.deinit();
+    }
+    try std.testing.expect(box.sealTask());
 }
 test "run-gated delivery linearizes with sealing and leaves UI enqueue unchanged" {
     const a = std.testing.allocator;

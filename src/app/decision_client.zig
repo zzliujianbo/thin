@@ -23,7 +23,8 @@ fn isCodex(provider: cfg.Provider) bool {
 // already validated the URL syntax; the appended endpoint has a separate
 // transport length bound, and frozen environment keys need UTF-8/C1 checks.
 fn nativeShortcutSafe(endpoint: []const u8, key: []const u8, payload: []const u8) bool {
-    if (endpoint.len > 8192 or key.len == 0 or key.len > 16384 or payload.len > 256 * 1024) return false;
+    if (endpoint.len > 8192 or key.len == 0 or key.len > 16384 or payload.len == 0 or payload[0] == '@' or !std.unicode.utf8ValidateSlice(payload)) return false;
+    for (payload) |byte| if (byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') return false;
     var it = (std.unicode.Utf8View.init(key) catch return false).iterator();
     while (it.nextCodepoint()) |cp| if (cp < 32 or (cp >= 127 and cp <= 159)) return false;
     return true;
@@ -231,6 +232,7 @@ pub const Client = struct {
         const cache = try a.create(metadata.Cache);
         defer a.destroy(cache);
         loadCache(a, self.io, self.home, cache);
+        defer cache.deinit(a);
         const selection = try resolver.resolve(state.config.arena.allocator(), config.*, cache, reference.provider, reference.model, false);
         resolver.apply(config, selection);
         if (config.model.protocol == .auto) return error.UnknownModelProtocol;
@@ -348,13 +350,12 @@ pub const Client = struct {
         self.diagnostic.stage = .credentials;
         const key = self.key orelse return error.ApiKeyNotFound;
         self.diagnostic.stage = .encode;
-        const declared = self.source.value.decision.?;
         // Native routing comes only from the independently resolved protocol;
         // SystemOne never borrows generative capabilities or the primary key.
         var scratch = std.heap.ArenaAllocator.init(output_allocator);
         defer scratch.deinit();
         const a = scratch.allocator();
-        const payload = try systemone.encodeRequest(a, config.model.name, input, declared.max_state_bytes);
+        const payload = try systemone.encodeRequest(a, config.model.name, input);
         const endpoint = try std.fmt.allocPrint(a, "{s}/systemone", .{std.mem.trimEnd(u8, config.provider.base_url, "/")});
         if (cancel.isRequested()) return error.Canceled;
         if (input == .refine_outputs and nativeShortcutSafe(endpoint, key, payload)) {
@@ -446,7 +447,6 @@ pub const Client = struct {
         var text: std.ArrayList(u8) = .empty;
         for (response.message.blocks) |block| switch (block) {
             .text => |part| {
-                if (part.len > 65536 -| text.items.len) return error.InvalidDecision;
                 try text.appendSlice(a, part);
             },
             .reasoning => {},

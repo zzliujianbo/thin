@@ -50,9 +50,7 @@ const Fixture = struct {
             .{ .name = "opencode-zen", .connection = zen },
         } };
         config.limits.low_price_input = false;
-        config.limits.max_rounds = 7;
-        config.limits.max_tool_calls = 19;
-        config.limits.read_bytes = 12345;
+        config.limits.command_timeout_ms = 12345;
         try store.save(config);
         return .{ .tmp = tmp, .home = home, .project = project, .env = env };
     }
@@ -69,7 +67,7 @@ const Fixture = struct {
     }
 
     fn bytes(self: *Fixture) ![]u8 {
-        return self.tmp.dir.readFileAlloc(io, "home/.thin/config.json", a, .limited(cfg.max_config_bytes));
+        return self.tmp.dir.readFileAlloc(io, "home/.thin/config.json", a, .unlimited);
     }
 
     fn noLogs(self: *Fixture) !void {

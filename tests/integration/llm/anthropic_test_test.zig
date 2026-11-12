@@ -293,9 +293,6 @@ test "anthropic errors truncation invalid sequence duplicate IDs bounds and sink
     try stop(&s, 0);
     try std.testing.expectError(error.DuplicateToolId, block(&s, 1, "{\"type\":\"tool_use\",\"id\":\"same\",\"name\":\"f\",\"input\":{}}"));
     try std.testing.expectError(error.InvalidStreamState, s.finish());
-    s = adapter.Stream.init(a, scope, .{});
-    s.bytes = c.max_bytes;
-    try std.testing.expectError(error.InputLimit, s.feed("", start));
     const Reject = struct {
         fn emit(_: ?*anyopaque, _: p.ModelEvent) !void {
             return error.SinkFailed;
@@ -510,7 +507,7 @@ test "anthropic signature fragments preserve initial bytes order and independent
     const sent = j.get(wire, "messages").?.array.items[0];
     try std.testing.expectEqualStrings(out.message.replay.?.json, try j.encode(a, sent));
 }
-test "anthropic signature bounds poison and empty fragments remain bounded" {
+test "anthropic long signature and content remain complete beyond former byte and event quotas" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -519,20 +516,30 @@ test "anthropic signature bounds poison and empty fragments remain bounded" {
     try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
     try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
     try std.testing.expect(!s.observedContent());
-    // White-box length seam isolates the collector cap from the stricter
-    // whole-SSE byte cap, without allocating a 16 MiB fixture.
-    s.open.?.signature.len = c.max_bytes - 1;
-    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"A\"}");
-    try std.testing.expectEqual(c.max_bytes, s.open.?.signature.len);
-    try delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}");
-    try std.testing.expectError(error.InputLimit, delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"B\"}"));
-    try std.testing.expectError(error.InvalidStreamState, s.finish());
-    s = adapter.Stream.init(a, scope, .{});
-    try s.feed("", start);
-    try block(&s, 0, "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}");
-    s.events = 65536;
-    try std.testing.expectError(error.InputLimit, delta(&s, 0, "{\"type\":\"signature_delta\",\"signature\":\"\"}"));
-    try std.testing.expectError(error.InvalidStreamState, s.finish());
+    // Exercise real collection, not fabricated lengths.
+    const long = try a.alloc(u8, 16 * 1024 * 1024 + 1);
+    @memset(long, 'A');
+    const signature_delta = try std.fmt.allocPrint(a, "{{\"type\":\"signature_delta\",\"signature\":\"{s}\"}}", .{long});
+    try delta(&s, 0, signature_delta);
+    for (0..65537) |_| try s.feed("", "{\"type\":\"ping\"}");
+    try stop(&s, 0);
+    try block(&s, 1, "{\"type\":\"text\",\"text\":\"\"}");
+    const text_delta = try std.fmt.allocPrint(a, "{{\"type\":\"text_delta\",\"text\":\"{s}\"}}", .{long});
+    try delta(&s, 1, text_delta);
+    try stop(&s, 1);
+    try end(&s, "end_turn");
+    const out = (try s.finish()).success;
+    try std.testing.expectEqual(@as(usize, 1), out.message.blocks.len);
+    try std.testing.expectEqualStrings(long, out.message.blocks[0].text);
+    const native = try j.parse(a, out.message.replay.?.json);
+    const content = j.get(native, "content").?.array.items;
+    try std.testing.expectEqualStrings(long, try c.text(content[0], "signature"));
+    try std.testing.expectEqualStrings(long, try c.text(content[1], "text"));
+    var req = request();
+    req.messages = &.{out.message};
+    const wire = try j.parse(a, try adapter.encode(a, req));
+    const sent = j.get(wire, "messages").?.array.items[0];
+    try std.testing.expectEqualStrings(out.message.replay.?.json, try j.encode(a, sent));
 }
 test "anthropic fragmented signatures never authorize incomplete or capped replay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

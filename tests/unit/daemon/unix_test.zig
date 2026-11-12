@@ -21,12 +21,12 @@ test "native socketPair configures nonblocking close-on-exec and Darwin no-SIGPI
 test "partial frame storage is wiped before discard and close is idempotent" {
     var conn = Connection.init(std.testing.allocator, -1, test_peer);
     defer conn.close();
-    conn.body = try std.testing.allocator.dupe(u8, "partial-login-credential");
-    conn.body_read = conn.body.len;
+    try conn.body.appendSlice(std.testing.allocator, "partial-login-credential");
+    conn.body_read = conn.body.items.len;
     conn.wipePendingBody();
-    for (conn.body) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (conn.body.items) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
     conn.close();
-    try std.testing.expectEqual(@as(usize, 0), conn.body.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.body.items.len);
     conn.close();
 }
 test "step reader preserves partial header and body without waiting" {
@@ -51,19 +51,16 @@ test "step reader preserves partial header and body without waiting" {
     pair.b.close();
     try std.testing.expect((try pair.a.readStep()) == .eof);
 }
-test "step reader rejects truncated and oversized frames" {
-    for ([_][]const u8{ &.{0}, &.{ 0, 0, 0, 2, 'x' }, &.{ 0xff, 0xff, 0xff, 0xff } }, 0..) |raw, index| {
+test "step reader rejects truncated frames without allocating declared length" {
+    for ([_][]const u8{ &.{0}, &.{ 0, 0, 0, 2, 'x' }, &.{ 0xff, 0xff, 0xff, 0xff } }) |raw| {
         var pair = try testPair(std.testing.allocator);
         defer pair.a.close();
         defer pair.b.close();
         try sendAll(pair.b.fd, raw);
+        try std.testing.expect((try pair.a.readStep()) == .pending);
+        try std.testing.expect(pair.a.body.capacity < 1024);
         pair.b.close();
-        if (index == 2) {
-            try std.testing.expectError(error.FrameTooLarge, pair.a.readStep());
-        } else {
-            try std.testing.expect((try pair.a.readStep()) == .pending);
-            try std.testing.expectError(error.TruncatedFrame, pair.a.readStep());
-        }
+        try std.testing.expectError(error.TruncatedFrame, pair.a.readStep());
         try std.testing.expectError(error.StreamPoisoned, pair.a.readStep());
     }
 }
@@ -75,7 +72,7 @@ test "step writer backpressure preserves the exact frame and another connection 
     var fast = try testPair(a);
     defer fast.a.close();
     defer fast.b.close();
-    const payload = try a.alloc(u8, max_frame_len);
+    const payload = try a.alloc(u8, 1024 * 1024 + 12345);
     defer a.free(payload);
     for (payload, 0..) |*byte, index| byte.* = @intCast(index % 251);
     try slow.a.queueFrame(payload);
@@ -243,7 +240,7 @@ test "truncated frame and poisoned stream" {
     try std.testing.expectError(error.TruncatedFrame, a.readFrame(testWait()));
     try std.testing.expectError(error.StreamPoisoned, a.readFrame(testWait()));
 }
-test "declared length above the transport bound is rejected" {
+test "maximum declared length does not allocate on header" {
     const allocator = std.testing.allocator;
     const pair = try testPair(allocator);
     var a = pair.a;
@@ -252,9 +249,12 @@ test "declared length above the transport bound is rejected" {
     defer b.close();
 
     var header: [header_size]u8 = undefined;
-    std.mem.writeInt(u32, &header, @intCast(max_frame_len + 1), .big);
+    std.mem.writeInt(u32, &header, std.math.maxInt(u32), .big);
     try sendAll(b.descriptor(), &header);
-    try std.testing.expectError(error.FrameTooLarge, a.readFrame(testWait()));
+    try std.testing.expect((try a.readStep()) == .pending);
+    try std.testing.expectEqual(@as(usize, 0), a.body.capacity);
+    b.close();
+    try std.testing.expectError(error.TruncatedFrame, a.readStep());
 }
 test "oversized write is refused before any byte is written" {
     const allocator = std.testing.allocator;
@@ -265,9 +265,9 @@ test "oversized write is refused before any byte is written" {
     defer b.close();
     const wait = testWait();
 
-    const payload = try allocator.alloc(u8, max_frame_len + 1);
-    defer allocator.free(payload);
-    @memset(payload, 'x');
+    if (@sizeOf(usize) <= @sizeOf(u32)) return error.SkipZigTest;
+    const ptr: [*]const u8 = @ptrFromInt(1);
+    const payload = ptr[0 .. @as(usize, std.math.maxInt(u32)) + 1];
     try std.testing.expectError(error.FrameTooLarge, b.writeFrame(payload, wait));
 
     // The stream is untouched and still usable.

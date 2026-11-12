@@ -4,8 +4,7 @@
 //! addressable by id; there is no per-root start/parallelism quota. `run` only
 //! starts the worker and returns the job id; `get`/`send`/`cancel` drive one
 //! job at a time and `endTask` cancels+joins everything before the root task
-//! settles. The only remaining bound is a small re-read cache of already
-//! collected terminal views; it never limits starting or hides a live job.
+//! settles. Collected terminal views remain addressable for the root lifetime.
 //!
 //! Threading contract:
 //! - The worker owns the child Runtime/Bridge/ChildSession and publishes job
@@ -37,18 +36,10 @@ const ImageClient = @import("image_client.zig").Client;
 
 /// Contract bounds, single-sourced from core/subagent.zig.
 pub const max_id_bytes: usize = subagent.max_id_bytes;
-pub const max_message_bytes: usize = subagent.max_message_bytes;
-pub const max_messages_per_direction: u32 = subagent.max_messages_per_direction;
-pub const max_unread_child_messages: usize = subagent.max_unread_messages;
-pub const max_progress_bytes: usize = subagent.max_progress_bytes;
 /// Parent approval description bound; the child proposal is untrusted text.
 const max_permission_description: usize = 1024;
 /// Poll interval for still-cancellable waits. Never a busy spin.
 const poll_ms: u64 = 2;
-/// Same-root terminal views kept for already-collected ids: a re-read cache,
-/// not a start or concurrency limit. Uncollected jobs live in the job list and
-/// are never evicted by it.
-const max_collected_results: usize = 4;
 /// Bounded before-finish hint: at most this many job ids are listed.
 const finish_hint_max_ids: usize = 8;
 const finish_hint_capacity: usize = 1024;
@@ -243,8 +234,7 @@ const Job = struct {
     phase: Phase = .running,
     question: ?Question = null,
     reply: ?[]u8 = null,
-    outbox: [max_unread_child_messages]?ChildMessage = @splat(null),
-    outbox_len: usize = 0,
+    outbox: std.ArrayList(ChildMessage) = .empty,
     progress: ?[]u8 = null,
     display: @import("subagent_progress.zig").Projection = .{},
     aggregate: *Aggregate,
@@ -255,8 +245,6 @@ const Job = struct {
     /// while running; it exists from `run` so a message accepted before the
     /// child session exists can be enqueued immediately.
     inbox: inbox_mod.Inbox = .{},
-    child_sent: u32 = 0,
-    parent_sent: u32 = 0,
     permission: PendingPermission = .{},
     next_permission_generation: u64 = 0,
     /// Parent-only: the last parent-domain permission id emitted for the
@@ -265,6 +253,9 @@ const Job = struct {
     terminal: ?r.Terminal = null,
     report: []u8 = &.{},
     report_truncated: bool = false,
+    /// Parent-control-thread only: delivery succeeded, but allocating the
+    /// terminal cache copy failed. Keep ID lookup without another finish hint.
+    result_delivered: bool = false,
     cleanup_failed: bool = false,
     failure: ?anyerror = null,
     /// Initialized on the parent control path before the worker exists. The
@@ -417,10 +408,8 @@ pub const SubagentService = struct {
     /// Job list head for the current root. Written only by the serialized parent
     /// control thread; `current` keeps its historical name.
     current: ?*Job = null,
-    /// Bounded FIFO of already-collected terminal views. A new accepted task
-    /// clears it; the oldest collected view is evicted first.
-    collected: [max_collected_results]?Collected = @splat(null),
-    collected_next: usize = 0,
+    /// Complete terminal views retained for the accepted root task.
+    collected: std.ArrayList(Collected) = .empty,
     next_id: u64 = 0,
     aggregate: Aggregate = .{},
     new_group: bool = true,
@@ -487,49 +476,27 @@ pub const SubagentService = struct {
     }
 
     fn clearCollected(self: *SubagentService) void {
-        self.collected_next = 0;
         const stable = self.deps.allocator;
-        for (&self.collected) |*slot| {
-            if (slot.*) |record| {
-                // The cached terminal JSON embeds the child report; wipe it.
-                wipeRelease(stable, record.text);
-                stable.free(record.id);
-                slot.* = null;
-            }
-        }
-    }
-
-    /// Keep a bounded terminal copy so a repeated same-root get/cancel can still
-    /// read the outcome instead of failing closed. Cache OOM never alters the
-    /// result already returned to the parent, and an evicted id fails closed as
-    /// unknown rather than returning a stale sibling view.
-    fn rememberCollected(self: *SubagentService, job: *Job, text: []const u8, is_error: bool) void {
-        const stable = self.deps.allocator;
-        const id_copy = stable.dupe(u8, job.id) catch return;
-        const text_copy = stable.dupe(u8, text) catch {
-            stable.free(id_copy);
-            return;
-        };
-        const truncated = job.reportWasTruncated();
-        const cleanup_failed = job.cleanup_failed;
-        // Ring FIFO: the slot about to be reused holds the oldest collected
-        // view. This never touches an uncollected job, which stays in the list.
-        const slot = &self.collected[self.collected_next];
-        self.collected_next = (self.collected_next + 1) % self.collected.len;
-        if (slot.*) |record| {
+        for (self.collected.items) |record| {
             wipeRelease(stable, record.text);
             stable.free(record.id);
         }
-        slot.* = .{ .id = id_copy, .text = text_copy, .is_error = is_error, .truncated = truncated, .cleanup_failed = cleanup_failed };
+        self.collected.deinit(stable);
+        self.collected = .empty;
+    }
+
+    fn rememberCollected(self: *SubagentService, job: *Job, text: []const u8, is_error: bool) !void {
+        const stable = self.deps.allocator;
+        const id_copy = try stable.dupe(u8, job.id);
+        errdefer stable.free(id_copy);
+        const text_copy = try stable.dupe(u8, text);
+        errdefer wipeRelease(stable, text_copy);
+        try self.collected.append(stable, .{ .id = id_copy, .text = text_copy, .is_error = is_error, .truncated = job.reportWasTruncated(), .cleanup_failed = job.cleanup_failed });
     }
 
     fn cached(self: *SubagentService, id: []const u8) ?*const Collected {
-        for (&self.collected) |*slot| {
-            // Pointer capture returns the address inside the cache slot; a
-            // payload value would point at a stack temporary.
-            if (slot.*) |*record| {
-                if (std.mem.eql(u8, record.id, id)) return record;
-            }
+        for (self.collected.items) |*record| {
+            if (std.mem.eql(u8, record.id, id)) return record;
         }
         return null;
     }
@@ -706,7 +673,7 @@ pub const SubagentService = struct {
             job.lock();
             if (job.isDone()) {
                 action = .terminal;
-            } else if (job.outbox_len != 0 or job.phase == .waiting) {
+            } else if (job.outbox.items.len != 0 or job.phase == .waiting) {
                 action = .snapshot;
             } else if (job.permission.active and job.emitted_permission_id == null) {
                 action = .permission;
@@ -748,7 +715,7 @@ pub const SubagentService = struct {
             }
             job.lock();
             // Re-evaluate under the lock: worker state may have changed during emit.
-            action = if (job.isDone()) .terminal else if (job.outbox_len != 0 or job.phase == .waiting) .snapshot else if (job.permission.active and job.emitted_permission_id == null) .permission else .wait;
+            action = if (job.isDone()) .terminal else if (job.outbox.items.len != 0 or job.phase == .waiting) .snapshot else if (job.permission.active and job.emitted_permission_id == null) .permission else .wait;
             if (action != observed_action) {
                 job.unlock();
                 continue;
@@ -828,7 +795,6 @@ pub const SubagentService = struct {
         // already requested (root cancel or a finished worker), can no longer
         // accept a message. Reporting success here would be a false delivery.
         if (job.isDone() or job.cancel.isRequested()) return error.SubagentFinished;
-        if (job.parent_sent >= max_messages_per_direction) return error.SubagentMessageLimit;
         if (job.phase == .waiting and job.question != null) {
             // Allocate everything before the single commit: a failed receipt or
             // copy allocation must not leave a half-published reply.
@@ -843,7 +809,6 @@ pub const SubagentService = struct {
             job.question = null;
             job.phase = .running;
             job.publishDisplay(.running);
-            job.parent_sent += 1;
             return .{ .text = receipt };
         }
         // Immediate non-blocking steering enqueue into the child's own Inbox.
@@ -851,8 +816,8 @@ pub const SubagentService = struct {
         // and only while the child's run stays open. `enqueueForRun` shares the
         // Inbox lock with `sealTask`, so a message can never be reported as
         // delivered to a run that is already sealed.
-        var buffer: [steering_prefix.len + max_message_bytes]u8 = undefined;
-        const framed = std.fmt.bufPrint(&buffer, "{s}{s}", .{ steering_prefix, request.message }) catch return error.InvalidSubagentMessage;
+        const framed = try std.fmt.allocPrint(job.allocator, "{s}{s}", .{ steering_prefix, request.message });
+        defer wipeRelease(job.allocator, framed);
         const receipt = try std.json.Stringify.valueAlloc(a, .{ .id = job.id, .status = "delivered" }, .{});
         // Only an error return releases the caller receipt; success transfers it.
         errdefer a.free(receipt);
@@ -860,7 +825,6 @@ pub const SubagentService = struct {
             error.RunSealed => error.SubagentFinished,
             else => err,
         };
-        job.parent_sent += 1;
         return .{ .text = receipt };
     }
 
@@ -889,18 +853,21 @@ pub const SubagentService = struct {
         return .{ .text = text, .is_error = failed, .truncated = truncated, .cleanup_failed = cleanup };
     }
 
-    /// Bounded host-state hint only: no reasoning, no Runtime re-entry. The
-    /// accepted-task reminder budget belongs to Runtime, not to this host. This
-    /// reports (never enforces) a bounded window over every live job: at most
+    /// Bounded host-state hint only: no reasoning or Runtime re-entry. Delivered
+    /// results retained after cache OOM are not pending. This reports (never
+    /// enforces) a bounded window over the remaining jobs: at most
     /// `finish_hint_max_ids` ids are listed plus a count of the rest, and all of
     /// them stay addressable by `get`/`cancel`.
     fn beforeFinish(raw: *anyopaque, a: std.mem.Allocator, cancel: *const p.Cancellation) !?[]const u8 {
         const self: *SubagentService = @ptrCast(@alignCast(raw));
         if (cancel.isRequested()) return null;
         const head = self.current orelse return null;
-        var total: usize = 1;
-        var counter = head;
-        while (counter.next) |next| : (counter = next) total += 1;
+        var total: usize = 0;
+        var counter: ?*Job = head;
+        while (counter) |job| : (counter = job.next) {
+            if (!job.result_delivered) total += 1;
+        }
+        if (total == 0) return null;
 
         var buffer: [finish_hint_capacity]u8 = undefined;
         var len: usize = 0;
@@ -910,7 +877,8 @@ pub const SubagentService = struct {
         len = header.len;
         var listed: usize = 0;
         var node: ?*Job = head;
-        while (node) |job| {
+        while (node) |job| : (node = job.next) {
+            if (job.result_delivered) continue;
             if (listed == finish_hint_max_ids) break;
             const status = jobStatus(job);
             var id_buffer: [max_id_bytes + 32]u8 = undefined;
@@ -918,7 +886,6 @@ pub const SubagentService = struct {
             if (len + part.len > buffer.len) break;
             appendBounded(&buffer, &len, part);
             listed += 1;
-            node = job.next;
         }
         if (listed < total) {
             var tail_buffer: [48]u8 = undefined;
@@ -1005,9 +972,15 @@ pub const SubagentService = struct {
     }
 
     fn collectJob(self: *SubagentService, job: *Job, text: []const u8, is_error: bool) void {
-        self.rememberCollected(job, text, is_error);
         self.withdrawPermission(job);
         if (job.cleanup_failed) self.deps.runtime.poisoned = true;
+        // All callers return the encoded result after this no-fail commit.
+        // Cache OOM retains the joined job for explicit ID re-reads, not for
+        // another beforeFinish reminder: its result has already been delivered.
+        self.rememberCollected(job, text, is_error) catch {
+            job.result_delivered = true;
+            return;
+        };
         self.releaseJob(job);
     }
 
@@ -1044,8 +1017,9 @@ pub const SubagentService = struct {
             job.retained_child = null;
         }
         job.lock();
-        for (job.outbox[0..job.outbox_len]) |slot| if (slot) |message| wipeRelease(job.allocator, message.text);
-        job.outbox_len = 0;
+        for (job.outbox.items) |message| wipeRelease(job.allocator, message.text);
+        job.outbox.deinit(job.allocator);
+        job.outbox = .empty;
         if (job.question) |question| wipeRelease(job.allocator, question.text);
         job.question = null;
         if (job.progress) |progress| wipeRelease(job.allocator, progress);
@@ -1071,20 +1045,18 @@ pub const SubagentService = struct {
     /// have already joined the worker (cancel path).
     fn encodeJob(self: *SubagentService, a: std.mem.Allocator, job: *Job, terminal: bool) ![]const u8 {
         _ = self;
-        var messages: [max_unread_child_messages + 1]MessageView = undefined;
-        var count: usize = 0;
+        var messages: std.ArrayList(MessageView) = .empty;
+        defer messages.deinit(a);
         if (job.phase == .waiting) if (job.question) |question| {
-            messages[count] = .{ .message = question.text, .requires_reply = true };
-            count += 1;
+            try messages.append(a, .{ .message = question.text, .requires_reply = true });
         };
-        for (job.outbox[0..job.outbox_len]) |slot| if (slot) |message| {
-            messages[count] = .{ .message = message.text, .requires_reply = message.requires_reply };
-            count += 1;
-        };
+        for (job.outbox.items) |message| {
+            try messages.append(a, .{ .message = message.text, .requires_reply = message.requires_reply });
+        }
         var snapshot_view = SnapshotView{
             .id = job.id,
             .status = if (job.phase == .waiting) "waiting_for_reply" else "running",
-            .messages = messages[0..count],
+            .messages = messages.items,
             .progress = job.progress orelse "",
         };
         if (terminal) {
@@ -1125,8 +1097,8 @@ pub const SubagentService = struct {
     /// Called while holding `job.lock()`, only after a successful encode.
     fn ackMessagesLocked(self: *SubagentService, job: *Job) void {
         _ = self;
-        for (job.outbox[0..job.outbox_len]) |slot| if (slot) |message| wipeRelease(job.allocator, message.text);
-        job.outbox_len = 0;
+        for (job.outbox.items) |message| wipeRelease(job.allocator, message.text);
+        job.outbox.clearRetainingCapacity();
     }
 
     /// Parent-domain approval broker: allocate, emit exactly once, authorize,
@@ -1414,13 +1386,8 @@ fn workerRun(job: *Job) !void {
     if (run_error) |err| return err;
     if (encode_oom) return error.OutOfMemory;
 
-    var bounded: subagent.Bounded = .{ .text = &.{}, .truncated = false };
-    if (std.unicode.utf8ValidateSlice(report)) {
-        bounded = try subagent.boundReport(stable, report);
-    } else {
-        bounded = .{ .text = try stable.dupe(u8, "[invalid UTF-8 subagent report omitted]"), .truncated = true };
-    }
-    job.publishTerminal(terminal, @constCast(bounded.text), truncated or bounded.truncated);
+    const full_report = try subagent.boundReport(stable, report);
+    job.publishTerminal(terminal, @constCast(full_report.text), truncated or full_report.truncated);
 }
 
 fn isCleanupFailure(detail: ?anyerror) bool {
@@ -1452,32 +1419,20 @@ fn extractReport(a: std.mem.Allocator, child: *ChildSession) !Report {
     const message = final orelse return .{ .text = "", .truncated = false };
     var total: usize = 0;
     for (message.blocks) |block| switch (block) {
-        .text => |text| total +|= text.len,
+        .text => |text| total = std.math.add(usize, total, text.len) catch return error.OutOfMemory,
         else => {},
     };
     if (total == 0) return .{ .text = "", .truncated = false };
-    const cap = @min(total, subagent.max_report_bytes + 4);
-    const buffer = try a.alloc(u8, cap);
+    const buffer = try a.alloc(u8, total);
     var written: usize = 0;
     for (message.blocks) |block| switch (block) {
         .text => |text| {
-            if (written == cap) break;
-            const take = @min(text.len, cap - written);
-            @memcpy(buffer[written..][0..take], text[0..take]);
-            written += take;
+            @memcpy(buffer[written..][0..text.len], text);
+            written += text.len;
         },
         else => {},
     };
-    if (written == total) return .{ .text = buffer[0..written], .truncated = false };
-    // The byte cap may split a multi-byte scalar. Back up over at most three
-    // continuation bytes and keep the truncation signal even when the aligned
-    // prefix happens to end exactly at max_report_bytes.
-    var end = written;
-    var backed: u3 = 0;
-    while (end > 0 and backed < 3 and !std.unicode.utf8ValidateSlice(buffer[0..end])) : (backed += 1) end -= 1;
-    if (end != 0 and !std.unicode.utf8ValidateSlice(buffer[0..end]))
-        return .{ .text = buffer[0..written], .truncated = true };
-    return .{ .text = buffer[0..end], .truncated = true };
+    return .{ .text = buffer[0..written], .truncated = false };
 }
 
 // ----------------------------------------------------------------------
@@ -1539,7 +1494,7 @@ const ChildSession = struct {
         self.root = try deps.root.duplicate();
         // Structural dependency only: memory actions are disabled and this
         // Store is never read or migrated before the child is destroyed.
-        self.store = mem.Store.init(&self.root.?, self.config.?.value.limits);
+        self.store = mem.Store.init(&self.root.?);
 
         if (deps.decision.*) |parent| self.decision = try parent.clone();
         if (deps.image.*) |parent| self.image = try parent.clone();
@@ -1776,7 +1731,7 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
 
     // Copy/allocate before taking the lock: OOM must never return holding it.
     var progress_owned: ?[]u8 = if (!message.wait_for_reply)
-        try boundCopy(job.allocator, message.message, max_progress_bytes)
+        try job.allocator.dupe(u8, message.message)
     else
         null;
     defer if (progress_owned) |value| wipeRelease(job.allocator, value);
@@ -1788,15 +1743,11 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
         job.unlock();
         return error.SubagentFinished;
     }
-    if (job.child_sent >= max_messages_per_direction) {
-        job.unlock();
-        return error.SubagentMessageLimit;
-    }
     if (!message.wait_for_reply) {
-        if (job.outbox_len >= max_unread_child_messages) {
+        job.outbox.ensureUnusedCapacity(job.allocator, 1) catch |err| {
             job.unlock();
-            return error.SubagentMessageQueueFull;
-        }
+            return err;
+        };
         const progress = progress_owned.?;
         progress_owned = null;
         const copy = copy_owned.?;
@@ -1805,12 +1756,10 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
         // fail after the queue slot is published.
         if (job.progress) |old| wipeRelease(job.allocator, old);
         job.progress = progress;
-        job.outbox[job.outbox_len] = .{ .text = copy, .requires_reply = false };
+        job.outbox.appendAssumeCapacity(.{ .text = copy, .requires_reply = false });
         job.display.begin();
         job.display.feed(copy);
         job.publishDisplay(.running);
-        job.outbox_len += 1;
-        job.child_sent += 1;
         job.unlock();
         return .{ .text = sent_text };
     }
@@ -1836,7 +1785,6 @@ fn postParentMessage(self: *ChildSession, a: std.mem.Allocator, message: subagen
     job.display.feed(copy);
     job.phase = .waiting;
     job.publishDisplay(.waiting);
-    job.child_sent += 1;
     job.unlock();
 
     while (true) {

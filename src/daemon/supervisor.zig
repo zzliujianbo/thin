@@ -22,7 +22,6 @@ const linux = std.os.linux;
 const fs = @import("../platform/filesystem.zig");
 const interrupt = @import("../platform/interrupt.zig");
 const logs = @import("../app/log_store.zig");
-const resume_codec = @import("../app/resume_codec.zig");
 const protocol = @import("protocol.zig");
 const unix = @import("unix.zig");
 const registry = @import("registry.zig");
@@ -256,7 +255,9 @@ const Supervisor = struct {
         if (fd < 0) return false;
         defer fs.closeFd(fd);
         const stat = fs.fileFromFd(fd).stat(self.io) catch return false;
-        return stat.kind == .file and stat.size > 0 and stat.size <= resume_codec.max_file_bytes;
+        // Actual frame validation belongs to the resume reader; this is only
+        // an existence check before launching the owner.
+        return stat.kind == .file and stat.size > 0;
     }
 
     fn acceptTick(self: *Supervisor) void {

@@ -104,6 +104,63 @@ test "cleanup grace covers the reported worker budget and never kills early" {
     try testing.expectEqual(@as(u64, cleanup_max_grace_ms), cleanupGraceMs(.{ .grace_ms = std.math.maxInt(u64), .timeout_ms = std.math.maxInt(u64) }, 2_000));
     try testing.expectEqual(@as(u64, cleanup_max_grace_ms), cleanupGraceMs(null, std.math.maxInt(u64)));
 }
+test "owned worker cleanup waits for 3.5 second SIGTERM completion beyond old watchdog" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const pair = try unix.socketPair();
+    defer fs.closeFd(pair[0]);
+    defer fs.closeFd(pair[1]);
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "trap 'printf T; sleep 3.5; printf D; exit 143' TERM; printf R; while :; do sleep 0.01; done" };
+    const env = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
+    const pid = c.fork();
+    if (pid < 0) return error.TestForkFailed;
+    if (pid == 0) {
+        if (c.setpgid(0, 0) != 0) c._exit(120);
+        if (SlowOwnedChild.dup2(pair[1], 1) < 0) c._exit(121);
+        _ = c.close(pair[0]);
+        _ = c.close(pair[1]);
+        _ = SlowOwnedChild.execve("/bin/sh", &argv, &env);
+        c._exit(122);
+    }
+    var worker: Worker = undefined;
+    worker.done = .init(false);
+    var child = SlowOwnedChild{ .pid = pid, .worker = &worker, .io = io };
+    defer std.debug.assert(c.pthread_mutex_destroy(&child.mutex) == .SUCCESS);
+    // Establish cleanup ownership immediately, before any fallible operation.
+    const thread = std.Thread.spawn(.{}, SlowOwnedChild.reap, .{&child}) catch |err| {
+        child.killOwned();
+        child.reap();
+        return err;
+    };
+    defer {
+        child.killOwned();
+        thread.join();
+    }
+    try SlowOwnedChild.marker(pair[0], 'R', 2000);
+    const started = std.Io.Clock.awake.now(io);
+    try child.signal(.TERM);
+    try SlowOwnedChild.marker(pair[0], 'T', 1000);
+    var workers: Workers = undefined;
+    workers.allocator = a;
+    workers.io = io;
+    workers.list = .empty;
+    defer workers.list.deinit(a);
+    try workers.list.append(a, &worker);
+    // The actual owner wait primitive, with the explicitly advertised 5s
+    // cleanup budget. No config field or extra production hook is involved.
+    workers.awaitAll(5000);
+    const elapsed = started.untilNow(io, .awake).toMilliseconds();
+    try testing.expect(worker.done.load(.acquire));
+    try testing.expect(elapsed >= 3500 and elapsed < 5500);
+    try SlowOwnedChild.marker(pair[0], 'D', 1000);
+    try testing.expect(!child.wait_error);
+    try testing.expectEqual(@as(c_int, 143 << 8), child.status);
+    try testing.expect(termConfirmed(worker.outcome.term));
+    // The owner has already reaped it. No second TERM or stale PID signal can
+    // be sent by the cleanup defer, nor can a nested sleep survive the marker.
+    try testing.expect(child.pid == null);
+    try testing.expectError(error.TestChildAlreadyReaped, child.signal(.TERM));
+}
 test "private startup rejection is classified only from a confirmed mapped exit" {
     const Term = std.process.Child.Term;
     // A clean, mapped normal exit is the only accepted shape.

@@ -4,13 +4,6 @@ const std = @import("std");
 const filesystem = @import("../platform/filesystem.zig");
 const ids = @import("session_id.zig");
 
-pub const Limits = struct {
-    /// 输入 JSON 的字节上限，不含附加的换行。
-    record_bytes: usize = 5 * 1024 * 1024,
-    /// 每个文件的硬上限，包含换行；单条记录不能跨文件。
-    file_bytes: usize = 500 * 1024 * 1024,
-};
-
 fn validateIgnore(io: std.Io, dir_fd: c_int) !void {
     const fd = filesystem.openAt(dir_fd, ".gitignore", .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
     if (fd < 0) return filesystem.osError();
@@ -46,7 +39,7 @@ pub fn openCheckpointDirectory(root: *filesystem.Root) !c_int {
     errdefer filesystem.closeFd(fd);
     const stat = try filesystem.fileFromFd(fd).stat(root.io);
     if (stat.kind != .directory or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeLogDirectory;
-    var owner = Store.init(root.allocator, root, .{});
+    var owner = Store.init(root.allocator, root);
     try owner.ensureIgnore(fd);
     return fd;
 }
@@ -54,14 +47,11 @@ pub fn openCheckpointDirectory(root: *filesystem.Root) !c_int {
 pub const Store = struct {
     allocator: std.mem.Allocator,
     root: *filesystem.Root,
-    limits: Limits,
     /// 仅在 start 成功后有效。
     session_id: [32]u8 = undefined,
     /// Set by the interactive lifecycle owner before the writer starts. The UI
     /// keeps its OWN immutable copy, never reads this worker-owned Store.
     pinned_id: ?ids.Id = null,
-    part: u32 = 0,
-    timestamp_ms: i64 = 0,
     logs_fd: ?c_int = null,
     file_fd: ?c_int = null,
     bytes: usize = 0,
@@ -70,8 +60,8 @@ pub const Store = struct {
     failed: bool = false,
 
     /// 无 I/O；root 必须稳定存活到 Store.deinit 之后。
-    pub fn init(allocator: std.mem.Allocator, root: *filesystem.Root, limits: Limits) Store {
-        return .{ .allocator = allocator, .root = root, .limits = limits };
+    pub fn init(allocator: std.mem.Allocator, root: *filesystem.Root) Store {
+        return .{ .allocator = allocator, .root = root };
     }
 
     /// No I/O, no archive creation; called only before writer ownership begins.
@@ -156,7 +146,6 @@ pub const Store = struct {
     fn startTimestamp(self: *Store, supplied_timestamp: ?i64) !void {
         if (self.failed) return error.LogStoreFailed;
         if (self.file_fd != null) return;
-        if (self.limits.record_bytes == 0 or self.limits.file_bytes == 0) return error.InvalidLimits;
         const thin_fd = try directory(self.root.dir.handle, ".thin");
         defer filesystem.closeFd(thin_fd);
         const logs_fd = try directory(thin_fd, "sessions");
@@ -183,8 +172,6 @@ pub const Store = struct {
                 return err;
             };
             self.session_id = id;
-            self.timestamp_ms = timestamp;
-            self.part = 0;
             self.path_buffer = path_buffer;
             self.path_len = relative.len;
             self.logs_fd = logs_fd;
@@ -195,27 +182,10 @@ pub const Store = struct {
         return error.LogNameExhausted;
     }
 
-    fn rotate(self: *Store) !void {
-        const next = std.math.add(u32, self.part, 1) catch return error.LogPartExhausted;
-        var buffer: [96]u8 = undefined;
-        const filename = try name(&buffer, self.timestamp_ms, self.session_id, next);
-        var path_buffer: [128]u8 = undefined;
-        const relative = try std.fmt.bufPrint(&path_buffer, ".thin/sessions/{s}", .{filename});
-        // 新文件完整建立后才释放旧 fd；任何失败都保留旧状态。
-        const fd = try self.createFile(self.logs_fd.?, filename);
-        filesystem.closeFd(self.file_fd.?);
-        self.file_fd = fd;
-        self.part = next;
-        self.bytes = 0;
-        self.path_buffer = path_buffer;
-        self.path_len = relative.len;
-    }
-
     /// 校验完整 JSON 对象后压紧空白，保留字符串、数字原文和键顺序。
     /// 所有校验/分配都在首次磁盘写入前完成；错误只返回错误码。
     pub fn append(self: *Store, json: []const u8) !void {
         if (self.failed) return error.LogStoreFailed;
-        if (json.len > self.limits.record_bytes) return error.RecordTooLarge;
         if (!std.unicode.utf8ValidateSlice(json)) return error.InvalidUtf8;
         if (std.mem.findAny(u8, json, "\r\n") != null) return error.RawNewline;
         const trimmed = std.mem.trim(u8, json, " \t");
@@ -245,15 +215,14 @@ pub const Store = struct {
         }
         line[n] = '\n';
         n += 1;
-        if (n > self.limits.file_bytes) return error.RecordExceedsFileLimit;
+        const end = std.math.add(usize, self.bytes, n) catch return error.RecordTooLarge;
         try self.start();
-        if (n > self.limits.file_bytes - self.bytes) try self.rotate();
         // writePositionalAll 出错可能已写入前缀。封锁后续 append，不能重试覆盖半行。
         filesystem.fileFromFd(self.file_fd.?).writePositionalAll(self.root.io, line[0..n], self.bytes) catch |err| {
             self.failed = true;
             return err;
         };
-        self.bytes += n;
+        self.bytes = end;
     }
 };
 

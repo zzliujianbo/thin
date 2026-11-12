@@ -20,7 +20,8 @@ const Fake = struct {
     approve: r.Decision = .allow_once,
     review_error: ?anyerror = null,
     prepare_error: bool = false,
-    block: bool = false,
+    cancel_on_execute: ?*p.Cancellation = null,
+    capture_command: bool = false,
     cleanup: bool = false,
     cancel_on_approval: ?*p.Cancellation = null,
     disconnect: bool = false,
@@ -40,11 +41,21 @@ const Fake = struct {
         if (self.prepare_error) return error.BadCommand;
         return .{ .payload = self, .description = args.command, .explicit_denial = "Fixture requires explicit approval; not executed.", .decision_input = .{ .command = .{ .command = args.command } } };
     }
-    fn execute(raw: *anyopaque, _: std.mem.Allocator, _: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
+    fn execute(raw: *anyopaque, alloc: std.mem.Allocator, prepared: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
         const self: *Fake = @ptrCast(@alignCast(raw));
         self.executions += 1;
         if (self.execute_error) return error.CommandFailed;
-        while (self.block and !cancel.isRequested()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        if (self.cancel_on_execute) |token| token.cancel();
+        if (self.capture_command) {
+            var env = std.process.Environ.Map.init(alloc);
+            defer env.deinit();
+            const captured = try @import("../platform/process.zig").run(alloc, std.testing.io, "/", prepared.description, &env, .{ .raw_output = true, .timeout_ms = 10000 }, cancel);
+            defer alloc.free(captured.stderr);
+            errdefer alloc.free(captured.stdout);
+            try std.testing.expect(!captured.cleanup_failed and !captured.timed_out and !captured.canceled);
+            try std.testing.expect(captured.term != null and captured.term.? == .exited and captured.term.?.exited == 0);
+            return .{ .text = captured.stdout, .truncated = captured.truncated };
+        }
         return .{ .text = self.result_text, .cleanup_failed = self.cleanup, .canceled = cancel.isRequested() };
     }
     fn review(raw: *anyopaque, _: std.mem.Allocator, input: d.Input, _: *const p.Cancellation) !d.Output {

@@ -17,7 +17,7 @@ pub const Decoder = struct {
     allocator: std.mem.Allocator,
     sink: Sink,
     /// 单个事件允许的最大字节数（data 与 event 字段合计），超出即报 EventTooLarge。
-    max_event_bytes: usize,
+    max_event_bytes: ?usize,
     /// 当前未结束的行缓冲，遇到 CR 或 LF 时交给 endLine 处理。
     line: std.ArrayList(u8) = .empty,
     /// 当前事件累计的 data 内容，每行以 LF 结尾。
@@ -34,7 +34,7 @@ pub const Decoder = struct {
     event_bytes: usize = 0,
 
     /// 创建解码器。allocator 用于行与数据缓冲，调用方需保证 sink 在解码期间有效。
-    pub fn init(allocator: std.mem.Allocator, max_event_bytes: usize, sink: Sink) Decoder {
+    pub fn init(allocator: std.mem.Allocator, max_event_bytes: ?usize, sink: Sink) Decoder {
         return .{ .allocator = allocator, .max_event_bytes = max_event_bytes, .sink = sink };
     }
 
@@ -60,8 +60,8 @@ pub const Decoder = struct {
                 self.skip_lf = byte == '\r';
             } else {
                 // 限制单个事件的总字节数，防止恶意服务器无限增长内存。
-                if (self.event_bytes >= self.max_event_bytes) return error.EventTooLarge;
-                self.event_bytes += 1;
+                if (self.max_event_bytes) |limit| if (self.event_bytes >= limit) return error.EventTooLarge;
+                self.event_bytes = std.math.add(usize, self.event_bytes, 1) catch return error.OutOfMemory;
                 try self.line.append(self.allocator, byte);
             }
         }
@@ -107,8 +107,8 @@ pub const Decoder = struct {
 
         // data 字段按行追加，每行以 LF 结尾；event 字段记录下一次分发使用的事件名。
         if (std.mem.eql(u8, field, "data")) {
-            if (self.event_bytes >= self.max_event_bytes) return error.EventTooLarge;
-            self.event_bytes += 1;
+            if (self.max_event_bytes) |limit| if (self.event_bytes >= limit) return error.EventTooLarge;
+            self.event_bytes = std.math.add(usize, self.event_bytes, 1) catch return error.OutOfMemory;
             try self.data.appendSlice(self.allocator, value);
             try self.data.append(self.allocator, '\n');
             self.has_data = true;

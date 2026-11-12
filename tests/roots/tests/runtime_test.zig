@@ -78,7 +78,7 @@ const Fake = struct {
     /// 宿主最近一次收到的已提交文本。
     committed_text: []const u8 = "",
     /// 是否已进入（阻塞的）模型调用。
-    entered_model: bool = false,
+    entered_model: std.atomic.Value(bool) = .init(false),
     /// 指向被测 Runtime，供事件回调读取其 token 估算值。
     current_runtime: ?*r.Runtime = null,
     /// 进入压缩状态前的估算 token 数。
@@ -164,9 +164,12 @@ const Fake = struct {
         }
 
         if (self.block_model) {
-            self.entered_model = true;
-            // 阻塞直到 Runtime 发出取消请求（例如任务超时触发的取消）。
-            while (!req.cancellation.?.isRequested()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            self.entered_model.store(true, .release);
+            // Block until explicit cancellation reaches this individual request.
+            var attempts: usize = 0;
+            while (!req.cancellation.?.isRequested() and attempts < 5000) : (attempts += 1)
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            if (!req.cancellation.?.isRequested()) return error.FixtureCancellationNotObserved;
             return .{ .failure = .{ .kind = .canceled, .message = "canceled fixture" } };
         }
 
@@ -336,11 +339,20 @@ fn configuration() cfg.Config {
         .limits = .{ .low_price_input = false },
     };
 }
-/// 小上下文配置：窗口仅 3000 tokens，安全余量缩小，使长任务很快触发压缩。
+/// Invert the adaptive reserve for a finite positive test input budget.
+fn windowForInputBudget(budget: u32) u32 {
+    std.debug.assert(budget > 0);
+    const room = @as(u64, budget) + 1;
+    const window: u32 = @intCast(room + @min(cfg.Policy.safety_tokens, room / 7));
+    std.debug.assert(@as(u64, window) - cfg.Policy.safetyTokens(window) - 1 == budget);
+    return window;
+}
+
+/// A real small model window with exactly 3000 input tokens of room.
 fn smallConfiguration() cfg.Config {
     var config = configuration();
-    config.model.context_tokens = 3000;
-    config.limits.safety_tokens = 100;
+    config.model.context_tokens = windowForInputBudget(3000);
+    std.debug.assert(context.inputBudget(config) == 3000);
     return config;
 }
 

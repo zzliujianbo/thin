@@ -1,17 +1,14 @@
-test "memory client frozen wire limits are independent of decoded JSON and preserve smaller policy" {
+test "memory client freezes shared timeout policy without wire quotas" {
     const a = std.testing.allocator;
     var config = testConfig();
-    config.limits.max_response_bytes = 48 * 1024;
-    config.limits.max_event_bytes = 24 * 1024;
+    config.limits.request_timeout_ms = 4321;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("SYNTHETIC_MEMORY_KEY", "own-key");
     const client = try Client.create(a, std.testing.io, config, &env);
     defer client.deinit();
-    try std.testing.expectEqual(config.limits.max_response_bytes, client.source.value.limits.max_response_bytes);
-    try std.testing.expectEqual(config.limits.max_event_bytes, client.source.value.limits.max_event_bytes);
-    try std.testing.expectEqual(config.limits.max_response_bytes, client.transport.?.config.limits.max_response_bytes);
-    try std.testing.expectEqual(config.limits.max_event_bytes, client.transport.?.config.limits.max_event_bytes);
+    try std.testing.expectEqualDeep(config.limits, client.source.value.limits);
+    try std.testing.expectEqualDeep(config.limits, client.transport.?.config.limits);
     try std.testing.expectEqual(config.model.output_tokens, client.source.value.model.output_tokens);
     try std.testing.expectEqual(@as(u64, 0), client.calls);
 }
@@ -219,15 +216,16 @@ test "memory client complete request exact input boundary without output clamp" 
     const body = try codec.encode(arena.allocator(), fixture);
     const messages = [_]p.Message{try p.textMessage(arena.allocator(), .user, body)};
     const estimated: u32 = @intCast(context.rawTokens(codec.instruction, &.{}, &messages));
-    client.source.value.limits.max_input_tokens = estimated + client.source.value.limits.input_margin_tokens;
-    client.source.value.model.context_tokens = estimated + client.source.value.limits.safety_tokens + 1;
+    client.source.value.model.context_tokens = windowForInputBudget(estimated);
+    try std.testing.expectEqual(@as(usize, estimated), context.inputBudget(client.source.value));
     var cancel: p.Cancellation = .{};
     const empty = try Client.extract(client, a, fixture, &cancel);
     defer codec.freeCandidates(a, empty);
     try context.checkInput(client.source.value, estimated);
     try std.testing.expectEqual(testConfig().model.output_tokens, client.source.value.model.output_tokens);
-    client.source.value.limits.max_input_tokens.? -= 1;
-    try std.testing.expectError(error.InputBudgetExceeded, Client.extract(client, a, fixture, &cancel));
+    client.source.value.model.context_tokens = windowForInputBudget(estimated - 1);
+    try std.testing.expectEqual(@as(usize, estimated - 1), context.inputBudget(client.source.value));
+    try std.testing.expectError(error.ContextTooLarge, Client.extract(client, a, fixture, &cancel));
     try std.testing.expectEqual(@as(u64, 1), client.calls);
 }
 test "memory client decoder CAS authorized update filters unauthorized candidate and OOM" {
@@ -323,7 +321,7 @@ test "memory client real decoders accept large final JSON and Chat large reasoni
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
-    const padding = try a.alloc(u8, 33000);
+    const padding = try a.alloc(u8, 70_000);
     defer a.free(padding);
     @memset(padding, ' ');
     const body = try std.fmt.allocPrint(a, "{s}{{\"items\":[]}}", .{padding});

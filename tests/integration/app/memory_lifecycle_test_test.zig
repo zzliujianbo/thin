@@ -10,7 +10,7 @@ test "initial core failures reach Session queue exactly once" {
         defer env.deinit();
         try env.put("HOME", root.path);
         if (!busy) {
-            var store = @import("../tools/memory.zig").Store.init(&root, .{});
+            var store = @import("../tools/memory.zig").Store.init(&root);
             const entry = try store.write(a, "core", "known owned-memory-lifecycle-key", null);
             a.free(entry.content);
             a.free(entry.version);

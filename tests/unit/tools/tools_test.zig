@@ -10,19 +10,18 @@ test "tool schemas have stable order and valid JSON" {
         try std.testing.expect(parsed.value == .object);
     };
 }
-test "edit parsing enforces the shared edit count limit" {
+test "edit parsing accepts more than 128 edits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const item = "{\"old_text\":\"a\",\"new_text\":\"b\"},";
-    const prefix = try a.alloc(u8, item.len * (text_edit.max_edits - 1));
-    for (0..text_edit.max_edits - 1) |i| @memcpy(prefix[i * item.len ..][0..item.len], item);
+    const count = 160;
+    const prefix = try a.alloc(u8, item.len * (count - 1));
+    for (0..count - 1) |i| @memcpy(prefix[i * item.len ..][0..item.len], item);
     const suffix = "{\"old_text\":\"a\",\"new_text\":\"b\"}";
     const at_limit = try std.fmt.allocPrint(a, "{{\"path\":\"a\",\"edits\":[{s}{s}]}}", .{ prefix, suffix });
     const valid = try parse(a, "edit_file", at_limit, .{});
-    try std.testing.expectEqual(text_edit.max_edits, valid.edit_file.edits.len);
-    const too_many = try std.fmt.allocPrint(a, "{{\"path\":\"a\",\"edits\":[{s}{s}{s}]}}", .{ prefix, item, suffix });
-    try std.testing.expectError(error.TooManyEdits, parse(a, "edit_file", too_many, .{}));
+    try std.testing.expectEqual(@as(usize, count), valid.edit_file.edits.len);
 }
 test "tool descriptions distinguish configured decision review from legacy approval" {
     const plain = schemasForDecision(false);
@@ -33,7 +32,7 @@ test "tool descriptions distinguish configured decision review from legacy appro
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes the extra command-approval prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Unavailable or invalid review pauses without executing") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Review decides only whether to ask") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "timeout_ms uses the host default when omitted and must not exceed the host maximum; built-in default is 5 minutes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "timeout_ms uses the host default when omitted; built-in default is 5 minutes") != null);
     try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "reviewer deadline") == null);
     for ([_]usize{ 0, 1, 3 }) |i| try std.testing.expectEqualStrings(plain[i].description, reviewed[i].description);
     for ([_]bool{ false, true }) |review| {
@@ -92,7 +91,7 @@ test "tool arguments remain strict" {
     const external = try parse(a, "read_file", "{\"path\":\"../outside.txt\"}", .{});
     try std.testing.expectEqualStrings("../outside.txt", external.read_file.path);
     try std.testing.expectError(error.PathEscape, parse(a, "write_file", "{\"path\":\"../outside.txt\",\"content\":\"x\"}", .{}));
-    try std.testing.expectError(error.InvalidReadLimit, parse(a, "read_file", "{\"path\":\"a\",\"limit\":99999999}", .{}));
+    try std.testing.expectEqual(@as(?usize, 99999999), (try parse(a, "read_file", "{\"path\":\"a\",\"limit\":99999999}", .{})).read_file.limit);
     try std.testing.expectError(error.MissingMemoryVersion, parse(a, "memory", "{\"action\":\"delete\",\"topic\":\"core\"}", .{}));
     try std.testing.expectError(error.UnknownField, parse(a, "bash", "{\"command\":\"true\",\"trust\":true}", .{}));
 }
@@ -311,8 +310,7 @@ test "session title schema is appended across the static matrix" {
     const edit_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, edit_schema.parameters_json, .{});
     defer edit_parsed.deinit();
     try std.testing.expect(edit_parsed.value == .object);
-    const max_items = edit_parsed.value.object.get("properties").?.object.get("edits").?.object.get("maxItems").?.integer;
-    try std.testing.expectEqual(@as(i64, text_edit.max_edits), max_items);
+    try std.testing.expect(edit_parsed.value.object.get("properties").?.object.get("edits").?.object.get("maxItems") == null);
 }
 test "session title prepare execution and capability boundaries" {
     const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
@@ -389,19 +387,35 @@ test "background bash and management arguments stay strict" {
     // 严格 bool：数字/null 不能被当成 true/false 接受。
     if (parse(a, "bash", "{\"command\":\"true\",\"background\":1}", .{})) |_| return error.ExpectedStrictBackground else |_| {}
     if (parse(a, "bash", "{\"command\":\"true\",\"background\":null}", .{})) |_| return error.ExpectedStrictBackground else |_| {}
-    // 旧 command 长度上限不受 background 影响。
+    // Commands beyond the former 32KiB cap remain complete in both modes.
     const long = try a.alloc(u8, 32769);
     @memset(long, 'a');
     const long_args = try std.fmt.allocPrint(a, "{{\"command\":\"{s}\"}}", .{long});
-    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", long_args, .{}));
+    try std.testing.expectEqualSlices(u8, long, (try parse(a, "bash", long_args, .{})).bash.command);
+    const long_bg = try std.fmt.allocPrint(a, "{{\"command\":\"{s}\",\"background\":true}}", .{long});
+    const accepted_bg = try parse(a, "bash", long_bg, .{});
+    try std.testing.expect(accepted_bg.bash.background);
+    try std.testing.expectEqualSlices(u8, long, accepted_bg.bash.command);
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", "{\"command\":\"\"}", .{}));
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", "{\"command\":\"a\\u0000b\"}", .{}));
+    if (parse(a, "bash", "{\"command\":\"\xff\"}", .{})) |_| return error.ExpectedInvalidUtf8 else |_| {}
 
     const logs = try parse(a, "background", "{\"action\":\"logs\",\"id\":\"0123456789ab-1\",\"stdout_offset\":4,\"limit\":128}", .{});
     try std.testing.expect(logs.background.action == .logs);
     try std.testing.expectEqual(@as(u64, 4), logs.background.stdout_offset.?);
     try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"extra\":1}", .{}));
     try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"id\":\"0123456789ab-1\"}", .{}));
-    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"limit\":101}", .{}));
+    const large_list = try parse(a, "background", "{\"action\":\"list\",\"limit\":101}", .{});
+    try std.testing.expectEqual(@as(?usize, 101), large_list.background.limit);
+    const large_logs = try parse(a, "background", "{\"action\":\"logs\",\"id\":\"0123456789ab-1\",\"limit\":67108865}", .{});
+    try std.testing.expectEqual(@as(?usize, 67108865), large_logs.background.limit);
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"unknown\"}", .{}));
+    try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"list\",\"limit\":0}", .{}));
     try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"status\"}", .{}));
+    for ([_][]const u8{ "", "a\\u0000b", "\xff" }) |id| {
+        const invalid_id = try std.fmt.allocPrint(a, "{{\"action\":\"status\",\"id\":\"{s}\"}}", .{id});
+        try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", invalid_id, .{}));
+    }
     try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"stop\",\"id\":\"0123456789ab-1\",\"after\":0}", .{}));
     try std.testing.expectError(error.InvalidBackgroundQuery, parse(a, "background", "{\"action\":\"logs\",\"id\":\"ABCDEF012345-1\"}", .{}));
 }
@@ -450,15 +464,14 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqualStrings("python -u app.py", fake.last_command);
     try std.testing.expectEqual(@as(u32, config.limits.command_timeout_ms), fake.last_startup_ms);
-    try std.testing.expectEqual(config.limits.output_bytes, fake.last_log_bytes);
-    try std.testing.expectEqual(@as(u32, config.limits.cleanup_grace_ms), fake.last_grace_ms);
-    try std.testing.expectEqual(@as(u32, config.limits.cleanup_timeout_ms), fake.last_cleanup_ms);
+    try std.testing.expectEqual(@as(u32, cfg.Policy.cleanup_grace_ms), fake.last_grace_ms);
+    try std.testing.expectEqual(@as(u32, cfg.Policy.cleanup_timeout_ms), fake.last_cleanup_ms);
     try std.testing.expectEqualStrings(fake.start_text, started.text);
     try std.testing.expect(!started.memory_evidence);
     try std.testing.expect(!started.is_error);
 
     // Explicit timeout_ms bounds only the startup wait, just like the default.
-    for ([_]u32{ 1, 4321, config.limits.command_max_timeout_ms }) |timeout_ms| {
+    for ([_]u32{ 1, 4321, 86_400_001 }) |timeout_ms| {
         const args = try std.fmt.allocPrint(a, "{{\"command\":\"svc\",\"background\":true,\"timeout_ms\":{d}}}", .{timeout_ms});
         const explicit = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = args });
         _ = try Tools.executePrepared(&tools, a, explicit, &cancel);
@@ -466,8 +479,6 @@ test "background capability is root-only approved and never re-encoded" {
     }
     const calls_before_invalid = fake.calls;
     try std.testing.expectError(error.InvalidCommandTimeout, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"svc\",\"background\":true,\"timeout_ms\":0}" }));
-    const over_max = try std.fmt.allocPrint(a, "{{\"command\":\"svc\",\"background\":true,\"timeout_ms\":{d}}}", .{@as(u64, config.limits.command_max_timeout_ms) + 1});
-    try std.testing.expectError(error.InvalidCommandTimeout, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = over_max }));
     try std.testing.expectEqual(calls_before_invalid, fake.calls);
 
     // stop returns the service's terminal state verbatim; stopping one service

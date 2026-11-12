@@ -61,6 +61,39 @@ test "ASCII batching matches scalar decoding and bounded sanitization" {
     try std.testing.expectEqual(@as(usize, 0), printableEnd(&large, 0, 0));
     try std.testing.expectEqual(@as(usize, 7), printableEnd(&large, 0, 7));
 }
+test "complete sanitizer matches bounded scalar policy" {
+    const a = std.testing.allocator;
+    const input = "中文\r\n\t\x1b\xff\u{202e}end";
+    const all = try sanitizeAll(a, input);
+    defer a.free(all);
+    const prefix = try sanitizePrefix(a, input, input.len * 3);
+    defer a.free(prefix.text);
+    try std.testing.expect(!prefix.truncated);
+    try std.testing.expectEqualStrings(prefix.text, all);
+    try std.testing.expectEqualStrings("中文\n\t���end", all);
+}
+
+test "complete sanitizer preserves expanded text across old threshold" {
+    const a = std.testing.allocator;
+    const input = try a.alloc(u8, 50_000 * "中\x1b".len);
+    defer a.free(input);
+    for (0..50_000) |i| @memcpy(input[i * 4 ..][0..4], "中\x1b");
+    const all = try sanitizeAll(a, input);
+    defer a.free(all);
+    try std.testing.expectEqual(@as(usize, 300_000), all.len);
+    try std.testing.expect(std.mem.endsWith(u8, all, "中�"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(all));
+}
+
+test "complete sanitizer propagates allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            const value = try sanitizeAll(a, "printable 中文\r\n\xff\x1b");
+            defer a.free(value);
+        }
+    }.run, .{});
+}
+
 test "ASCII batch allocation failure releases output" {
     const Scenario = struct {
         fn run(a: std.mem.Allocator) !void {

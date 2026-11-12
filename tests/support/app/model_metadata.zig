@@ -74,9 +74,10 @@ fn testRoot(dir: std.Io.Dir) !fs.Root {
 }
 
 fn cacheAllocationCheck(a: std.mem.Allocator) !void {
-    const cache = try parseCache(a,
+    var cache = try parseCache(a,
         \\{"version":16,"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek/raw/id","context_window":131072,"available":true,"protocol":"chat","reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_present":true,"dev_output_tokens":8192,"dev_context_tokens":262144,"dev_input_price_flat_limit":262144}],"refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{},{}]}
     );
+    defer cache.deinit(a);
     try std.testing.expectEqualStrings("deepseek/raw/id", cache.directory.name(0));
     try std.testing.expectEqual(@as(u64, 7), cache.refresh[0].generation);
 }

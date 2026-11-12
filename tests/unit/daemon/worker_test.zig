@@ -23,11 +23,11 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
         slots[i] = .{ .id = i + 1, .conn = unix.Connection.init(a, fds[0], credentials) };
         peers[i] = unix.Connection.init(a, fds[1], credentials);
     }
-    var attach = try protocol.parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"attach\"}");
+    var attach = try protocol.parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"attach\"}");
     defer attach.deinit();
     const attached = try host.dispatch(a, &attach, 1, false);
     defer a.free(attached);
-    var request = try protocol.parseRequest(a, "{\"v\":4,\"id\":2,\"op\":\"watch\",\"epoch\":1}");
+    var request = try protocol.parseRequest(a, "{\"v\":5,\"id\":2,\"op\":\"watch\",\"epoch\":1}");
     defer request.deinit();
     // A stream on the control socket itself must not erase its identity.
     try std.testing.expectError(error.StaleControl, startWatch(host, a, io, &slots[0].?, &request, &slots));
@@ -60,10 +60,10 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
     try std.testing.expect(std.mem.indexOf(u8, event, "\"from\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, event, "\"through\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, event, "\"seq\":1") != null);
-    var invalid = try protocol.parseRequest(a, "{\"v\":4,\"id\":3,\"op\":\"watch\",\"epoch\":1,\"since\":2}");
+    var invalid = try protocol.parseRequest(a, "{\"v\":5,\"id\":3,\"op\":\"watch\",\"epoch\":1,\"since\":2}");
     defer invalid.deinit();
     try std.testing.expectError(error.InvalidSequence, host.watchResume(1, try invalid.u64Field("since")));
-    var resumed = try protocol.parseRequest(a, "{\"v\":4,\"id\":4,\"op\":\"watch\",\"epoch\":1,\"since\":1}");
+    var resumed = try protocol.parseRequest(a, "{\"v\":5,\"id\":4,\"op\":\"watch\",\"epoch\":1,\"since\":1}");
     defer resumed.deinit();
     try startWatch(host, a, io, &slots[1].?, &resumed, &slots);
     try std.testing.expect(slots[1].?.watch.?.baseline == null);
@@ -82,7 +82,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
     try std.testing.expect(!slots[1].?.conn.writePending());
     // The bound watch socket is the only stream-side mutation: a display ACK.
     // A future watermark is refused without retiring anything.
-    try peers[1].?.writeFrame("{\"v\":4,\"id\":5,\"op\":\"ack\",\"epoch\":1,\"sequence\":9}", .{ .io = io, .timeout_ms = 2_000 });
+    try peers[1].?.writeFrame("{\"v\":5,\"id\":5,\"op\":\"ack\",\"epoch\":1,\"sequence\":9}", .{ .io = io, .timeout_ms = 2_000 });
     serveWatchInput(host, a, io, &slots[1].?, &slots[1], &slots);
     try std.testing.expect(try slots[1].?.conn.writeStep());
     const refused = (try peers[1].?.readStep()).frame;
@@ -92,7 +92,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
     try std.testing.expectEqual(@as(u64, 0), host.events.reclaimed_through);
     // The displayed watermark retires exactly through the offered page and the
     // reply is a control frame, not a display page.
-    try peers[1].?.writeFrame("{\"v\":4,\"id\":6,\"op\":\"ack\",\"epoch\":1,\"sequence\":1}", .{ .io = io, .timeout_ms = 2_000 });
+    try peers[1].?.writeFrame("{\"v\":5,\"id\":6,\"op\":\"ack\",\"epoch\":1,\"sequence\":1}", .{ .io = io, .timeout_ms = 2_000 });
     serveWatchInput(host, a, io, &slots[1].?, &slots[1], &slots);
     try std.testing.expect(try slots[1].?.conn.writeStep());
     const confirmed = (try peers[1].?.readStep()).frame;
@@ -112,7 +112,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
         var impostor = unix.Connection.init(a, fds[1], credentials);
         defer impostor.close();
         slots[2] = .{ .id = 3, .conn = unix.Connection.init(a, fds[0], credentials) };
-        try impostor.writeFrame("{\"v\":4,\"id\":7,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", .{ .io = io, .timeout_ms = 2_000 });
+        try impostor.writeFrame("{\"v\":5,\"id\":7,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", .{ .io = io, .timeout_ms = 2_000 });
         serveWatchInput(host, a, io, &slots[2].?, &slots[2], &slots);
         try std.testing.expect(slots[2] == null);
         try std.testing.expectEqual(@as(u64, 1), host.events.reclaimed_through);
@@ -130,7 +130,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
         defer impostor.close();
         slots[2] = .{ .id = 4, .conn = unix.Connection.init(a, fds[0], other) };
         slots[2].?.watch = .{ .request_id = 9, .epoch = 1, .control_id = 1, .cursor = 1, .stamp = host.watchStamp(), .baseline = null };
-        try impostor.writeFrame("{\"v\":4,\"id\":8,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", .{ .io = io, .timeout_ms = 2_000 });
+        try impostor.writeFrame("{\"v\":5,\"id\":8,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", .{ .io = io, .timeout_ms = 2_000 });
         serveWatchInput(host, a, io, &slots[2].?, &slots[2], &slots);
         try std.testing.expect(slots[2] == null);
         try std.testing.expectEqual(@as(u64, 1), host.events.reclaimed_through);
@@ -142,7 +142,7 @@ test "watch binds kernel peer and epoch and pushes without events RPC" {
     try std.testing.expect(!watchValid(host, &slots, &slots[1].?));
     // After revocation an ACK-shaped frame with a stale epoch is dropped: no
     // position is retired and the session task is untouched.
-    try peers[1].?.writeFrame("{\"v\":4,\"id\":9,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", .{ .io = io, .timeout_ms = 2_000 });
+    try peers[1].?.writeFrame("{\"v\":5,\"id\":9,\"op\":\"ack\",\"epoch\":1,\"sequence\":2}", .{ .io = io, .timeout_ms = 2_000 });
     serveWatchInput(host, a, io, &slots[1].?, &slots[1], &slots);
     try std.testing.expect(slots[1] == null);
     try std.testing.expectEqual(@as(u64, 1), host.events.reclaimed_through);
@@ -239,7 +239,7 @@ test "worker entry rejects non-worker mode before creating any session state" {
         .worker_session = std.mem.zeroes([32]u8),
     }));
 }
-test "watch ACK retires a full ring past its bound while the control channel stays live" {
+test "watch ACK retires thousands of retained events while the control channel stays live" {
     if (builtin.os.tag != .linux) return error.SkipZigTest; // Linux socketpair flags
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -265,11 +265,11 @@ test "watch ACK retires a full ring past its bound while the control channel sta
         peers[i] = unix.Connection.init(a, fds[1], credentials);
     }
     const parent_pid: std.os.linux.pid_t = @intCast(std.os.linux.getpid());
-    var attach = try protocol.parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"attach\"}");
+    var attach = try protocol.parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"attach\"}");
     defer attach.deinit();
     const attached = try host.dispatch(a, &attach, 1, false);
     defer a.free(attached);
-    var watch = try protocol.parseRequest(a, "{\"v\":4,\"id\":2,\"op\":\"watch\",\"epoch\":1}");
+    var watch = try protocol.parseRequest(a, "{\"v\":5,\"id\":2,\"op\":\"watch\",\"epoch\":1}");
     defer watch.deinit();
     try startWatch(host, a, io, &slots[1].?, &watch, &slots);
     try std.testing.expect(try slots[1].?.conn.writeStep());
@@ -282,24 +282,20 @@ test "watch ACK retires a full ring past its bound while the control channel sta
     defer a.free(baseline);
     try std.testing.expect(std.mem.indexOf(u8, baseline, "\"stream\":\"baseline\"") != null);
 
-    // Phase 1: no ACK at all. The ring fills and the producer stops; the held
-    // event plus the ring retain more than the 1024-entry bound without loss.
+    // No ACK at all: every produced event remains available beyond the old
+    // 1024-entry bound. The control socket still has independent progress.
     const bridge_host = host.bridge.host();
-    var produced: usize = 0;
-    while (produced < 4096) {
+    const produced: usize = 4096;
+    for (0..produced) |_| {
         host.pump(0);
-        if (host.pending_event != null and host.events.items.items.len >= host.events.max_count) break;
         try bridge_host.emit_fn(bridge_host.context, .{ .text = "s" }, &host.cancel);
-        produced += 1;
     }
     host.pump(0);
-    try std.testing.expect(produced > host.events.max_count);
-    try std.testing.expect(produced < 4096);
-    try std.testing.expectEqual(host.events.max_count, host.events.items.items.len);
-    try std.testing.expect(host.pending_event != null);
+    try std.testing.expectEqual(produced, host.events.items.items.len);
+    try std.testing.expect(host.pending_event == null);
     try std.testing.expectEqual(@as(u64, 0), host.events.reclaimed_through);
     // Saturation of the display path does not gate this control connection.
-    try peers[0].?.writeFrame("{\"v\":4,\"id\":9,\"op\":\"ping\"}", .{ .io = io, .timeout_ms = 2_000 });
+    try peers[0].?.writeFrame("{\"v\":5,\"id\":9,\"op\":\"ping\"}", .{ .io = io, .timeout_ms = 2_000 });
     serveOne(host, a, io, &slots[0].?, parent_pid, &slots[0], &slots);
     try std.testing.expect(try slots[0].?.conn.writeStep());
     const pong = (try peers[0].?.readStep()).frame;
@@ -356,7 +352,7 @@ test "watch ACK retires a full ring past its bound while the control channel sta
         serveWatchInput(host, a, io, &slots[1].?, &slots[1], &slots);
     }
     try std.testing.expectEqual(produced, delivered);
-    try std.testing.expect(delivered > host.events.max_count);
+    try std.testing.expect(delivered > 1024);
     try std.testing.expectEqual(acked, host.events.reclaimed_through);
     try std.testing.expect(host.pending_event == null);
     try std.testing.expectEqual(@as(usize, 0), host.events.items.items.len);
@@ -390,11 +386,11 @@ test "a held CR cannot block selectively acknowledged metadata before its LF" {
         slots[i] = .{ .id = i + 1, .conn = unix.Connection.init(a, fds[0], credentials) };
         peers[i] = unix.Connection.init(a, fds[1], credentials);
     }
-    var attach = try protocol.parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"attach\"}");
+    var attach = try protocol.parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"attach\"}");
     defer attach.deinit();
     const attached = try host.dispatch(a, &attach, 1, false);
     defer a.free(attached);
-    var watch = try protocol.parseRequest(a, "{\"v\":4,\"id\":2,\"op\":\"watch\",\"epoch\":1}");
+    var watch = try protocol.parseRequest(a, "{\"v\":5,\"id\":2,\"op\":\"watch\",\"epoch\":1}");
     defer watch.deinit();
     try startWatch(host, a, io, &slots[1].?, &watch, &slots);
     try std.testing.expect(try slots[1].?.conn.writeStep());
@@ -503,7 +499,7 @@ test "a held CR cannot block selectively acknowledged metadata before its LF" {
     try std.testing.expectEqual(@as(usize, 1), host.events.items.items.len);
     try std.testing.expectEqual(@as(u64, 1), host.events.items.items[0].seq);
     // Once the CR text is really proven as a prefix, everything retires.
-    const all = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":9,\"op\":\"ack\",\"epoch\":1,\"sequence\":{d}}}", .{highest});
+    const all = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":9,\"op\":\"ack\",\"epoch\":1,\"sequence\":{d}}}", .{highest});
     defer a.free(all);
     try peers[1].?.writeFrame(all, .{ .io = io, .timeout_ms = 2_000 });
     serveWatchInput(host, a, io, &slots[1].?, &slots[1], &slots);

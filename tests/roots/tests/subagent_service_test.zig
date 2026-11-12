@@ -164,7 +164,7 @@ const FakeModel = struct {
                     .finish = .tool_calls,
                 } };
                 if (lastToolText(request)) |last| {
-                    self.saw_progress = std.mem.indexOf(u8, last, "SubagentMessageQueueFull") != null;
+                    self.saw_progress = std.mem.indexOf(u8, last, "sent") != null;
                 }
                 self.progress_flood_checked.store(true, .release);
                 return .{ .success = .{
@@ -255,7 +255,7 @@ const Fixture = struct {
     service: SubagentService,
     parent_cancel: p.Cancellation = .{},
 
-    fn create(a: std.mem.Allocator, io: std.Io, parent_protocol: p.Protocol, effective: p.Protocol, task_timeout_ms: u32) !*Fixture {
+    fn create(a: std.mem.Allocator, io: std.Io, parent_protocol: p.Protocol, effective: p.Protocol) !*Fixture {
         const self = try a.create(Fixture);
         errdefer a.destroy(self);
         self.a = a;
@@ -273,7 +273,7 @@ const Fixture = struct {
         self.config = .{
             .provider = .{ .base_url = "http://127.0.0.1:1/v1", .api_key = "fake-parent-key" },
             .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = parent_protocol, .output_tokens = 8192 },
-            .limits = .{ .low_price_input = false, .request_timeout_ms = 10000, .task_timeout_ms = task_timeout_ms },
+            .limits = .{ .low_price_input = false, .request_timeout_ms = 10000 },
         };
         self.parent_client = try http.Client.init(a, io, &self.config, "fake-parent-key");
         errdefer self.parent_client.deinit();
@@ -468,6 +468,9 @@ const ApprovalRecorder = struct {
     io: std.Io = undefined,
     delay_ms: u64 = 0,
     reply: r.Decision = .deny,
+    /// A finite child-local cancellation at the authorization boundary; this
+    /// replaces the removed accepted-task watchdog in approval lifecycle tests.
+    cancel_child: ?*p.Cancellation = null,
 
     fn emit(raw: ?*anyopaque, event: r.Event, _: *const p.Cancellation) !void {
         const self: *ApprovalRecorder = @ptrCast(@alignCast(raw.?));
@@ -495,8 +498,9 @@ const ApprovalRecorder = struct {
             try std.testing.expect(std.mem.indexOf(u8, permission.description, self.expect_source) != null);
         // Emit-before-authorize: the parent already published this id.
         try std.testing.expectEqual(self.authorized, self.emitted);
-        // A cooperative host must abort the prompt on the broker-local token:
-        // the child's local timeout/steering cancels it without touching root.
+        // A cooperative host aborts on the broker-local token when child-local
+        // cancellation or steering withdraws the question without touching root.
+        if (self.cancel_child) |child| child.cancel();
         if (self.delay_ms != 0) {
             const began = std.Io.Clock.awake.now(self.io);
             while (began.untilNow(self.io, .awake).toMilliseconds() < self.delay_ms) {

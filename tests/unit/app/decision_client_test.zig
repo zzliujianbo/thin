@@ -218,9 +218,11 @@ test "SystemOne metadata refresh prepares frozen auxiliary transport without reb
     listing.* = try metadata.parseDev(a,
         \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"reviewer/raw-id":{"api":{"url":"https://opencode.ai/inference/systemone/v1"}}}}}
     );
+    defer listing.deinit(a);
     const published = try a.create(metadata.Cache);
     defer a.destroy(published);
     published.* = try metadata.commit(&store.root, 0, listing.*);
+    defer published.deinit(a);
     // Failed preparation must release the temporary resolved config and remain
     // unpublished/retryable, not leave a native-null ready state behind.
     for (0..2) |_| {
@@ -367,12 +369,12 @@ test "decision creation and unresolved clone allocate no metadata cache" {
     try std.testing.expect(try client.resolve() == ready);
     try std.testing.expectEqual(@as(usize, 2), gate.cache_attempts);
 }
-test "native no-op validates bounds copies and frees after cancellation" {
+test "native no-op grows payloads validates identities copies and frees after cancellation" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var config = try cfg.parse(a,
-        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://fixture.invalid/v1","api_key":"fake-key","models":{"main":{"protocol":"chat","context_tokens":32768},"judge":{"protocol":"systemone"}}}}},"decision":{"model":"p/judge","max_state_bytes":16384}}
+        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://fixture.invalid/v1","api_key":"fake-key","models":{"main":{"protocol":"chat","context_tokens":32768},"judge":{"protocol":"systemone"}}}}},"decision":{"model":"p/judge"}}
     );
     defer cfg.release(&config);
     const client = (try Client.create(a, std.testing.io, config.value, &env)).?;
@@ -418,20 +420,27 @@ test "native no-op validates bounds copies and frees after cancellation" {
         .{ .refine_outputs = &.{.{ .id = "id", .text = "\xff" }} },
         .{ .refine_outputs = &.{.{ .id = "\xff", .text = "valid" }} },
         .{ .refine_outputs = &.{.{ .id = "id", .text = "" }} },
-        .{ .refine_outputs = &.{
-            .{ .id = "0", .text = "x" }, .{ .id = "1", .text = "x" }, .{ .id = "2", .text = "x" },
-            .{ .id = "3", .text = "x" }, .{ .id = "4", .text = "x" }, .{ .id = "5", .text = "x" },
-            .{ .id = "6", .text = "x" }, .{ .id = "7", .text = "x" }, .{ .id = "8", .text = "x" },
-        } },
     };
     for (bad_inputs) |input| try std.testing.expectError(error.InvalidDecisionInput, client.service().decide(a, input, &cancel));
-    const too_long: [8193]u8 = @splat('x');
-    try std.testing.expectError(error.InvalidDecisionOutput, client.service().decide(a, .{ .refine_outputs = &.{.{ .id = "long", .text = &too_long }} }, &cancel));
-    const exact = try client.service().decide(a, .{ .refine_outputs = &.{.{ .id = "long", .text = too_long[0..8192] }} }, &cancel);
+    const large = try a.alloc(u8, 65537);
+    defer a.free(large);
+    @memset(large, 'x');
+    const exact = try client.service().decide(a, .{ .refine_outputs = &.{.{ .id = "long", .text = large }} }, &cancel);
     defer policy.freeOutput(a, exact);
-    try std.testing.expectEqual(@as(usize, 8192), exact.refine_outputs[0].text.len);
+    try std.testing.expectEqualStrings(large, exact.refine_outputs[0].text);
+    var many: [9]policy.RefineItem = undefined;
+    var ids: [9][1]u8 = undefined;
+    for (&many, &ids, 0..) |*item, *id, i| {
+        id[0] = @intCast('0' + i);
+        item.* = .{ .id = id, .text = "unchanged" };
+    }
+    const many_output = try client.service().decide(a, .{ .refine_outputs = &many }, &cancel);
+    defer policy.freeOutput(a, many_output);
+    try std.testing.expectEqual(@as(usize, 9), many_output.refine_outputs.len);
     const escaped: [8200]u8 = @splat('"');
-    try std.testing.expectError(error.DecisionInputTooLarge, client.service().decide(a, .{ .refine_outputs = &.{.{ .id = "escaped", .text = &escaped }} }, &cancel));
+    const escaped_output = try client.service().decide(a, .{ .refine_outputs = &.{.{ .id = "escaped", .text = &escaped }} }, &cancel);
+    defer policy.freeOutput(a, escaped_output);
+    try std.testing.expectEqualStrings(&escaped, escaped_output.refine_outputs[0].text);
     try std.testing.expectEqual(@as(u64, 0), client.calls);
 
     const Allocation = struct {

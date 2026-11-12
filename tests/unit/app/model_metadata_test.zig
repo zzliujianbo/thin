@@ -1,8 +1,9 @@
 test "explicit SystemOne directory identity survives cache without generative capabilities" {
     const a = std.testing.allocator;
-    const listing = try parseListing(a,
+    var listing = try parseListing(a,
         \\{"data":[{"id":"reviewer/not-jev","protocol":"systemone"}]}
     , .opencode_zen);
+    defer listing.deinit(a);
     const cache: Cache = .{ .directory = listing.directory, .directory_mask = listing.directory_mask };
     const entry = dynamicEntry(&cache, .opencode_zen, "reviewer/not-jev").?;
     try std.testing.expectEqual(Protocol.systemone, entry.model.protocol);
@@ -16,18 +17,21 @@ test "explicit SystemOne directory identity survives cache without generative ca
     var bytes: std.Io.Writer.Allocating = .init(a);
     defer bytes.deinit();
     try std.json.Stringify.value(Document{ .directory_mask = listing.directory_mask, .models = &.{.{ .provider = .opencode_zen, .id = "reviewer/not-jev", .protocol = entry.model.protocol, .available = true }} }, .{}, &bytes.writer);
-    const restored = try parseCache(a, bytes.written());
+    var restored = try parseCache(a, bytes.written());
+    defer restored.deinit(a);
     const again = dynamicEntry(&restored, .opencode_zen, "reviewer/not-jev").?;
     try std.testing.expectEqual(Protocol.systemone, again.model.protocol);
     try std.testing.expectEqual(@as(u32, 0), again.model.context_tokens);
 }
 test "models.dev native API identity survives cache roundtrip without generative metadata" {
     const a = std.testing.allocator;
-    const source = try parseDev(a,
+    var source = try parseDev(a,
         \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"reviewer":{"api":{"url":"https://opencode.ai/inference/systemone/v1"},"limit":{"context":100000,"output":32000},"cost":{"input":1,"output":2}}}}}
     );
+    defer source.deinit(a);
     var merged: Listing = .{};
-    try mergeDev(&merged, &source);
+    defer merged.deinit(a);
+    try mergeDev(a, &merged, &source);
     const row = merged.directory.rows[merged.directory.find(.opencode_zen, "reviewer").?];
     try std.testing.expectEqual(Protocol.systemone, row.dev_protocol);
     var bytes: std.Io.Writer.Allocating = .init(a);
@@ -42,7 +46,8 @@ test "models.dev native API identity survives cache roundtrip without generative
         .dev_input_price_threshold = row.dev_input_price_threshold,
         .dev_input_price_flat_limit = row.dev_input_price_flat_limit,
     }} }, .{}, &bytes.writer);
-    const cache = try parseCache(a, bytes.written());
+    var cache = try parseCache(a, bytes.written());
+    defer cache.deinit(a);
     const entry = restoreEntry(&cache, .opencode_zen, "reviewer").?;
     try std.testing.expectEqual(Protocol.systemone, entry.model.protocol);
     try std.testing.expectEqual(@as(u32, 0), entry.model.context_tokens);
@@ -56,10 +61,11 @@ test "models.dev native API identity survives cache roundtrip without generative
 }
 test "documented SystemOne fallback resolves listed Jev without inventing availability or capabilities" {
     var cache: Cache = .{};
+    defer cache.deinit(std.testing.allocator);
     cache.directory_mask = bit(.opencode_zen);
     const name = "jev-1.13-free";
     try std.testing.expect(dynamicEntry(&cache, .opencode_zen, name) == null);
-    const row = try cache.directory.upsert(.opencode_zen, name);
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_zen, name);
     row.available = true;
     row.tokens = 65536;
     row.dev_context_tokens = 65536;
@@ -84,9 +90,10 @@ test "documented SystemOne fallback resolves listed Jev without inventing availa
     try std.testing.expect(dynamicEntry(&cache, .opencode_go, name) == null);
 }
 test "Codex listing uses explicit route, visibility and advertised efforts" {
-    const listing = try parseListing(std.testing.allocator,
+    var listing = try parseListing(std.testing.allocator,
         \\{"models":[{"slug":"sample/raw","visibility":"list","supported_in_api":false,"context_window":12345,"max_context_window":99999,"supported_reasoning_levels":[{"effort":"high","description":""},{"effort":"ultra","description":""}]},{"slug":"hidden","visibility":"hide"}]}
     , .openai_codex);
+    defer listing.deinit(std.testing.allocator);
     const row = listing.directory.rows[listing.directory.find(.openai_codex, "sample/raw").?];
     try std.testing.expectEqual(Protocol.responses, row.protocol);
     try std.testing.expectEqual(@as(?u32, 12345), row.tokens);
@@ -94,10 +101,11 @@ test "Codex listing uses explicit route, visibility and advertised efforts" {
     try std.testing.expectEqualStrings("high", row.reasoning.?.declaration().map.high.?);
     try std.testing.expect(row.reasoning.?.declaration().map.off == null);
     try std.testing.expect(listing.directory.rows[listing.directory.find(.openai_codex, "hidden").?].available == false);
-    const empty = try parseListing(std.testing.allocator, "{\"models\":[]}", .openai_codex);
+    var empty = try parseListing(std.testing.allocator, "{\"models\":[]}", .openai_codex);
+    defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqual(bit(.openai_codex), empty.directory_mask);
 }
-test "metadata lexical limits precede allocation and respect quoted escapes" {
+test "metadata lexical validation permits deep JSON and respects quoted escapes" {
     const a = std.testing.allocator;
     var buffer: [2048]u8 = undefined;
     for ([_]usize{ 31, 32 }) |levels| {
@@ -107,23 +115,18 @@ test "metadata lexical limits precede allocation and respect quoted escapes" {
         try w.writeAll("null");
         for (0..levels) |_| try w.writeByte(']');
         try w.writeByte('}');
-        if (levels == 31) {
-            _ = try parseListing(a, buffer[0..w.end], .deepseek);
-        } else {
-            // A zero-capacity allocator proves this rejects before JSON allocation.
-            var fixed = std.heap.FixedBufferAllocator.init(&.{});
-            try std.testing.expectError(error.MetadataTooDeep, parseListing(fixed.allocator(), buffer[0..w.end], .deepseek));
-            try std.testing.expectError(error.MetadataTooDeep, parseCache(fixed.allocator(), buffer[0..w.end]));
-        }
+        var listing = try parseListing(a, buffer[0..w.end], .deepseek);
+        listing.deinit(a);
     }
     const quoted =
         \\{"data":[],"extra":{"text":"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\\\"{}","next":true}}
     ;
-    _ = try parseListing(a, quoted, .deepseek);
+    var quoted_listing = try parseListing(a, quoted, .deepseek);
+    defer quoted_listing.deinit(a);
     try std.testing.expectError(error.DuplicateField, parseListing(a, "{\"data\":[],\"extra\":{\"x\":1,\"x\":2}}", .deepseek));
     try std.testing.expectError(error.DuplicateField, parseCache(a, "{\"version\":1,\"version\":1,\"attempted\":0,\"records\":[]}"));
-    try std.testing.expectError(error.InvalidMetadata, boundJson("{\"x\":\"unterminated", max_body_bytes));
-    try std.testing.expectError(error.InvalidMetadata, boundJson("{]", max_body_bytes));
+    try std.testing.expectError(error.UnexpectedEndOfInput, boundJson(a, "{\"x\":\"unterminated"));
+    try std.testing.expectError(error.SyntaxError, boundJson(a, "{]"));
     const many = try a.alloc(u8, 2 * 32768 + 1);
     defer a.free(many);
     many[0] = '[';
@@ -132,27 +135,18 @@ test "metadata lexical limits precede allocation and respect quoted escapes" {
         many[2 + 2 * i] = if (i == 32767) ']' else ',';
     }
     many[many.len - 3] = ']';
-    try boundJson(many[0 .. many.len - 2], max_body_bytes);
+    try boundJson(a, many[0 .. many.len - 2]);
     many[many.len - 3] = ',';
-    var fixed = std.heap.FixedBufferAllocator.init(&.{});
-    try std.testing.expectError(error.MetadataTooComplex, parseListing(fixed.allocator(), many, .deepseek));
+    try std.testing.expectError(error.UnexpectedEndOfInput, boundJson(a, many[0 .. many.len - 2]));
 }
-test "metadata deep oversized and duplicate caches remain untouched" {
+test "metadata malformed and duplicate caches remain untouched" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
-    const oversized = try std.testing.allocator.alloc(u8, max_cache_bytes + 1);
-    defer std.testing.allocator.free(oversized);
-    @memset(oversized, ' ');
-    var deep: [66]u8 = undefined;
-    @memset(deep[0..33], '[');
-    @memset(deep[33..], ']');
     const cases = [_]struct { body: []const u8, err: anyerror }{
-        .{ .body = &deep, .err = error.MetadataTooDeep },
-        .{ .body = oversized, .err = error.MetadataTooLarge },
         .{ .body = "{\"version\":1,\"version\":1,\"attempted\":0,\"records\":[]}", .err = error.DuplicateField },
-        .{ .body = "{\"version\":", .err = error.InvalidMetadata },
+        .{ .body = "{\"version\":", .err = error.UnexpectedEndOfInput },
     };
     for (cases) |case| {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
@@ -160,7 +154,7 @@ test "metadata deep oversized and duplicate caches remain untouched" {
         try std.testing.expectError(case.err, claim(&root, all_mask, true));
         try std.testing.expectError(case.err, commit(&root, all_mask, .{}));
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
-        const result = try root.read(std.testing.allocator, file_name, 0, max_cache_bytes + 1);
+        const result = try root.read(std.testing.allocator, file_name, 0, case.body.len + 1);
         defer std.testing.allocator.free(result.data);
         try std.testing.expectEqualStrings(case.body, result.data);
     }
@@ -179,7 +173,8 @@ test "Codex private fetch seam uses exact headers and fixed production scope" {
     const credential: codex_auth.RequestCredential = .{ .access_token = &token, .account_id = &account };
     var server_job = try std.Io.concurrent(io, serveCodexFixture, .{ io, &server });
     defer server_job.cancel(io) catch {};
-    const listing = try fetchCodexAt(a, io, &credential, null, 5000, url);
+    var listing = try fetchCodexAt(a, io, &credential, null, 5000, url);
+    defer listing.deinit(a);
     try server_job.await(io);
     try std.testing.expectEqual(bit(.openai_codex), listing.directory_mask);
     try std.testing.expectEqualStrings("fake-token", &token);
@@ -193,16 +188,15 @@ test "metadata loopback transport success redirects size short body and cleanup"
     const a = std.testing.allocator;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     const close_head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
-    const streamed_oversized = try a.alloc(u8, close_head.len + max_body_bytes + 1);
+    const streamed_oversized = try a.alloc(u8, close_head.len + 512 * 1024 + 1);
     defer a.free(streamed_oversized);
     @memcpy(streamed_oversized[0..close_head.len], close_head);
     @memset(streamed_oversized[close_head.len..], ' ');
     const cases = [_]struct { response: []const u8, err: ?anyerror }{
         .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}", .err = null },
         .{ .response = "HTTP/1.1 302 Found\r\nLocation: /not-followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .err = error.MetadataHttpStatus },
-        .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 524289\r\nConnection: close\r\n\r\n", .err = error.MetadataTooLarge },
         .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}", .err = error.IncompleteMetadata },
-        .{ .response = streamed_oversized, .err = error.StreamTooLong },
+        .{ .response = streamed_oversized, .err = null },
     };
     for (cases) |case| {
         var server = try address.listen(io, .{});
@@ -213,11 +207,14 @@ test "metadata loopback transport success redirects size short body and cleanup"
         var worker = try std.Io.concurrent(io, serveMetadata, .{ io, &server, case.response, &cleaned });
         defer worker.cancel(io) catch {};
         if (case.err) |err| {
-            try std.testing.expectError(err, fetchUrl(a, io, url, "synthetic-test-key", max_body_bytes));
+            try std.testing.expectError(err, fetchUrl(a, io, url, "synthetic-test-key"));
         } else {
-            const body = try fetchUrl(a, io, url, null, max_body_bytes);
+            const body = try fetchUrl(a, io, url, null);
             defer a.free(body);
-            _ = try parseListing(a, body, .deepseek);
+            if (case.response.ptr != streamed_oversized.ptr) {
+                var parsed = try parseListing(a, body, .deepseek);
+                defer parsed.deinit(a);
+            } else try std.testing.expectEqual(@as(usize, 512 * 1024 + 1), body.len);
         }
         try worker.await(io);
         try std.testing.expect(cleaned.load(.acquire));
@@ -228,15 +225,19 @@ test "metadata uses only context_window and exact provider raw names" {
     const body =
         \\{"object":"list","data":[{"id":"deepseek-flash","context_window":12345,"max_tokens":2},{"id":"deepseek-v4-pro","max_tokens":8192,"input_tokens":100000,"output_tokens":3}]}
     ;
-    const values = try parseListing(a, body, .deepseek);
+    var values = try parseListing(a, body, .deepseek);
+    defer values.deinit(a);
     try std.testing.expectEqual(@as(?u32, 12345), testRow(&values, .deepseek, "deepseek-flash").tokens);
     try std.testing.expect(testRow(&values, .deepseek, "deepseek-v4-pro").tokens == null);
-    const other = try parseListing(a, body, .opencode_go);
+    var other = try parseListing(a, body, .opencode_go);
+    defer other.deinit(a);
     try std.testing.expect(other.directory.find(.deepseek, "deepseek-flash") == null);
-    const absent = try parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":null}]}", .deepseek);
+    var absent = try parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":null}]}", .deepseek);
+    defer absent.deinit(a);
     try std.testing.expect(testRow(&absent, .deepseek, "deepseek-flash").tokens == null);
     const shared = "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":204800}]}";
-    const zen = try parseListing(a, shared, .opencode_zen);
+    var zen = try parseListing(a, shared, .opencode_zen);
+    defer zen.deinit(a);
     try std.testing.expectEqual(@as(?u32, 204800), testRow(&zen, .opencode_zen, "minimax-m2.7").tokens);
     try std.testing.expect(zen.directory.find(.opencode_go, "minimax-m2.7") == null);
 }
@@ -249,12 +250,8 @@ test "metadata rejects invalid IDs capacities duplicate IDs and shapes" {
     for (bad) |body| try std.testing.expectError(error.InvalidMetadata, parseListing(std.testing.allocator, body, .deepseek));
     try std.testing.expectError(error.DuplicateField, parseListing(std.testing.allocator, "{\"data\":[],\"data\":[]}", .deepseek));
 }
-test "metadata body list and ID bounds are enforced" {
+test "metadata accepts listings and IDs beyond old capacity limits" {
     const a = std.testing.allocator;
-    const oversized = try a.alloc(u8, max_body_bytes + 1);
-    defer a.free(oversized);
-    @memset(oversized, ' ');
-    try std.testing.expectError(error.MetadataTooLarge, parseListing(a, oversized, .deepseek));
     var buffer: [32768]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try writer.writeAll("{\"data\":[");
@@ -263,12 +260,16 @@ test "metadata body list and ID bounds are enforced" {
         try writer.print("{{\"id\":\"model-{d}\"}}", .{i});
     }
     try writer.writeAll("]}");
-    try std.testing.expectError(error.InvalidMetadata, parseListing(a, buffer[0..writer.end], .deepseek));
+    var large_list = try parseListing(a, buffer[0..writer.end], .deepseek);
+    defer large_list.deinit(a);
+    try std.testing.expectEqual(@as(usize, 513), large_list.directory.count);
     writer = std.Io.Writer.fixed(&buffer);
     try writer.writeAll("{\"data\":[{\"id\":\"");
     for (0..257) |_| try writer.writeByte('a');
     try writer.writeAll("\"}]}");
-    try std.testing.expectError(error.InvalidMetadata, parseListing(a, buffer[0..writer.end], .deepseek));
+    var long_id = try parseListing(a, buffer[0..writer.end], .deepseek);
+    defer long_id.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), long_id.directory.count);
 }
 test "metadata private roundtrip claims once and merges only successful providers" {
     var tmp = std.testing.tmpDir(.{});
@@ -284,21 +285,30 @@ test "metadata private roundtrip claims once and merges only successful provider
     try std.testing.expectEqual(@as(u8, 0), (try claim(&second, all_mask, false)).mask);
     try std.testing.expectEqual(bit(.deepseek), (try claim(&second, bit(.deepseek), true)).mask);
     var original: Listing = .{};
+    defer original.deinit(std.testing.allocator);
     for (providers.Id.all) |id| {
-        const source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":1000}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":1000}]}", id);
-        try mergeOfficial(&original, &source, id);
+        var source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":1000}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":1000}]}", id);
+        defer source.deinit(std.testing.allocator);
+        try mergeOfficial(std.testing.allocator, &original, &source, id);
     }
-    _ = try commit(&first, all_mask, original);
-    const refreshed = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":2000,\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
-    const cache = try commit(&second, bit(.deepseek), refreshed);
+    var initial = try commit(&first, all_mask, original);
+    defer initial.deinit(std.testing.allocator);
+    var refreshed = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":2000,\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
+    defer refreshed.deinit(std.testing.allocator);
+    var cache = try commit(&second, bit(.deepseek), refreshed);
+    defer cache.deinit(std.testing.allocator);
     const row = cache.directory.rows[cache.directory.find(.deepseek, "deepseek-flash").?];
     try std.testing.expectEqual(@as(?u32, 2000), row.tokens);
     try std.testing.expectEqualStrings("max", row.reasoning.?.declaration().map.max.?);
     try std.testing.expectEqual(@as(?u32, 1000), cache.directory.rows[cache.directory.find(.opencode_zen, "raw/id").?].tokens);
-    try std.testing.expectEqualDeep(cache, try load(&first));
+    var loaded = try load(&first);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(cache.directory.count, loaded.directory.count);
+    try std.testing.expectEqual(cache.directory_mask, loaded.directory_mask);
     const stat = try tmp.dir.statFile(std.testing.io, file_name, .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
-    _ = try commit(&first, 0, .{});
+    var unchanged = try commit(&first, 0, .{});
+    defer unchanged.deinit(std.testing.allocator);
     try std.testing.expectEqual(stat.inode, (try tmp.dir.statFile(std.testing.io, file_name, .{})).inode);
 }
 test "metadata rejects old future unknown and malformed cache without writing" {
@@ -322,7 +332,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
             try std.testing.expectError(error.InvalidMetadata, claimAt(&root, all_mask | dev_bit, true, 1000, .{}));
             try std.testing.expectError(error.InvalidMetadata, commitAt(&root, all_mask, .{}, 1000));
         }
-        const bytes = try root.read(a, file_name, 0, max_cache_bytes);
+        const bytes = try root.read(a, file_name, 0, body.len + 1);
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(body, bytes.data);
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
@@ -338,7 +348,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         const before = try root.dir.statFile(root.io, file_name, .{});
         try std.testing.expectError(error.UnknownField, claimAt(&root, all_mask, true, 1000, .{}));
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
-        const bytes = try root.read(a, file_name, 0, max_cache_bytes);
+        const bytes = try root.read(a, file_name, 0, body.len + 1);
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(body, bytes.data);
     }
@@ -355,33 +365,41 @@ test "metadata stale document is rebuilt by manual and automatic claims only" {
     defer root.deinit();
     const a = std.testing.allocator;
     // A claim against a missing cache still starts at generation 1.
-    const first = try claimAt(&root, all_mask, true, 900, .{});
+    var first = try claimAt(&root, all_mask, true, 900, .{});
+    defer first.cache.deinit(a);
     try std.testing.expectEqual(@as(u64, 1), first.generations[0]);
     const stale = "{\"version\":12,\"attempted\":1750000000000,\"records\":[{\"id\":\"legacy\",\"context_window\":4096}],\"models\":[{\"provider\":\"deepseek\",\"id\":\"legacy\",\"context_window\":4096}]}";
     var listing: Listing = .{};
+    defer listing.deinit(a);
     for (providers.Id.all) |id| {
-        const source = try parseListing(a, if (id == .openai_codex) "{\"models\":[{\"slug\":\"fresh\",\"visibility\":\"list\",\"context_window\":8192}]}" else "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
-        try mergeOfficial(&listing, &source, id);
+        var source = try parseListing(a, if (id == .openai_codex) "{\"models\":[{\"slug\":\"fresh\",\"visibility\":\"list\",\"context_window\":8192}]}" else "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
+        defer source.deinit(a);
+        try mergeOfficial(a, &listing, &source, id);
     }
     for ([_]bool{ true, false }) |manual| {
         try root.writeMode(file_name, stale, true, 0o600);
         try std.testing.expectError(error.OutdatedMetadataCache, load(&root));
-        const bytes = try root.read(a, file_name, 0, max_cache_bytes);
+        const bytes = try root.read(a, file_name, 0, stale.len + 1);
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(stale, bytes.data);
-        const rebuilt = try claimAt(&root, all_mask, manual, 1000, .{});
+        var rebuilt = try claimAt(&root, all_mask, manual, 1000, .{});
+        defer rebuilt.cache.deinit(a);
         try std.testing.expectEqual(all_mask, rebuilt.mask);
         try std.testing.expectEqual(@as(usize, 0), rebuilt.cache.directory.count);
         for (rebuilt.generations) |generation| try std.testing.expect(generation >= (@as(u64, 1) << 61));
-        const published = try commitClaimedAt(&root, all_mask, listing, rebuilt.generations, 1010);
+        var published = try commitClaimedAt(&root, all_mask, listing, rebuilt.generations, 1010);
+        defer published.cache.deinit(a);
         try std.testing.expectEqual(all_mask, published.accepted);
-        const reloaded = try load(&root);
+        var reloaded = try load(&root);
+        defer reloaded.deinit(a);
         try std.testing.expectEqual(providers.Id.all.len, reloaded.directory.count);
         try std.testing.expectEqual(@as(?u32, 8192), reloaded.directory.rows[reloaded.directory.find(.deepseek, "fresh").?].tokens);
         // A claim taken before the rebuild can no longer publish.
-        const delayed = try commitClaimedAt(&root, all_mask, listing, first.generations, 1020);
+        var delayed = try commitClaimedAt(&root, all_mask, listing, first.generations, 1020);
+        defer delayed.cache.deinit(a);
         try std.testing.expectEqual(@as(u8, 0), delayed.accepted);
-        const after = try load(&root);
+        var after = try load(&root);
+        defer after.deinit(a);
         try std.testing.expectEqual(providers.Id.all.len, after.directory.count);
         try std.testing.expectEqual(@as(?u32, 8192), after.directory.rows[after.directory.find(.deepseek, "fresh").?].tokens);
     }
@@ -414,14 +432,17 @@ test "official effort metadata maps exact model IDs and protocol formats" {
 }
 test "metadata listing tracks exact membership independently of capacity and provider" {
     const a = std.testing.allocator;
-    const listing = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\"},{\"id\":\"deepseek-flash\",\"context_window\":42},{\"id\":\"unknown\",\"context_window\":100}]}", .opencode_go);
+    var listing = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\"},{\"id\":\"deepseek-flash\",\"context_window\":42},{\"id\":\"unknown\",\"context_window\":100}]}", .opencode_go);
+    defer listing.deinit(a);
     try std.testing.expectEqual(@as(usize, 3), listing.directory.count);
     try std.testing.expectEqual(@as(?bool, true), testRow(&listing, .opencode_go, "minimax-m2.7").available);
     try std.testing.expect(testRow(&listing, .opencode_go, "minimax-m2.7").tokens == null);
     try std.testing.expect(listing.directory.find(.deepseek, "deepseek-flash") == null);
-    const absent = try parseListing(a, "{\"data\":[{\"id\":\"opencode-go/minimax-m2.7\"},{\"id\":\"MINIMAX-M2.7\"}]}", .opencode_go);
+    var absent = try parseListing(a, "{\"data\":[{\"id\":\"opencode-go/minimax-m2.7\"},{\"id\":\"MINIMAX-M2.7\"}]}", .opencode_go);
+    defer absent.deinit(a);
     try std.testing.expect(absent.directory.find(.opencode_go, "minimax-m2.7") == null);
-    const explicit_null = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":null}]}", .opencode_go);
+    var explicit_null = try parseListing(a, "{\"data\":[{\"id\":\"minimax-m2.7\",\"context_window\":null}]}", .opencode_go);
+    defer explicit_null.deinit(a);
     try std.testing.expectEqual(@as(?bool, true), testRow(&explicit_null, .opencode_go, "minimax-m2.7").available);
     try std.testing.expect(testRow(&explicit_null, .opencode_go, "minimax-m2.7").tokens == null);
 }
@@ -431,14 +452,21 @@ test "metadata empty official listing is authoritative and failed refresh preser
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     var listing: Listing = .{};
+    defer listing.deinit(std.testing.allocator);
     for (providers.Id.all) |id| {
-        const source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":4096}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
-        try mergeOfficial(&listing, &source, id);
+        var source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":4096}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
+        defer source.deinit(std.testing.allocator);
+        try mergeOfficial(std.testing.allocator, &listing, &source, id);
     }
-    const original = try commit(&root, all_mask, listing);
-    try std.testing.expectEqualDeep(original, try commit(&root, 0, .{}));
-    const empty = try parseListing(std.testing.allocator, "{\"data\":[]}", .deepseek);
-    const removed = try commit(&root, bit(.deepseek), empty);
+    var original = try commit(&root, all_mask, listing);
+    defer original.deinit(std.testing.allocator);
+    var unchanged = try commit(&root, 0, .{});
+    defer unchanged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(original.directory.count, unchanged.directory.count);
+    var empty = try parseListing(std.testing.allocator, "{\"data\":[]}", .deepseek);
+    defer empty.deinit(std.testing.allocator);
+    var removed = try commit(&root, bit(.deepseek), empty);
+    defer removed.deinit(std.testing.allocator);
     for (providers.Id.all) |id| {
         const row = removed.directory.rows[removed.directory.find(id, "raw/id").?];
         try std.testing.expectEqual(@as(?bool, id != .deepseek), row.available);
@@ -446,14 +474,23 @@ test "metadata empty official listing is authoritative and failed refresh preser
     }
     try std.testing.expect(hasDirectory(&removed, .deepseek));
     try std.testing.expect(findEntry(&removed, "deepseek/deepseek-flash") == null);
-    try std.testing.expectEqualDeep(removed, try load(&root));
-    const claimed = try claim(&root, all_mask, true);
-    try std.testing.expectEqualDeep(removed.directory, claimed.cache.directory);
-    const before = try load(&root);
+    var readback = try load(&root);
+    defer readback.deinit(std.testing.allocator);
+    try std.testing.expectEqual(removed.directory.count, readback.directory.count);
+    var claimed = try claim(&root, all_mask, true);
+    defer claimed.cache.deinit(std.testing.allocator);
+    try std.testing.expectEqual(removed.directory.count, claimed.cache.directory.count);
+    var before = try load(&root);
+    defer before.deinit(std.testing.allocator);
     var invalid = listing;
+    invalid.directory = try listing.directory.clone(std.testing.allocator);
+    defer invalid.deinit(std.testing.allocator);
     invalid.directory.rows[invalid.directory.find(.deepseek, "raw/id").?].tokens = 0;
     try std.testing.expectError(error.InvalidMetadata, commit(&root, bit(.deepseek), invalid));
-    try std.testing.expectEqualDeep(before, try load(&root));
+    var after = try load(&root);
+    defer after.deinit(std.testing.allocator);
+    try std.testing.expectEqual(before.directory.count, after.directory.count);
+    try std.testing.expectEqualDeep(before.refresh, after.refresh);
 }
 test "metadata rejects malformed availability and duplicate cache records without overwrite" {
     var tmp = std.testing.tmpDir(.{});
@@ -472,7 +509,7 @@ test "metadata rejects malformed availability and duplicate cache records withou
         try std.testing.expectError(case.err, claim(&root, all_mask, true));
         try std.testing.expectError(case.err, commit(&root, all_mask, .{}));
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
-        const bytes = try root.read(std.testing.allocator, file_name, 0, max_cache_bytes);
+        const bytes = try root.read(std.testing.allocator, file_name, 0, case.body.len + 1);
         defer std.testing.allocator.free(bytes.data);
         try std.testing.expectEqualStrings(case.body, bytes.data);
     }
@@ -496,21 +533,29 @@ test "models.dev profiles persist in current cache and automatic claims observe 
     const body =
         \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
     ;
-    const listing = try parseDev(std.testing.allocator, body);
+    var listing = try parseDev(std.testing.allocator, body);
+    defer listing.deinit(std.testing.allocator);
     try std.testing.expect(listing.dev_done);
     try std.testing.expectEqualStrings("off", testRow(&listing, .deepseek, "deepseek-flash").dev_reasoning.?.declaration().map.off.?);
     try std.testing.expectEqual(dev_bit, (try claim(&root, dev_bit, false)).mask);
-    _ = try commit(&root, 0, listing);
-    const reloaded = try load(&root);
+    var committed = try commit(&root, 0, listing);
+    defer committed.deinit(std.testing.allocator);
+    var reloaded = try load(&root);
+    defer reloaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("off", reloaded.directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].dev_reasoning.?.declaration().map.off.?);
     try std.testing.expect(reloaded.directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].reasoning == null);
     try std.testing.expect(reloaded.refresh[providers.Id.all.len].last_attempt_ms != null);
-    try std.testing.expectEqual(@as(u8, 0), (try claim(&root, dev_bit, false)).mask);
+    var claim_result = try claim(&root, dev_bit, false);
+    defer claim_result.cache.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), claim_result.mask);
     // A failed later models.dev fetch does not erase the last successful profile.
-    _ = try commit(&root, 0, .{});
-    try std.testing.expect((try load(&root)).directory.rows[reloaded.directory.find(.deepseek, "deepseek-flash").?].dev_reasoning != null);
+    var unchanged = try commit(&root, 0, .{});
+    defer unchanged.deinit(std.testing.allocator);
+    var after = try load(&root);
+    defer after.deinit(std.testing.allocator);
+    try std.testing.expect(after.directory.rows[after.directory.find(.deepseek, "deepseek-flash").?].dev_reasoning != null);
 }
-test "models.dev loopback transport parses public catalog and enforces its own size limit" {
+test "models.dev loopback transport parses a catalog larger than old size limit" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -518,7 +563,7 @@ test "models.dev loopback transport parses public catalog and enforces its own s
         \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
     ;
     // A valid catalog body larger than the official provider's 512 KiB limit.
-    const body = try a.alloc(u8, max_body_bytes + document.len + 1);
+    const body = try a.alloc(u8, 512 * 1024 + document.len + 1);
     defer a.free(body);
     @memset(body, ' ');
     @memcpy(body[body.len - document.len ..], document);
@@ -531,15 +576,15 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     var cleaned = std.atomic.Value(bool).init(false);
     var worker = try std.Io.concurrent(io, servePublicMetadata, .{ io, &server, response, &cleaned });
     defer worker.cancel(io) catch {};
-    const fetched = try fetchUrl(a, io, url, null, models_dev.max_body_bytes);
+    const fetched = try fetchUrl(a, io, url, null);
     defer a.free(fetched);
-    const listing = try parseDev(a, fetched);
+    var listing = try parseDev(a, fetched);
+    defer listing.deinit(a);
     try worker.await(io);
     try std.testing.expect(cleaned.load(.acquire));
     try std.testing.expect(listing.dev_done);
     try std.testing.expectEqualStrings("off", testRow(&listing, .deepseek, "deepseek-flash").dev_reasoning.?.declaration().map.off.?);
-    // The provider limit (512 KiB) is not used for the public catalog, and a
-    // smaller explicit limit fails before any parser sees a partial document.
+    // An incomplete response must still fail rather than silently truncate.
     var tiny = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var second = try tiny.listen(io, .{});
     defer second.deinit(io);
@@ -549,7 +594,7 @@ test "models.dev loopback transport parses public catalog and enforces its own s
     const oversized_head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
     var second_worker = try std.Io.concurrent(io, servePublicMetadata, .{ io, &second, oversized_head, &second_cleaned });
     defer second_worker.cancel(io) catch {};
-    try std.testing.expectError(error.MetadataTooLarge, fetchUrl(a, io, second_url, null, 8));
+    try std.testing.expectError(error.IncompleteMetadata, fetchUrl(a, io, second_url, null));
     try second_worker.await(io);
     try std.testing.expect(second_cleaned.load(.acquire));
 }
@@ -560,8 +605,10 @@ test "metadata declaration identity never strips a provider prefix inside raw ID
     var listing = try parseDev(std.testing.allocator,
         \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"raw/id":{"reasoning_options":[{"type":"effort","values":["low"]}]},"opencode-go/raw/id":{"reasoning_options":[{"type":"effort","values":["high"]}]}}}}
     );
-    const official = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\"},{\"id\":\"opencode-go/raw/id\"}]}", .opencode_go);
-    try mergeOfficial(&listing, &official, .opencode_go);
+    defer listing.deinit(std.testing.allocator);
+    var official = try parseListing(std.testing.allocator, "{\"data\":[{\"id\":\"raw/id\"},{\"id\":\"opencode-go/raw/id\"}]}", .opencode_go);
+    defer official.deinit(std.testing.allocator);
+    try mergeOfficial(std.testing.allocator, &listing, &official, .opencode_go);
     const cache: Cache = .{ .directory = listing.directory, .directory_mask = bit(.opencode_go) };
     var config: cfg.Config = .{ .provider = catalog.connection(.opencode_go), .model = .{ .name = "opencode-go/raw/id", .protocol = .chat, .context_tokens = 32768 } };
     try std.testing.expectEqualStrings("high", declarationForConfig(&cache, config).?.map.high.?);
@@ -580,7 +627,8 @@ test "provider reasoning source is fixed by verified provider" {
     const t = std.testing;
     for (providers.Id.all) |id| {
         var cache: Cache = .{};
-        const row = try cache.directory.upsert(id, "source-test");
+        defer cache.deinit(t.allocator);
+        const row = try cache.directory.upsert(t.allocator, id, "source-test");
         row.available = true;
         const protocol: Protocol = if (id == .deepseek) .chat else .responses;
         const format: thinking.Format = if (id == .deepseek) .deepseek else .standard;
@@ -642,7 +690,8 @@ test "provider reasoning source official route ignores public protocol" {
     const t = std.testing;
     for ([_]providers.Id{ .deepseek, .openai_codex }) |id| {
         var cache: Cache = .{};
-        const row = try cache.directory.upsert(id, "route-test");
+        defer cache.deinit(t.allocator);
+        const row = try cache.directory.upsert(t.allocator, id, "route-test");
         const protocol: Protocol = if (id == .deepseek) .chat else .responses;
         const format: thinking.Format = if (id == .deepseek) .deepseek else .standard;
         const official = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .high = "high" } });
@@ -673,20 +722,23 @@ test "provider reasoning source official route ignores public protocol" {
 }
 test "provider reasoning source ignores stale public cache and public refresh for DeepSeek" {
     const t = std.testing;
-    const cache = try parseCache(t.allocator,
+    var cache = try parseCache(t.allocator,
         \\{"version":16,"models":[{"provider":"deepseek","id":"refresh-test","protocol":"chat","dev_protocol":"chat","dev_present":true,"dev_reasoning":{"format":"deepseek","map":{"off":"off","low":"low"}}}]}
     );
-    var listing: Listing = .{ .directory = cache.directory };
+    defer cache.deinit(t.allocator);
+    var listing: Listing = .{ .directory = try cache.directory.clone(t.allocator) };
+    defer listing.deinit(t.allocator);
     const entry = restoreEntry(&cache, .deepseek, "refresh-test").?;
     try t.expect(entryDeclaration(&cache, entry) == null);
     const row = &listing.directory.rows[listing.directory.find(.deepseek, "refresh-test").?];
     row.reasoning = try directory.Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } });
     var public: Listing = .{ .dev_done = true };
-    const fresh = try public.directory.upsert(.deepseek, "refresh-test");
+    defer public.deinit(t.allocator);
+    const fresh = try public.directory.upsert(t.allocator, .deepseek, "refresh-test");
     fresh.dev_present = true;
     fresh.dev_protocol = .chat;
     fresh.dev_reasoning = try directory.Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .max = "max" } });
-    try mergeDev(&listing, &public);
+    try mergeDev(t.allocator, &listing, &public);
     const refreshed: Cache = .{ .directory = listing.directory };
     const declaration = entryDeclaration(&refreshed, entry).?;
     try t.expectEqualStrings("high", declaration.map.high.?);

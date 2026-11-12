@@ -75,8 +75,14 @@ test "native protocol is an ordinary exact model and large windows stay bounded"
         try std.testing.expect(rendered.selected_line.? < rendered.lines.len);
         try std.testing.expect(std.mem.find(u8, rendered.lines[rendered.selected_line.?], "login/Native/Judge") != null);
     }
-    const too_many: [max_models + 1]cfg.Model = @splat(models[0]);
-    try std.testing.expect(fingerprint(&too_many, &logged) == null);
+    const many: [4097]cfg.Model = @splat(models[0]);
+    try std.testing.expect(fingerprint(&many, &logged) != null);
+    try std.testing.expectEqual(@as(usize, 4098), count(&many, &logged, ""));
+    try std.testing.expectEqualStrings(models[0].name, choice(&many, &logged, "", 4097).?.model);
+    var providers: [257]Provider = @splat(.{ .name = "other" });
+    providers[256] = .{ .name = "login" };
+    try std.testing.expectEqual(@as(usize, 41), count(&models, &providers, ""));
+    try std.testing.expect(fingerprint(&models, &providers) != null);
     const long_name: [max_name_bytes + 1]u8 = @splat('a');
     const too_long = [_]cfg.Model{.{ .name = &long_name, .context_tokens = 16384 }};
     try std.testing.expect(fingerprint(&too_long, &logged) == null);

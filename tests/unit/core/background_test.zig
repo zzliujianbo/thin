@@ -2,7 +2,7 @@ test "validateQuery rejects cross-action fields" {
     try validateQuery(.{ .action = .list });
     try validateQuery(.{ .action = .list, .after = 3, .limit = 100 });
     try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .list, .id = "ab-1" }));
-    try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .list, .limit = 101 }));
+    try validateQuery(.{ .action = .list, .limit = 101 });
     try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .list, .limit = 0 }));
     try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .list, .stdout_offset = 0 }));
 
@@ -12,7 +12,7 @@ test "validateQuery rejects cross-action fields" {
     try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .status, .id = "ab-1", .limit = 20 }));
 
     try validateQuery(.{ .action = .logs, .id = "ab-1", .stdout_offset = 0, .stderr_offset = 9, .limit = 16384 });
-    try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .logs, .id = "ab-1", .limit = 16385 }));
+    try validateQuery(.{ .action = .logs, .id = "ab-1", .limit = 16385 });
     try testing.expectError(error.InvalidQuery, validateQuery(.{ .action = .logs, .id = "ab-1", .after = 1 }));
 
     try validateQuery(.{ .action = .stop, .id = "ab-1" });
@@ -34,10 +34,10 @@ test "validId bounds and charset" {
     try testing.expect(!validId(&long_sep));
 }
 test "defaults" {
-    try testing.expectEqual(@as(u32, 20), pageLimit(.{ .action = .list }));
-    try testing.expectEqual(@as(u32, 100), pageLimit(.{ .action = .list, .limit = 100 }));
-    try testing.expectEqual(@as(u32, 4096), logBudget(.{ .action = .logs }));
-    try testing.expectEqual(@as(u32, 16384), logBudget(.{ .action = .logs, .limit = 16384 }));
+    try testing.expectEqual(@as(usize, 20), pageLimit(.{ .action = .list }));
+    try testing.expectEqual(@as(usize, 100), pageLimit(.{ .action = .list, .limit = 100 }));
+    try testing.expectEqual(@as(usize, 4096), logBudget(.{ .action = .logs }));
+    try testing.expectEqual(@as(usize, 16384), logBudget(.{ .action = .logs, .limit = 16384 }));
 }
 test "parseQuery rejects coercion, null fields and duplicates" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -62,8 +62,7 @@ test "parseQuery rejects coercion, null fields and duplicates" {
     try testing.expectError(error.InvalidQuery, parseQuery(a, "{\"action\":\"list\",\"after\":-0}"));
     try testing.expectError(error.InvalidQuery, parseQuery(a, "{\"action\":\"list\",\"after\":18446744073709551616}"));
     try testing.expectError(error.InvalidQuery, parseQuery(a, "{\"action\":\"logs\",\"id\":\"0123456789ab-1\",\"stdout_offset\":1.0}"));
-    // limit 上限仍由 validateQuery 决定。
-    try testing.expectError(error.InvalidQuery, parseQuery(a, "{\"action\":\"list\",\"limit\":101}"));
+    try testing.expectEqual(@as(?usize, 101), (try parseQuery(a, "{\"action\":\"list\",\"limit\":101}")).limit);
     try testing.expectError(error.InvalidQuery, parseQuery(a, "{\"action\":\"list\",\"limit\":0}"));
 
     // null 不等于缺省：无关字段、必填字段、未知字段都拒绝。
@@ -95,7 +94,7 @@ test "parseQuery accepts strict per-action fields" {
 
     const paged = try parseQuery(a, "{\"action\":\"list\",\"after\":3,\"limit\":100}");
     try testing.expectEqual(@as(?u64, 3), paged.after);
-    try testing.expectEqual(@as(?u32, 100), paged.limit);
+    try testing.expectEqual(@as(?usize, 100), paged.limit);
 
     const status = try parseQuery(a, "{\"action\":\"status\",\"id\":\"0123456789ab-1\"}");
     try testing.expectEqual(Action.status, status.action);
@@ -105,7 +104,7 @@ test "parseQuery accepts strict per-action fields" {
     const logs = try parseQuery(a, "{\"action\":\"logs\",\"id\":\"0123456789ab-1\",\"stdout_offset\":0,\"stderr_offset\":9,\"limit\":16384}");
     try testing.expectEqual(@as(?u64, 0), logs.stdout_offset);
     try testing.expectEqual(@as(?u64, 9), logs.stderr_offset);
-    try testing.expectEqual(@as(?u32, 16384), logs.limit);
+    try testing.expectEqual(@as(?usize, 16384), logs.limit);
 
     const stop = try parseQuery(a, "{\"action\":\"stop\",\"id\":\"0123456789ab-1\"}");
     try testing.expectEqual(Action.stop, stop.action);

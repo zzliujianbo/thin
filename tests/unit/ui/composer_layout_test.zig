@@ -90,7 +90,7 @@ test "composer viewport follows a middle cursor and bounds long input allocation
     defer middle.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), middle.lines.len);
     try std.testing.expect(middle.cursor_row < middle.lines.len and middle.cursor_column < 4);
-    const bytes = try a.alloc(u8, 65536);
+    const bytes = try a.alloc(u8, 65537);
     defer a.free(bytes);
     @memset(bytes, 'a');
     const long = try layout(a, bytes, bytes.len, 8, 999);
@@ -98,7 +98,7 @@ test "composer viewport follows a middle cursor and bounds long input allocation
     try std.testing.expectEqual(max_rows, long.lines.len);
     try std.testing.expectEqual(@as(usize, 8193), long.total_rows);
     try std.testing.expectEqual(@as(usize, 7), long.cursor_row);
-    try std.testing.expectEqual(@as(usize, 65536), bytes.len);
+    try std.testing.expectEqual(@as(usize, 65537), bytes.len);
 }
 test "composer viewport cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});

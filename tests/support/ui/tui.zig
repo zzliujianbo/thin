@@ -566,7 +566,6 @@ const PreferenceFixture = struct {
             .memory_auto => self.state.memory_auto = value.? == 1,
             .command_timeout_ms => self.state.limits.command_timeout_ms = value.?,
             .request_timeout_ms => self.state.limits.request_timeout_ms = value.?,
-            .task_timeout_ms => self.state.limits.task_timeout_ms = value.?,
         }
     }
     fn connection(self: *@This()) Connection {

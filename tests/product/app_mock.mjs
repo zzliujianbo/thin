@@ -616,7 +616,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
       const provider = ['auth-activate','exit-unconfigured','exit-secret'].includes(kind) ? {base_url:url, api_key_env:'', api_key:null, chat_max_tokens:true} : {base_url:url, api_key_env:'THIN_FIXTURE_KEY'};
       // The configured effort is logical; the provider maps logical off to wire 'none'.
-      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'off':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+      const content = kind === 'auth-empty' ? ' \t\n\r\n ' : JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{...provider,models:{'fixture-model':{protocol,context_tokens:kind==='compact'?6000:32768,reasoning_effort:['model-select','model-select-empty'].includes(kind)?'off':['stream-markdown','tool-icons'].includes(kind)?'high':undefined,reasoning:['model-select','model-select-empty'].includes(kind)?{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}:undefined},...(['model-select','model-select-empty'].includes(kind)?{'fixture-next':{protocol,context_tokens:65536,reasoning_effort:'low',reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}},'fixture-custom':{protocol,context_tokens:32768,reasoning:{format:'standard',map:{off:'none',minimal:'minimal',low:'low',medium:'medium',high:'high',xhigh:'xhigh'}}}}:{})}}}}, limits:{low_price_input:false,request_timeout_ms:10000}});
       await writeFile(join(home,'.thin',filename), content);
     }
 
@@ -953,6 +953,8 @@ try {
     await timed('suite', 'decision-model', () => decisionModelRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--settings-only')) {
     await timed('suite', 'settings', () => settingsRegressions({app,pty,execute,send}));
+  } else if (process.argv.includes('--log-only')) {
+    await timed('suite', 'log', () => logRegressions(app,pty));
   } else if (process.argv.includes('--selection-restore-only')) {
     await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));
   } else if (process.argv.includes('--resume-only')) {
@@ -998,8 +1000,11 @@ try {
 } catch (error) {
   // 中文：不要渲染捕获的终端或模型输出、响应头或请求体。
   // Do not render captured terminal/model output, headers, or request bodies.
+  const frame = /^\s+at .*\/tests\/product\/([a-zA-Z0-9_-]+\.mjs):(\d+):\d+\)?$/m.exec(error.stack ?? '');
+  const location = /^[a-zA-Z0-9_-]+\.mjs:\d+$/.test(error.fixtureLocation ?? '')
+    ? error.fixtureLocation : frame ? `${frame[1]}:${frame[2]}` : 'unknown';
   const label = /^(?:log|selection|settings|resume|login|pty)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_=-]+$/.test(error.fixtureCheck ?? '')
-    ? `${error.fixtureCase}: ${error.fixtureCheck}` : `offline fixture assertion at app_mock.mjs:${/app_mock\.mjs:(\d+):/.exec(error.stack ?? '')?.[1] ?? 'unknown'} (details withheld)`;
+    ? `${error.fixtureCase}: ${error.fixtureCheck} at ${location}` : `offline fixture assertion at ${location} (details withheld)`;
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;
 }

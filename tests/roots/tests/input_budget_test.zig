@@ -106,7 +106,6 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
         }
     };
     var config = configuration();
-    config.limits.input_margin_tokens = 100;
     if (unknown_anthropic) {
         config.model.protocol = .anthropic;
         config.model.output_tokens = null;
@@ -127,12 +126,19 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
     for (runtime.messages(), 0..) |message, i| expected[i] = try p.cloneMessage(alloc, message);
     expected[protected] = try p.textMessage(alloc, .user, goal);
     const normal_input = runtime.estimator.tokens(c.rawTokens(runtime.system, &.{}, expected));
-    const ceiling: u32 = @intCast(normal_input + config.limits.input_margin_tokens - 1);
-    if (unknown_anthropic) config.model.input_price_threshold = ceiling else config.limits.max_input_tokens = ceiling;
+    const ceiling: u32 = @intCast(normal_input + cfg.Policy.input_margin_tokens - 1);
+    if (unknown_anthropic) {
+        config.model.input_price_threshold = ceiling;
+    } else {
+        // Set the actual physical input budget to normal_input - 1,
+        // including the proportional reserve for this small window.
+        config.model.context_tokens = @intCast(@max(2, normal_input + @min(cfg.Policy.safety_tokens, normal_input / 7)));
+        try std.testing.expectEqual(normal_input - 1, c.inputBudget(config));
+    }
     try c.validateInputPolicy(config);
     try std.testing.expect(config.limits.compaction_enabled);
     try std.testing.expect(normal_input > c.inputBudget(config));
-    try std.testing.expect(normal_input >= c.threshold(c.inputBudget(config), config.limits.compaction_trigger_percent));
+    try std.testing.expect(normal_input >= c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
     // Use the AUTOMATIC plan with the accepted input included, not the loaded
     // four-message history or manual compaction's different protected boundary.
     const plan = try c.plan(alloc, config, runtime.estimator, runtime.system, &.{}, expected, protected);
@@ -146,21 +152,21 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
         try c.checkInputFor(config, .summary, summary_input);
     } else {
         try std.testing.expect(summary_input > c.inputBudgetFor(config, .summary));
-        try std.testing.expectError(error.InputBudgetExceeded, c.checkInputFor(config, .summary, summary_input));
+        try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, summary_input));
     }
     var capture = Capture{ .runtime = &runtime, .allocator = alloc };
     runtime.host = .{ .context = &capture, .emit_fn = Capture.emit };
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run(goal, &cancel);
-    try std.testing.expectEqual(r.Status.paused, terminal.status);
-    try std.testing.expectEqual(error.InputBudgetExceeded, terminal.detail.?);
+    try std.testing.expectEqual(if (unknown_anthropic) r.Status.paused else r.Status.failed, terminal.status);
+    try std.testing.expectEqual(if (unknown_anthropic) error.InputBudgetExceeded else error.ContextTooLarge, terminal.detail.?);
     try std.testing.expect(terminal.detail.? != error.InputBudgetSummaryFailed);
     try std.testing.expect(terminal.model_failure == null and terminal.http_status == null);
     try std.testing.expectEqual(@as(usize, 1), capture.failures);
-    try std.testing.expectEqual(if (unknown_anthropic) error.UnknownModelOutputCapacity else error.InputBudgetExceeded, capture.cause.?);
+    try std.testing.expectEqual(if (unknown_anthropic) error.UnknownModelOutputCapacity else error.ContextTooLarge, capture.cause.?);
     try std.testing.expectEqual(@as(?usize, protected), capture.protected_index);
     try std.testing.expectEqualDeep(@as([]const p.Message, expected), capture.history.items);
-    try std.testing.expectEqualDeep(@as([]const p.Message, expected), runtime.messages());
+    try std.testing.expectEqualDeep(@as([]const p.Message, if (unknown_anthropic) expected else expected[0..protected]), runtime.messages());
     try std.testing.expectEqual(protected, runtime.protected_index);
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.summaries + fake.tools);
     try std.testing.expectEqual(@as(usize, 0), capture.compacting + capture.committed + capture.usages);

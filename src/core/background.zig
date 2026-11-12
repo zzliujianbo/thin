@@ -9,12 +9,8 @@ pub const Cancellation = protocol.Cancellation;
 
 /// 工具层 `{"action":"list"}` 的默认页大小（不是服务数量上限）。
 pub const default_page_limit: u32 = 20;
-/// 单页最多返回多少条记录（不是服务数量上限）。
-pub const max_page_limit: u32 = 100;
 /// `logs` 默认的 stdout+stderr 原始字节总读取预算。
 pub const default_log_budget: u32 = 4096;
-/// `logs` 单次允许的最大原始字节总读取预算。
-pub const max_log_budget: u32 = 16384;
 /// ID 最大长度（随机实例前缀 + 单调序号）。
 pub const max_id_len: usize = 64;
 
@@ -40,8 +36,6 @@ pub const Start = struct {
     command: []const u8,
     /// 有界启动等待（config 的 u32 毫秒，0 视为无效）。
     startup_timeout_ms: u32,
-    /// stdout+stderr 日志环总容量（原始字节），两路各半。
-    log_bytes: u32,
     term_grace_ms: u32,
     cleanup_timeout_ms: u32,
 };
@@ -52,7 +46,7 @@ pub const Query = struct {
     after: ?u64 = null,
     stdout_offset: ?u64 = null,
     stderr_offset: ?u64 = null,
-    limit: ?u32 = null,
+    limit: ?usize = null,
 };
 
 /// 已编码的响应；Tools 不再重复编码。
@@ -81,7 +75,7 @@ pub fn validateQuery(q: Query) ValidationError!void {
             if (q.id != null) return error.InvalidQuery;
             if (q.stdout_offset != null or q.stderr_offset != null) return error.InvalidQuery;
             if (q.limit) |limit| {
-                if (limit == 0 or limit > max_page_limit) return error.InvalidQuery;
+                if (limit == 0) return error.InvalidQuery;
             }
         },
         .status, .stop => {
@@ -93,7 +87,7 @@ pub fn validateQuery(q: Query) ValidationError!void {
             if (q.id == null) return error.InvalidQuery;
             if (q.after != null) return error.InvalidQuery;
             if (q.limit) |limit| {
-                if (limit == 0 or limit > max_log_budget) return error.InvalidQuery;
+                if (limit == 0) return error.InvalidQuery;
             }
         },
     }
@@ -157,7 +151,7 @@ pub fn parseQuery(a: std.mem.Allocator, bytes: []const u8) ParseError!Query {
     if (object.get("stdout_offset")) |value| q.stdout_offset = try parseUnsigned(value);
     if (object.get("stderr_offset")) |value| q.stderr_offset = try parseUnsigned(value);
     if (object.get("limit")) |value| {
-        q.limit = std.math.cast(u32, try parseUnsigned(value)) orelse return error.InvalidQuery;
+        q.limit = std.math.cast(usize, try parseUnsigned(value)) orelse return error.InvalidQuery;
     }
     // 先沿用借用 parsed 字符串的 id 做完整校验，成功后只复制 id。
     if (object.get("id")) |value| {
@@ -202,12 +196,12 @@ pub fn validId(id: []const u8) bool {
 }
 
 /// 分页游标：`after` 之后最多 `limit` 条（默认 `default_page_limit`）。
-pub fn pageLimit(q: Query) u32 {
+pub fn pageLimit(q: Query) usize {
     return q.limit orelse default_page_limit;
 }
 
 /// 日志原始字节总预算（默认 `default_log_budget`）。
-pub fn logBudget(q: Query) u32 {
+pub fn logBudget(q: Query) usize {
     return q.limit orelse default_log_budget;
 }
 

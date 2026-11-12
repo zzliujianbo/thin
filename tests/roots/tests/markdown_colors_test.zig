@@ -136,6 +136,58 @@ fn allocationCase(a: Allocator) !void {
     markdown.release(a, rendered);
 }
 
+// Observe actual successful growth, not attempted resizes or shrinking.
+const GrowthObserver = struct {
+    failing: *std.testing.FailingAllocator,
+    grew: bool = false,
+
+    fn allocator(self: *GrowthObserver) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *GrowthObserver = @ptrCast(@alignCast(ctx));
+        return self.failing.allocator().rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *GrowthObserver = @ptrCast(@alignCast(ctx));
+        if (!self.failing.allocator().rawResize(bytes, alignment, len, ra)) return false;
+        if (len > bytes.len and !self.failing.has_induced_failure) self.grew = true;
+        return true;
+    }
+    fn remap(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *GrowthObserver = @ptrCast(@alignCast(ctx));
+        const result = self.failing.allocator().rawRemap(bytes, alignment, len, ra) orelse return null;
+        if (len > bytes.len and !self.failing.has_induced_failure) self.grew = true;
+        return result;
+    }
+    fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *GrowthObserver = @ptrCast(@alignCast(ctx));
+        self.failing.allocator().rawFree(bytes, alignment, ra);
+    }
+};
+
+fn sweepNormalAllocationCase(bound: usize, fixed: bool) !bool {
+    var grew_before_oom = false;
+    for (0..bound) |fail_index| {
+        // Reset the controlled layout for every attempt; the other sweep uses
+        // the ordinary testing allocator and makes no layout assumptions.
+        var storage: [256 * 1024]u8 = undefined;
+        var buffer = std.heap.FixedBufferAllocator.init(&storage);
+        const backing = if (fixed) buffer.allocator() else std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        var observer: GrowthObserver = .{ .failing = &failing };
+        if (allocationCase(observer.allocator())) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            if (observer.grew) grew_before_oom = true;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    return grew_before_oom;
+}
+
 fn appendHeldCrAllocationCase(a: Allocator) !void {
     const body = try body_mod.Body.create(a, 4);
     defer body.destroy();

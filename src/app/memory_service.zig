@@ -252,7 +252,7 @@ pub const Coordinator = struct {
         }
         if (self.tail) |tail| tail.next = job else self.head = job;
         self.tail = job;
-        self.status.queued_count += 1;
+        self.status.queued_count +|= 1;
         self.status.revision +%= 1;
         self.wake.set(self.io);
         self.unlock();
@@ -474,7 +474,7 @@ pub const Coordinator = struct {
         var owned = try cfg.clone(a, config);
         errdefer cfg.release(&owned);
         self.* = .{ .allocator = a, .io = io, .root = anchored, .store = undefined, .config = owned, .codex_source = source };
-        self.store = mem.Store.init(&self.root, owned.value.limits);
+        self.store = mem.Store.init(&self.root);
         // Automatic finalization is auxiliary and must never hang primary settle
         // behind another process's project transaction.
         self.store.wait_for_lock = false;
@@ -561,19 +561,16 @@ pub const Coordinator = struct {
         self.failure.store(if (err) |e| @intFromError(e) else 0, .release);
     }
 
-    pub fn retrieve(self: *Coordinator, a: std.mem.Allocator, query: []const u8, max_bytes: usize) ![]const u8 {
+    pub fn retrieve(self: *Coordinator, a: std.mem.Allocator, query: []const u8) ![]const u8 {
         if (self.isPoisoned()) return error.CleanupFailed;
         if (self.secret_registration_failed) return error.TooManySessionCredentials;
         // Retrieval can run concurrently with an automatic Memory job. Store has
         // mutable transaction state, so use a distinct instance on the same root.
-        var store = mem.Store.init(&self.root, self.config.value.limits);
+        var store = mem.Store.init(&self.root);
         store.wait_for_lock = false;
-        if (max_bytes == 0) return a.dupe(u8, "");
-        var end = @min(query.len, 8192);
-        while (end > 0 and end < query.len and query[end] & 0xc0 == 0x80) end -= 1;
         var repository = knowledge.Repository.init(&store);
         var reference_wiping: cfg.WipingAllocator = .{ .backing = a };
-        const reference = try repository.retrieve(reference_wiping.allocator(), query[0..end], now(self.io), @min(max_bytes, k.max_retrieval_bytes));
+        const reference = try repository.retrieve(reference_wiping.allocator(), query, now(self.io));
         if (self.containsSecret(reference)) {
             reference_wiping.allocator().free(reference);
             return error.SensitiveMemoryMaterial;
@@ -674,7 +671,7 @@ pub const Coordinator = struct {
         for (source.sources) |evidence| {
             if (self.containsSecret(evidence.text) or k.sensitiveMaterial(evidence.text)) continue;
             try sources.append(a, evidence);
-            if (evidence.kind == .user and query.items.len + evidence.text.len + 1 <= 8192) {
+            if (evidence.kind == .user) {
                 try query.appendSlice(a, evidence.text);
                 try query.append(a, '\n');
             }
@@ -719,7 +716,8 @@ pub const Coordinator = struct {
                     out.saved_count +|= 1;
                     out.summary.append(std.mem.trim(u8, candidate.content, " \t\r\n"));
                 },
-                .conflict, .unchanged, .expired => {},
+                .conflict => return error.MemoryConflict,
+                .unchanged, .expired => {},
             }
         }
         out.set(if (out.saved_count == 0) .skipped else .saved, null);

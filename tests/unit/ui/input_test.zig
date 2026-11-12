@@ -126,7 +126,7 @@ test "delayed paste framing escapes still parse and tainted timeout is consumed"
         try std.testing.expectEqual(@as(usize, 1), record.escapes);
     }
 }
-test "editor preserves UTF8 cluster boundaries and bounded input" {
+test "editor preserves UTF8 cluster boundaries and accepts large input" {
     try text.initLocale();
 
     var editor = Editor{ .allocator = std.testing.allocator };
@@ -141,7 +141,23 @@ test "editor preserves UTF8 cluster boundaries and bounded input" {
     try std.testing.expectEqualStrings("a", editor.bytes.items);
 
     const huge: [65536]u8 = @splat('x');
-    try std.testing.expect(!try editor.insert(&huge));
+    try std.testing.expect(try editor.insert(&huge));
+    try std.testing.expectEqual(@as(usize, 65537), editor.bytes.items.len);
+    try std.testing.expectEqual(@as(u8, 'a'), editor.bytes.items[0]);
+    try std.testing.expectEqual(@as(u8, 'x'), editor.bytes.items[65536]);
+}
+test "editor allocation failure preserves draft and cursor" {
+    var editor = Editor{ .allocator = std.testing.allocator };
+    defer editor.deinit();
+    try std.testing.expect(try editor.insert("a你"));
+    editor.left();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    editor.allocator = failing.allocator();
+    defer editor.allocator = std.testing.allocator;
+    const large: [65537]u8 = @splat('x');
+    try std.testing.expectError(error.OutOfMemory, editor.insert(&large));
+    try std.testing.expectEqualStrings("a你", editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), editor.cursor);
 }
 test "secret storage erases removed bytes and fails closed on invalid input and overflow" {
     var secret = SecretInput{};

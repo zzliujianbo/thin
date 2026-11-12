@@ -15,20 +15,30 @@ test "exact edits reject ambiguity overlap empty and limits" {
     try std.testing.expectError(error.FileTooLarge, apply(a, "a", &.{.{ .old_text = "a", .new_text = "xx" }}, 1));
     try std.testing.expectError(error.FileTooLarge, apply(a, "ab", &.{.{ .old_text = "ab", .new_text = "" }}, 1));
 }
-test "exact edit count is bounded at the helper boundary" {
+test "exact edits accept more than 128 entries" {
     const a = std.testing.allocator;
-    var before: [max_edits * 4]u8 = undefined;
-    var edits: [max_edits + 1]Edit = undefined;
-    for (0..max_edits) |i| {
+    const count = 160;
+    var before: [count * 4]u8 = undefined;
+    var edits: [count]Edit = undefined;
+    for (0..count) |i| {
         const part = before[i * 4 ..][0..4];
         _ = try std.fmt.bufPrint(part, "{d:0>3};", .{i});
         edits[i] = .{ .old_text = part, .new_text = "" };
     }
-    edits[max_edits] = .{ .old_text = "extra", .new_text = "" };
-    const out = try apply(a, &before, edits[0..max_edits], before.len);
+    const out = try apply(a, &before, &edits, null);
     defer a.free(out);
     try std.testing.expectEqualStrings("", out);
-    try std.testing.expectError(error.TooManyEdits, apply(a, &before, &edits, before.len));
+}
+test "unlimited exact edit accepts file above former eight MiB boundary" {
+    const a = std.testing.allocator;
+    const before = try a.alloc(u8, 8 * 1024 * 1024 + 1);
+    defer a.free(before);
+    @memset(before, 'a');
+    before[before.len - 1] = 'z';
+    const out = try apply(a, before, &.{.{ .old_text = "z", .new_text = "end" }}, null);
+    defer a.free(out);
+    try std.testing.expectEqual(before.len + 2, out.len);
+    try std.testing.expectEqualStrings("end", out[out.len - 3 ..]);
 }
 test "observed local edits in a multi-megabyte file" {
     const a = std.testing.allocator;

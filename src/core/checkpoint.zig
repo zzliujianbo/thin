@@ -12,9 +12,9 @@ const chat = @import("../llm/chat.zig");
 const responses = @import("../llm/responses.zig");
 const anthropic = @import("../llm/anthropic.zig");
 const j = @import("../util/json.zig");
+const json_bound = @import("../app/json_bound.zig");
 const Allocator = std.mem.Allocator;
 
-pub const max_bytes: usize = 16 * 1024 * 1024;
 pub const State = struct {
     version: u32 = 2,
     /// Tool-prefix provenance only, never configuration or send authority.
@@ -36,9 +36,7 @@ pub const State = struct {
     input_budget_frozen: bool = false,
     input_price_threshold: ?u32 = null,
     input_price_flat_limit: ?u32 = null,
-    max_input_tokens: ?u32 = null,
     low_price_input: bool = false,
-    input_margin_tokens: u32 = 5000,
     permission_id: u64,
     poisoned: bool = false,
     /// Observer continuity only; the Runtime never treats these as authority.
@@ -46,15 +44,14 @@ pub const State = struct {
     journal_turn: u64 = 0,
 };
 
-// Empty-buffer counter rejects before any output allocation, including escaping.
+// Count escaped output before allocating the exact encoded size.
 const Counter = struct {
     writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
     count: usize = 0,
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Counter = @fieldParentPtr("writer", w);
         const n = std.Io.Writer.countSplat(data, splat);
-        if (n > max_bytes - self.count) return error.WriteFailed;
-        self.count += n;
+        self.count = std.math.add(usize, self.count, n) catch return error.WriteFailed;
         return n;
     }
 };
@@ -76,38 +73,33 @@ pub fn encode(a: Allocator, state: State) ![]u8 {
     return bytes;
 }
 
-// Bound nesting and structural work before invoking an allocating JSON parser.
+// Check UTF-8 and basic bracket balance before strict JSON parsing.
 fn preflight(bytes: []const u8) !void {
-    if (bytes.len > max_bytes) return error.InputLimit;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
     var quoted = false;
     var escaped = false;
     var depth: usize = 0;
-    var nodes: usize = 0;
     for (bytes) |b| {
         if (quoted) {
             if (escaped) escaped = false else if (b == '\\') escaped = true else if (b == '"') quoted = false;
         } else switch (b) {
             '"' => quoted = true,
             '{', '[' => {
-                depth += 1;
-                nodes += 1;
-                if (depth > 64) return error.InputLimit;
+                depth = std.math.add(usize, depth, 1) catch return error.InputLimit;
             },
             '}', ']' => {
                 if (depth == 0) return error.InvalidJson;
                 depth -= 1;
             },
-            ',', ':' => nodes += 1,
             else => {},
         }
-        if (nodes > 65536) return error.InputLimit;
     }
     if (quoted or depth != 0) return error.InvalidJson;
 }
 
 fn strictJson(a: Allocator, bytes: []const u8) !std.json.Parsed(j.Value) {
     try preflight(bytes);
+    try json_bound.validate(a, bytes);
     return std.json.parseFromSlice(j.Value, a, bytes, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
@@ -133,7 +125,6 @@ fn shape(comptime T: type, v: j.Value) !void {
                 if (!std.unicode.utf8ValidateSlice(v.string)) return error.InvalidUtf8;
             } else {
                 if (v != .array) return error.InvalidType;
-                if (v.array.items.len > 1024) return error.InputLimit;
                 for (v.array.items) |item| try shape(info.child, item);
             }
         },
@@ -178,8 +169,16 @@ fn shape(comptime T: type, v: j.Value) !void {
 }
 
 pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
-    const tree = try strictJson(a, bytes);
+    var tree = try strictJson(a, bytes);
     defer tree.deinit();
+    // v2 formerly persisted these policy fields at the top level. Validate
+    // their original types before removing only these known retired keys.
+    if (tree.value == .object) {
+        if (tree.value.object.get("max_input_tokens")) |v| try shape(?u32, v);
+        if (tree.value.object.get("input_margin_tokens")) |v| try shape(u32, v);
+        _ = tree.value.object.swapRemove("max_input_tokens");
+        _ = tree.value.object.swapRemove("input_margin_tokens");
+    }
     try shape(State, tree.value);
     const parsed = try std.json.parseFromValue(State, a, tree.value, .{});
     errdefer parsed.deinit();
@@ -188,18 +187,13 @@ pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
 }
 
 fn utf8(s: []const u8) !void {
-    if (s.len > max_bytes) return error.InputLimit;
     if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
 }
 
 fn basic(state: State) !void {
     if (state.version != 2) return error.UnsupportedVersion;
     try utf8(state.system);
-    if (state.messages.len > 1024) return error.InputLimit;
-    var blocks: usize = 0;
     for (state.messages) |m| {
-        if (m.blocks.len > 1024 - blocks) return error.InputLimit;
-        blocks += m.blocks.len;
         if (m.replay) |r| {
             try utf8(r.scope.connection);
             try utf8(r.scope.model);
@@ -268,15 +262,15 @@ pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
     }
     // boundaries allocates before some errors; the temporary arena owns failures.
     _ = try context.boundaries(t, req.messages);
-    // Exercise actual outgoing history validation, including native item expansion
-    // count limits and Responses' native-reasoning requirement. No network calls.
+    // Exercise actual outgoing history validation and native-reasoning requirements.
+    // No network calls.
     const wire = switch (proto) {
         .chat => try chat.encode(t, req),
         .responses => try responses.encode(t, req),
         .anthropic => try anthropic.encode(t, req),
         .auto, .systemone => unreachable,
     };
-    if (wire.len > max_bytes) return error.InputLimit;
+    _ = wire;
 }
 
 fn sameCall(a: p.ToolCall, b: p.ToolCall) bool {
@@ -297,7 +291,6 @@ fn sameBlock(a: p.Block, b: p.Block) bool {
 fn validateResponses(a: Allocator, m: p.Message) !void {
     const r = m.replay.?;
     const prefix = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":";
-    if (r.json.len > max_bytes - prefix.len - 2) return error.InputLimit;
     // Only the event envelope is synthetic. Output bytes/opaque fields are never
     // rewritten, stripped, or converted; the adapter derives canonical blocks.
     const event = try std.fmt.allocPrint(a, "{s}{s}}}}}", .{ prefix, r.json });

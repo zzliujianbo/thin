@@ -178,6 +178,7 @@ pub const App = struct {
         // Price thresholds are always derived, even with explicit reasoning/output.
         {
             var cache: metadata.Cache = .{};
+            defer cache.deinit(a);
             var store: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, io, home) catch null;
             if (store) |*value| {
                 defer value.deinit();
@@ -260,7 +261,7 @@ pub const App = struct {
         errdefer a.free(self.shell_name);
         self.session_cwd = try a.dupe(u8, self.root.path);
         errdefer a.free(self.session_cwd);
-        self.memory = mem.Store.init(&self.root, self.config.value.limits);
+        self.memory = mem.Store.init(&self.root);
         self.journal = try Journal.init(a, &self.root, key);
         errdefer self.journal.deinit();
         try rememberConfiguredKeys(&self.journal, self.config.value, environ);
@@ -389,9 +390,9 @@ pub const App = struct {
         return !self.memory_coordinator.isPoisoned();
     }
 
-    fn retrieveMemory(raw: *anyopaque, a: std.mem.Allocator, query: []const u8, max_bytes: usize) ![]const u8 {
+    fn retrieveMemory(raw: *anyopaque, a: std.mem.Allocator, query: []const u8) ![]const u8 {
         const self: *App = @ptrCast(@alignCast(raw));
-        return self.memory_coordinator.retrieve(a, query, max_bytes) catch |err| {
+        return self.memory_coordinator.retrieve(a, query) catch |err| {
             self.memory_coordinator.reportFailure(err);
             return err;
         };
@@ -406,7 +407,7 @@ pub const App = struct {
         var filtered: knowledge.Capture = .{ .allocator = arena.allocator(), .omitted_sources = capture.omitted_sources };
         for (capture.sources.items) |source| {
             if (self.journal.containsSecret(source.text)) {
-                filtered.omitted_sources += 1;
+                filtered.omitted_sources +|= 1;
                 continue;
             }
             filtered.add(source.kind, source.text);
@@ -465,6 +466,7 @@ pub const App = struct {
         const cache = try a.create(metadata.Cache);
         defer a.destroy(cache);
         cache.* = .{};
+        defer cache.deinit(a);
         if (self.home_path.len != 0) {
             const opened: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, self.root.io, self.home_path) catch |err| switch (err) {
                 error.FileNotFound => null,

@@ -1,8 +1,9 @@
-test "directory owns exact provider keys and metadata across value copies" {
+test "directory owns exact provider keys and metadata across independent clones" {
     const t = std.testing;
     var original: Directory = .{};
+    defer original.deinit(t.allocator);
     var input = [_]u8{ 'n', 'e', 'w', '/', 'i', 'd' };
-    const row = try original.upsert(.opencode_go, &input);
+    const row = try original.upsert(t.allocator, .opencode_go, &input);
     row.tokens = 123;
     row.dev_context_tokens = 456;
     row.available = true;
@@ -12,7 +13,8 @@ test "directory owns exact provider keys and metadata across value copies" {
     row.reasoning = try Profile.from(.{ .map = .{ .off = "none", .low = "low" } });
     row.dev_reasoning = try Profile.from(.{ .format = .anthropic, .map = .{ .off = "disabled", .high = "high" } });
     input[0] = 'X';
-    var copied = original;
+    var copied = try original.clone(t.allocator);
+    defer copied.deinit(t.allocator);
     original.names[0] = 'X';
     try t.expectEqualStrings("opencode-go/new/id", copied.selector(0));
     try t.expectEqualStrings("new/id", copied.name(0));
@@ -21,11 +23,12 @@ test "directory owns exact provider keys and metadata across value copies" {
     try t.expect(copied.find(.opencode_go, "opencode-go/new/id") == null);
     try t.expectEqual(@as(usize, 0), copied.find(.opencode_go, "new/id").?);
     try t.expectEqual(@as(usize, 1), copied.count);
-    _ = try copied.upsert(.opencode_go, "new/id");
+    _ = try copied.upsert(t.allocator, .opencode_go, "new/id");
     try t.expectEqual(@as(usize, 1), copied.count);
     var dest: Directory = .{};
-    _ = try dest.upsert(.deepseek, "other");
-    try dest.copyRecord(&copied, 0);
+    defer dest.deinit(t.allocator);
+    _ = try dest.upsert(t.allocator, .deepseek, "other");
+    try dest.copyRecord(t.allocator, &copied, 0);
     try t.expect(dest.rows[1].offset != copied.rows[0].offset);
     try t.expectEqualStrings("new/id", dest.name(1));
     try t.expectEqual(@as(?u32, 123), dest.rows[1].tokens);
@@ -36,39 +39,24 @@ test "directory owns exact provider keys and metadata across value copies" {
     try t.expect(dest.rows[1].dev_present);
     try t.expectEqualStrings("none", dest.rows[1].reasoning.?.declaration().map.off.?);
     try t.expectEqualStrings("disabled", dest.rows[1].dev_reasoning.?.declaration().map.off.?);
-    try dest.copyRecord(&dest, 1);
+    try dest.copyRecord(t.allocator, &dest, 1);
     try t.expectEqual(@as(usize, 2), dest.count);
 }
-test "directory rejects invalid IDs and fails atomically at both capacity limits" {
+test "directory rejects invalid IDs while growing beyond old limits" {
     const t = std.testing;
     var d: Directory = .{};
-    const long: [257]u8 = @splat('x');
-    for ([_][]const u8{ "", "   ", "\t", "bad\n", "bad\x7f", &long }) |id| {
-        try t.expectError(error.InvalidMetadata, d.upsert(.deepseek, id));
+    defer d.deinit(t.allocator);
+    for ([_][]const u8{ "", "   ", "\t", "bad\n", "bad\x7f" }) |id| {
+        try t.expectError(error.InvalidMetadata, d.upsert(t.allocator, .deepseek, id));
     }
-    try t.expectEqual(@as(usize, 0), d.count);
-    var buf: [32]u8 = undefined;
-    for (0..max_models) |i| _ = try d.upsert(.deepseek, try std.fmt.bufPrint(&buf, "id-{d}", .{i}));
-    const used = d.used;
-    try t.expectError(error.MetadataTooLarge, d.upsert(.deepseek, "overflow"));
-    try t.expectEqual(used, d.used);
-    _ = try d.upsert(.deepseek, "id-0"); // Updating at capacity remains legal.
-    d = .{};
-    const name_bytes: [256]u8 = @splat('x');
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        var id = name_bytes;
+    var id: [256]u8 = @splat('x');
+    for (0..1600) |i| {
         _ = try std.fmt.bufPrint(id[0..8], "{d:0>8}", .{i});
-        const before_count = d.count;
-        const before_used = d.used;
-        _ = d.upsert(.opencode_go, &id) catch |err| {
-            try t.expectEqual(error.MetadataTooLarge, err);
-            try t.expectEqual(before_count, d.count);
-            try t.expectEqual(before_used, d.used);
-            try t.expect(d.count < max_models);
-            break;
-        };
+        _ = try d.upsert(t.allocator, .opencode_go, &id);
     }
+    try t.expectEqual(@as(usize, 1600), d.count);
+    try t.expect(d.used > 128 * 1024);
+    try t.expect(d.find(.opencode_go, &id) != null);
 }
 test "compact profiles round trip canonical wires and reject custom mappings" {
     const t = std.testing;

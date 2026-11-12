@@ -7,7 +7,6 @@ pub const model_id = "deepseek-flash";
 pub const max_image_bytes = 4 * 1024 * 1024;
 pub const max_dimension = 8192;
 pub const max_question_bytes = 4096;
-pub const max_result_bytes = 16 * 1024;
 /// Current Flash vision documentation: each image consumes at most 1024 tokens.
 /// A transport byte limit is separate; base64 bytes are not text-token usage.
 pub const image_token_bound: u32 = 1024;
@@ -70,7 +69,7 @@ pub const Service = struct {
             a.free(output.text);
             return error.Canceled;
         }
-        if (output.text.len == 0 or output.text.len > max_result_bytes or !std.unicode.utf8ValidateSlice(output.text) or std.mem.indexOfScalar(u8, output.text, 0) != null) {
+        if (output.text.len == 0 or !std.unicode.utf8ValidateSlice(output.text) or std.mem.indexOfScalar(u8, output.text, 0) != null) {
             a.free(output.text);
             return error.InvalidImageResponse;
         }

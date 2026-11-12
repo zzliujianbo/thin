@@ -71,25 +71,22 @@ pub fn rawTokens(system: []const u8, tools: []const p.ToolSchema, messages: []co
 /// Reserve minimal response room for hard input preflight. This does not set
 /// a model output allowance; output length belongs to the provider.
 fn windowInputBudget(config: cfg.Config) usize {
-    return @as(usize, config.model.context_tokens) -| config.limits.safety_tokens -| 1;
+    return @as(usize, config.model.context_tokens) -| cfg.Policy.safetyTokens(config.model.context_tokens) -| 1;
 }
 
 pub fn inputBudget(config: cfg.Config) usize {
     return inputBudgetFor(config, .normal);
 }
 
-/// Summary exempts only price policy. Explicit input caps and physical room remain.
+/// Summary exempts price policy but still respects physical context room.
 pub fn inputBudgetFor(config: cfg.Config, purpose: p.Purpose) usize {
     const window = windowInputBudget(config);
-    var ceiling: ?u32 = config.limits.max_input_tokens;
-    if (purpose == .normal and config.limits.low_price_input) {
-        const price_limit = if (config.model.input_price_threshold) |step|
-            (if (config.model.input_price_flat_limit) |flat| @min(step, flat) else step)
-        else
-            config.model.input_price_flat_limit orelse return 0;
-        ceiling = if (ceiling) |manual| @min(manual, price_limit) else price_limit;
-    }
-    return if (ceiling) |limit| @min(window, @as(usize, limit) -| config.limits.input_margin_tokens) else window;
+    if (purpose != .normal or !config.limits.low_price_input) return window;
+    const price_limit = if (config.model.input_price_threshold) |step|
+        (if (config.model.input_price_flat_limit) |flat| @min(step, flat) else step)
+    else
+        config.model.input_price_flat_limit orelse return 0;
+    return @min(window, @as(usize, price_limit) -| cfg.Policy.input_margin_tokens);
 }
 
 /// Enabled policy is conservative estimation, never an exact billing promise.
@@ -102,7 +99,7 @@ pub fn validateInputPolicy(config: cfg.Config) !void {
 }
 
 pub fn inputBudgetError(config: cfg.Config) anyerror {
-    return if (config.limits.low_price_input or config.limits.max_input_tokens != null) error.InputBudgetExceeded else error.ContextTooLarge;
+    return if (config.limits.low_price_input) error.InputBudgetExceeded else error.ContextTooLarge;
 }
 
 pub fn checkInput(config: cfg.Config, estimated_input: usize) !void {
@@ -111,8 +108,9 @@ pub fn checkInput(config: cfg.Config, estimated_input: usize) !void {
 
 pub fn checkInputFor(config: cfg.Config, purpose: p.Purpose, estimated_input: usize) !void {
     if (purpose == .normal) try validateInputPolicy(config);
+    if (estimated_input > windowInputBudget(config)) return error.ContextTooLarge;
     if (inputBudgetFor(config, purpose) == 0 or estimated_input > inputBudgetFor(config, purpose))
-        return inputBudgetError(config);
+        return if (purpose == .summary) error.ContextTooLarge else inputBudgetError(config);
 }
 
 /// 按百分比计算阈值（向下取整）。
@@ -125,14 +123,14 @@ pub fn threshold(budget: usize, percent: u8) usize {
 /// 中文：返回长度为 messages.len+1 的数组，safe[k] 为 true 表示 messages[0..k) 可以安全地整体切走。
 /// 工具组必须闭合；若某回合含 opaque 续接数据，则整个用户回合都要保留。运行时不解析线协议 JSON。
 pub fn boundaries(a: std.mem.Allocator, messages: []const p.Message) ![]bool {
-    const safe = try a.alloc(bool, messages.len + 1);
+    const safe = try a.alloc(bool, std.math.add(usize, messages.len, 1) catch return error.OutOfMemory);
+    errdefer a.free(safe);
     @memset(safe, false);
     // 空前缀总是安全的。
     safe[0] = true;
 
-    // 尚未收到结果的工具调用 ID 栈，上限 64 个。
-    var pending: [64][]const u8 = undefined;
-    var count: usize = 0;
+    var pending = std.StringHashMap(void).init(a);
+    defer pending.deinit();
     // 当前用户回合的起始下标，以及该回合是否需要整体保留。
     var turn_start: usize = 0;
     var retain_turn = false;
@@ -140,7 +138,7 @@ pub fn boundaries(a: std.mem.Allocator, messages: []const p.Message) ![]bool {
     for (messages, 0..) |message, i| {
         if (message.role == .user) {
             // 进入新的用户回合时，上一回合的工具组必须已经闭合。
-            if (count != 0) return error.IncompleteToolGroup;
+            if (pending.count() != 0) return error.IncompleteToolGroup;
             // 若旧回合需要整体保留，则其内部所有切分点都不安全。
             if (retain_turn) @memset(safe[turn_start + 1 .. i], false);
             turn_start = i;
@@ -149,41 +147,28 @@ pub fn boundaries(a: std.mem.Allocator, messages: []const p.Message) ![]bool {
 
         if (message.replay) |replay| retain_turn = retain_turn or replay.retain_turn;
         // assistant 消息开始时不能有未完成的工具组。
-        if (message.role == .assistant and count != 0) return error.IncompleteToolGroup;
+        if (message.role == .assistant and pending.count() != 0) return error.IncompleteToolGroup;
 
         for (message.blocks) |block| switch (block) {
             .tool_call => |call| {
                 // 只有 assistant 可以发起工具调用，且 ID 不能为空。
                 if (message.role != .assistant or call.id.len == 0) return error.InvalidToolAssociation;
                 // 同一组内不允许重复的调用 ID，否则结果无法唯一配对。
-                for (pending[0..count]) |id| if (std.mem.eql(u8, id, call.id)) return error.DuplicateToolId;
-                if (count == pending.len) return error.TooManyToolCalls;
-                pending[count] = call.id;
-                count += 1;
+                const entry = try pending.getOrPut(call.id);
+                if (entry.found_existing) return error.DuplicateToolId;
             },
             .tool_result => |result| {
                 // 只有 tool 角色可以携带工具结果。
                 if (message.role != .tool) return error.InvalidToolAssociation;
-                var found: ?usize = null;
-                for (pending[0..count], 0..) |id, k| {
-                    if (std.mem.eql(u8, id, result.call_id)) {
-                        found = k;
-                        break;
-                    }
-                }
-                // 结果找不到对应的调用时视为孤立结果，属于非法历史。
-                const k = found orelse return error.OrphanToolResult;
-                // 与栈顶交换后出栈，O(1) 删除，不关心 pending 中的顺序。
-                count -= 1;
-                pending[k] = pending[count];
+                if (!pending.remove(result.call_id)) return error.OrphanToolResult;
             },
             else => {},
         };
         // 只有没有未闭合工具调用时，messages[0..i+1) 才是安全切分点。
-        safe[i + 1] = count == 0;
+        safe[i + 1] = pending.count() == 0;
     }
 
-    if (count != 0) return error.IncompleteToolGroup;
+    if (pending.count() != 0) return error.IncompleteToolGroup;
     // 最后一个回合若需要整体保留，其内部切分点同样不安全。
     if (retain_turn and messages.len > turn_start) @memset(safe[turn_start + 1 .. messages.len], false);
     return safe;
@@ -235,7 +220,7 @@ fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, 
         inputBudgetFor(config, .summary)
     else
         inputBudget(config);
-    const target = threshold(target_budget, config.limits.compaction_target_percent);
+    const target = threshold(target_budget, cfg.Policy.compaction_target_percent);
 
     var best: ?usize = null;
     var cut: usize = 1;

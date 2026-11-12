@@ -182,7 +182,7 @@ fn scenario(allowed: bool) !void {
     defer root.deinit();
 
     const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
-    var memory = mem.Store.init(&root, config.limits);
+    var memory = mem.Store.init(&root);
 
     // 启动时 memory 快照为空，且 .thin 目录尚未创建。
     const snapshot = try memory.snapshot(a);
@@ -300,7 +300,7 @@ fn bashApproval(command: []const u8, decision: r.Decision, ask: bool, run: bool)
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
     const config = cfg.Config{ .provider = .{ .base_url = "http://unused.invalid", .api_key_env = "FAKE_KEY" }, .model = .{ .name = "scripted", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
-    var memory = mem.Store.init(&root, config.limits);
+    var memory = mem.Store.init(&root);
     var source = std.process.Environ.Map.init(a);
     defer source.deinit();
     try source.put("PATH", "/usr/bin:/bin");

@@ -12,7 +12,7 @@ test "registry headless resolves manual declarations without requests and protec
     try std.testing.expectEqual(@as(?u32, 128000), app.config.value.model.output_tokens);
     try std.testing.expect(!app.config.value.selection_pending);
     try std.testing.expect(app.environment.get("PATH") == null);
-    try std.testing.expectEqual(@as(usize, 2), app.journal.known_key_count);
+    try std.testing.expectEqual(@as(usize, 2), app.journal.known_keys.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
     var unresolved = app.config.value;
     unresolved.selection_pending = true;
@@ -33,8 +33,9 @@ test "registry headless default resolves exact cached directory with no handwrit
     try fixture.env.put("FAKE_GO_KEY", "fake-registry-cached");
     var store = try auth.Store.openExisting(std.testing.allocator, std.testing.io, fixture.home);
     defer store.deinit();
-    var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_go, "org/cached");
+    var listing: metadata.Listing = .{};
+    defer listing.deinit(std.testing.allocator);
+    const row = try listing.directory.upsert(std.testing.allocator, .opencode_go, "org/cached");
     row.available = true;
     row.protocol = .responses;
     row.tokens = 1000000;
@@ -42,12 +43,10 @@ test "registry headless default resolves exact cached directory with no handwrit
     row.dev_output_tokens = 128000;
     row.dev_input_price_threshold = 200000;
     row.dev_present = true;
-    cache.directory_mask = metadata.bit(.opencode_go);
-    _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), .{
-        .directory = cache.directory,
-        .directory_mask = cache.directory_mask,
-        .dev_done = true,
-    });
+    listing.directory_mask = metadata.bit(.opencode_go);
+    listing.dev_done = true;
+    var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+    defer committed.deinit(std.testing.allocator);
     const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
     defer app.deinit();
     try std.testing.expectEqual(.responses, app.config.value.model.protocol);
@@ -61,11 +60,10 @@ test "registry headless default resolves exact cached directory with no handwrit
     // Loading history must not be rejected by a changed input policy; current
     // capabilities still govern any subsequent send.
     app.config.value.limits.low_price_input = false;
-    app.config.value.limits.max_input_tokens = 100000;
-    app.config.value.limits.input_margin_tokens += 1;
+    app.config.value.model.context_tokens = 100000;
     try app.runtime.restoreCheckpoint(saved);
     try std.testing.expect(!app.runtime.config.limits.low_price_input);
-    try std.testing.expectEqual(@as(?u32, 100000), app.runtime.config.limits.max_input_tokens);
+    try std.testing.expectEqual(@as(u32, 100000), app.runtime.config.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }

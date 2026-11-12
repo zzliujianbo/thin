@@ -103,7 +103,7 @@ test "refinement exact IDs owned strings all-or-nothing validation" {
         } else |_| {}
     }
 }
-test "refinement response and input hard bounds UTF8 and allocation cleanup" {
+test "refinement large response input UTF8 identity and allocation cleanup" {
     const t = std.testing;
     const a = t.allocator;
     const Harness = struct {
@@ -120,11 +120,26 @@ test "refinement response and input hard bounds UTF8 and allocation cleanup" {
     const input: Input = .{ .refine_outputs = &.{.{ .id = "id", .text = big }} };
     try t.expectError(error.InvalidDecisionOutput, parseOutput(a, input, big));
     try t.expectError(error.InvalidDecisionOutput, parseOutput(a, input, "{\"items\":[{\"id\":\"id\",\"text\":\"\xff\"}]}"));
-    const too_long = try std.fmt.allocPrint(a, "{{\"items\":[{{\"id\":\"id\",\"text\":\"{s}\"}}]}}", .{big[0..8193]});
-    defer a.free(too_long);
-    try t.expectError(error.InvalidDecisionOutput, parseOutput(a, input, too_long));
+    @memset(big, 'x');
+    const large = try std.fmt.allocPrint(a, "{{\"items\":[{{\"id\":\"id\",\"text\":\"{s}\"}}]}}", .{big});
+    defer a.free(large);
+    const result = try parseOutput(a, input, large);
+    defer freeOutput(a, result);
+    try t.expectEqualStrings(big, result.refine_outputs[0].text);
     const repeated: [9]RefineItem = @splat(.{ .id = "id", .text = "original" });
+    // Nine duplicate IDs still fail for identity, not for the old item quota.
     try t.expectError(error.InvalidDecisionInput, encodeInput(a, .{ .refine_outputs = &repeated }));
+    var items: [9]RefineItem = undefined;
+    var ids: [9][1]u8 = undefined;
+    for (&items, &ids, 0..) |*item, *id, i| {
+        id[0] = @intCast('0' + i);
+        item.* = .{ .id = id, .text = big };
+    }
+    const encoded = try encodeInput(a, .{ .refine_outputs = &items });
+    defer a.free(encoded);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer parsed.deinit();
+    try t.expectEqual(@as(usize, 9), parsed.value.object.get("data").?.array.items.len);
     try t.expectError(error.InvalidDecisionInput, encodeInput(a, .{ .refine_outputs = repeated[0..2] }));
     try t.expectError(error.InvalidDecisionInput, encodeInput(a, .{ .command = .{ .command = "\xff" } }));
     const duplicate = "{\"items\":[{\"id\":\"id\",\"text\":\"x\",\"text\":\"y\"}]}";

@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v4 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v5 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -31,18 +31,13 @@ const background = @import("../core/background_status.zig");
 /// Peers are matched exactly: there is
 /// no older-wire compatibility path, migration or automatic worker restart.
 /// A mismatched peer is refused before adoption, display or controller claim.
-pub const version: u16 = 4;
+pub const version: u16 = 5;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
-/// Prompt, queue entry, tool result and notice text.
-pub const max_text: usize = 64 * 1024;
 pub const max_name: usize = 1024;
 pub const max_events: u16 = 32;
 pub const max_history: u16 = 32;
 pub const max_previews = 16;
-pub const max_blocks = 256;
-/// Reuses the project's fixed structural preflight depth (32), not a new parser.
-pub const max_json_depth: usize = json_bound.max_depth;
 
 /// Wire error codes. The client maps these to the exact `anyerror` values that
 /// `ui/session_client.describe` already classifies.
@@ -325,9 +320,9 @@ pub const Request = struct {
     }
 
     /// Required bounded, valid UTF-8 string without NUL.
-    pub fn stringField(self: *const Request, name: []const u8, max: usize) ![]const u8 {
+    pub fn stringField(self: *const Request, name: []const u8, max: ?usize) ![]const u8 {
         const raw = self.optionalString(name) orelse return error.BadRequest;
-        if (raw.len > max) return error.InputTooLarge;
+        if (max) |limit| if (raw.len > limit) return error.InputTooLarge;
         if (std.mem.findScalar(u8, raw, 0) != null or !std.unicode.utf8ValidateSlice(raw)) return error.BadRequest;
         return raw;
     }
@@ -361,8 +356,7 @@ fn valueU64(value: std.json.Value) !u64 {
 pub fn parseRequest(a: std.mem.Allocator, bytes: []const u8) !Request {
     if (bytes.len == 0 or bytes.len > unix.max_frame_len) return error.BadRequest;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.BadRequest;
-    // Allocation-free structural preflight before std.json allocates anything.
-    json_bound.bound(bytes, unix.max_frame_len, 65536) catch return error.BadRequest;
+    json_bound.validate(a, bytes) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadRequest;
 
     // `alloc_always` copies every string out of the frame, so a login key in
     // the body is private to `doc` and can be wiped before the arena is freed.
@@ -416,10 +410,7 @@ fn numberU64(value: std.json.Value) !u64 {
 // ---------------------------------------------------------------------------
 
 pub fn clipText(bytes: []const u8) []const u8 {
-    if (bytes.len <= max_text) return bytes;
-    var n = max_text;
-    while (n > 0 and (bytes[n] & 0xc0) == 0x80) n -= 1;
-    return bytes[0..n];
+    return bytes;
 }
 
 fn appendString(buf: *std.ArrayList(u8), a: std.mem.Allocator, bytes: []const u8) !void {
@@ -490,13 +481,12 @@ fn appendInt(buf: *std.ArrayList(u8), a: std.mem.Allocator, value: anytype) !voi
 
 pub const Raw = struct { json: []const u8 };
 
-/// Bounded JSON response builder. Nesting is limited to max_json_depth.
+/// Owned JSON builder with dynamically sized container separator state.
 pub const Out = struct {
     a: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
     depth: usize = 0,
-    comma: [max_json_depth + 2]bool = @splat(false),
-    failed: bool = false,
+    comma: std.ArrayList(bool) = .empty,
 
     pub fn init(a: std.mem.Allocator) Out {
         return .{ .a = a };
@@ -504,6 +494,7 @@ pub const Out = struct {
 
     pub fn deinit(self: *Out) void {
         self.buf.deinit(self.a);
+        self.comma.deinit(self.a);
         self.* = undefined;
     }
 
@@ -513,7 +504,7 @@ pub const Out = struct {
         try self.buf.appendSlice(self.a, ",\"id\":");
         try appendInt(&self.buf, self.a, id);
         try self.buf.appendSlice(self.a, ",\"ok\":true");
-        self.comma[0] = true;
+        try self.comma.append(self.a, true);
     }
 
     pub fn fail(self: *Out, id: u64, code: ErrorCode) !void {
@@ -527,12 +518,15 @@ pub const Out = struct {
         // fields; only `finish` closes it. Closing here produced a frame with a
         // trailing stray brace once the caller finished normally.
         try self.buf.append(self.a, '"');
-        self.comma[0] = true;
+        try self.comma.append(self.a, true);
     }
 
     fn separate(self: *Out) !void {
-        if (self.comma[self.depth]) try self.buf.append(self.a, ',');
-        self.comma[self.depth] = true;
+        // Client requests open the implicit root directly in buf. Reserve its
+        // separator state before writing any field bytes; OOM stays local.
+        if (self.comma.items.len == 0) try self.comma.append(self.a, false);
+        if (self.comma.items[self.depth]) try self.buf.append(self.a, ',');
+        self.comma.items[self.depth] = true;
     }
 
     pub fn key(self: *Out, name: []const u8) !void {
@@ -593,30 +587,31 @@ pub const Out = struct {
     }
 
     pub fn beginObjectRaw(self: *Out) !void {
-        if (self.depth + 1 >= self.comma.len) return error.BadRequest;
+        if (self.comma.items.len == 0) try self.comma.append(self.a, false);
+        try self.comma.append(self.a, false);
         try self.buf.append(self.a, '{');
         self.depth += 1;
-        self.comma[self.depth] = false;
     }
 
     pub fn endObject(self: *Out) !void {
         try self.buf.append(self.a, '}');
         if (self.depth == 0) return error.BadRequest;
         self.depth -= 1;
+        _ = self.comma.pop();
     }
 
     pub fn beginArray(self: *Out, name: []const u8) !void {
         try self.key(name);
-        if (self.depth + 1 >= self.comma.len) return error.BadRequest;
+        try self.comma.append(self.a, false);
         try self.buf.append(self.a, '[');
         self.depth += 1;
-        self.comma[self.depth] = false;
     }
 
     pub fn endArray(self: *Out) !void {
         try self.buf.append(self.a, ']');
         if (self.depth == 0) return error.BadRequest;
         self.depth -= 1;
+        _ = self.comma.pop();
     }
 
     /// Append one scalar-encoded value as an array element. `value` writes raw
@@ -762,8 +757,9 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
     var out = Out{ .a = a, .buf = buf.* };
     // The builder appends into the caller's list; publish it on every exit.
     defer buf.* = out.buf;
-    var truncated = if (meta) |value| value.truncated else false;
-    var complete = if (meta) |value| value.canonical_complete else true;
+    defer out.comma.deinit(a);
+    const truncated = if (meta) |value| value.truncated else false;
+    const complete = if (meta) |value| value.canonical_complete else true;
     try out.beginObjectRaw();
     switch (event) {
         .state => |phase| {
@@ -787,24 +783,20 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
         .assistant_committed => |blocks| {
             try out.field("t", "assistant");
             try out.beginArray("blocks");
-            var bytes: usize = 0;
-            const bounded = @min(blocks.len, max_blocks);
             var n: usize = 0;
-            while (n < bounded and bytes < max_text) : (n += 1) {
+            while (n < blocks.len) : (n += 1) {
                 const block = blocks[n];
                 var element = Out{ .a = a, .buf = std.ArrayList(u8).empty };
-                defer element.buf.deinit(a);
+                defer element.deinit();
                 try element.beginObjectRaw();
                 switch (block) {
                     .text => |text| {
                         try element.field("k", "text");
                         try element.field("v", text);
-                        bytes +|= @min(text.len, max_text);
                     },
                     .reasoning => |text| {
                         try element.field("k", "reasoning");
                         try element.field("v", text);
-                        bytes +|= @min(text.len, max_text);
                     },
                     .tool_call => |call| {
                         try element.field("k", "tool_call");
@@ -812,7 +804,6 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
                         try element.field("name", call.name);
                         try element.field("args", call.arguments);
                         try element.field("item", call.item_id);
-                        bytes +|= @min(call.arguments.len, max_text) + @min(call.name.len, max_name);
                     },
                     .tool_result => |result| {
                         try element.field("k", "tool_result");
@@ -821,18 +812,12 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
                         try element.field("is_error", result.is_error);
                         try element.field("canceled", result.canceled);
                         try element.field("trunc", result.truncated);
-                        bytes +|= @min(result.text.len, max_text);
                     },
                 }
                 try element.endObject();
                 try out.element(element.buf.items);
             }
             try out.endArray();
-            // A bounded or byte-capped block list must never look final.
-            if (n < blocks.len) {
-                truncated = true;
-                complete = false;
-            }
         },
         .user_committed => |value| {
             try out.field("t", "user");
@@ -872,12 +857,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try encodeCaption(&out, "display", view.display);
             try encodeProgress(&out, "wprog", view.write_progress);
             if (view.subagent_progress) |progress| {
-                var n = @min(progress.len, 2048);
-                if (n < progress.len) {
-                    while (n > 0 and (progress[n] & 0xc0) == 0x80) n -= 1;
-                    truncated = true;
-                }
-                try out.field("sprog", progress[0..n]);
+                try out.field("sprog", progress);
             } else try out.field("sprog", @as(?[]const u8, null));
         },
         .permission => |value| {
@@ -1004,10 +984,6 @@ fn encodeEventWith(a: std.mem.Allocator, event: r.Event, meta: ?EventMeta) ![]u8
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(a);
     try appendEventWith(&buf, a, event, meta);
-    if (buf.items.len > max_text * 3 + 8192) {
-        buf.deinit(a);
-        return error.InputTooLarge;
-    }
     return buf.toOwnedSlice(a);
 }
 
@@ -1328,9 +1304,7 @@ fn decodeProgress(object: std.json.ObjectMap, name: []const u8) !?write_preview.
 }
 
 fn decodeSubagentProgress(object: std.json.ObjectMap) !?[]const u8 {
-    const value = try optionalText(object, "sprog");
-    if (value) |text| if (text.len > 2048) return error.BadRequest;
-    return value;
+    return optionalText(object, "sprog");
 }
 
 fn decodeFileStats(object: std.json.ObjectMap, name: []const u8) !?line_stats.File {
@@ -1516,7 +1490,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
     if (json.len == 0 or json.len > max_response) return error.BadRequest;
     if (!std.unicode.utf8ValidateSlice(json)) return error.BadRequest;
     // Allocation-free structural preflight before std.json allocates anything.
-    json_bound.bound(json, unix.max_frame_len, 65536) catch return error.BadRequest;
+    json_bound.validate(a, json) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadRequest;
 
     var doc = std.json.parseFromSlice(std.json.Value, a, json, .{
         .allocate = .alloc_always,
@@ -1532,8 +1506,8 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
         else => return error.BadRequest,
     };
     const arena = doc.arena.allocator();
-    var display_truncated = try optionalBool(object, "disp_trunc") orelse false;
-    var canonical_complete = try optionalBool(object, "canon_complete") orelse true;
+    const display_truncated = try optionalBool(object, "disp_trunc") orelse false;
+    const canonical_complete = try optionalBool(object, "canon_complete") orelse true;
     const epoch = try optionalU64(object, "epoch") orelse 0;
 
     const kind = try requireText(object, "t");
@@ -1637,14 +1611,10 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
         event = .{ .compaction_failed = Failure.toError(failure) orelse error.RemoteFailure };
     } else if (std.mem.eql(u8, kind, "assistant")) {
         const array = try requireArray(object, "blocks");
-        const count = @min(array.items.len, max_blocks);
+        const count = array.items.len;
         // Arena-owned: same lifetime as the decoded text, freed by `doc.deinit`.
         const blocks = try arena.alloc(p.Block, count);
         for (array.items[0..count], 0..) |item, i| blocks[i] = try decodeBlock(item);
-        if (array.items.len > count) {
-            display_truncated = true;
-            canonical_complete = false;
-        }
         event = .{ .assistant_committed = blocks };
     } else if (std.mem.eql(u8, kind, "background_completed")) {
         event = .{ .background_completed = try decodeBackgroundTerminal(object) };

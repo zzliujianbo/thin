@@ -6,8 +6,6 @@ pub const Menu = @import("provider_picker.zig").Picker;
 pub const Rows = @import("settings_menu.zig").Rows;
 pub const Provider = @import("model_picker.zig").Provider;
 pub const Choice = union(enum) { off, model: []const u8 };
-pub const max_models = 4096;
-pub const max_providers = 256;
 pub const max_name_bytes = 1089;
 pub const Fingerprint = [32]u8;
 
@@ -21,7 +19,7 @@ fn eligible(model: cfg.Model, providers: ?[]const Provider) bool {
     const slash = std.mem.indexOfScalar(u8, model.name, '/') orelse return false;
     if (slash == 0 or slash + 1 == model.name.len) return false;
     const entries = providers orelse return false;
-    for (entries[0..@min(entries.len, max_providers)]) |entry| {
+    for (entries) |entry| {
         if (std.mem.eql(u8, entry.name, model.name[0..slash])) return true;
     }
     return false;
@@ -43,7 +41,7 @@ fn matches(label: []const u8, query: []const u8) bool {
 }
 pub fn count(models: []const cfg.Model, providers: ?[]const Provider, query: []const u8) usize {
     var n: usize = @intFromBool(matches("Off", query));
-    for (models[0..@min(models.len, max_models)]) |model| if (eligible(model, providers) and matches(model.name, query)) {
+    for (models) |model| if (eligible(model, providers) and matches(model.name, query)) {
         n += 1;
     };
     return n;
@@ -52,7 +50,7 @@ pub fn choice(models: []const cfg.Model, providers: ?[]const Provider, query: []
     const off = matches("Off", query);
     if (off and index == 0) return .off;
     var n: usize = @intFromBool(off);
-    for (models[0..@min(models.len, max_models)]) |model| {
+    for (models) |model| {
         if (!eligible(model, providers) or !matches(model.name, query)) continue;
         if (n == index) return .{ .model = model.name };
         n += 1;
@@ -62,7 +60,7 @@ pub fn choice(models: []const cfg.Model, providers: ?[]const Provider, query: []
 pub fn indexOf(models: []const cfg.Model, providers: ?[]const Provider, query: []const u8, current: ?[]const u8) usize {
     const name = current orelse return 0;
     var n: usize = @intFromBool(matches("Off", query));
-    for (models[0..@min(models.len, max_models)]) |model| {
+    for (models) |model| {
         if (!eligible(model, providers) or !matches(model.name, query)) continue;
         if (std.mem.eql(u8, model.name, name)) return n;
         n += 1;
@@ -74,11 +72,9 @@ fn hashString(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     hash.update(std.mem.asBytes(&len));
     hash.update(value);
 }
-/// Fixed-size identity proof; work and bytes are bounded. Oversized catalogs
-/// may be previewed but cannot authorize saves. Null providers means empty.
+/// Fixed-size identity proof over the complete catalog. Null providers means empty.
 pub fn fingerprint(models: []const cfg.Model, providers: ?[]const Provider) ?Fingerprint {
     const entries = providers orelse &.{};
-    if (models.len > max_models or entries.len > max_providers) return null;
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&models.len));
     for (models) |model| {

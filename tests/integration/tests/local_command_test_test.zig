@@ -78,12 +78,11 @@ test "local command decision ask and review failure preserve pairing" {
         }
     }
 }
-test "local command cancellation timeout cleanup prepare and host errors finish once" {
+test "local command approval and execution cancellation cleanup prepare and host errors finish once" {
     for (0..6) |mode| {
         var cancel: p.Cancellation = .{};
-        var fake: Fake = .{ .cancel_on_approval = if (mode == 0) &cancel else null, .block = mode == 1, .cleanup = mode == 2, .prepare_error = mode == 3, .disconnect = mode == 4, .execute_error = mode == 5 };
-        var config = configuration();
-        if (mode == 1) config.limits.task_timeout_ms = 10;
+        var fake: Fake = .{ .cancel_on_approval = if (mode == 0) &cancel else null, .cancel_on_execute = if (mode == 1) &cancel else null, .cleanup = mode == 2, .prepare_error = mode == 3, .disconnect = mode == 4, .execute_error = mode == 5 };
+        const config = configuration();
         var runtime = try fake.init(&config, false);
         defer runtime.deinit();
         fake.runtime = &runtime;
@@ -92,7 +91,11 @@ test "local command cancellation timeout cleanup prepare and host errors finish 
         try std.testing.expectEqual(@as(usize, 1), fake.finished);
         try std.testing.expectEqual(@as(usize, 0), fake.primary);
         if (mode == 0) try std.testing.expectEqual(r.Status.canceled, terminal.status);
-        if (mode == 1) try std.testing.expectEqual(error.TaskTimeout, terminal.detail.?);
+        if (mode == 1) {
+            try std.testing.expectEqual(error.Canceled, terminal.detail.?);
+            try std.testing.expectEqual(r.Status.canceled, terminal.status);
+            try std.testing.expectEqual(@as(usize, 1), fake.executions);
+        }
         if (mode == 2) {
             try std.testing.expect(runtime.poisoned);
             const before = fake.executions;
@@ -113,14 +116,33 @@ test "local command validates before adding executable history" {
     for ([_][]const u8{ "! ", "no bang", "!x\x00", "!\xff" }) |text| {
         try std.testing.expectEqual(error.InvalidInput, (try runtime.executeCommand(text, &cancel)).detail.?);
     }
-    var oversized: [32770]u8 = @splat('x');
-    oversized[0] = '!';
-    try std.testing.expectEqual(error.InputTooLarge, (try runtime.executeCommand(&oversized, &cancel)).detail.?);
     try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
-    try std.testing.expectEqual(@as(usize, 5), fake.finished);
+    try std.testing.expectEqual(@as(usize, 4), fake.finished);
     cancel.cancel();
     try std.testing.expectEqual(r.Status.canceled, (try runtime.executeCommand("!not started", &cancel)).status);
     try std.testing.expectEqual(@as(usize, 0), fake.executions + fake.primary);
+}
+test "local command accepts shell input beyond former command byte quota" {
+    var fake: Fake = .{ .capture_command = true };
+    const config = configuration();
+    var runtime = try fake.init(&config, false);
+    defer runtime.deinit();
+    fake.runtime = &runtime;
+    // A valid no-op with trailing spaces crosses 32 KiB but stays well below
+    // the operating system's per-argument limit. Execute it rather than mocking.
+    const submitted = try a.alloc(u8, 32770);
+    defer a.free(submitted);
+    @memset(submitted, ' ');
+    @memcpy(submitted[0..2], "!:");
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.executeCommand(submitted, &cancel)).status);
+    try std.testing.expectEqualStrings(submitted, runtime.messages()[0].blocks[0].text);
+    const parsed = try std.json.parseFromSlice(struct { command: []const u8 }, a, runtime.messages()[1].blocks[1].tool_call.arguments, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(submitted[1..], parsed.value.command);
+    try std.testing.expectEqual(@as(usize, 1), fake.executions);
+    try std.testing.expectEqual(@as(usize, 0), fake.primary);
+    try paired(&runtime);
 }
 test "local command matches trimmed UI prefix but preserves exact shell bytes" {
     var fake: Fake = .{};
@@ -142,20 +164,22 @@ test "local command matches trimmed UI prefix but preserves exact shell bytes" {
     try std.testing.expectEqualStrings(" printf '%s' escaped\\ \n", parsed.value.command);
     try paired(&runtime);
 }
-test "local command retains response cap independently of input policy" {
-    var fake: Fake = .{};
-    var config = configuration();
-    config.limits.max_response_bytes = 1024;
-    config.limits.max_event_bytes = 1024;
+test "local command preserves full captured output beyond former response quota without inference" {
+    var fake: Fake = .{ .capture_command = true };
+    const config = configuration();
     var runtime = try fake.init(&config, false);
     defer runtime.deinit();
     fake.runtime = &runtime;
     const calibration = runtime.estimator;
     var cancel: p.Cancellation = .{};
-    _ = try runtime.executeCommand("!bounded", &cancel);
+    // A short shell-only command emits more than the former 16 MiB quota;
+    // do not pass an oversized script through execve/ARG_MAX.
+    const terminal = try runtime.executeCommand("!i=0; while [ \"$i\" -lt 8193 ]; do printf '%02048d' 0; i=$((i+1)); done", &cancel);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
     const result = runtime.messages()[2].blocks[0].tool_result;
-    try std.testing.expectEqual(@as(usize, 1024), result.text.len);
-    try std.testing.expect(result.truncated);
+    try std.testing.expectEqual(@as(usize, 8193 * 2048), result.text.len);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, result.text, "0").len);
+    try std.testing.expect(!result.truncated);
     try std.testing.expectEqualDeep(calibration, runtime.estimator);
     try std.testing.expectEqual(@as(usize, 0), fake.primary);
     try paired(&runtime);
@@ -167,7 +191,7 @@ test "local command dense imported IDs are indexed once and pre-cancel never all
     defer runtime.deinit();
     fake.runtime = &runtime;
     const owned = runtime.arena.allocator();
-    const count = 65536;
+    const count = 65537;
     const calls = try owned.alloc(p.Block, count);
     const results = try owned.alloc(p.Block, count);
     for (calls, results, 1..) |*call, *result, number| {
@@ -186,9 +210,9 @@ test "local command dense imported IDs are indexed once and pre-cancel never all
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(r.Status.success, (try runtime.executeCommand("!new", &cancel)).status);
     const new_call = runtime.messages()[3].blocks[1].tool_call;
-    try std.testing.expectEqualStrings("local_command_65537", new_call.id);
+    try std.testing.expectEqualStrings("local_command_65538", new_call.id);
     try std.testing.expectEqualStrings(new_call.id, runtime.messages()[4].blocks[0].tool_result.call_id);
-    try std.testing.expectEqual(@as(u64, 65538), runtime.permission_id);
+    try std.testing.expectEqual(@as(u64, 65539), runtime.permission_id);
     try std.testing.expectEqual(@as(usize, 1), fake.executions);
     try std.testing.expectEqual(@as(usize, 0), fake.primary);
     try std.testing.expectEqual(@as(usize, 2), fake.finished);
@@ -213,34 +237,30 @@ test "local command malformed output completes may-have-run and cleanup failure 
         try paired(&runtime);
     }
 }
-test "local command UTF8 truncation aligns multibyte scalars and rejects malformed prefixes" {
-    // Exercise each split position of a four-byte scalar at the byte cap.
+test "local command preserves complete UTF8 across former byte boundaries and rejects malformed output" {
+    // Exercise each former split position of a four-byte scalar.
     for (1..4) |split| {
         var bytes: [1030]u8 = @splat('x');
         const start = 1024 - split;
         @memcpy(bytes[start..][0..4], "\xf0\x9f\x98\x80");
         var fake: Fake = .{ .result_text = &bytes };
-        var config = configuration();
-        config.limits.max_response_bytes = 1024;
-        config.limits.max_event_bytes = 1024;
+        const config = configuration();
         var runtime = try fake.init(&config, false);
         defer runtime.deinit();
         fake.runtime = &runtime;
         var cancel: p.Cancellation = .{};
         try std.testing.expectEqual(r.Status.success, (try runtime.executeCommand("!utf8", &cancel)).status);
         const result = runtime.messages()[2].blocks[0].tool_result;
-        try std.testing.expectEqual(start, result.text.len);
+        try std.testing.expectEqualStrings(&bytes, result.text);
         try std.testing.expect(std.unicode.utf8ValidateSlice(result.text));
-        try std.testing.expect(result.truncated);
+        try std.testing.expect(!result.truncated);
         try paired(&runtime);
     }
-    // Large malformed prefix: one bounded validation, no bytewise rescans.
+    // Malformed UTF8 remains invalid even without a capture byte quota.
     var bytes: [8192]u8 = @splat('x');
     bytes[0] = 0xff;
     var fake: Fake = .{ .result_text = &bytes };
-    var config = configuration();
-    config.limits.max_response_bytes = 4096;
-    config.limits.max_event_bytes = 4096;
+    const config = configuration();
     var runtime = try fake.init(&config, false);
     defer runtime.deinit();
     fake.runtime = &runtime;

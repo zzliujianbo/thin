@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const fs = @import("../platform/filesystem.zig");
-const config = @import("../core/config.zig");
 
 const Root = fs.Root;
 extern "c" fn fsync(c_int) c_int;
@@ -26,14 +25,12 @@ pub const Entry = struct { content: []const u8, version: []const u8 };
 pub const Store = struct {
     /// 项目根目录（不是 .thin/memory 本身）。
     root: *Root,
-    /// core 与单条分片的大小上限。There is no total index budget.
-    limits: config.Limits,
     /// Optional reference reads may decline contention; manual operations wait.
     wait_for_lock: bool = true,
 
     /// 创建 Store；本身不做任何磁盘操作。
-    pub fn init(root: *Root, limits: config.Limits) Store {
-        return .{ .root = root, .limits = limits };
+    pub fn init(root: *Root) Store {
+        return .{ .root = root };
     }
 
     /// 获取跨线程、跨进程的独占锁。每次都重新 open 根目录得到新的 open description，
@@ -69,25 +66,23 @@ pub const Store = struct {
         };
     }
 
-    /// 检查文件大小是否超出 core 或分片的上限（core 与分片使用不同配额）。
-    fn bound(self: *Store, topic: []const u8, size: u64) !void {
-        if (std.mem.eql(u8, topic, "core")) {
-            if (size > self.limits.core_bytes) return error.CoreTooLarge;
-        } else if (size > self.limits.shard_bytes) return error.ShardTooLarge;
-    }
-
     /// 读取 topic 正文并计算版本；返回的 content 与 version 都由 a 分配，调用方释放。
     fn load(self: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8) !Entry {
         const name = try filename(a, topic);
         defer a.free(name);
-        const max = if (std.mem.eql(u8, topic, "core")) self.limits.core_bytes else self.limits.shard_bytes;
-        const r = try mem.read(a, name, 0, max);
-        errdefer a.free(r.data);
-
-        // 先按真实大小校验；若读取被截断却仍通过校验，说明读取期间文件被改动，返回 FileChanged。
-        try self.bound(topic, r.total_bytes);
-        if (r.truncated) return error.FileChanged;
-        return .{ .content = r.data, .version = try version(a, r.data) };
+        const fd = fs.openAt(mem.dir.handle, name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
+        if (fd < 0) return fs.osError();
+        defer fs.closeFd(fd);
+        const file = fs.fileFromFd(fd);
+        const stat = try file.stat(self.root.io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+        const data = try a.alloc(u8, size);
+        errdefer a.free(data);
+        if (try file.readPositionalAll(self.root.io, data, 0) != size) return error.FileChanged;
+        if ((try file.stat(self.root.io)).size != stat.size) return error.FileChanged;
+        try fs.validateText(data);
+        return .{ .content = data, .version = try version(a, data) };
     }
 
     /// 在锁内读取 topic。topic 先于加锁校验；返回的 Entry 由 allocator 分配，调用方释放。
@@ -112,7 +107,6 @@ pub const Store = struct {
 
     fn writeImpl(self: *Store, allocator: std.mem.Allocator, topic: []const u8, content: []const u8, expected_version: ?[]const u8, guard: ?u64) !Entry {
         try validTopic(topic);
-        try self.bound(topic, content.len);
         try fs.validateText(content);
         // Reserve all result allocations before committing a filesystem change.
         const owned_content = try allocator.dupe(u8, content);
@@ -361,7 +355,7 @@ pub const Store = struct {
 
     /// Read only the first line, capped at max_title_bytes. Truncation happens
     /// on a UTF-8 boundary; the complete body is never loaded for listing.
-    fn firstLine(self: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8) ![]const u8 {
+    fn firstLine(_: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8) ![]const u8 {
         const name = try filename(a, topic);
         defer a.free(name);
         var parent = try mem.parent(name);
@@ -375,7 +369,6 @@ pub const Store = struct {
         const file = fs.fileFromFd(fd);
         const stat = try file.stat(mem.io);
         if (stat.kind != .file) return error.NotRegularFile;
-        try self.bound(topic, stat.size);
 
         const want: usize = @intCast(@min(stat.size, max_title_bytes));
         const line = try a.alloc(u8, want);

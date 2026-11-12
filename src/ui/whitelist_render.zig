@@ -27,14 +27,16 @@ const Sink = struct {
     base: usize,
     seed: Checkpoint,
     preview: bool = false,
-    max_rows: usize,
+    max_rows: ?usize,
     overflow: bool = false,
     fn onRow(ctx: *anyopaque, line: []const u8, _: usize, _: []const u8) output.Error!void {
         const self: *Sink = @ptrCast(@alignCast(ctx));
-        if (self.rows.items.len >= self.max_rows) {
-            self.a.free(line);
-            self.overflow = true;
-            return;
+        if (self.max_rows) |max_rows| {
+            if (self.rows.items.len >= max_rows) {
+                self.a.free(line);
+                self.overflow = true;
+                return;
+            }
         }
         const end = self.writer.origin_end;
         var cp = self.seed;
@@ -55,10 +57,19 @@ const Sink = struct {
 
 /// `source` is the entire retained window, including lookahead beyond quantum.
 pub fn render(a: std.mem.Allocator, source: []const u8, base: usize, state: scan.State, final: bool, columns: usize, ansi: bool, tone: output.Tone, quantum: usize, max_rows: usize) !Result {
-    var budget: output.Budget = .{};
-    var writer: output.Writer = .{ .a = a, .columns = std.math.clamp(columns, 1, 512), .ansi = ansi, .base = tone, .budget = &budget };
-    defer writer.deinit();
     if (max_rows == 0) return error.MarkdownRenderLimit;
+    return renderImpl(a, source, base, state, final, columns, ansi, tone, quantum, max_rows);
+}
+
+/// Complete static rendering uses the same scanner without streaming budgets.
+pub fn renderAll(a: std.mem.Allocator, source: []const u8, columns: usize, ansi: bool, tone: output.Tone) !Result {
+    return renderImpl(a, source, 0, .{}, true, columns, ansi, tone, source.len, null);
+}
+
+fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan.State, final: bool, columns: usize, ansi: bool, tone: output.Tone, quantum: usize, max_rows: ?usize) !Result {
+    var budget: output.Budget = .{};
+    var writer: output.Writer = .{ .a = a, .columns = std.math.clamp(columns, 1, 512), .ansi = ansi, .base = tone, .budget = if (max_rows != null) &budget else null };
+    defer writer.deinit();
     var sink: Sink = .{ .a = a, .writer = &writer, .base = base, .seed = .{ .end = base, .state = state }, .max_rows = max_rows };
     defer sink.trace.deinit(a);
     errdefer {
@@ -72,8 +83,8 @@ pub fn render(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
     while (offset < source.len) {
         // Work quantum is a yield point, not a hard source cap. Finish one
         // physical row first; enforce a bounded pathological-row policy below.
-        if (sink.rows.items.len >= max_rows or (offset >= @max(quantum, 1) and sink.rows.items.len != 0)) break;
-        if (base + offset - sink.seed.end > max_row_source_bytes) return error.MarkdownRenderLimit;
+        if ((if (max_rows) |n| sink.rows.items.len >= n else false) or (max_rows != null and offset >= @max(quantum, 1) and sink.rows.items.len != 0)) break;
+        if (max_rows != null and base + offset - sink.seed.end > max_row_source_bytes) return error.MarkdownRenderLimit;
         switch (scan.next(source, base, offset, current, final)) {
             .need_more => {
                 stopped = true;
@@ -88,20 +99,21 @@ pub fn render(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
                 if (token.text.len != 0) {
                     if (!std.meta.eql(writer.style, token.style)) try writer.setStyle(token.style);
                     try writer.emitSourced(token.text, token.start, token.end, token.exact);
-                    if (writer.cluster != null and !writer.pending_origin_synthetic and
+                    if (max_rows != null and writer.cluster != null and !writer.pending_origin_synthetic and
                         writer.pending_origin_end - writer.pending_origin_start > max_cluster_source_bytes)
                         return error.MarkdownRenderLimit;
                 }
-                if (base + offset - sink.seed.end > max_row_source_bytes) return error.MarkdownRenderLimit;
+                if (max_rows != null and base + offset - sink.seed.end > max_row_source_bytes) return error.MarkdownRenderLimit;
             },
         }
     }
     const work = offset;
     const eof = final and !stopped and offset == source.len;
-    if (writer.hasContent() and sink.rows.items.len < max_rows) {
+    const full = if (max_rows) |n| sink.rows.items.len >= n else false;
+    if (writer.hasContent() and !full) {
         sink.preview = !eof;
         try writer.finish();
-    } else if (sink.rows.items.len >= max_rows and (sink.overflow or writer.hasContent() or !eof)) {
+    } else if (full and (sink.overflow or writer.hasContent() or !eof)) {
         // The staged next cluster belongs to the next build, never this frame.
         offset = sink.seed.end - base;
     }

@@ -1,15 +1,16 @@
 test "official context requires an available exact directory row and compatible route" {
     var cache: metadata.Cache = .{};
+    defer cache.deinit(std.testing.allocator);
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
     // A static preset is a useful local fallback, never official evidence.
     try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
-    const row = try cache.directory.upsert(.opencode_go, "gpt-6-luna-alias");
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_go, "gpt-6-luna-alias");
     row.available = true;
     row.protocol = .responses;
     row.tokens = entry.model.context_tokens;
     cache.directory_mask = metadata.bit(.opencode_go);
     try std.testing.expect(!officialContext(&cache, entry, entry.model.context_tokens));
-    const exact = try cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    const exact = try cache.directory.upsert(std.testing.allocator, .opencode_go, "gpt-6-luna");
     exact.dev_present = true;
     exact.dev_protocol = .responses;
     exact.dev_context_tokens = entry.model.context_tokens;
@@ -32,7 +33,8 @@ test "provider reasoning source resolver uses official and preserves manual over
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.deepseek, "fixture");
+    defer cache.deinit(std.testing.allocator);
+    const row = try cache.directory.upsert(std.testing.allocator, .deepseek, "fixture");
     row.protocol = .chat;
     row.dev_protocol = .chat;
     row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .low = "low" } });
@@ -42,7 +44,7 @@ test "provider reasoning source resolver uses official and preserves manual over
     selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "ds", "fixture", false);
     try std.testing.expectEqualStrings("high", selection.model.reasoning.?.map.high.?);
     try std.testing.expect(selection.model.reasoning.?.map.low == null);
-    const manual = try cache.directory.upsert(.deepseek, "manual");
+    const manual = try cache.directory.upsert(std.testing.allocator, .deepseek, "manual");
     manual.protocol = .chat;
     selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "ds", "manual", false);
     try std.testing.expectEqualStrings("user-high", selection.model.reasoning.?.map.high.?);
@@ -59,7 +61,8 @@ test "SystemOne cache-only selection needs no capacity and imports no generative
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_zen, "reviewer");
+    defer cache.deinit(std.testing.allocator);
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_zen, "reviewer");
     row.available = true;
     row.protocol = .systemone;
     row.tokens = 200000;
@@ -96,9 +99,11 @@ test "models.dev SystemOne routes only exact Zen to native retaining alias crede
         \\{"llm":{"default":"zen/reviewer","providers":{"zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen","api_key":"fake-own-key"},"other":{"base_url":"https://opencode.ai/zen/v1","api_key":"fake-other-key"},"custom":{"base_url":"http://127.0.0.1:1/v1","models":{"reviewer":{"protocol":"systemone"}}},"lookalike":{"base_url":"https://opencode.ai.example/zen/v1","kind":"opencode_zen","models":{"reviewer":{"protocol":"systemone"}}},"go":{"base_url":"https://opencode.ai/zen/go/v1"},"native":{"base_url":"https://opencode.ai/inference/systemone/v1/","api_key_env":"OWN_FIXTURE_KEY"}}},"proxy":{"address":"127.0.0.1","port":7890,"models":["zen/reviewer"]}}
     );
     defer cfg.release(&parsed);
-    const listing = try metadata.parseDev(a,
+    var listing = try metadata.parseDev(a,
         \\{"opencode":{"models":{"reviewer":{"api":{"url":"https://opencode.ai/inference/systemone/v1"}}}},"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"reviewer":{"limit":{"context":32768}}}}}
     );
+    defer listing.deinit(a);
+    // Borrow only; listing owns the directory throughout all resolver calls.
     const cache: metadata.Cache = .{ .directory = listing.directory };
     try std.testing.expectEqual(Protocol.systemone, try protocolFor(parsed.value, &cache, "zen", "reviewer"));
     const selection = try resolve(parsed.arena.allocator(), parsed.value, &cache, "zen", "reviewer", false);
@@ -147,6 +152,7 @@ test "price proof resolves exact direct flat routes and clears on proxy protocol
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
+    defer cache.deinit(std.testing.allocator);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const flat = try resolve(arena.allocator(), parsed.value, &cache, "ds", "deepseek-flash", false);
@@ -163,7 +169,7 @@ test "price proof resolves exact direct flat routes and clears on proxy protocol
     candidate.model.protocol = .responses;
     applyInputThreshold(&cache, &candidate);
     try std.testing.expect(candidate.model.input_price_flat_limit == null);
-    const row = try cache.directory.upsert(.deepseek, "deepseek-flash");
+    const row = try cache.directory.upsert(std.testing.allocator, .deepseek, "deepseek-flash");
     row.dev_protocol = .chat;
     row.dev_input_price_threshold = 100000;
     candidate.model = flat.model;
@@ -186,7 +192,8 @@ test "registry resolution merges fields but never borrows identity from a custom
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_go, "shared");
+    defer cache.deinit(std.testing.allocator);
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_go, "shared");
     row.available = true;
     row.protocol = .responses;
     row.tokens = 1000000;
@@ -227,7 +234,8 @@ test "registry unrelated incompatible partial profile cannot poison an independe
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_go, "stale");
+    defer cache.deinit(std.testing.allocator);
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_go, "stale");
     row.available = true;
     row.protocol = .chat;
     row.tokens = 65536;
@@ -243,14 +251,17 @@ test "registry dynamic unknown window cannot adopt a display or archived capabil
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_go, "never-a-preset");
+    defer cache.deinit(std.testing.allocator);
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_go, "never-a-preset");
     row.available = true;
     row.protocol = .chat;
     cache.directory_mask = metadata.bit(.opencode_go);
     try std.testing.expectError(error.UnknownModelContext, applyDefault(parsed.arena.allocator(), &parsed.value, &cache));
     try std.testing.expect(parsed.value.selection_pending);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.registry.?.providers[0].models.len);
-    cache.directory.count = 0;
+    // Remove the owned rows and their lookup index together; changing count
+    // alone would leave a stale hash entry rather than an empty directory.
+    cache.directory.deinit(std.testing.allocator);
     try std.testing.expectError(error.DefaultModelUnavailable, applyDefault(parsed.arena.allocator(), &parsed.value, &cache));
 }
 test "registry default may be discovered without a manual entry and explicit custom entries remain isolated" {
@@ -260,7 +271,8 @@ test "registry default may be discovered without a manual entry and explicit cus
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_go, "org/model");
+    defer cache.deinit(std.testing.allocator);
+    const row = try cache.directory.upsert(std.testing.allocator, .opencode_go, "org/model");
     row.available = true;
     row.protocol = .chat;
     row.tokens = 262144;

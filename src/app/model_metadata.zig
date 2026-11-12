@@ -13,24 +13,27 @@ const directory = @import("model_directory.zig");
 const Protocol = @import("../core/protocol.zig").Protocol;
 
 pub const file_name = "model-metadata.json";
-pub const max_body_bytes = 512 * 1024;
-pub const max_cache_bytes = 512 * 1024;
 
-fn boundJson(bytes: []const u8, limit: usize) !void {
-    return json_bound.bound(bytes, limit, 32768);
+fn boundJson(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    return json_bound.validate(allocator, bytes);
 }
 const max_tokens = 16 * 1024 * 1024;
 pub const Listing = struct {
-    /// Owned byte offsets, not borrowed model IDs; safe across worker publication.
     directory: directory.Directory = .{},
     directory_mask: u8 = 0,
     dev_done: bool = false,
+    pub fn deinit(self: *Listing, a: std.mem.Allocator) void {
+        self.directory.deinit(a);
+    }
 };
 pub const Cache = struct {
     directory: directory.Directory = .{},
     /// A successful official listing (even empty) supersedes offline presets.
     directory_mask: u8 = 0,
     refresh: [providers.Id.all.len + 1]Refresh = @splat(.{}),
+    pub fn deinit(self: *Cache, a: std.mem.Allocator) void {
+        self.directory.deinit(a);
+    }
 };
 /// Shared cache-only resolution for interactive and headless entry. No network,
 /// capacity mutation or preset capabilities; explicit user overrides stay local.
@@ -277,14 +280,15 @@ pub fn entryDeclaration(cache: *const Cache, entry: catalog.Entry) ?thinking.Dec
 
 /// Merge only a joined provider's owned result. Credential filtering still
 /// happens at publication/commit, independently for each provider.
-pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id) !void {
+pub fn mergeOfficial(a: std.mem.Allocator, target: *Listing, source: *const Listing, id: providers.Id) !void {
     // A source that overflows the shared pool must not consume its capacity or
     // partially overwrite records belonging to other successful provider jobs.
-    var merged = target.directory;
+    var merged = try target.directory.clone(a);
+    errdefer merged.deinit(a);
     for (source.directory.rows[0..source.directory.count], 0..) |row, i| {
         if (row.provider != id) continue;
         const old = if (merged.find(id, source.directory.name(i))) |index| merged.rows[index] else null;
-        try merged.copyRecord(&source.directory, i);
+        try merged.copyRecord(a, &source.directory, i);
         if (old) |previous| {
             const dest = &merged.rows[merged.find(id, source.directory.name(i)).?];
             dest.dev_protocol = previous.dev_protocol;
@@ -296,13 +300,15 @@ pub fn mergeOfficial(target: *Listing, source: *const Listing, id: providers.Id)
             dest.dev_present = previous.dev_present;
         }
     }
+    target.directory.deinit(a);
     target.directory = merged;
     target.directory_mask |= source.directory_mask & bit(id);
 }
 
-pub fn mergeDev(target: *Listing, source: *const Listing) !void {
+pub fn mergeDev(a: std.mem.Allocator, target: *Listing, source: *const Listing) !void {
     if (!source.dev_done) return;
-    var merged = target.directory;
+    var merged = try target.directory.clone(a);
+    errdefer merged.deinit(a);
     for (merged.rows[0..merged.count]) |*row| {
         row.dev_protocol = .auto;
         row.dev_reasoning = null;
@@ -314,7 +320,7 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
     }
     for (source.directory.rows[0..source.directory.count], 0..) |source_row, index| {
         if (!source_row.dev_present or source_row.provider == .openai_codex) continue;
-        const row = try merged.upsert(source_row.provider, source.directory.name(index));
+        const row = try merged.upsert(a, source_row.provider, source.directory.name(index));
         row.dev_protocol = source_row.dev_protocol;
         row.dev_reasoning = source_row.dev_reasoning;
         row.dev_output_tokens = source_row.dev_output_tokens;
@@ -323,6 +329,7 @@ pub fn mergeDev(target: *Listing, source: *const Listing) !void {
         row.dev_input_price_flat_limit = source_row.dev_input_price_flat_limit;
         row.dev_present = true;
     }
+    target.directory.deinit(a);
     target.directory = merged;
     target.dev_done = true;
 }
@@ -412,27 +419,28 @@ fn parseEffort(value: std.json.Value, provider: providers.Id, protocol: @import(
 /// Legacy capacity-array view; parseListing also retains all discovered IDs.
 pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !Listing {
     if (id == .openai_codex) return parseCodexListing(a, body);
-    try boundJson(body, max_body_bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_body_bytes });
+    try boundJson(a, body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = body.len });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidMetadata;
     if (parsed.value.object.get("object")) |kind| {
         if (kind != .string or !std.mem.eql(u8, kind.string, "list")) return error.InvalidMetadata;
     }
     const data = parsed.value.object.get("data") orelse return error.InvalidMetadata;
-    if (data != .array or data.array.items.len > 512) return error.InvalidMetadata;
+    if (data != .array) return error.InvalidMetadata;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
     var result: Listing = .{ .directory_mask = bit(id) };
+    errdefer result.deinit(a);
     for (data.array.items) |record| {
         if (record != .object) return error.InvalidMetadata;
         const name = record.object.get("id") orelse return error.InvalidMetadata;
-        if (name != .string or name.string.len == 0 or name.string.len > 256) return error.InvalidMetadata;
+        if (name != .string or name.string.len == 0) return error.InvalidMetadata;
         for (name.string) |c| if (c < 0x20 or c == 0x7f) return error.InvalidMetadata;
         const entry = try seen.getOrPut(a, name.string);
         if (entry.found_existing) return error.InvalidMetadata;
         const n = if (record.object.get("context_window")) |v| try capacity(v) else null;
-        const row = try result.directory.upsert(id, name.string);
+        const row = try result.directory.upsert(a, id, name.string);
         row.available = true;
         row.tokens = n;
         if (record.object.get("protocol")) |v| {
@@ -455,20 +463,21 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
 
 /// Codex catalog is authenticated discovery, not a guarantee of entitlement.
 fn parseCodexListing(a: std.mem.Allocator, body: []const u8) !Listing {
-    try boundJson(body, max_body_bytes);
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_body_bytes });
+    try boundJson(a, body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .duplicate_field_behavior = .@"error", .max_value_len = body.len });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidMetadata;
     const models = parsed.value.object.get("models") orelse return error.InvalidMetadata;
-    if (models != .array or models.array.items.len > 512) return error.InvalidMetadata;
+    if (models != .array) return error.InvalidMetadata;
     var result: Listing = .{ .directory_mask = bit(.openai_codex) };
+    errdefer result.deinit(a);
     for (models.array.items) |item| {
         if (item != .object) return error.InvalidMetadata;
         const slug = item.object.get("slug") orelse return error.InvalidMetadata;
         if (slug != .string) return error.InvalidMetadata;
         try directory.validateId(slug.string);
         if (result.directory.find(.openai_codex, slug.string) != null) return error.InvalidMetadata;
-        const row = try result.directory.upsert(.openai_codex, slug.string);
+        const row = try result.directory.upsert(a, .openai_codex, slug.string);
         row.protocol = .responses;
         const visibility = item.object.get("visibility") orelse .null;
         row.available = visibility == .string and std.mem.eql(u8, visibility.string, "list");
@@ -534,7 +543,7 @@ fn codexCapacity(value: std.json.Value) ?u32 {
 /// The borrowed caller key is not mutated; the owned header copy is wiped.
 pub fn fetch(a: std.mem.Allocator, io: std.Io, id: providers.Id, key: ?[]const u8) !Listing {
     if (id == .openai_codex) return error.CodexCredentialRequired;
-    const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key), max_body_bytes);
+    const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key));
     defer a.free(body);
     return parseListing(a, body, id);
 }
@@ -604,9 +613,8 @@ fn fetchCodexUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, credential: 
     var head: [8192]u8 = undefined;
     var response = try request.receiveHead(&head);
     if (response.head.status != .ok) return error.MetadataHttpStatus;
-    if (response.head.content_length) |size| if (size > max_body_bytes) return error.MetadataTooLarge;
     var transfer: [8192]u8 = undefined;
-    const body = try response.reader(&transfer).allocRemaining(a, .limited(max_body_bytes));
+    const body = try response.reader(&transfer).allocRemaining(a, .unlimited);
     errdefer a.free(body);
     switch (request.reader.state) {
         .body_remaining_content_length, .body_remaining_chunk_len => return error.IncompleteMetadata,
@@ -618,7 +626,7 @@ fn fetchCodexUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, credential: 
 /// Public catalog: no credentials and no provider listing key. Parsing is the
 /// same bounded models.dev parser used by tests; unusable profiles stay unknown.
 pub fn fetchDev(a: std.mem.Allocator, io: std.Io) !Listing {
-    const body = try fetchUrl(a, io, models_dev.url, null, models_dev.max_body_bytes);
+    const body = try fetchUrl(a, io, models_dev.url, null);
     defer a.free(body);
     return parseDev(a, body);
 }
@@ -643,7 +651,7 @@ fn listingKey(id: providers.Id, key: ?[]const u8) ?[]const u8 {
 
 /// Private transport seam for owned loopback tests. Production callers can only
 /// reach it through fetch's fixed official endpoint, never through user URLs.
-fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8, limit: usize) ![]u8 {
+fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8) ![]u8 {
     try cfg.validateKeySource(.{ .base_url = url, .api_key = key });
     const authorization = if (key) |k| try std.fmt.allocPrint(a, "Bearer {s}", .{k}) else null;
     defer if (authorization) |header| {
@@ -666,9 +674,8 @@ fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8,
     var head: [8192]u8 = undefined;
     var response = try request.receiveHead(&head);
     if (response.head.status != .ok) return error.MetadataHttpStatus;
-    if (response.head.content_length) |size| if (size > limit) return error.MetadataTooLarge;
     var transfer: [8192]u8 = undefined;
-    const body = try response.reader(&transfer).allocRemaining(a, .limited(limit));
+    const body = try response.reader(&transfer).allocRemaining(a, .unlimited);
     errdefer a.free(body);
     switch (request.reader.state) {
         .body_remaining_content_length, .body_remaining_chunk_len => return error.IncompleteMetadata,
@@ -751,13 +758,13 @@ const Document = struct {
 };
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
-    try json_bound.bound(bytes, max_cache_bytes, 131072);
+    try json_bound.validate(a, bytes);
     // Typed JSON integer parsing also accepts numeric strings. Cache capability
     // fields deliberately require JSON integer tokens, not that coercion. This
     // raw pass also classifies an older integer schema so a claim can rebuild
     // instead of being blocked by the stale document.
     {
-        var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
+        var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = bytes.len });
         defer raw.deinit();
         if (raw.value == .object) {
             const version = raw.value.object.get("version") orelse return error.InvalidMetadata;
@@ -806,16 +813,17 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             }
         }
     }
-    var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = max_cache_bytes });
+    var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = bytes.len });
     defer parsed.deinit();
     const doc = parsed.value;
     if (doc.version != cache_version) return error.InvalidMetadata;
-    if (doc.models.len > directory.max_models or doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
+    if (doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
     var result: Cache = .{ .directory_mask = doc.directory_mask, .refresh = doc.refresh };
+    errdefer result.deinit(a);
     for (doc.models) |record| {
         if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
         if (result.directory.find(record.provider, record.id) != null) return error.InvalidMetadata;
-        const row = try result.directory.upsert(record.provider, record.id);
+        const row = try result.directory.upsert(a, record.provider, record.id);
         row.tokens = record.context_window;
         row.dev_context_tokens = record.dev_context_tokens;
         row.dev_input_price_threshold = record.dev_input_price_threshold;
@@ -848,11 +856,10 @@ pub fn load(root: *fs.Root) !Cache {
     const file = fs.fileFromFd(fd);
     const stat = try file.stat(root.io);
     if (stat.kind != .file) return error.NotRegularFile;
-    if (stat.size > max_cache_bytes) return error.MetadataTooLarge;
-    const buffer = try root.allocator.alloc(u8, max_cache_bytes + 1);
+    const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+    const buffer = try root.allocator.alloc(u8, try std.math.add(usize, size, 1));
     defer root.allocator.free(buffer);
     const len = try file.readPositionalAll(root.io, buffer, 0);
-    if (len > max_cache_bytes) return error.MetadataTooLarge;
     if (len != stat.size) return error.FileChanged;
     return parseCache(root.allocator, buffer[0..len]);
 }
@@ -905,12 +912,11 @@ fn save(root: *fs.Root, cache: Cache) !void {
         .dev_reasoning = if (row.dev_reasoning) |profile| profile.declaration() else null,
         .dev_present = row.dev_present,
     };
-    const bytes = try root.allocator.alloc(u8, max_cache_bytes);
-    defer root.allocator.free(bytes);
-    var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(Document{ .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer);
-    try writer.writeByte('\n');
-    try root.writeMode(file_name, bytes[0..writer.end], true, 0o600);
+    var writer: std.Io.Writer.Allocating = .init(root.allocator);
+    defer writer.deinit();
+    try std.json.Stringify.value(Document{ .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer.writer);
+    try writer.writer.writeByte('\n');
+    try root.writeMode(file_name, writer.written(), true, 0o600);
 }
 
 /// Persist the attempt before network work, even if the worker later fails.
@@ -938,6 +944,7 @@ pub fn claimAt(root: *fs.Root, requested: u8, manual: bool, now: u64, policy: Po
         },
         else => return err,
     };
+    errdefer cache.deinit(root.allocator);
     const mask = if (manual) requested else eligible(&cache, requested, now, policy);
     if (mask != 0) {
         for (source_bits, &cache.refresh) |source, *timing| {
@@ -988,6 +995,7 @@ pub fn commitClaimedAt(root: *fs.Root, succeeded: u8, listing: Listing, generati
 
 fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing, now: u64) !Cache {
     var cache = previous;
+    errdefer cache.deinit(root.allocator);
     const refreshed = succeeded & listing.directory_mask;
     for (cache.directory.rows[0..cache.directory.count]) |*row| {
         if (refreshed & bit(row.provider) != 0) {
@@ -1012,7 +1020,7 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
     for (listing.directory.rows[0..listing.directory.count], 0..) |source, index| {
         const official = refreshed & bit(source.provider) != 0 and source.available != null;
         if (!official and !(listing.dev_done and source.dev_present)) continue;
-        const row = try cache.directory.upsert(source.provider, listing.directory.name(index));
+        const row = try cache.directory.upsert(root.allocator, source.provider, listing.directory.name(index));
         if (official) {
             row.available = source.available;
             row.input_image = source.input_image;

@@ -36,7 +36,6 @@ pub const Action = union(enum) {
     poll_metadata: bool,
 
     fn text(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-        if (bytes.len > session.max_item_bytes) return error.InputTooLarge;
         return a.dupe(u8, bytes);
     }
 

@@ -16,7 +16,7 @@ const knowledge = @import("knowledge.zig");
 /// for auxiliary inference or retain borrowed capture bytes.
 pub const MemoryHooks = struct {
     context: *anyopaque,
-    retrieve_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, usize) anyerror![]const u8,
+    retrieve_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
     submit_fn: *const fn (*anyopaque, *const knowledge.Capture, p.Protocol) void,
     check_fn: ?*const fn (*anyopaque) bool = null,
 };
@@ -35,7 +35,7 @@ pub const Execution = struct {
     is_error: bool = false,
     /// 工具因取消而中止；结果仍会回填，保证 tool_call 有对应结果。
     canceled: bool = false,
-    /// 输出已被截断（见 fitResult）。
+    /// The executor reports whether its own result is incomplete.
     truncated: bool = false,
     /// 进程组清理失败：会使 Runtime poisoned，之后拒绝继续运行。
     cleanup_failed: bool = false,
@@ -77,8 +77,8 @@ pub const Executor = struct {
     /// 第二阶段：实际执行，必须响应传入的 cancellation。
     execute_fn: *const fn (*anyopaque, std.mem.Allocator, Prepared, *const p.Cancellation) anyerror!Execution,
     /// Called once after run() actually accepts a task (busy swap won), before
-    /// the first model call. `cancel` is the accepted-root token (the same
-    /// object the watchdog cancels), never a local tool-call token. Used to
+    /// the first model call. `cancel` is the accepted-root token, never a
+    /// local tool-call token. Used to
     /// reset a per-root-task budget; a rejected Busy run must not call it.
     /// Must not fail or run tools.
     begin_task_fn: ?*const fn (*anyopaque, *const p.Cancellation) void = null,
@@ -89,8 +89,7 @@ pub const Executor = struct {
     /// fabricated tool call. Returns null when nothing remains.
     before_finish_fn: ?*const fn (*anyopaque, std.mem.Allocator, *const p.Cancellation) anyerror!?[]const u8 = null,
     /// Unified end-of-accepted-task cleanup. Called on every exit path
-    /// (including an early watchdog-start failure), before the watchdog is
-    /// joined and before Memory finalization/finished. Cancel/join or retain
+    /// before Memory finalization/finished. Cancel/join or retain
     /// every child job here. A failure must poison the parent.
     end_task_fn: ?*const fn (*anyopaque, *const p.Cancellation) anyerror!void = null,
     /// Optional display-only pre-write snapshot. It must never create or alter
@@ -663,9 +662,7 @@ pub const Runtime = struct {
             .input_budget_frozen = true,
             .input_price_threshold = self.config.model.input_price_threshold,
             .input_price_flat_limit = self.config.model.input_price_flat_limit,
-            .max_input_tokens = self.config.limits.max_input_tokens,
             .low_price_input = self.config.limits.low_price_input,
-            .input_margin_tokens = self.config.limits.input_margin_tokens,
             .permission_id = self.permission_id,
         };
         try @import("checkpoint.zig").validateStructure(state);
@@ -767,41 +764,17 @@ pub const Runtime = struct {
 
     /// 单次 run 的计数与终态；用于限制轮数与工具调用次数。
     const Task = struct {
-        /// Normal model calls this run, saturating so unlimited runs cannot
-        /// overflow. Compaction is not counted toward max_rounds.
+        /// Normal model calls this run, counted with saturating arithmetic.
         rounds: u32 = 0,
-        /// Stop-time interaction reminders already delivered this accepted task.
-        finish_reminders: u8 = 0,
-
-        /// 已执行的工具调用次数，受 max_tool_calls 限制。
+        /// Number of executed tool calls, for observation only.
         tool_calls: u32 = 0,
         /// Possible paid summary attempts, including transport throws before usage.
         summary_attempts: u64 = 0,
         /// 累计的用量与终态，run 结束时返回。
         terminal: Terminal = .{ .status = .success },
 
-        fn roundLimitReached(self: Task, limit: ?u16) bool {
-            return if (limit) |max| self.rounds >= max else false;
-        }
-
         fn countRound(self: *Task) void {
             self.rounds +|= 1;
-        }
-    };
-
-    /// 任务超时看门狗：睡眠 timeout_ms 后置位 expired 并取消 cancel。
-    const Watchdog = struct {
-        io: Io,
-        timeout_ms: u32,
-        cancel: *p.Cancellation,
-        /// 区分超时与用户取消：仅超时路径会置位。
-        expired: std.atomic.Value(bool) = .init(false),
-
-        fn run(self: *Watchdog) void {
-            // run 结束时看门狗会被提前 cancel，sleep 返回错误，此时不应标记超时。
-            Io.sleep(self.io, .fromMilliseconds(self.timeout_ms), .awake) catch return;
-            self.expired.store(true, .release);
-            self.cancel.cancel();
         }
     };
 
@@ -855,27 +828,7 @@ pub const Runtime = struct {
         defer self.memory_capture = null;
 
         var task = Task{};
-        var watchdog = Watchdog{ .io = self.io, .timeout_ms = self.config.limits.task_timeout_ms, .cancel = cancel };
 
-        // 看门狗无法启动时直接以 failed 结束，不进入模型循环。Even this early
-        // path must run the unified end hook before publishing finished.
-        var timer = Io.concurrent(self.io, Watchdog.run, .{&watchdog}) catch |err| {
-            var terminal = Terminal{ .status = .failed, .detail = err, .context_snapshot = self.contextSnapshot() };
-            var end_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .end_task });
-            if (self.executor.end_task_fn) |end_task| end_task(self.executor.context, cancel) catch |cleanup_err| {
-                end_span.fail(cleanup_err);
-                self.poisoned = true;
-                terminal = .{ .status = .failed, .detail = error.CleanupFailed, .context_snapshot = self.contextSnapshot() };
-            };
-            end_span.finish(.ok);
-            var finished_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .finished_emit });
-            self.emit(.{ .finished = terminal }, cancel) catch |emit_err| finished_span.fail(emit_err);
-            finished_span.finish(.ok);
-            return terminal;
-        };
-
-        // A reached round budget is a bounded pause, not a model/HTTP failure.
-        // Only a new explicit user submission grants another per-run budget.
         const result = switch (operation) {
             .prompt => |text| self.runInner(text, cancel, &task),
             .compact => self.compactInner(cancel, &task),
@@ -887,7 +840,7 @@ pub const Runtime = struct {
             if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
         };
 
-        // Children end before watchdog join, Memory finalization and finished on
+        // Children end before Memory finalization and finished on
         // EVERY accepted path. An end/cleanup failure outranks success, cancel,
         // timeout and paused, and poisons the parent Runtime.
         var end_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .end_task });
@@ -897,22 +850,14 @@ pub const Runtime = struct {
         };
         end_span.finish(.ok);
 
-        // 先停止看门狗，之后读取 expired 才能反映本次 run 是否超时。
-        var watchdog_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .watchdog_join });
-        timer.cancel(self.io);
-        watchdog_span.finish(.ok);
-
         // poisoned 优先级最高：清理失败覆盖取消与超时结果。
         if (self.poisoned) {
             task.terminal.status = .failed;
             task.terminal.detail = error.CleanupFailed;
-        } else if (watchdog.expired.load(.acquire)) {
-            task.terminal.status = .failed;
-            task.terminal.detail = error.TaskTimeout;
         }
 
         // A stop response/assistant commit is not success: final Inbox sealing,
-        // pairing, watchdog join and a last cancellation check must all precede
+        // pairing and a last cancellation check must all precede
         // publication. UI/log delivery is deliberately not the extraction trigger.
         if (task.terminal.status == .success and cancel.isRequested()) {
             task.terminal.status = .canceled;
@@ -951,7 +896,6 @@ pub const Runtime = struct {
         // of a here-document, so validate emptiness without rewriting its bytes.
         const command = input[1..];
         if (std.mem.trim(u8, command, " \t\r\n").len == 0) return error.InvalidInput;
-        if (command.len > 32768 or text.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
         try self.syncSessionContext();
 
         // Imported checkpoints need not share our permission counter. Bound both
@@ -970,7 +914,6 @@ pub const Runtime = struct {
                     else => continue,
                 };
                 if (!ids.contains(id)) {
-                    if (ids.count() == 65536) return error.ToolCallLimit;
                     try ids.put(id, {});
                 }
             }
@@ -990,7 +933,6 @@ pub const Runtime = struct {
             }
         } else return error.PermissionIdExhausted;
         const arguments = try std.json.Stringify.valueAlloc(a, .{ .command = command }, .{});
-        if (arguments.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
         const owned = self.arena.allocator();
         const user = try p.cloneMessage(owned, .{ .role = .user, .blocks = &.{.{ .text = text }} });
         const assistant = try p.cloneMessage(owned, .{ .role = .assistant, .blocks = &.{
@@ -1231,38 +1173,24 @@ pub const Runtime = struct {
         var scratch = std.heap.ArenaAllocator.init(wiping.allocator());
         defer scratch.deinit();
         const a = scratch.allocator();
-        // Reserve both input and reference framing. A UTF-8 byte costs at most
-        // one textTokens token; binary search also respects learned calibration.
-        const raw = context.rawTokens(self.system, self.executor.schemas, self.history.items) +|
-            context.textTokens(query) +| 24 +| context.textTokens(memory_reference_prefix) +| 32;
-        const budget = context.inputBudget(self.config.*);
-        var low: usize = 0;
-        var high: usize = knowledge.max_retrieval_bytes;
-        while (low < high) {
-            const mid = low + (high - low + 1) / 2;
-            if (self.estimator.tokens(raw +| mid) <= budget) low = mid else high = mid - 1;
-        }
-        const returned = hooks.retrieve_fn(hooks.context, a, query, low) catch |err| {
+        const returned = hooks.retrieve_fn(hooks.context, a, query) catch |err| {
+            if (err == error.OutOfMemory) return err;
             if (err == error.CleanupFailed or err == error.UnsafeToContinue) {
                 self.poisoned = true;
                 return error.CleanupFailed;
             }
-            if (low == 0) return;
-            self.appendMemoryReference(a, "Latest Memory unavailable; earlier snapshots are not current truth.");
+            try self.appendMemoryReference(a, "Latest Memory unavailable; earlier snapshots are not current truth.");
             return;
         };
-        // Even with no room, the callback ran to snapshot Store generation and
-        // wake deferred work. Do not append reference content in this case.
-        if (low == 0) return;
-        if (returned.len > low or !std.unicode.utf8ValidateSlice(returned) or std.mem.findScalar(u8, returned, 0) != null) {
-            self.appendMemoryReference(a, "Latest Memory unavailable (invalid retrieval); earlier snapshots are not current truth.");
+        if (!std.unicode.utf8ValidateSlice(returned) or std.mem.findScalar(u8, returned, 0) != null) {
+            try self.appendMemoryReference(a, "Latest Memory unavailable (invalid retrieval); earlier snapshots are not current truth.");
             return;
         }
-        self.appendMemoryReference(a, if (returned.len == 0) "Latest Memory selection is empty (no matching complete entries fit); earlier snapshots are not current truth." else returned);
+        try self.appendMemoryReference(a, if (returned.len == 0) "Latest Memory selection is empty; earlier snapshots are not current truth." else returned);
     }
 
-    fn appendMemoryReference(self: *Runtime, a: std.mem.Allocator, body: []const u8) void {
-        const text = std.fmt.allocPrint(a, "{s}{s}", .{ memory_reference_prefix, body }) catch return;
+    fn appendMemoryReference(self: *Runtime, a: std.mem.Allocator, body: []const u8) !void {
+        const text = try std.fmt.allocPrint(a, "{s}{s}", .{ memory_reference_prefix, body });
         // Compare the LATEST live reference, not any historic A before B. No
         // cached pointer can outlive a compaction/restore history replacement.
         var index = self.history.items.len;
@@ -1274,8 +1202,8 @@ pub const Runtime = struct {
             break;
         }
         const owned = self.arena.allocator();
-        const copy = owned.dupe(u8, text) catch return;
-        appendContextMessage(owned, &self.history, copy) catch return;
+        const copy = try owned.dupe(u8, text);
+        try appendContextMessage(owned, &self.history, copy);
         // This is new input, not a primary usage report. Preserve the latest
         // displayed total (including fresh zero/unknown); request safety still
         // uses estimatedTokens(), which includes this appended reference.
@@ -1316,7 +1244,6 @@ pub const Runtime = struct {
             self.steering_lease = null;
             var resolved = false;
             defer if (!resolved) box.restore(lease);
-            if (lease.text.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
             try self.retainCurrentInput(retained);
             const a = self.arena.allocator();
             const message = try p.cloneMessage(a, .{ .role = .user, .blocks = &.{.{ .text = lease.text }} });
@@ -1354,7 +1281,6 @@ pub const Runtime = struct {
         // it back: the next accepted turn must keep the same cached prefix.
         try self.syncSessionContext();
         if (std.mem.trim(u8, text, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(text)) return error.InvalidInput;
-        if (text.len > self.config.limits.max_response_bytes) return error.InputTooLarge;
         // Failure here is reference unavailability, not a failed user task.
         try self.retrieveMemory(text);
         if (self.memory_capture) |capture| capture.add(.user, text);
@@ -1386,10 +1312,6 @@ pub const Runtime = struct {
             try checkCanceled(cancel);
 
             // Only explicit limits pause a run. Never retain a borrowed stack block.
-            if (task.roundLimitReached(self.config.limits.max_rounds)) {
-                try self.retainCurrentInput(&input_retained);
-                return error.RoundLimit;
-            }
             // A summary/host callback may have received steering. Re-plan with
             // its committed input rather than sending an obsolete request.
             if (try self.consumeSteering(&input_retained, cancel)) continue;
@@ -1455,14 +1377,10 @@ pub const Runtime = struct {
                 self.discardToolViews(cancel);
                 try checkCanceled(cancel);
                 // A child may still need collection or a reply. The host returns
-                // only a bounded status/ID hint; it is a context message, not a
-                // user turn, Memory evidence or a tool call. Bounded per accepted
-                // task so a cooperative child cannot extend the loop forever.
+                // only a status/ID hint; it is a context message, not a
+                // user turn, Memory evidence or a tool call.
                 if (self.executor.before_finish_fn) |before_finish| {
                     if (try before_finish(self.executor.context, result_arena.allocator(), cancel)) |hint| {
-                        if (task.finish_reminders >= @import("subagent.zig").max_finish_reminders)
-                            return error.SubagentInteractionRequired;
-                        task.finish_reminders += 1;
                         const owned = self.arena.allocator();
                         const copy = try owned.dupe(u8, hint);
                         try appendContextMessage(owned, &self.history, copy);
@@ -1649,9 +1567,6 @@ pub const Runtime = struct {
 
     /// 发起模型调用前检查上下文是否超过压缩阈值，超过则尝试压缩。
     fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
-        // No model round remains. The caller reports RoundLimit and keeps the
-        // current goal; do not spend another summary on a turn that cannot continue.
-        if (task.roundLimitReached(self.config.limits.max_rounds)) return;
         try context.validateInputPolicy(self.config.*);
         const budget = context.inputBudget(self.config.*);
         const before = self.estimatedTokens();
@@ -1659,7 +1574,7 @@ pub const Runtime = struct {
             if (before > budget) return context.inputBudgetError(self.config.*);
             return;
         }
-        if (before < context.threshold(budget, self.config.limits.compaction_trigger_percent)) return;
+        if (before < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) return;
         const attempts = task.summary_attempts;
         self.compact(cancel, task, .automatic) catch |err| {
             // Cleanup failure is terminal even before a summary attempt. Never
@@ -1757,7 +1672,7 @@ pub const Runtime = struct {
         const response = switch (result.outcome) {
             .success => |r| r,
             .failure => |f| {
-                if (self.config.limits.low_price_input or self.config.limits.max_input_tokens != null) {
+                if (self.config.limits.low_price_input) {
                     task.terminal.model_failure = f.kind;
                     task.terminal.http_status = f.http_status;
                 }
@@ -1834,19 +1749,17 @@ pub const Runtime = struct {
 
     fn refineOutputsImpl(self: *Runtime, a: std.mem.Allocator, scratch_messages: []p.Message, cancel: *p.Cancellation) !void {
         const service = self.decision_service orelse return;
-        var items: [8]decision.RefineItem = undefined;
+        var items: std.ArrayList(decision.RefineItem) = .empty;
         const Location = struct { message: usize, block: usize, metadata: std.json.Value };
-        var locations: [8]Location = undefined;
-        var count: usize = 0;
-        var total: usize = 0;
+        var locations: std.ArrayList(Location) = .empty;
         for (scratch_messages, 0..) |message, mi| for (message.blocks, 0..) |block, bi| {
-            if (count == items.len or block != .tool_result) continue;
+            if (block != .tool_result) continue;
             const result = block.tool_result;
             var bash = false;
             for (scratch_messages[0..mi]) |earlier| for (earlier.blocks) |earlier_block| {
                 if (earlier_block == .tool_call and std.mem.eql(u8, earlier_block.tool_call.id, result.call_id) and std.mem.eql(u8, earlier_block.tool_call.name, "bash")) bash = true;
             };
-            if (!bash or result.text.len < 2048 or result.text.len > 262144) continue;
+            if (!bash or result.text.len < 2048) continue;
             // Only known JSON bash output is eligible. Unknown/truncated raw
             // fragments retain their exact original text, including status.
             const parsed = std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always }) catch |err| {
@@ -1860,41 +1773,38 @@ pub const Runtime = struct {
             if (stdout != .string or stderr != .string) continue;
             _ = metadata.object.swapRemove("stdout");
             _ = metadata.object.swapRemove("stderr");
-            const original_metadata = try std.json.Stringify.valueAlloc(a, metadata, .{});
-            if (original_metadata.len > 4096) continue;
             const source = try std.fmt.allocPrint(a, "stdout (untrusted data):\n{s}\nstderr (untrusted data):\n{s}", .{ stdout.string, stderr.string });
             // Do not hide middle errors from the refiner. Oversized records stay
             // ORIGINAL in the primary summary view rather than excerpting data.
-            if (source.len < 2048 or source.len > 8192) continue;
-            if (total + source.len + result.call_id.len > 16384) continue;
+            if (source.len < 2048) continue;
             // Duplicate IDs are invalid history, not auxiliary authority.
             var duplicate = false;
-            for (items[0..count]) |item| if (std.mem.eql(u8, item.id, result.call_id)) {
+            for (items.items) |item| if (std.mem.eql(u8, item.id, result.call_id)) {
                 duplicate = true;
             };
             if (duplicate) continue;
-            items[count] = .{ .id = result.call_id, .text = source };
-            locations[count] = .{ .message = mi, .block = bi, .metadata = metadata };
-            count += 1;
-            total += source.len + result.call_id.len;
+            try items.append(a, .{ .id = result.call_id, .text = source });
+            try locations.append(a, .{ .message = mi, .block = bi, .metadata = metadata });
         };
-        if (count == 0) return;
-        const input: decision.Input = .{ .refine_outputs = items[0..count] };
+        if (items.items.len == 0) return;
+        const input: decision.Input = .{ .refine_outputs = items.items };
         const output = service.decide(a, input, cancel) catch |err| {
             if (err == error.Canceled or err == error.CleanupFailed) return err;
             return; // Quality failure: whole original scratch remains available.
         };
         try checkCanceled(cancel);
         const Replacement = struct { message: usize, blocks: []p.Block };
-        var replacements: [8]Replacement = undefined;
-        var replacement_count: usize = 0;
-        for (items[0..count], 0..) |item, i| {
-            var summary: []const u8 = undefined;
+        if (output != .refine_outputs or output.refine_outputs.len != items.items.len) return error.InvalidDecisionOutput;
+        var replacements: std.ArrayList(Replacement) = .empty;
+        for (items.items, 0..) |item, i| {
+            var matched: ?[]const u8 = null;
             for (output.refine_outputs) |refined| if (std.mem.eql(u8, item.id, refined.id)) {
-                summary = refined.text;
-                break;
+                if (matched != null) return error.InvalidDecisionOutput;
+                matched = refined.text;
             };
-            const location = locations[i];
+            const summary = matched orelse return error.InvalidDecisionOutput;
+            if (summary.len == 0 or summary.len > item.text.len or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidDecisionOutput;
+            const location = locations.items[i];
             const original = scratch_messages[location.message].blocks[location.block].tool_result;
             // The model NEVER owns execution metadata. JSON exit/error/timeout,
             // canceled/truncated/byte counts and canonical flags stay CODE-owned.
@@ -1908,7 +1818,7 @@ pub const Runtime = struct {
             // Only a profitable replacement owns mutable blocks. Reuse that
             // clone for later profitable results in the same message.
             var prior: ?[]p.Block = null;
-            for (replacements[0..replacement_count]) |replacement| {
+            for (replacements.items) |replacement| {
                 if (replacement.message == location.message) {
                     prior = replacement.blocks;
                     break;
@@ -1916,8 +1826,7 @@ pub const Runtime = struct {
             }
             const blocks = prior orelse blk: {
                 const owned = try a.dupe(p.Block, scratch_messages[location.message].blocks);
-                replacements[replacement_count] = .{ .message = location.message, .blocks = owned };
-                replacement_count += 1;
+                try replacements.append(a, .{ .message = location.message, .blocks = owned });
                 break :blk owned;
             };
             var result = original;
@@ -1927,8 +1836,8 @@ pub const Runtime = struct {
         // Allocation-free publication after the whole batch succeeded. Shared
         // message replacements already contain every refined block.
         try checkCanceled(cancel);
-        if (replacement_count == 0) return;
-        for (replacements[0..replacement_count]) |replacement| {
+        if (replacements.items.len == 0) return;
+        for (replacements.items) |replacement| {
             scratch_messages[replacement.message].blocks = replacement.blocks;
             scratch_messages[replacement.message].replay = null;
         }
@@ -1996,18 +1905,17 @@ pub const Runtime = struct {
 
         if (kind == .local) self.beginToolViews(cancel);
         errdefer self.discardToolViews(cancel);
-        var display_keys: [64]p.ToolDisplayKey = undefined;
-        var display_count: usize = 0;
-        for (blocks) |block| if (block == .tool_call and display_count < display_keys.len) {
+        var display_keys: std.ArrayList(p.ToolDisplayKey) = .empty;
+        defer display_keys.deinit(self.allocator);
+        for (blocks) |block| if (block == .tool_call) {
             const call = block.tool_call;
             const linked = self.display_links.lookup(call.id, call.arguments);
-            var key = if (linked) |value| value.key else self.display_links.fresh(display_keys[0..display_count]);
-            for (display_keys[0..display_count]) |previous| if (previous.eql(key)) {
-                key = self.display_links.fresh(display_keys[0..display_count]);
+            var key = if (linked) |value| value.key else self.display_links.fresh(display_keys.items);
+            for (display_keys.items) |previous| if (previous.eql(key)) {
+                key = self.display_links.fresh(display_keys.items);
                 break;
             };
-            display_keys[display_count] = key;
-            display_count += 1;
+            try display_keys.append(self.allocator, key);
             var extractor: @import("tool_preview.zig").Extractor = .{};
             extractor.feed(call.arguments);
             const valid = extractor.finish();
@@ -2027,7 +1935,7 @@ pub const Runtime = struct {
 
             // 模型给出的 call.id 只用于回填结果；事件使用 Runtime 分配的 host_id。
             const call = block.tool_call;
-            const display_key: ?p.ToolDisplayKey = if (display_ordinal < display_count) display_keys[display_ordinal] else null;
+            const display_key: ?p.ToolDisplayKey = if (display_ordinal < display_keys.items.len) display_keys.items[display_ordinal] else null;
 
             // Monotonic for this Bridge. Wrapping to 0 would be <= last_id and
             // surface as InvalidPermission; overflow rebases or refuses first.
@@ -2123,8 +2031,6 @@ pub const Runtime = struct {
             // 危险命令被拒绝时回传分类原因，而不是笼统的 denied。
             var result: Execution = .{ .text = prepared.explicit_denial orelse "User denied this action; it was not executed", .is_error = true };
             if (allowed) {
-                // 工具调用次数限制在执行前检查。
-                if (task.tool_calls >= self.config.limits.max_tool_calls) return error.ToolCallLimit;
                 try self.emit(.{ .state = .executing_tool }, cancel);
                 try checkCanceled(cancel);
                 if (!try self.confirmationBarrier(cancel, kind)) break :calls;
@@ -2132,7 +2038,7 @@ pub const Runtime = struct {
                 // Dirty-marker failure returns before started_call, so this call
                 // is recorded as not executed and later calls in the batch are too.
                 try self.emit(.{ .tool_started = .{ .id = host_id, .name = call.name, .started_ms = @intCast(@max(0, began.toMilliseconds())), .display_key = display_key } }, cancel);
-                task.tool_calls += 1;
+                task.tool_calls +|= 1;
 
                 // 执行错误转为 is_error 结果而不是 run 失败；Canceled 标记为 canceled。
                 started_call = call.id;
@@ -2151,20 +2057,7 @@ pub const Runtime = struct {
             // 清理失败可能残留子进程，之后必须拒绝运行。
             if (result.cleanup_failed) self.poisoned = true;
 
-            // 超出上下文预算时截断输出。
-            if (kind == .normal) {
-                result = try self.fitResult(a, call.id, result);
-            } else {
-                // Bound injected executors independently of unknown-price input
-                // policy. Align a split scalar in <=3 steps, then validate once:
-                // malformed prefixes must not cause quadratic rescanning.
-                var end = @min(result.text.len, self.config.limits.max_response_bytes);
-                var backed: usize = 0;
-                while (end < result.text.len and end > 0 and backed < 3 and (result.text[end] & 0xc0) == 0x80) : (backed += 1) end -= 1;
-                if (!std.unicode.utf8ValidateSlice(result.text[0..end])) return error.InvalidToolOutput;
-                result.truncated = result.truncated or end < result.text.len;
-                result.text = result.text[0..end];
-            }
+            if (!std.unicode.utf8ValidateSlice(result.text)) return error.InvalidToolOutput;
             try self.appendResult(call.id, result);
             started_call = null;
             next_block += 1;
@@ -2192,7 +2085,7 @@ pub const Runtime = struct {
             try checkCanceled(cancel);
             const skipped: Execution = .{ .text = "Skipped: superseded by steering before this call started; not executed.", .is_error = true };
             const id = try self.allocatePermissionId();
-            const key: ?p.ToolDisplayKey = if (display_ordinal < display_count) display_keys[display_ordinal] else null;
+            const key: ?p.ToolDisplayKey = if (display_ordinal < display_keys.items.len) display_keys.items[display_ordinal] else null;
             try self.appendResult(block.tool_call.id, skipped);
             next_block += 1;
             display_ordinal += 1;
@@ -2261,52 +2154,27 @@ pub const Runtime = struct {
         }
         self.observer.notify(.{ .tool_completed = .{ .call_id = id, .result = result } });
     }
-
-    /// 若把结果加入历史会超过输入预算，则保留首尾片段并标记截断；否则原样返回。
-    fn fitResult(self: *Runtime, a: std.mem.Allocator, id: []const u8, result: Execution) !Execution {
-        // 饱和加法（+|）防止估算溢出。
-        const current = context.rawTokens(self.system, self.executor.schemas, self.history.items);
-        const extra = 24 +| context.textTokens(id) +| context.textTokens(result.text);
-        if (self.estimator.tokens(current +| extra) <= context.inputBudget(self.config.*)) return result;
-
-        const used = self.estimator.tokens(current);
-        const available = context.inputBudget(self.config.*) -| used;
-
-        // At the hard boundary retain bounded head/tail instead of committing an
-        // unrequestable history. Mark fragments as text, not complete JSON.
-        const cap = @min(result.text.len, @max(@as(usize, 128), available / 2));
-        const half = cap / 2;
-        var head = @min(half, result.text.len);
-        while (head > 0 and !std.unicode.utf8ValidateSlice(result.text[0..head])) head -= 1;
-
-        var tail = result.text.len - @min(half, result.text.len - head);
-        while (tail < result.text.len and !std.unicode.utf8ValidateSlice(result.text[tail..])) tail += 1;
-
-        var shortened = result;
-        shortened.text = try std.fmt.allocPrint(a, "[Tool output truncated for context budget; fragments below may not be complete JSON. Request a smaller range.]\n{s}\n[... omitted ...]\n{s}", .{ result.text[0..head], result.text[tail..] });
-        shortened.truncated = true;
-        return shortened;
-    }
 };
 
-/// 校验模型响应：角色必须是 assistant；tool_call 的 id 非空且唯一（最多 64 个）；
+/// 校验模型响应：角色必须是 assistant；tool_call 的 id 非空且唯一；
 /// 参数必须是 JSON 对象；finish 必须与是否包含工具调用一致。
 fn validateResponse(a: std.mem.Allocator, response: p.Response, history: []const p.Message) !void {
     if (response.message.role != .assistant) return error.InvalidAssistantResponse;
 
-    // 栈上记录已见的 id 用于去重，超过 64 个视为无效。
-    var calls: [64][]const u8 = undefined;
+    // Track all IDs to reject duplicates.
+    var calls = std.StringHashMap(void).init(a);
+    defer calls.deinit();
     var count: usize = 0;
     for (response.message.blocks) |block| switch (block) {
         .tool_call => |call| {
-            if (call.id.len == 0 or count == calls.len) return error.InvalidToolCall;
-            for (calls[0..count]) |id| if (std.mem.eql(u8, id, call.id)) return error.DuplicateToolId;
+            if (call.id.len == 0) return error.InvalidToolCall;
+            const entry = try calls.getOrPut(call.id);
+            if (entry.found_existing) return error.DuplicateToolId;
             // 与编码器一致：ID 在当前 canonical 历史中全局唯一，执行副作用前拒绝冲突。
             for (history) |message| for (message.blocks) |old| {
                 if (old == .tool_call and std.mem.eql(u8, old.tool_call.id, call.id)) return error.DuplicateToolId;
             };
-            calls[count] = call.id;
-            count += 1;
+            count = std.math.add(usize, count, 1) catch return error.OutOfMemory;
 
             // leaky 解析：内存由 a（单轮 arena）持有，随本轮结束释放。
             const value = try std.json.parseFromSliceLeaky(std.json.Value, a, call.arguments, .{});

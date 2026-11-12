@@ -160,11 +160,14 @@ test "image official Anthropic base uses the same availability and cached limits
     {
         var store = try Store.openExisting(a, io, home);
         defer store.deinit();
-        const claim = try metadata.claimAt(&store.root, metadata.dev_bit, true, 200, .{});
-        const listing = try metadata.parseDev(a,
+        var claim = try metadata.claimAt(&store.root, metadata.dev_bit, true, 200, .{});
+        defer claim.cache.deinit(a);
+        var listing = try metadata.parseDev(a,
             \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"deepseek-flash":{"limit":{"context":8192,"output":512}}}}}
         );
-        const result = try metadata.commitClaimedAt(&store.root, 0, listing, claim.generations, 201);
+        defer listing.deinit(a);
+        var result = try metadata.commitClaimedAt(&store.root, 0, listing, claim.generations, 201);
+        defer result.cache.deinit(a);
         try std.testing.expectEqual(metadata.dev_bit, result.accepted);
     }
     var env = std.process.Environ.Map.init(a);

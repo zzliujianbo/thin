@@ -14,11 +14,6 @@ const directory = @import("model_directory.zig");
 const providers = @import("../core/providers.zig");
 
 pub const url = "https://models.dev/api.json";
-pub const max_body_bytes = 16 * 1024 * 1024;
-pub const max_structural_nodes = 2_000_000;
-pub const max_value_bytes = 2048;
-/// Supported provider rows only; independent of the smaller output directory.
-pub const max_records = 65536;
 
 const Profile = struct {
     map: thinking.LevelMap = .{},
@@ -49,7 +44,7 @@ fn equal(a: []const u8, b: []const u8) bool {
 }
 
 fn nextString(scanner: *std.json.Scanner, allocator: std.mem.Allocator) ![]const u8 {
-    return switch (try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes)) {
+    return switch (try scanner.nextAllocMax(allocator, .alloc_if_needed, scanner.input.len)) {
         .string => |value| value,
         .allocated_string => |value| value,
         else => error.InvalidModelsDev,
@@ -57,7 +52,7 @@ fn nextString(scanner: *std.json.Scanner, allocator: std.mem.Allocator) ![]const
 }
 
 fn expect(scanner: *std.json.Scanner, allocator: std.mem.Allocator, expected: std.meta.Tag(std.json.Token)) !void {
-    if (std.meta.activeTag(try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes)) != expected) return error.InvalidModelsDev;
+    if (std.meta.activeTag(try scanner.nextAllocMax(allocator, .alloc_if_needed, scanner.input.len)) != expected) return error.InvalidModelsDev;
 }
 
 fn at(scanner: *std.json.Scanner, expected: std.json.Scanner.TokenType) !bool {
@@ -141,7 +136,7 @@ fn parseLevels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, profile
     var count: usize = 0;
     while (!(try at(scanner, .array_end))) : (count += 1) {
         if (try at(scanner, .string)) {
-            const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_body_bytes);
+            const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, scanner.input.len);
             const value = switch (token) {
                 .string, .allocated_string => |v| v,
                 else => unreachable,
@@ -323,7 +318,7 @@ fn parseLimits(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Limits
             if (seen.*) return error.InvalidModelsDev;
             seen.* = true;
             if (try at(scanner, .number)) {
-                const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes);
+                const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, scanner.input.len);
                 const text = switch (token) {
                     .number, .allocated_number => |value| value,
                     else => unreachable,
@@ -351,7 +346,7 @@ const ExactPrice = struct {
     // Scanner already validated JSON-number syntax; only the bounded numeric
     // domain and canonical comparison view are established here.
     fn parse(text: []const u8) ?ExactPrice {
-        if (text.len == 0 or text.len > max_value_bytes or text[0] == '-') return null;
+        if (text.len == 0 or text[0] == '-') return null;
         const exponent_at = std.mem.indexOfAny(u8, text, "eE") orelse text.len;
         const mantissa = text[0..exponent_at];
         const exponent = if (exponent_at < text.len)
@@ -372,14 +367,15 @@ const ExactPrice = struct {
                 continue;
             }
             if (byte < '0' or byte > '9') return null;
-            if (!fraction) integer_digits += 1;
+            if (!fraction) integer_digits = std.math.add(i32, integer_digits, 1) catch return null;
             if (byte != '0') {
                 if (first == null) first = i;
                 last = i;
-            } else if (first == null) leading += 1;
+            } else if (first == null) leading = std.math.add(i32, leading, 1) catch return null;
         }
         const start = first orelse return .{ .digits = "", .magnitude = 0 };
-        return .{ .digits = mantissa[start .. last + 1], .magnitude = exponent + integer_digits - leading };
+        const magnitude = std.math.sub(i32, std.math.add(i32, exponent, integer_digits) catch return null, leading) catch return null;
+        return .{ .digits = mantissa[start .. last + 1], .magnitude = magnitude };
     }
 
     fn order(left: ExactPrice, right: ExactPrice) std.math.Order {
@@ -402,14 +398,13 @@ const ExactPrice = struct {
 };
 const PriceTier = struct { input: ?ExactPrice = null, output: ?ExactPrice = null, size: ?u32 = null, flat_eligible: bool = true };
 const PriceSchedule = struct { threshold: ?u32 = null, flat: bool = false };
-const max_price_tiers = 128;
 
 fn priceNumber(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?ExactPrice {
     if (!(try at(scanner, .number))) {
         try scanner.skipValue();
         return null;
     }
-    const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes);
+    const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, scanner.input.len);
     const text = switch (token) {
         .number, .allocated_number => |v| v,
         else => unreachable,
@@ -440,7 +435,7 @@ fn tierSize(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !TierSize 
             if (seen_size) return error.InvalidModelsDev;
             seen_size = true;
             if (try at(scanner, .number)) {
-                const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, max_value_bytes);
+                const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, scanner.input.len);
                 const text = switch (token) {
                     .number, .allocated_number => |v| v,
                     else => unreachable,
@@ -498,8 +493,8 @@ fn parseCost(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !PriceSch
     try expect(scanner, allocator, .object_begin);
     var baseline: PriceTier = .{};
     var seen: u8 = 0;
-    var tiers: [max_price_tiers]PriceTier = undefined;
-    var count: usize = 0;
+    var tiers: std.ArrayList(PriceTier) = .empty;
+    defer tiers.deinit(allocator);
     var invalid = false;
     var flat_eligible = true;
     var seen_scalar: u8 = 0;
@@ -534,10 +529,7 @@ fn parseCost(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !PriceSch
                 try expect(scanner, allocator, .array_begin);
                 while (!(try at(scanner, .array_end))) {
                     const tier = try parsePriceTier(scanner, allocator);
-                    if (count < tiers.len) {
-                        tiers[count] = tier;
-                        count += 1;
-                    } else invalid = true;
+                    try tiers.append(allocator, tier);
                 }
                 try expect(scanner, allocator, .array_end);
             },
@@ -550,13 +542,13 @@ fn parseCost(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !PriceSch
     const output = baseline.output orelse return .{};
     // Sort integer bounds first: exact decimal comparisons then need only
     // adjacent tiers, not quadratic work over long price token prefixes.
-    std.mem.sort(PriceTier, tiers[0..count], {}, struct {
+    std.mem.sort(PriceTier, tiers.items, {}, struct {
         fn lessThan(_: void, left: PriceTier, right: PriceTier) bool {
             return (left.size orelse 0) < (right.size orelse 0);
         }
     }.lessThan);
     var threshold: ?u32 = null;
-    for (tiers[0..count], 0..) |tier, i| {
+    for (tiers.items, 0..) |tier, i| {
         flat_eligible = flat_eligible and tier.flat_eligible;
         const ti = tier.input orelse return .{};
         const to = tier.output orelse return .{};
@@ -565,7 +557,7 @@ fn parseCost(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !PriceSch
         const output_order = to.order(output);
         if (input_order == .lt or output_order == .lt) return .{};
         if (i != 0) {
-            const previous = tiers[i - 1];
+            const previous = tiers.items[i - 1];
             const pi = previous.input.?.order(ti);
             const po = previous.output.?.order(to);
             if (previous.size == size and (pi != .eq or po != .eq)) return .{};
@@ -624,7 +616,6 @@ fn parseModels(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provide
         const model = try nextString(scanner, allocator);
         try directory.validateId(model);
         if ((try seen.getOrPut(allocator, model)).found_existing) return error.InvalidModelsDev;
-        if (records.items.len >= max_records) return error.MetadataTooLarge;
         const row = try parseModel(scanner, allocator);
         try records.append(allocator, .{ .provider = provider, .model = model, .profile = row.profile, .npm = row.npm, .override_invalid = row.override_invalid, .described_api = row.described_api, .output_tokens = row.limits.output, .context_tokens = row.limits.context, .input_price_threshold = row.input_price_threshold, .input_price_flat_limit = if (row.input_price_flat) row.limits.context else null });
     }
@@ -675,7 +666,7 @@ fn parseProvider(scanner: *std.json.Scanner, allocator: std.mem.Allocator, provi
 
 /// Returned records borrow the caller's arena, never the scanner's lifetime.
 fn scan(a: std.mem.Allocator, body: []const u8) ![]const Record {
-    try json_bound.bound(body, max_body_bytes, max_structural_nodes);
+    try json_bound.validate(a, body);
     var scanner = std.json.Scanner.initCompleteInput(a, body);
     defer scanner.deinit();
     var records: std.ArrayList(Record) = .empty;
@@ -710,9 +701,10 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
     defer arena.deinit();
     const records = try scan(arena.allocator(), body);
     var result: directory.Directory = .{};
+    errdefer result.deinit(allocator);
     for (records) |record| {
         const id = providerId(record.provider) orelse continue;
-        const row = try result.upsert(id, record.model);
+        const row = try result.upsert(allocator, id, record.model);
         row.dev_present = true;
         row.dev_protocol = record.api;
         if (record.api == .systemone) continue; // Identity only: no generative capabilities.

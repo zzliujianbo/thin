@@ -1,7 +1,22 @@
-test "default log size limits" {
-    const limits = Limits{};
-    try std.testing.expectEqual(@as(usize, 500 * 1024 * 1024), limits.file_bytes);
-    try std.testing.expectEqual(@as(usize, 5 * 1024 * 1024), limits.record_bytes);
+test "record above former five MiB limit is written intact" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var store = Store.init(a, &root);
+    defer store.deinit();
+    const record = try a.alloc(u8, 5 * 1024 * 1024 + 17);
+    defer a.free(record);
+    @memset(record, 'x');
+    @memcpy(record[0..6], "{\"v\":\"");
+    @memcpy(record[record.len - 2 ..], "\"}");
+    try store.append(record);
+    const result = try root.read(a, store.path(), 0, record.len + 1);
+    defer a.free(result.data);
+    try std.testing.expectEqual(record.len + 1, result.data.len);
+    try std.testing.expectEqualSlices(u8, record, result.data[0..record.len]);
+    try std.testing.expectEqual(@as(u8, '\n'), result.data[record.len]);
 }
 test "pinned identity is lazy immutable and collision never substitutes another identity" {
     var tmp = std.testing.tmpDir(.{});
@@ -9,7 +24,7 @@ test "pinned identity is lazy immutable and collision never substitutes another 
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const id: ids.Id = @splat('b');
-    var store = Store.init(std.testing.allocator, &root, .{});
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
     var invalid = id;
     invalid[0] = '\n';
@@ -24,7 +39,7 @@ test "pinned identity is lazy immutable and collision never substitutes another 
     try std.testing.expectEqualSlices(u8, &id, &store.session_id);
     try std.testing.expectError(error.SessionIDAlreadyStarted, store.pinSessionID(id));
     try store.append("{}");
-    var collision = Store.init(std.testing.allocator, &root, .{});
+    var collision = Store.init(std.testing.allocator, &root);
     defer collision.deinit();
     try collision.pinSessionID(id);
     try std.testing.expectError(error.LogNameExhausted, collision.startTimestamp(1234));
@@ -37,7 +52,7 @@ test "log store lazy init private modes ordered compact lines and independent se
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
-    var store = Store.init(std.testing.allocator, &root, .{});
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
     try std.testing.expectEqualStrings("", store.path());
     try std.testing.expectError(error.FileNotFound, filesystem.openDirectory(root.dir.handle, ".thin"));
@@ -60,19 +75,19 @@ test "log store lazy init private modes ordered compact lines and independent se
     try store.append(" { \"a\": 1, \"s\": \"中 \\\" \\n\" } ");
     try store.append("{\"b\":2}");
     try expectContent(&root, original, "{\"a\":1,\"s\":\"中 \\\" \\n\"}\n{\"b\":2}\n");
-    var other = Store.init(std.testing.allocator, &root, .{});
+    var other = Store.init(std.testing.allocator, &root);
     defer other.deinit();
     try other.append("{}");
     try std.testing.expect(!std.mem.eql(u8, store.path(), other.path()));
     try std.testing.expect(!std.mem.eql(u8, &store.session_id, &other.session_id));
     try expectContent(&root, other.path(), "{}\n");
 }
-test "log store rotates without splitting or overwriting and keeps old fd on collision" {
+test "log store does not rotate at former file threshold" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
-    var store = Store.init(std.testing.allocator, &root, .{ .record_bytes = 8, .file_bytes = 6 });
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
     try store.pinSessionID(@splat('b'));
     try store.startTimestamp(1234);
@@ -80,46 +95,30 @@ test "log store rotates without splitting or overwriting and keeps old fd on col
     try store.append("{}");
     const first = try std.testing.allocator.dupe(u8, store.path());
     defer std.testing.allocator.free(first);
-    try store.append("{}");
-    try std.testing.expectEqual(@as(u32, 0), store.part);
-    try store.append("{}");
-    try std.testing.expectEqual(@as(u32, 1), store.part);
-    try std.testing.expectEqualStrings(".thin/sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-1234-1.jsonl", store.path());
-    try expectContent(&root, first, "{}\n{}\n");
-    try expectContent(&root, store.path(), "{}\n");
-    try store.append("{}");
-    try store.append("{}");
-    try std.testing.expectEqual(@as(u32, 2), store.part);
-    try std.testing.expectEqualStrings(".thin/sessions/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-1234-2.jsonl", store.path());
-    try store.append("{}");
-    var buffer: [96]u8 = undefined;
-    const next = try Store.name(&buffer, store.timestamp_ms, store.session_id, 3);
-    const collision = try store.createFile(store.logs_fd.?, next);
-    defer filesystem.closeFd(collision);
     const old_fd = store.file_fd.?;
-    try std.testing.expectError(error.PathAlreadyExists, store.append("{}"));
+    // Sparse positional offset crosses the old 500 MiB threshold without a large fixture.
+    store.bytes = 500 * 1024 * 1024;
+    try store.append("{}");
     try std.testing.expectEqual(old_fd, store.file_fd.?);
-    try std.testing.expectEqual(@as(u32, 2), store.part);
-    try expectContent(&root, store.path(), "{}\n{}\n");
-    try std.testing.expectEqual(@as(u64, 0), (try filesystem.fileFromFd(collision).stat(root.io)).size);
+    try std.testing.expectEqualStrings(first, store.path());
+    try std.testing.expectEqual(@as(usize, 500 * 1024 * 1024 + 3), store.bytes);
+    try std.testing.expectEqual(@as(u64, 500 * 1024 * 1024 + 3), (try filesystem.fileFromFd(old_fd).stat(root.io)).size);
 }
 test "log store invalid records and allocation failure do not create directories" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
-    var store = Store.init(std.testing.allocator, &root, .{ .record_bytes = 16, .file_bytes = 6 });
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
-    try std.testing.expectError(error.RecordTooLarge, store.append("{\"long\":123456789}"));
     try std.testing.expectError(error.RawNewline, store.append("{}\n"));
     try std.testing.expectError(error.RawNewline, store.append("{\r}"));
     try std.testing.expectError(error.InvalidUtf8, store.append("{\"a\":\"\xff\"}"));
     try std.testing.expectError(error.ExpectedJsonObject, store.append("[]"));
     try std.testing.expectError(error.InvalidJson, store.append("{\"a\":}"));
     try std.testing.expectError(error.InvalidJson, store.append("{}{}"));
-    try std.testing.expectError(error.RecordExceedsFileLimit, store.append("{\"a\":1}"));
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var oom = Store.init(failing.allocator(), &root, .{});
+    var oom = Store.init(failing.allocator(), &root);
     defer oom.deinit();
     try std.testing.expectError(error.OutOfMemory, oom.append("{}"));
     try std.testing.expectError(error.FileNotFound, filesystem.openDirectory(root.dir.handle, ".thin"));
@@ -131,7 +130,7 @@ test "log store partial write poisons store and creation failure closes owned fd
     defer root.deinit();
     var vtable = root.io.vtable.*;
     root.io.vtable = &vtable;
-    var store = Store.init(std.testing.allocator, &root, .{});
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
     // 先准备有效 marker，下面的 stat 故障只用于日志新文件。
     const thin = try Store.directory(root.dir.handle, ".thin");
@@ -189,7 +188,7 @@ test "log store ignore marker rejects unsafe modes content symlinks FIFO and dir
                 try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(logs, ".gitignore", @intCast(mode), 0));
             },
         }
-        var store = Store.init(std.testing.allocator, &root, .{});
+        var store = Store.init(std.testing.allocator, &root);
         defer store.deinit();
         const before = try openFdCount();
         for (0..4) |_| {
@@ -218,9 +217,9 @@ test "log store marker lock is bounded and independent stores start after releas
     defer filesystem.closeFd(thin);
     const logs = try Store.directory(thin, "sessions");
     defer filesystem.closeFd(logs);
-    var one = Store.init(std.testing.allocator, &root, .{});
+    var one = Store.init(std.testing.allocator, &root);
     defer one.deinit();
-    var two = Store.init(std.testing.allocator, &root, .{});
+    var two = Store.init(std.testing.allocator, &root);
     defer two.deinit();
     try std.testing.expectEqual(@as(c_int, 0), filesystem.flock(logs, filesystem.LOCK.EX | filesystem.LOCK.NB));
     const before = try openFdCount();
@@ -253,7 +252,7 @@ test "log store marker partial creation fails closed without leaking or creating
     var vtable = root.io.vtable.*;
     root.io.vtable = &vtable;
     vtable.fileWritePositional = partialWriteFailure;
-    var store = Store.init(std.testing.allocator, &root, .{});
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
     const before = try openFdCount();
     try std.testing.expectError(error.NoSpaceLeft, store.append("{}"));
@@ -284,7 +283,7 @@ test "log store rejects symlink regular file and FIFO at either directory compon
                 2 => try std.testing.expectEqual(@as(c_int, 0), mkfifoat(parent, entry, 0o600)),
                 else => unreachable,
             }
-            var store = Store.init(std.testing.allocator, &root, .{});
+            var store = Store.init(std.testing.allocator, &root);
             defer store.deinit();
             // 多次失败始终不拥有 fd；外部有界测试也验证 FIFO 不阻塞。
             const before = try openFdCount();
@@ -305,7 +304,7 @@ test "log store rejects insecure existing logs without chmod and preserves thin 
     try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(thin, 0o755));
     const logs = try Store.directory(thin, "sessions");
     defer filesystem.closeFd(logs);
-    var store = Store.init(std.testing.allocator, &root, .{});
+    var store = Store.init(std.testing.allocator, &root);
     defer store.deinit();
     for ([_]u32{ 0o710, 0o701, 0o777 }) |mode| {
         try std.testing.expectEqual(@as(c_int, 0), std.c.fchmod(logs, @intCast(mode)));

@@ -1,7 +1,7 @@
-test "SystemOne request code-owned questions and bounded untrusted state" {
+test "SystemOne request code-owned questions and untrusted state" {
     const a = std.testing.allocator;
     for ([_]decision.Input{ test_command, test_refine, .{ .refine_outputs = &.{} } }) |input| {
-        const request = try encodeRequest(a, "jev-test", input, 65536);
+        const request = try encodeRequest(a, "jev-test", input);
         defer a.free(request);
         const tree = try std.json.parseFromSlice(Value, a, request, .{});
         defer tree.deinit();
@@ -36,7 +36,40 @@ test "SystemOne request code-owned questions and bounded untrusted state" {
             },
         }
     }
-    try std.testing.expectError(error.DecisionInputTooLarge, encodeRequest(a, "jev", test_command, 1));
+}
+test "SystemOne accepts more than eight items and former state response byte caps" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 16385);
+    defer a.free(large);
+    @memset(large, 'x');
+    var items = [_]decision.RefineItem{
+        .{ .id = "0", .text = "x" }, .{ .id = "1", .text = "x" }, .{ .id = "2", .text = "x" },
+        .{ .id = "3", .text = "x" }, .{ .id = "4", .text = "x" }, .{ .id = "5", .text = "x" },
+        .{ .id = "6", .text = "x" }, .{ .id = "7", .text = "x" }, .{ .id = "8", .text = "x" },
+    };
+    items[0].text = large;
+    const bytes = try encodeRequest(a, "jev", .{ .refine_outputs = &items });
+    defer a.free(bytes);
+    const tree = try std.json.parseFromSlice(Value, a, bytes, .{});
+    defer tree.deinit();
+    try std.testing.expectEqual(@as(usize, 9), tree.value.object.get("questions").?.object.count());
+    try std.testing.expect(tree.value.object.get("state").?.string.len > 16384);
+    var body: std.Io.Writer.Allocating = .init(a);
+    defer body.deinit();
+    try body.writer.writeAll("{\"answers\":{");
+    for (items, 0..) |_, i| {
+        if (i != 0) try body.writer.writeByte(',');
+        try body.writer.print("\"retain_{d}\":{{\"type\":\"noul\",\"noul\":0.98}}", .{i});
+    }
+    try body.writer.writeAll("}}");
+    for (0..65537) |_| try body.writer.writeByte(' ');
+    const result = try parseResponse(a, .{ .refine_outputs = &items }, body.written());
+    defer decision.freeOutput(a, result.output);
+    try std.testing.expectEqual(items.len, result.output.refine_outputs.len);
+    for (items, result.output.refine_outputs) |original, owned| {
+        try std.testing.expectEqualStrings(original.id, owned.id);
+        try std.testing.expectEqualStrings(original.text, owned.text);
+    }
 }
 test "SystemOne command harm scope and refinement envelopes" {
     const a = std.testing.allocator;
@@ -46,7 +79,7 @@ test "SystemOne command harm scope and refinement envelopes" {
         test_refine,
     };
     for (inputs, 0..) |input, i| {
-        const bytes = try encodeRequest(a, "jev-test", input, 16384);
+        const bytes = try encodeRequest(a, "jev-test", input);
         defer a.free(bytes);
         const parsed = try std.json.parseFromSlice(Value, a, bytes, .{});
         defer parsed.deinit();
@@ -74,23 +107,17 @@ test "SystemOne command harm scope and refinement envelopes" {
             else => unreachable,
         }
     }
-    try std.testing.expectError(error.InvalidDecisionInput, encodeRequest(a, "jev", .{ .command = .{ .command = "bad\xff" } }, 16384));
-    try std.testing.expectError(error.InvalidDecisionInput, encodeRequest(a, "jev", .{ .command = .{ .command = "valid", .risk = "" } }, 16384));
+    try std.testing.expectError(error.InvalidDecisionInput, encodeRequest(a, "jev", .{ .command = .{ .command = "bad\xff" } }));
+    try std.testing.expectError(error.InvalidDecisionInput, encodeRequest(a, "jev", .{ .command = .{ .command = "valid", .risk = "" } }));
 }
 test "SystemOne parser validates input before response and allocation" {
     const t = std.testing;
     const malformed = "{\"answers\":}";
-    const too_many = [_]decision.RefineItem{
-        .{ .id = "0", .text = "x" }, .{ .id = "1", .text = "x" }, .{ .id = "2", .text = "x" },
-        .{ .id = "3", .text = "x" }, .{ .id = "4", .text = "x" }, .{ .id = "5", .text = "x" },
-        .{ .id = "6", .text = "x" }, .{ .id = "7", .text = "x" }, .{ .id = "8", .text = "x" },
-    };
     for ([_]decision.Input{
         .{ .command = .{ .command = "" } },
         .{ .command = .{ .command = "valid", .risk = "" } },
         .{ .command = .{ .command = "valid", .risk = "\xff" } },
         .{ .refine_outputs = &.{ .{ .id = "same", .text = "x" }, .{ .id = "same", .text = "y" } } },
-        .{ .refine_outputs = &too_many },
         .{ .refine_outputs = &.{.{ .id = "id", .text = "" }} },
     }) |input| {
         try t.expectError(error.InvalidDecisionInput, parseResponse(t.allocator, input, malformed));
@@ -131,14 +158,17 @@ test "SystemOne command rejects missing invalid and duplicate ask answers" {
 test "SystemOne strict records IDs duplicates finite scores nesting and usage" {
     const a = std.testing.allocator;
     for ([_][]const u8{
-        "{}",                                                                                            "[]",                                                                                     "NaN",                                                             "{\"answers\":{}}",
-        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":true}}}",                                "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":NaN}}}",                          "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1e999}}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":-0.1}}}",
-        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1.1}}}",                                 "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9,\"noul\":0.9}}}",             "{\"answers\":{\"wrong\":{}}}",                                    "{\"answers\":{\"retain_0\":{\"type\":\"choice\",\"noul\":0.9}}}",
-        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":-1}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"x\":[[[[[[[[[]]]]]]]]]}", "{\"answers\":{},\"answers\":{}}",                                 "{\"answers\":{},\"x\":\"\xff\"}",
+        "{}",                                                                                            "[]",                                                                         "NaN",                                                             "{\"answers\":{}}",
+        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":true}}}",                                "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":NaN}}}",              "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1e999}}}", "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":-0.1}}}",
+        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":1.1}}}",                                 "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9,\"noul\":0.9}}}", "{\"answers\":{\"wrong\":{}}}",                                    "{\"answers\":{\"retain_0\":{\"type\":\"choice\",\"noul\":0.9}}}",
+        "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":-1}}", "{\"answers\":{},\"answers\":{}}",                                            "{\"answers\":{},\"x\":\"\xff\"}",
     }) |bad| try std.testing.expectError(invalid, parseResponse(a, test_refine, bad));
     const large_usage = try parseResponse(a, test_refine, "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.83,\"x\":0},\"metadata\":{}},\"usage\":{\"input_tokens\":18446744073709551615}}");
     defer decision.freeOutput(a, large_usage.output);
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), large_usage.usage.input_tokens);
+    const nested = try parseResponse(a, test_refine, "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.9}},\"x\":[[[[[[[[[]]]]]]]]]}");
+    defer decision.freeOutput(a, nested.output);
+    try std.testing.expectEqualStrings(test_refine.refine_outputs[0].text, nested.output.refine_outputs[0].text);
     const huge = try a.alloc(u8, 65537);
     defer a.free(huge);
     @memset(huge, ' ');
@@ -176,22 +206,13 @@ test "SystemOne refinement original protected middle diagnostics and ownership" 
 }
 test "SystemOne raw byte prebound model bounds and serialized bound" {
     const t = std.testing;
-    // Failure must precede even the first allocator call and must include every
-    // string member, not just the command/content/text payload.
-    for ([_]decision.Input{
-        .{ .command = .{ .command = "1234", .risk = "5678" } },
-        .{ .refine_outputs = &.{ .{ .id = "12", .text = "34" }, .{ .id = "56", .text = "78" } } },
-    }) |input| try t.expectError(error.DecisionInputTooLarge, encodeRequest(t.failing_allocator, "jev", input, 7));
-    var total: usize = std.math.maxInt(usize);
-    try t.expectError(error.DecisionInputTooLarge, addRawBytes(&total, 1, std.math.maxInt(u32)));
-    // Raw input fits, but the serialized JSON plus untrusted label does not.
-    try t.expectError(error.DecisionInputTooLarge, encodeRequest(t.allocator, "jev", test_command, 7));
+    try t.expectError(error.OutOfMemory, encodeRequest(t.failing_allocator, "jev", test_command));
     const too_long: [1025]u8 = @splat('m');
     for ([_][]const u8{ "", &too_long, "bad\nmodel", "bad\x00model", "bad\x7fmodel", "bad\xc2\x85model", "\xff" }) |model| {
-        try t.expectError(error.InvalidDecisionInput, encodeRequest(t.failing_allocator, model, test_command, 65536));
+        try t.expectError(error.InvalidDecisionInput, encodeRequest(t.failing_allocator, model, test_command));
     }
     const model: [1024]u8 = @splat('m');
-    const request = try encodeRequest(t.allocator, &model, test_command, 65536);
+    const request = try encodeRequest(t.allocator, &model, test_command);
     defer t.allocator.free(request);
 }
 test "SystemOne first last eligible progress exact newlines and small candidate sets" {
@@ -251,19 +272,25 @@ test "SystemOne shared progress eligibility protects fences diagnostics and endp
     const nine: [9]decision.RefineItem = @splat(.{ .id = "id", .text = "x" });
     try std.testing.expectError(error.InvalidDecisionInput, unchangedRefinement(a, &nine));
     const long: [8193]u8 = @splat('x');
-    try std.testing.expectError(invalid, unchangedRefinement(a, &.{.{ .id = "long", .text = &long }}));
+    const long_copy = (try unchangedRefinement(a, &.{.{ .id = "long", .text = &long }})).?;
+    defer decision.freeOutput(a, long_copy);
+    try std.testing.expectEqualStrings(&long, long_copy.refine_outputs[0].text);
     const exact = (try unchangedRefinement(a, &.{.{ .id = "long", .text = long[0..8192] }})).?;
     defer decision.freeOutput(a, exact);
     try std.testing.expectEqualStrings(long[0..8192], exact.refine_outputs[0].text);
 }
-test "SystemOne final refinement 8192 byte cap including uncertain originals" {
+test "SystemOne final refinement preserves long uncertain originals without a byte cap" {
     const a = std.testing.allocator;
     const text: [8193]u8 = @splat('x');
     const keep = "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.98}}}";
     const omit = "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.04}}}";
     const large: decision.Input = .{ .refine_outputs = &.{.{ .id = "id", .text = &text }} };
-    try std.testing.expectError(invalid, parseResponse(a, large, keep));
-    try std.testing.expectError(invalid, parseResponse(a, large, omit));
+    const large_keep = try parseResponse(a, large, keep);
+    defer decision.freeOutput(a, large_keep.output);
+    try std.testing.expectEqualStrings(&text, large_keep.output.refine_outputs[0].text);
+    const large_omit = try parseResponse(a, large, omit);
+    defer decision.freeOutput(a, large_omit.output);
+    try std.testing.expectEqualStrings(&text, large_omit.output.refine_outputs[0].text);
     const exact: decision.Input = .{ .refine_outputs = &.{.{ .id = "id", .text = text[0..8192] }} };
     const accepted = try parseResponse(a, exact, keep);
     defer decision.freeOutput(a, accepted.output);
@@ -274,7 +301,9 @@ test "SystemOne final refinement 8192 byte cap including uncertain originals" {
     for (0..2000) |_| try log.writer.writeAll("tick\n");
     try log.writer.writeAll("ERROR /path:12\n");
     const compressible: decision.Input = .{ .refine_outputs = &.{.{ .id = "id", .text = log.written() }} };
-    try std.testing.expectError(invalid, parseResponse(a, compressible, keep));
+    const preserved = try parseResponse(a, compressible, keep);
+    defer decision.freeOutput(a, preserved.output);
+    try std.testing.expectEqualStrings(log.written(), preserved.output.refine_outputs[0].text);
     const compressed = try parseResponse(a, compressible, omit);
     defer decision.freeOutput(a, compressed.output);
     try std.testing.expectEqualStrings("diagnostic\ntick\ntick\nERROR /path:12\n", compressed.output.refine_outputs[0].text);
@@ -283,7 +312,7 @@ test "SystemOne all allocation failures request and caller-owned response" {
     const Harness = struct {
         fn run(a: Allocator) !void {
             for ([_]decision.Input{ test_command, test_refine }) |input| {
-                const req = try encodeRequest(a, "jev", input, 65536);
+                const req = try encodeRequest(a, "jev", input);
                 a.free(req);
             }
             const result = try parseResponse(a, test_refine, "{\"answers\":{\"retain_0\":{\"type\":\"noul\",\"noul\":0.04}}}");

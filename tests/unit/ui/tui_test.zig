@@ -1,3 +1,58 @@
+test "restored assistant retains and lays out complete large static source" {
+    const a = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(a);
+    try source.appendSlice(a, "HEADMARK\n");
+    for (0..9000) |_| try source.appendSlice(a, "0123456789abcdefghijklmnopqrstuv\n");
+    try source.appendSlice(a, "TAILMARK\x1b[2J中文");
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.restoreHistory(&.{.{ .role = .assistant, .blocks = &.{.{ .text = source.items }} }});
+    var found = false;
+    for (ui.records.items) |*record| {
+        if (record.kind != .assistant) continue;
+        found = true;
+        try std.testing.expect(record.batch and !record.clipped);
+        try std.testing.expectEqualStrings(source.items, record.body.items);
+        try record.layout(a, 80);
+        try std.testing.expect(!record.excerpt);
+        try std.testing.expect(record.lines.len > 8192);
+        try std.testing.expect(std.mem.indexOf(u8, record.lines[0], "HEADMARK") != null);
+        try std.testing.expect(std.mem.indexOf(u8, record.lines[record.lines.len - 1], "TAILMARK") != null);
+        for (record.lines) |line| try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[2J") == null);
+    }
+    try std.testing.expect(found);
+}
+
+fn staticMarkdownAllocationScenario(a: std.mem.Allocator) !void {
+    const rendered = try markdown.render(a, "head **bold** 中文\x1b[2J\ntail", .{ .columns = 12, .max_lines = null });
+    defer markdown.release(a, rendered);
+    try std.testing.expect(!rendered.truncated);
+}
+
+test "static markdown allocation failures are transactional" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, staticMarkdownAllocationScenario, .{});
+}
+
+test "static plaintext preserves all rows beyond former limits" {
+    const a = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(a);
+    try source.appendSlice(a, "HEADMARK\n");
+    for (0..9000) |_| try source.appendSlice(a, "0123456789abcdefghijklmnopqrstuv\n");
+    try source.appendSlice(a, "TAILMARK\x1b[2J中文");
+    const rendered = try markdown.render(a, source.items, .{ .columns = 80, .max_lines = null, .markdown = false, .ansi = false });
+    defer markdown.release(a, rendered);
+    try std.testing.expect(!rendered.truncated);
+    try std.testing.expect(rendered.lines.len > 8192);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.lines[0], "HEADMARK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.lines[rendered.lines.len - 1], "TAILMARK") != null);
+    for (rendered.lines) |line| try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
+}
+
 test "stable pending pulses preserve native history and tail" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -400,7 +455,7 @@ test "rendered unacknowledged body window applies admission pressure" {
     try std.testing.expect(ui.displayBackpressured());
     body.abort();
 }
-test "large history restore retains bounded visible suffix" {
+test "large history restore retains all records and identities" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -414,15 +469,16 @@ test "large history restore retains bounded visible suffix" {
         message.* = .{ .role = .user, .blocks = blocks[i .. i + 1] };
     }
     try ui.restoreHistory(&messages);
-    try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 101), ui.records.items.len);
     try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, ui.records.items[0].body.items, "display may be shortened") != null);
-    for (ui.records.items[1..], 37..) |record, i| {
+    for (ui.records.items[1..], 0..) |record, i| {
         try std.testing.expectEqual(Kind.user, record.kind);
         try std.testing.expectEqualStrings(blocks[i].text, record.body.items);
+        try std.testing.expectEqual(i + 1, ui.record_index.get(record.id).?);
     }
 }
-test "restore mixed long multi-block assistants stays within byte budget" {
+test "restore mixed long multi-block assistants retains all bytes" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -449,11 +505,11 @@ test "restore mixed long multi-block assistants stays within byte budget" {
     for (ui.records.items) |record| {
         bytes += record.body.items.len;
         if (record.kind == .assistant) assistants += 1;
-        if (record.kind == .user) try std.testing.expect(!std.mem.eql(u8, record.body.items, "short-001"));
+        if (record.kind == .user and std.mem.eql(u8, record.body.items, "short-001")) try std.testing.expect(record.batch);
     }
-    try std.testing.expect(bytes <= 1024 * 1024);
-    try std.testing.expect(ui.records.items.len <= 64 and ui.records.items.len < messages.len + 1);
-    try std.testing.expect(assistants != 0);
+    try std.testing.expect(bytes > 1024 * 1024);
+    try std.testing.expectEqual(messages.len + 1, ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 12), assistants);
     try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expectEqual(Kind.user, ui.records.items[ui.records.items.len - 1].kind);
     try std.testing.expectEqualStrings("short-023", ui.records.items[ui.records.items.len - 1].body.items);
@@ -466,9 +522,10 @@ test "normal admission never evicts unprinted records" {
     defer ui.deinit();
     const first = try ui.add(.user, "oldest-pending");
     const first_id = ui.records.items[first].id;
-    for (1..64) |_| _ = try ui.add(.user, "pending");
-    try std.testing.expectError(error.DisplayCapacity, ui.add(.user, "overflow"));
-    try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
+    for (1..100) |_| _ = try ui.add(.user, "pending");
+    _ = try ui.add(.user, "overflow");
+    try std.testing.expectEqual(@as(usize, 101), ui.records.items.len);
+    try std.testing.expect(!ui.displayBackpressured());
     try std.testing.expectEqual(first_id, ui.records.items[0].id);
     try std.testing.expectEqualStrings("oldest-pending", ui.records.items[0].body.items);
     try std.testing.expectEqualStrings("pending", ui.records.items[63].body.items);
@@ -562,24 +619,22 @@ test "frame abort keeps unacknowledged record" {
     try std.testing.expect(!ui.records.items[index].output);
     try std.testing.expect(ui.records.items[index].stream != null);
 }
-test "eviction requires acknowledged inactive record without frame state" {
+test "acknowledged and frame-owned records survive subsequent admissions" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     const index = try ui.add(.user, "pending");
-    try std.testing.expect(!ui.canEvictOldest());
+    const id = ui.records.items[index].id;
     ui.records.items[index].output = true;
-    try std.testing.expect(ui.canEvictOldest());
     ui.records.items[index].pending_output = true;
-    try std.testing.expect(!ui.canEvictOldest());
-    ui.records.items[index].pending_output = false;
-    ui.draft = index;
-    try std.testing.expect(!ui.canEvictOldest());
-    ui.draft = null;
     ui.records.items[index].pending_flow_change = true;
-    try std.testing.expect(!ui.canEvictOldest());
+    for (0..70) |_| _ = try ui.add(.user, "later");
+    try std.testing.expectEqual(id, ui.records.items[0].id);
+    try std.testing.expect(ui.records.items[0].pending_output);
+    try std.testing.expect(ui.records.items[0].pending_flow_change);
+    try std.testing.expectEqual(@as(usize, 0), ui.record_index.get(id).?);
 }
 test "idle Enter waits for pending transcript output before releasing prompt rows" {
     var cancel: p.Cancellation = .{};
@@ -845,7 +900,7 @@ test "idle Enter staging OOM keeps request draft and acknowledged ownership" {
     try std.testing.checkAllAllocationFailures(backing.allocator(), idleEnterAllocationScenario, .{});
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }
-test "local command bridge clipping preserves outer truncation provenance" {
+test "complete bridge source preserves actual runtime truncation provenance" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
@@ -859,24 +914,38 @@ test "local command bridge clipping preserves outer truncation provenance" {
     const result = try std.fmt.allocPrint(a, "{{\"stdout\":\"{s}\",\"stderr\":\"UNAVAILABLE_BRIDGE_TAIL\",\"exit_code\":7}}", .{stdout});
     defer a.free(result);
     const host = bridge.host();
-    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = result, .is_error = true, .truncated = false } } }, &cancel);
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = result, .is_error = true, .truncated = true } } }, &cancel);
     var item = bridge.pop() orelse return error.MissingToolUiEvent;
     defer item.deinit();
-    try std.testing.expect(item.display_truncated);
-    try std.testing.expect(!item.event.tool_result.result.truncated);
-    try std.testing.expect(item.event.tool_result.result.text.len < result.len);
+    try std.testing.expect(!item.display_truncated);
+    try std.testing.expect(item.event.tool_result.result.truncated);
+    try std.testing.expectEqualStrings(result, item.event.tool_result.result.text);
     try ui.event(item);
     try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
     try std.testing.expect(ui.records.items[0].command_row);
-    try std.testing.expectEqualStrings(item.event.tool_result.result.text, ui.records.items[1].body.items);
+    try std.testing.expect(std.mem.startsWith(u8, ui.records.items[1].body.items, stdout));
     try std.testing.expect(!ui.records.items[1].clipped); // Below the formatter's independent cap.
     try std.testing.expectEqual(Kind.notice, ui.records.items[2].kind);
     try std.testing.expect(std.mem.indexOf(u8, ui.records.items[2].body.items, "result was truncated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "UNAVAILABLE_BRIDGE_TAIL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "UNAVAILABLE_BRIDGE_TAIL") != null);
     try std.testing.expect(std.mem.endsWith(u8, result, "\"exit_code\":7}"));
     try ui.draw();
     try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Local command result was truncated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Command exited with status 7") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "Command exited with status 7") != null);
+}
+test "local command captured truncation is not display clipping" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.localCommandOutput("{\"stdout\":\"hello\",\"stderr\":\"\",\"exit_code\":0,\"truncated\":true}", false);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    const record = &ui.records.items[0];
+    try std.testing.expect(!record.clipped);
+    try std.testing.expect(std.mem.indexOf(u8, record.body.items, "[output truncated]") != null);
+    try record.layout(std.testing.allocator, 80);
+    for (record.lines) |line| try std.testing.expect(std.mem.indexOf(u8, line, "[display clipped") == null);
 }
 test "local command outer truncation remains visible with incomplete JSON" {
     var cancel: p.Cancellation = .{};
@@ -1317,7 +1386,15 @@ test "editing recalled history commits draft ownership only after insertion succ
     ui.editor.cursor = 0;
     ui.editor_pasted = true;
     try ui.navigateInput(false);
-    try Ui.key(&ui, .{ .text = .{ .value = "x", .pasted = false } });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const prior_allocator = ui.editor.allocator;
+    ui.editor.allocator = failing.allocator();
+    const insertion = try std.testing.allocator.alloc(u8, 65537);
+    defer std.testing.allocator.free(insertion);
+    @memset(insertion, 'x');
+    const attempted = Ui.key(&ui, .{ .text = .{ .value = insertion, .pasted = false } });
+    ui.editor.allocator = prior_allocator;
+    try std.testing.expectError(error.OutOfMemory, attempted);
     try std.testing.expectEqual(@as(usize, 65536), ui.editor.bytes.items.len);
     try std.testing.expect(ui.input_history.index != null and ui.history_draft != null);
     try ui.navigateInput(true);
@@ -2033,6 +2110,20 @@ test "natural exit preserves a canonical gap at the scrollback boundary" {
     try std.testing.expect((try Locate.row(&screen, "boundary-hint")) > previous);
     try std.testing.expect((try Locate.row(&screen, "boundary-shell")) > (try Locate.row(&screen, "boundary-hint")));
 }
+test "resume retains long user input in navigable session history" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const input_text = try a.alloc(u8, 65537);
+    defer a.free(input_text);
+    @memset(input_text, 'x');
+    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = input_text }} }});
+    try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
+    try std.testing.expectEqualSlices(u8, input_text, ui.input_history.target(false).?.text);
+}
 test "resume startup projects saved text and tool outcomes without replaying reasoning or commands" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};
@@ -2243,7 +2334,7 @@ test "rolling thinking keeps a bounded incremental tail and can be hidden" {
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    const large = try std.testing.allocator.alloc(u8, 3 * (record_limit / 3 + 10));
+    const large = try std.testing.allocator.alloc(u8, 3 * (canonical_mirror_limit / 3 + 10));
     defer std.testing.allocator.free(large);
     for (0..large.len / 3) |i| @memcpy(large[i * 3 ..][0..3], "你");
     try ui.appendDraft(.reasoning, large);
@@ -2806,20 +2897,23 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, " pwd") == null);
 }
-test "incomplete canonical block tails cannot publish a false final heading" {
+test "complete canonical tails beyond the old block cap prevent a false final heading" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    var blocks: [bridge_module.block_limit + 1]p.Block = @splat(.{ .text = "" });
+    const old_block_limit = 256;
+    var blocks: [old_block_limit + 1]p.Block = @splat(.{ .text = "" });
     blocks[0] = .{ .text = "intermediate-body" };
-    blocks[bridge_module.block_limit] = .{ .tool_call = .{ .id = "tail-tool", .name = "bash", .arguments = "{\"command\":\"pwd\"}" } };
+    blocks[old_block_limit] = .{ .tool_call = .{ .id = "tail-tool", .name = "bash", .arguments = "{\"command\":\"pwd\"}" } };
     const host = bridge.host();
     try host.emit_fn(host.context, .{ .assistant_committed = &blocks }, &cancel);
     var item = bridge.pop().?;
     defer item.deinit();
-    try std.testing.expect(item.display_truncated and !item.canonical_complete);
+    try std.testing.expect(!item.display_truncated and item.canonical_complete);
+    try std.testing.expectEqual(blocks.len, item.event.assistant_committed.len);
+    try std.testing.expectEqualStrings("tail-tool", item.event.assistant_committed[old_block_limit].tool_call.id);
     try ui.event(item);
     try std.testing.expect(ui.draft == null and ui.records.items.len == 1);
     try std.testing.expectEqual(Kind.assistant, ui.records.items[0].kind);
@@ -3330,7 +3424,7 @@ test "canonical stream commit drains long finalized paragraphs by complete prefi
         defer std.testing.allocator.free(source);
         const rendered = try markdown.render(std.testing.allocator, source, .{ .columns = columns - 1, .max_lines = 8192 });
         defer markdown.release(std.testing.allocator, rendered);
-        try std.testing.expect(!rendered.truncated and !rendered.degraded);
+        try std.testing.expect(!rendered.truncated);
         var drawn: usize = 0;
         try ui.replaceCommitted(&.{.{ .text = source }}, false, true);
         const index = ui.records.items.len - 1;
@@ -3510,7 +3604,7 @@ test "withdrawn streamed text is explained without clearing native scrollback" {
     try std.testing.expect(screen.count("stream-row-") > 0);
     try std.testing.expectEqual(@as(usize, 1), screen.count("Stream preview withdrawn"));
 }
-test "clipped empty canonical preserves an unacknowledged streamed body" {
+test "complete canonical retains body beyond large reasoning without synthetic clipping" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -3525,12 +3619,13 @@ test "clipped empty canonical preserves an unacknowledged streamed body" {
     try host.emit_fn(host.context, .{ .assistant_committed = &.{ .{ .reasoning = thought }, .{ .text = "BODY-NOT-YET-ACKED" } } }, &cancel);
     var item = bridge.pop().?;
     defer item.deinit();
-    try std.testing.expect(item.display_truncated and item.canonical_complete);
-    try std.testing.expectEqual(@as(usize, 0), item.event.assistant_committed[1].text.len);
+    try std.testing.expect(!item.display_truncated and item.canonical_complete);
+    try std.testing.expectEqualSlices(u8, thought, item.event.assistant_committed[0].reasoning);
+    try std.testing.expectEqualStrings("BODY-NOT-YET-ACKED", item.event.assistant_committed[1].text);
     try ui.event(item);
     const index = ui.record_index.get(id).?;
     try std.testing.expectEqualStrings("BODY-NOT-YET-ACKED", ui.records.items[index].body.items);
-    try std.testing.expect(ui.records.items[index].clipped);
+    try std.testing.expect(!ui.records.items[index].clipped);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
@@ -4820,7 +4915,7 @@ test "remote sessions never announce a local task ownership" {
     ui.endTaskOwnership();
     try std.testing.expectEqual(@as(usize, 0), Tracker.joins);
 }
-test "permission line clipping is deny-only even when bytes fit bridge budget" {
+test "upstream truncated permission preview is deny-only" {
     try text.initLocale();
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4828,12 +4923,10 @@ test "permission line clipping is deny-only even when bytes fit bridge budget" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
 
-    // 10000 个换行，使预览行数超出上限。
-    const lines: [10000]u8 = @splat('\n');
     const host = bridge.host();
-    try host.emit_fn(host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = &lines } }, &cancel);
+    try host.emit_fn(host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = "incomplete preview" } }, &cancel);
     var item = bridge.pop().?;
-    try std.testing.expect(!item.display_truncated);
+    item.display_truncated = true;
     try ui.event(item);
     item.deinit();
 
@@ -4910,6 +5003,29 @@ test "inline approval preserves conversation and pages its plain preview" {
     try std.testing.expect(screen.visible("PREVIEW-4"));
     try std.testing.expect(!screen.visible("PREVIEW-1"));
     try std.testing.expectEqual(@as(?ApprovalChoice, .deny), ui.displayed_permission_choice);
+}
+test "large approval pages retain the first and last rows with fresh ACK" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(a);
+    try source.appendSlice(a, "HEAD-PREVIEW\n");
+    for (0..8200) |_| try source.appendSlice(a, "preview line\n");
+    try source.appendSlice(a, "TAIL-PREVIEW");
+    ui.permission = .{ .id = 12, .description = try a.dupe(u8, source.items), .clipped = false };
+    try ui.draw();
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "HEAD-PREVIEW") != null);
+    testAcknowledgeFullFrame(&ui);
+    try Ui.key(&ui, .end);
+    try std.testing.expect(ui.displayed_permission == null);
+    try ui.draw();
+    try std.testing.expect(std.mem.indexOf(u8, ui.frame, "TAIL-PREVIEW") != null);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(?u64, 12), ui.displayed_permission);
 }
 test "inline approval page keys cover every preview line" {
     var cancel: p.Cancellation = .{};
@@ -5483,7 +5599,7 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try std.testing.expect(!fixture.state.image_enabled);
     try std.testing.expect((Connection.State{ .runtime = null, .model = "", .base_url = "" }).image_models.len == 0);
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
@@ -5506,7 +5622,7 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(fixture.state.image_enabled and ui.settings_model_picker != .image and ui.settings_menu.selected == 6);
+    try std.testing.expect(fixture.state.image_enabled and ui.settings_model_picker != .image and ui.settings_menu.selected == 5);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try std.testing.expectEqualStrings("login/family/judge", fixture.state.decision_model.?);
     try ui.draw();
@@ -5517,14 +5633,14 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
-    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 6);
+    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 5);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\rquery\x1b[D\r", sink); // Root open discards the entire tail.
     try std.testing.expect(ui.settings_model_picker == .image and ui.editor.bytes.items.len == 0);
     try ui.parser.feed("query\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 6 and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 5 and ui.editor.bytes.items.len == 0);
     ui.settings_menu.selected = 1;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -5548,7 +5664,7 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -5794,7 +5910,6 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     ui.closeSettingsMenu();
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try std.testing.expectEqualStrings("Command timeout (s)", Ui.settingsValueTitle(.command_timeout_ms));
-    try std.testing.expectEqualStrings("Task timeout (s)", Ui.settingsValueTitle(.task_timeout_ms));
     try std.testing.expect(std.mem.find(u8, Ui.settingsValueTitle(.request_timeout_ms), "(s;") != null);
 }
 test "Decision search clips UTF8 controls and tiny windows without granting authority" {
@@ -5889,7 +6004,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -5898,7 +6013,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.memory_auto);
     try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
-    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 7);
+    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 6);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try ui.draw();
@@ -5964,10 +6079,10 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 3 and ui.settings_open);
     try std.testing.expectEqualStrings("unchanged-primary", fixture.state.model);
 }
-test "settings custom task timeout stages before a second fresh ACK and preserves parent" {
+test "settings custom request timeout stages before a second fresh ACK and preserves parent" {
     try text.initLocale();
     var fixture: PreferenceFixture = .{};
-    fixture.state.limits.task_timeout_ms = 1024;
+    fixture.state.limits.request_timeout_ms = 1024;
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5976,8 +6091,8 @@ test "settings custom task timeout stages before a second fresh ACK and preserve
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
-    ui.openSettingsValue(.task_timeout_ms, fixture.state);
+    ui.settings_menu.selected = 4;
+    ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -5991,21 +6106,21 @@ test "settings custom task timeout stages before a second fresh ACK and preserve
     try ui.parser.feed("\r\r", sink);
     try std.testing.expect(!ui.settings_value_picker.?.editing);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try std.testing.expectEqual(@as(u32, 1024), fixture.state.limits.task_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 1024), fixture.state.limits.request_timeout_ms);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expectEqual(@as(u32, 8192), fixture.state.limits.task_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 5);
-    ui.openSettingsValue(.task_timeout_ms, fixture.state);
+    try std.testing.expectEqual(@as(u32, 8192), fixture.state.limits.request_timeout_ms);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 4);
+    ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 300000);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
-    try std.testing.expectEqual(@as(u32, 300000), fixture.state.limits.task_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 5);
+    try std.testing.expectEqual(@as(u32, 300000), fixture.state.limits.request_timeout_ms);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 4);
 }
 test "settings shared request timeout rejects pasted numbers and preserves parent" {
     try text.initLocale();
@@ -7603,6 +7718,7 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     try std.testing.expectEqual(before.input_price_threshold, session.app.?.config.value.model.input_price_threshold);
     try std.testing.expectEqual(before.protocol, session.app.?.config.value.model.protocol);
     // The adopted map must be owned, not borrowed from movable cache storage.
+    session.metadata_cache.deinit(a);
     session.metadata_cache = .{};
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -9022,7 +9138,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 8;
+    ui.settings_menu.selected = 7;
     // Settings-root draft: the child must never destroy it.
     _ = try ui.editor.insert("draft");
     try ui.draw();
@@ -9101,7 +9217,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.escape);
     try std.testing.expect(!ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 8), ui.settings_menu.selected);
+    try std.testing.expectEqual(@as(usize, 7), ui.settings_menu.selected);
     try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
 }
 test "proxy picker owns its query while the parent submenu stays marked" {
@@ -9119,7 +9235,7 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 8;
+    ui.settings_menu.selected = 7;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9164,7 +9280,7 @@ test "settings proxy submenu reports a missing endpoint instead of stalling" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 8;
+    ui.settings_menu.selected = 7;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9226,10 +9342,10 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 8;
+    ui.settings_menu.selected = 7;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
-    // Root 8 -> second level -> Address, prefilled empty when nothing is set.
+    // Root 7 -> second level -> Address, prefilled empty when nothing is set.
     try ui.settingsKey(.enter);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -9317,7 +9433,7 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 8;
+    ui.settings_menu.selected = 7;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9361,7 +9477,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 8;
+    ui.settings_menu.selected = 7;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9642,7 +9758,7 @@ test "regression idle selectors Ctrl-C reaches child modal via parser" {
         try std.testing.expect(!ui.settingsModelOpen() and ui.model_picker == null and !ui.provider_open);
         if (kind < 2) {
             try std.testing.expect(ui.settings_open);
-            try std.testing.expectEqual(@as(usize, if (kind == 0) 1 else 6), ui.settings_menu.selected);
+            try std.testing.expectEqual(@as(usize, if (kind == 0) 1 else 5), ui.settings_menu.selected);
             try std.testing.expectEqualStrings("", ui.editor.bytes.items);
         }
         try std.testing.expect(!ui.stop_open and !cancel.isRequested());
@@ -10609,8 +10725,8 @@ test "active agent rows do not consume ordinary record capacity" {
         try std.testing.expect(ui.records.items[index].agent_open);
     }
     for (0..64) |_| _ = try ui.add(.user, "ordinary");
-    try std.testing.expectError(error.DisplayCapacity, ui.add(.user, "overflow"));
-    try std.testing.expectEqual(@as(usize, 129), ui.records.items.len);
+    _ = try ui.add(.user, "overflow");
+    try std.testing.expectEqual(@as(usize, 130), ui.records.items.len);
     for (ui.subagent_rows.items) |row| try std.testing.expect(ui.record_index.contains(row.record_id));
 }
 test "per-agent status rows incomplete terminal pages" {
@@ -11496,7 +11612,7 @@ test "canonical stream commit long finalized paragraph delivery waits for every 
     defer std.testing.allocator.free(source);
     const rendered = try markdown.render(std.testing.allocator, source, .{ .columns = 186, .max_lines = 8192 });
     defer markdown.release(std.testing.allocator, rendered);
-    try std.testing.expect(!rendered.truncated and !rendered.degraded);
+    try std.testing.expect(!rendered.truncated);
     fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .assistant_committed = &.{.{ .text = source }} });
     fake.item.?.delivery_epoch = 9;
     fake.item.?.delivery_sequence = 1;
@@ -11946,7 +12062,7 @@ test "an unsupported ACK enqueue never retires live delivery" {
     try std.testing.expect(std.mem.find(u8, ui.notice, "ACK unsupported") != null);
     try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
 }
-test "an unmet delivery fence protects its record from eviction" {
+test "unmet delivery fence and record survive additional admissions" {
     var fake = FakeRemote{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -11958,12 +12074,13 @@ test "an unmet delivery fence protects its record from eviction" {
     _ = try ui.add(.user, "live tail");
     ui.draft = 1;
     ui.reasoning = 1;
-    try std.testing.expect(ui.canEvictOldest());
     const id = ui.records.items[0].id;
     ui.pushDeliveryFence(.{ .epoch = 9, .sequence = 1, .record_id = id });
-    try std.testing.expect(!ui.canEvictOldest());
-    ui.delivery_fences.items[0].proven = true;
-    try std.testing.expect(ui.canEvictOldest());
+    for (0..70) |_| _ = try ui.add(.user, "later");
+    try std.testing.expectEqual(id, ui.records.items[0].id);
+    try std.testing.expectEqual(id, ui.delivery_fences.items[0].record_id);
+    try std.testing.expect(!ui.delivery_fences.items[0].proven);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
 }
 test "remote approval delivery waits for higher priority owner to release" {
     for (0..4) |owner| {
@@ -12246,14 +12363,30 @@ test "display admission leaves remote event queued while cancel input remains li
     defer bridge.deinit();
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
-    for (0..62) |_| _ = try ui.add(.user, "pending");
+    var sequence: u64 = 1;
+    while (sequence <= delivery_fence_capacity) : (sequence += 1) ui.admitDelivery(9, sequence);
+    try std.testing.expect(ui.displayBackpressured());
     fake.item = try session_client.ownEvent(std.testing.allocator, 1, .{ .text = "not consumed" });
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = delivery_fence_capacity + 1;
     defer if (fake.item) |*item| item.deinit();
     try ui.pumpDisplay();
     try std.testing.expect(fake.item != null);
     try std.testing.expectEqual(@as(usize, 0), bridge.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
     try Ui.key(&ui, .cancel);
     try std.testing.expect(ui.stop_open);
+    try Ui.key(&ui, .escape);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, delivery_fence_capacity), ui.delivery_acked);
+    try ui.pumpDisplay();
+    try std.testing.expect(fake.item == null);
+    try std.testing.expectEqual(@as(u64, delivery_fence_capacity + 1), ui.delivery_admitted);
+    try std.testing.expect(ui.draft != null);
+    try std.testing.expectEqualStrings("not consumed", ui.records.items[ui.draft.?].body.items);
+    try ui.pumpDisplay();
+    try std.testing.expectEqualStrings("not consumed", ui.records.items[ui.draft.?].body.items);
 }
 test "synchronizing remote view never paints an idle prompt or invents a running task" {
     var fake = FakeRemote{ .snapshot = .{ .available = false, .attached = true, .control_epoch = 1 } };

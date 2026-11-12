@@ -363,7 +363,6 @@ pub const Client = struct {
             try self.job.checkBudget();
             self.head = head;
             if (head.status != 200) {
-                if (bytes.len > 65536 - self.error_body.items.len) return error.CurlResponseTooLarge;
                 return self.error_body.appendSlice(self.allocator, bytes);
             }
             if (!head.is_sse) return error.ExpectedSse;
@@ -393,11 +392,11 @@ pub const Client = struct {
             .systemone => return error.UnsupportedProtocol,
             .auto => unreachable,
         };
-        var decoder = sse.Decoder.init(job.client.allocator, job.client.config.limits.max_event_bytes, .{ .context = &stream, .emit_fn = Stream.feed });
+        var decoder = sse.Decoder.init(job.client.allocator, null, .{ .context = &stream, .emit_fn = Stream.feed });
         defer decoder.deinit();
         var body: ProxyBody = .{ .job = job, .decoder = &decoder, .allocator = a };
         const remaining: u32 = @intCast(@max(1, @as(i64, job.client.config.limits.request_timeout_ms) - job.start.untilNow(job.client.io, .awake).toMilliseconds()));
-        const head = transport.streamPost(a, address, headers[0..count], payload, @max(1, remaining), job.client.config.limits.max_response_bytes, .{ .context = &body, .write_fn = ProxyBody.write, .check_fn = ProxyBody.check }, job.request.cancellation orelse &uncanceled) catch |err| switch (err) {
+        const head = transport.streamPost(a, address, headers[0..count], payload, @max(1, remaining), null, .{ .context = &body, .write_fn = ProxyBody.write, .check_fn = ProxyBody.check }, job.request.cancellation orelse &uncanceled) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled, error.CleanupFailed, error.RequestTimeout => return err,
             error.Timeout => return error.RequestTimeout,
             error.InvalidHttpHead, error.ExpectedSse, error.InvalidModelEvent, error.CurlResponseTooLarge => return failure(.protocol, "Invalid or oversized proxied model response", if (body.head) |h| h.status else null, stream.observed()),
@@ -521,7 +520,7 @@ pub const Client = struct {
 
         // 非 200：读取最多 64KB 的错误体后交给分类器；读取失败时不做错误分类。
         if (status != 200) {
-            const error_body = reader.allocRemaining(a, .limited(65536)) catch
+            const error_body = reader.allocRemaining(a, .unlimited) catch
                 return failure(if (status >= 500) .server else .protocol, "API error body could not be read safely", status, false);
             // 错误体未读完（连接中断）时，不能依据残缺内容判断错误类型。
             switch (request.reader.state) {
@@ -545,16 +544,13 @@ pub const Client = struct {
             .auto => unreachable,
         };
 
-        // 单个 SSE 事件大小受 max_event_bytes 限制，防止恶意服务端耗尽内存。
-        var decoder = sse.Decoder.init(self.allocator, self.config.limits.max_event_bytes, .{
+        var decoder = sse.Decoder.init(self.allocator, null, .{
             .context = &stream,
             .emit_fn = Stream.feed,
         });
         defer decoder.deinit();
 
-        // 读取循环：累计字节数不超过 max_response_bytes。
         var buffer: [8192]u8 = undefined;
-        var total: usize = 0;
         while (true) {
             // readVec copies an existing buffered prefix, then can block in
             // another socket read before returning it. Deliver that prefix
@@ -565,10 +561,6 @@ pub const Client = struct {
             };
             // 0 字节只表示暂时没有数据，不是 EOF。
             if (n == 0) continue;
-            // total 始终不超过上限，因此减法不会下溢；先判断再累加。
-            if (n > self.config.limits.max_response_bytes - total)
-                return failure(.protocol, "Model response exceeds its byte limit", status, stream.observed());
-            total += n;
             // 解析错误（格式错误、事件过大）映射为协议错误；OOM 与取消原样上抛。
             decoder.feed(buffer[0..n]) catch |err| switch (err) {
                 error.OutOfMemory, error.Canceled => return err,

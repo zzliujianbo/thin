@@ -224,14 +224,13 @@ test "SystemOne without context is auxiliary eligible but cannot become primary 
     try std.testing.expect(session.app.?.decision_client.?.native == null);
     try std.testing.expectEqualStrings("first", session.app.?.config.value.model.name);
 }
-test "Decision generic candidates use auxiliary caps even when primary candidate cannot fit" {
+test "Decision generic candidate remains catalog eligible despite small context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    // Declare the tiny model without a capacity; only the owned cache supplies
-    // its 2048-token window. Manual declarations still obey the global 5000
-    // safety margin, while a resolved auxiliary candidate uses its own 256.
+    // Only the owned cache supplies the real 2048-token window. It is a
+    // valid capability; actual requests must still fit that physical window.
     var declaration = try cfg.parse(a, fixture);
     defer cfg.release(&declaration);
     const owned = declaration.arena.allocator();
@@ -245,7 +244,6 @@ test "Decision generic candidates use auxiliary caps even when primary candidate
         provider.models = models;
     };
     declaration.value.registry.?.providers = providers;
-    declaration.value.limits.safety_tokens = 5000;
     const bytes = try declarationsWithoutDecision(declaration.value);
     defer a.free(bytes);
     try seed(home, bytes);
@@ -254,7 +252,7 @@ test "Decision generic candidates use auxiliary caps even when primary candidate
     try env.put("HOME", home);
     var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
-    const row = try session.metadata_cache.directory.upsert(.deepseek, "tiny");
+    const row = try session.metadata_cache.directory.upsert(a, .deepseek, "tiny");
     row.available = true;
     row.protocol = .chat;
     row.tokens = 2048;
@@ -263,19 +261,26 @@ test "Decision generic candidates use auxiliary caps even when primary candidate
     // it does not send inference or refresh metadata over the network.
     const connection = session.connection();
     try connection.select_model_fn.?(connection.context, "route/first");
-    var primary_unavailable = false;
+    var primary_context: ?u32 = null;
     for (session.connection().current().models) |model| {
-        if (std.mem.eql(u8, model.name, "route/tiny")) primary_unavailable = model.context_tokens == 0;
+        if (std.mem.eql(u8, model.name, "route/tiny")) primary_context = model.context_tokens;
     }
-    try std.testing.expect(primary_unavailable);
-    try std.testing.expect(contains(session.connection().current().decision_models, "route/tiny"));
+    try std.testing.expectEqual(@as(?u32, 2048), primary_context);
+    var decision_context: ?u32 = null;
+    for (session.connection().current().decision_models) |model| {
+        if (std.mem.eql(u8, model.name, "route/tiny")) decision_context = model.context_tokens;
+    }
+    try std.testing.expectEqual(@as(?u32, 2048), decision_context);
     try choose(&session, "route/tiny");
     try std.testing.expectEqualStrings("route/tiny", session.app.?.decision_client.?.source.value.decision.?.model);
     try std.testing.expectEqual(@as(u32, 65536), session.app.?.config.value.model.context_tokens);
     try std.testing.expect(session.app.?.config.value.limits.low_price_input);
     // Unknown primary price does not exclude a reviewer; its limits are separate.
     const limits = session.global_config.?.value.decision.?.modelLimits(session.global_config.?.value.limits.request_timeout_ms);
-    try std.testing.expect(!limits.low_price_input and limits.safety_tokens == 256);
+    try std.testing.expect(!limits.low_price_input);
+    try std.testing.expect(session.app.?.decision_client.?.source.value.decisionActive());
+    try std.testing.expectEqualStrings("route/tiny", session.connection().current().decision_model.?);
+    try std.testing.expectEqual(@as(usize, 0), session.app.?.decision_client.?.calls);
 }
 test "Decision generic CAS failure and same-model key refresh keep primary frozen" {
     var tmp = std.testing.tmpDir(.{});

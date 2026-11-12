@@ -40,19 +40,11 @@ test "value picker preserves exact current custom values and stable stages" {
     try std.testing.expectError(error.CustomChoice, picker.chosen(picker.count() - 1));
     try std.testing.expectError(error.InvalidIndex, picker.chosen(picker.count()));
 }
-test "value constraints include command maximum and timeout bounds" {
-    const legacy = Picker.init(.request_timeout_ms, 86400001, .{});
-    try std.testing.expectEqual(@as(?u32, 86400001), legacy.values[legacy.currentIndex()]);
-    try std.testing.expectError(error.InvalidValue, legacy.chosen(legacy.currentIndex()));
-    const command = Picker.init(.command_timeout_ms, 123, .{ .command_max_timeout_ms = 1000 });
-    try std.testing.expectError(error.InvalidValue, command.validate(1001));
-    try command.validate(1000);
-    try std.testing.expectEqual(@as(?u32, 123), try command.chosen(command.find(123).?));
-    for ([_]Key{ .request_timeout_ms, .task_timeout_ms }) |key| {
-        const picker = Picker.init(key, 300000, .{});
-        const maximum: u32 = 86400000;
-        try picker.validate(maximum);
-        try std.testing.expectError(error.InvalidValue, picker.validate(maximum + 1));
+test "timeouts accept positive u32 values without an artificial maximum" {
+    for ([_]Key{ .command_timeout_ms, .request_timeout_ms }) |key| {
+        const picker = Picker.init(key, 86400001, .{});
+        try std.testing.expectEqual(@as(?u32, 86400001), try picker.chosen(picker.currentIndex()));
+        try picker.validate(std.math.maxInt(u32));
         try std.testing.expectError(error.InvalidValue, picker.validate(null));
         try std.testing.expectError(error.InvalidValue, picker.validate(0));
     }
@@ -98,8 +90,8 @@ test "editing custom can only stage valid complete input then confirm staged row
     try std.testing.expect(std.mem.find(u8, staged.lines[0], "234.567 s (staged)") != null);
 }
 test "seconds custom input is exact atomic and strictly bounded" {
-    for ([_]Key{ .command_timeout_ms, .request_timeout_ms, .task_timeout_ms }) |key| {
-        var picker = Picker.init(key, 123456, .{ .command_max_timeout_ms = 86400000 });
+    for ([_]Key{ .command_timeout_ms, .request_timeout_ms }) |key| {
+        var picker = Picker.init(key, 123456, .{});
         picker.beginCustom();
         for ([_][]const u8{ ".", ".1", "-1", "1..2", "1.0001", "1e3", "1\n", "auto", "12x", "\x1b[200~12", "１２" }) |bad| {
             try std.testing.expect(!picker.append(bad));
@@ -114,7 +106,7 @@ test "seconds custom input is exact atomic and strictly bounded" {
         try std.testing.expectEqualStrings("1.001", picker.input[0..picker.input_len]);
         picker.backspace();
         try std.testing.expectEqualStrings("1.00", picker.input[0..picker.input_len]);
-        for ([_][]const u8{ "0", "0.000", "86400.001", "4294967.296", "99999999999999" }) |bad| {
+        for ([_][]const u8{ "0", "0.000", "4294967.296", "99999999999999" }) |bad| {
             picker.clear();
             try std.testing.expect(picker.append(bad));
             try std.testing.expectError(error.InvalidValue, picker.submitCustom());
@@ -131,14 +123,11 @@ test "seconds custom input is exact atomic and strictly bounded" {
         const maximum = try picker.submitCustom();
         try std.testing.expectEqual(@as(?u32, 86400000), try picker.chosen(maximum));
     }
-    var command = Picker.init(.command_timeout_ms, 1, .{ .command_max_timeout_ms = 1500 });
+    var command = Picker.init(.command_timeout_ms, 1, .{});
     command.beginCustom();
-    try std.testing.expect(command.append("1.501"));
-    try std.testing.expectError(error.InvalidValue, command.submitCustom());
-    command.clear();
-    try std.testing.expect(command.append("1.5"));
+    try std.testing.expect(command.append("86400.001"));
     const index = try command.submitCustom();
-    try std.testing.expectEqual(@as(?u32, 1500), try command.chosen(index));
+    try std.testing.expectEqual(@as(?u32, 86400001), try command.chosen(index));
 }
 test "seconds append rejection preserves all bytes and preset staging stays exact" {
     var picker = Picker.init(.request_timeout_ms, 123456, .{});

@@ -2,23 +2,21 @@
 const std = @import("std");
 const line_stats = @import("../util/line_stats.zig");
 
-pub const max_edits: usize = 128;
 pub const Edit = struct { old_text: []const u8, new_text: []const u8 };
 const Span = struct { start: usize, end: usize, replacement: []const u8, after_start: usize = 0, after_end: usize = 0 };
 pub const Applied = struct { bytes: []u8, changes: ?line_stats.Changes };
 
-pub fn apply(a: std.mem.Allocator, before: []const u8, edits: []const Edit, limit: usize) ![]u8 {
+pub fn apply(a: std.mem.Allocator, before: []const u8, edits: []const Edit, limit: ?usize) ![]u8 {
     return (try applyInternal(a, before, edits, limit, false)).bytes;
 }
 
-pub fn applyObserved(a: std.mem.Allocator, before: []const u8, edits: []const Edit, limit: usize) !Applied {
+pub fn applyObserved(a: std.mem.Allocator, before: []const u8, edits: []const Edit, limit: ?usize) !Applied {
     return applyInternal(a, before, edits, limit, true);
 }
 
-fn applyInternal(a: std.mem.Allocator, before: []const u8, edits: []const Edit, limit: usize, observe: bool) !Applied {
-    if (before.len > limit) return error.FileTooLarge;
+fn applyInternal(a: std.mem.Allocator, before: []const u8, edits: []const Edit, limit: ?usize, observe: bool) !Applied {
+    if (limit) |bound| if (before.len > bound) return error.FileTooLarge;
     if (edits.len == 0) return error.EmptyEdits;
-    if (edits.len > max_edits) return error.TooManyEdits;
     const spans = try a.alloc(Span, edits.len);
     defer a.free(spans);
     var size = before.len;
@@ -37,7 +35,7 @@ fn applyInternal(a: std.mem.Allocator, before: []const u8, edits: []const Edit, 
         size -= edit.old_text.len;
         size = std.math.add(usize, size, edit.new_text.len) catch return error.FileTooLarge;
     }
-    if (size > limit) return error.FileTooLarge;
+    if (limit) |bound| if (size > bound) return error.FileTooLarge;
     std.mem.sort(Span, spans, {}, struct {
         fn less(_: void, x: Span, y: Span) bool {
             return x.start < y.start;

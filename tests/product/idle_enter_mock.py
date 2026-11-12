@@ -263,7 +263,7 @@ def run(app, width, batched):
         assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
-        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'safety_tokens': 100, 'request_timeout_ms': 10000, 'task_timeout_ms': 15000}}
+        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
         config_path = home / '.thin/config.json'
         config_bytes = json.dumps(config).encode()
         config_path.write_bytes(config_bytes)
@@ -570,8 +570,7 @@ def first_entry(app, origin, width, auto, response='normal'):
                   'providers': {'local': {'base_url': 'http://127.0.0.1:1/v1',
                   'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model':
                   {'protocol': 'chat', 'context_tokens': 32768}}}}},
-                  'limits': {'low_price_input': False, 'safety_tokens': 100,
-                             'request_timeout_ms': 10000, 'task_timeout_ms': 15000}}
+                  'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
         config_path = home / '.thin/config.json'
         config_path.write_text(json.dumps(config))
         config_path.chmod(0o600)
@@ -846,8 +845,7 @@ def streaming(app, line_count):
                   'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                   'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model':
                   {'protocol': 'chat', 'context_tokens': 32768}}}}},
-                  'limits': {'low_price_input': False, 'safety_tokens': 100,
-                             'request_timeout_ms': 10000, 'task_timeout_ms': 15000}}
+                  'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
         path = home / '.thin/config.json'
         path.write_text(json.dumps(config))
         path.chmod(0o600)

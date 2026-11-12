@@ -209,7 +209,16 @@ test "root UTF8 ranges align every character byte and paginate without loss" {
     try std.testing.expectEqual(@as(usize, 0), eof.data.len);
     try std.testing.expect(!eof.truncated);
     try std.testing.expectError(error.InvalidOffset, root.read(a, "text", std.math.maxInt(u64), 4));
-    try std.testing.expectError(error.InvalidLimit, root.read(a, "text", 1, std.math.maxInt(usize)));
+    const large_page = try root.read(a, "text", 1, std.math.maxInt(usize));
+    defer a.free(large_page.data);
+    try std.testing.expectEqual(@as(u64, 1), large_page.offset);
+    try std.testing.expectEqual(@as(u64, text.len), large_page.total_bytes);
+    try std.testing.expectEqualStrings(text[1..], large_page.data);
+    try std.testing.expect(!large_page.truncated);
+    const zero_page = try root.read(a, "text", 1, 0);
+    defer a.free(zero_page.data);
+    try std.testing.expectEqual(@as(usize, 0), zero_page.data.len);
+    try std.testing.expect(zero_page.truncated);
     for (7..10) |inside| try std.testing.expectError(error.ReadLimitTooSmall, root.read(a, "text", inside, 3));
 
     // Same byte parameters as the reported failure, without reading any session.

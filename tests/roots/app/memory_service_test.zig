@@ -43,7 +43,7 @@ fn openRoot(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !fs.Root {
     return fs.Root.open(a, io, buffer[0..try dir.realPath(io, &buffer)]);
 }
 fn begin(owner: *Coordinator, a: std.mem.Allocator, text: []const u8) !void {
-    const reference = try owner.retrieve(a, text, 8192);
+    const reference = try owner.retrieve(a, text);
     a.free(reference);
 }
 fn finalize(owner: *Coordinator, a: std.mem.Allocator, text: []const u8, cancel: *const p.Cancellation) !memory_status.Terminal {

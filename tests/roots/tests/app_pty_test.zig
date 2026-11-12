@@ -1265,8 +1265,8 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.waitText(start, "values-warmup-answer");
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
-    try decisionModelScreen(d, a, &.{ "> Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Task timeout", "Image model" }, &.{"Output limit"});
-    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Task timeout", "Image model", "Auto memory" });
+    try decisionModelScreen(d, a, &.{ "> Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Image model" }, &.{ "Output limit", "Task timeout" });
+    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Image model", "Auto memory", "Proxy" });
     try settingsValueGate(d, a, project, "opened");
     try settingsValueOpen(d, a, "Auto compaction"); // Boolean toggle, no numeric picker.
     try decisionModelScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
@@ -1325,8 +1325,8 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try decisionModelScreen(d, a, &.{"> 10 s (current)"}, &.{});
     try settingsValueChoose(d, a, "60 s", "Request timeout");
     try settingsValueGate(d, a, project, "request");
-    try settingsValueOpen(d, a, "Task timeout");
-    try settingsValueChoose(d, a, "900 s", "Task timeout");
+    // The retired task timeout is not a setting; no save occurs at this gate.
+    try decisionModelScreen(d, a, &.{"> Request timeout"}, &.{"Task timeout"});
     try settingsValueGate(d, a, project, "task");
 
     try settingsValueOpen(d, a, "Decision model");

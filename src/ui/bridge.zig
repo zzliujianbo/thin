@@ -9,14 +9,8 @@ const p = @import("../core/protocol.zig");
 const r = @import("../core/runtime.zig");
 const Io = std.Io;
 
-/// 队列最大条目数（待消费事件的上限）。
-pub const queue_capacity = 64;
-/// 所有在途事件共享的总字节预算，超出时生产者等待而不是无限增长内存。
-pub const data_budget = 256 * 1024;
-/// 单个事件文本拷贝的字节上限，超出部分被截断并标记 display_truncated。
+/// Streaming chunk size, not a limit on canonical event contents.
 pub const item_budget = 64 * 1024;
-/// assistant_committed 事件最多拷贝的 Block 数，防止恶意超大数组耗尽预算。
-pub const block_limit = 256;
 
 /// 事件拷贝所用的内存类型；按 Block 对齐，便于直接把 Block 数组放在其中。
 const Storage = []align(@alignOf(p.Block)) u8;
@@ -48,10 +42,7 @@ pub const Item = struct {
     }
 };
 
-// Two bounded passes: measure first, reserve under lock, allocate/copy unlocked.
-// Block metadata itself counts against the display budget. Never inspect more
-// than block_limit blocks, even for adversarially large canonical arrays.
-// 中文：分两遍处理：先测量长度，锁内预留预算，锁外分配并拷贝；Block 元数据也计入预算，且最多检查 block_limit 个 Block。
+// Two passes: measure, then allocate and copy the complete event.
 /// 事件深拷贝器。storage 为 null 时只测量需要的字节数（used），不做拷贝。
 const Copy = struct {
     /// 拷贝目标；为 null 表示测量阶段。
@@ -62,15 +53,9 @@ const Copy = struct {
     clipped: bool = false,
     canonical_complete: bool = true,
 
-    /// 拷贝一段字符串，超出 item_budget 的部分截断。
+    /// Copy the complete string.
     fn text(self: *Copy, src: []const u8) []const u8 {
-        var n = @min(src.len, item_budget - self.used);
-        // 中文：截断时回退到 UTF-8 码点边界，避免把多字节字符切成两半。
-        // Avoid cutting a valid UTF-8 codepoint in half.
-        if (n < src.len) {
-            while (n > 0 and (src[n] & 0xc0) == 0x80) n -= 1;
-            self.clipped = true;
-        }
+        const n = src.len;
         const start = self.used;
         self.used += n;
         if (self.storage) |buf| {
@@ -102,12 +87,11 @@ const Copy = struct {
         };
     }
 
-    /// 深拷贝事件中的字符串字段；assistant_committed 的 Block 数组最多处理 block_limit 个。
+    /// Deep-copy every event field and canonical block.
     fn event(self: *Copy, e: r.Event) r.Event {
         return switch (e) {
             .text => |s| .{ .text = self.text(s) },
-            // Inbox bounds this at item_budget. Unlike display previews, this
-            // is the canonical user message and must be copied in its entirety.
+            // This is canonical user content, not a display preview.
             .user_committed => |v| .{ .user_committed = .{ .id = v.id, .text = self.text(v.text) } },
             .reasoning => |s| .{ .reasoning = self.text(s) },
             .tool_preview => |v| .{ .tool_preview = .{ .index = v.index, .arguments = self.text(v.arguments), .write_file = v.write_file, .argument_bytes = v.argument_bytes } },
@@ -120,14 +104,7 @@ const Copy = struct {
                 c.fields.topic = self.field(v.fields.topic);
                 c.fields.task = self.field(v.fields.task);
                 c.fields.id = self.field(v.fields.id);
-                if (v.subagent_progress) |progress_text| {
-                    var n = @min(progress_text.len, 2048);
-                    if (n < progress_text.len) {
-                        while (n > 0 and (progress_text[n] & 0xc0) == 0x80) n -= 1;
-                        self.clipped = true;
-                    }
-                    c.subagent_progress = self.text(progress_text[0..n]);
-                }
+                if (v.subagent_progress) |progress_text| c.subagent_progress = self.text(progress_text);
                 break :blk .{ .tool_view = c };
             },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },
@@ -143,9 +120,7 @@ const Copy = struct {
                 break :blk .{ .tool_result = c };
             },
             .assistant_committed => |blocks| blk: {
-                const n: usize = @min(blocks.len, block_limit);
-                self.canonical_complete = blocks.len == n;
-                self.clipped = !self.canonical_complete;
+                const n = blocks.len;
                 // 中文：Block 数组本身存放在 storage 开头，此处先按元数据大小计入预算。
                 self.used = n * @sizeOf(p.Block);
                 // 中文：测量阶段 storage 为 null，dst 为空切片，仅用于计算需求。
@@ -192,11 +167,8 @@ pub const Bridge = struct {
     /// UI 已断开（close 之后为 true），之后的事件会被拒绝。
     disconnected: bool = false,
 
-    /// 环形队列，有效区间为 [head, head + len) 对 queue_capacity 取模。
-    queue: [queue_capacity]Item = undefined,
-    /// 环形队列的头下标。
-    head: usize = 0,
-    /// 队列中当前的条目数。
+    queue: std.ArrayList(Item) = .empty,
+    /// Current queued count, exposed to the existing frontend under the lock.
     len: usize = 0,
 
     /// 已占用的预算字节数（含预留中的拷贝与已弹出但未 deinit 的 Item）。
@@ -271,8 +243,6 @@ pub const Bridge = struct {
     /// 只有 .text / .reasoning 会被切成多段逐个入队，其它事件仍是一条一次。
     fn emit(ctx: ?*anyopaque, event: r.Event, cancel: *const p.Cancellation) anyerror!void {
         const self = from(ctx);
-        // Canonical injected user text is never a clipped display preview.
-        if (event == .user_committed and event.user_committed.text.len > item_budget) return error.InputTooLarge;
         self.lock();
         // 中文：finished 不进入队列，只保存终态，也不占用预算。
         if (event == .finished) {
@@ -347,29 +317,7 @@ pub const Bridge = struct {
         // 中文：第一遍只测量需要的字节数，不做分配。
         var measure = Copy{};
         _ = measure.event(event);
-        // 中文：预留阶段。队列满或预算不足时短暂让出并重试；预留成功后立即释放锁。
-        while (true) {
-            self.lock();
-            if (self.stopped(cancel)) {
-                self.unlock();
-                return error.Canceled;
-            }
-            if (self.len < queue_capacity and measure.used <= data_budget - self.bytes) {
-                self.bytes += measure.used;
-                self.unlock();
-                break;
-            }
-            self.unlock();
-            try self.pause();
-        }
-
-        errdefer {
-            self.lock();
-            self.bytes -= measure.used;
-            self.unlock();
-        }
-
-        // 中文：第二遍在锁外分配并拷贝，避免分配期间持有互斥锁。
+        // Allocate and copy outside the lock; admission below is transactional.
         const storage = try self.allocator.alignedAlloc(u8, .of(p.Block), measure.used);
         errdefer self.allocator.free(storage);
         var copy = Copy{ .storage = storage };
@@ -380,8 +328,9 @@ pub const Bridge = struct {
             defer self.unlock();
             // 中文：分配期间 UI 可能已断开或被取消，入队前必须再检查一次。
             if (self.stopped(cancel)) return error.Canceled;
-            self.queue[(self.head + self.len) % queue_capacity] = .{ .event = owned, .display_truncated = copy.clipped, .canonical_complete = copy.canonical_complete, .storage = storage, .owner = self };
+            try self.queue.append(self.allocator, .{ .event = owned, .display_truncated = copy.clipped, .canonical_complete = copy.canonical_complete, .storage = storage, .owner = self });
             self.len += 1;
+            self.bytes += measure.used;
             self.outstanding += 1;
         }
         self.notify();
@@ -468,10 +417,8 @@ pub const Bridge = struct {
         self.lock();
         defer self.unlock();
         if (self.len == 0) return null;
-        const item = self.queue[self.head];
-        self.head = (self.head + 1) % queue_capacity;
         self.len -= 1;
-        return item;
+        return self.queue.orderedRemove(0);
     }
 
     /// 断开 UI：触发取消、标记 disconnected 并清除权限请求。
@@ -498,7 +445,7 @@ pub const Bridge = struct {
     pub fn reset(self: *Bridge) !void {
         self.lock();
         defer self.unlock();
-        if (self.active != 0 or self.len != 0 or self.outstanding != 0 or self.bytes != 0) return error.Busy;
+        if (self.active != 0 or self.queue.items.len != 0 or self.outstanding != 0 or self.bytes != 0) return error.Busy;
 
         self.clearPermission();
         // Keep the ID high-water mark: stale prior-task decisions cannot approve
@@ -507,7 +454,6 @@ pub const Bridge = struct {
         self.terminal = null;
         self.disconnected = false;
         self.cancel.requested.store(false, .release);
-        self.head = 0;
     }
 
     /// 关闭并释放桥。调用前工作线程必须已 join；会逐个弹出并 deinit 残留的 Item。
@@ -522,6 +468,7 @@ pub const Bridge = struct {
         }
 
         std.debug.assert(self.outstanding == 0 and self.bytes == 0);
+        self.queue.deinit(self.allocator);
         std.debug.assert(std.c.pthread_mutex_destroy(&self.mutex) == .SUCCESS);
         self.* = undefined;
     }

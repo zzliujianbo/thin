@@ -6,7 +6,7 @@ test "local output is literal without stream success or encoding labels" {
     for ([_][]const u8{ "stdout:", "stderr:", "exit:", "output encoding:" }) |s| try std.testing.expect(std.mem.indexOf(u8, out.text, s) == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out.text, 0x1b) == null);
 }
-test "local output fallback empty unknown and bounded" {
+test "local output fallback empty and unknown" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "Denied", "", "{}", "{\"unknown\":{\"nested\":[]}}", "{\"stdout\":42}" }) |s| {
         const out = try format(a, s);
@@ -19,12 +19,34 @@ test "local output fallback empty unknown and bounded" {
     const empty = try format(a, "{\"stdout\":\"\",\"truncated\":true}");
     defer a.free(empty.text);
     try std.testing.expectEqualStrings("[output truncated]\n", empty.text);
-    const large = try a.alloc(u8, limit + 1);
-    defer a.free(large);
-    @memset(large, 'x');
-    const out = try format(a, large);
+}
+
+test "large local output decodes complete streams and statuses" {
+    const a = std.testing.allocator;
+    const stdout = try a.alloc(u8, 140 * 1024);
+    defer a.free(stdout);
+    @memset(stdout, 'x');
+    const json = try std.fmt.allocPrint(a, "{{\"stdout\":\"HEAD{s}TAIL\",\"stderr\":\"ERROR-END\",\"exit_code\":7}}", .{stdout});
+    defer a.free(json);
+    const out = try format(a, json);
     defer a.free(out.text);
-    try std.testing.expect(out.clipped and out.text.len <= limit);
+    try std.testing.expect(std.mem.startsWith(u8, out.text, "HEAD"));
+    try std.testing.expect(std.mem.endsWith(u8, out.text, "TAIL\nERROR-END\nCommand exited with status 7\n"));
+    try std.testing.expectEqual(@as(usize, stdout.len + "HEADTAIL\nERROR-END\nCommand exited with status 7\n".len), out.text.len);
+}
+
+test "large malformed output remains fully sanitized literal" {
+    const a = std.testing.allocator;
+    const input = try a.alloc(u8, 140 * 1024 + 5);
+    defer a.free(input);
+    @memset(input, 'x');
+    @memcpy(input[input.len - 5 ..], "\xff\x1b\r\nZ");
+    const out = try format(a, input);
+    defer a.free(out.text);
+    try std.testing.expectEqual(@as(usize, 140 * 1024 + 8), out.text.len);
+    try std.testing.expect(std.mem.endsWith(u8, out.text, "��\nZ"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.text));
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.text, 0x1b) == null);
 }
 test "local output propagates allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {

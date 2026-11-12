@@ -8,8 +8,7 @@ pub const Key = @import("../core/settings.zig").Key;
 pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
     "Low-price input", "Decision model", "Auto compaction", "Command timeout",
-    "Request timeout", "Task timeout",   "Image model",     "Auto memory",
-    "Proxy",
+    "Request timeout", "Image model",    "Auto memory",     "Proxy",
 };
 /// Bounded endpoint text buffer: host/port, [IPv6]:port or a borrowed address.
 pub const endpoint_buffer_bytes = cfg.max_proxy_endpoint_bytes + 8;
@@ -36,8 +35,7 @@ pub fn preferenceKey(selected: usize) ?Key {
         2 => .compaction_enabled,
         3 => .command_timeout_ms,
         4 => .request_timeout_ms,
-        5 => .task_timeout_ms,
-        7 => .memory_auto,
+        6 => .memory_auto,
         else => null,
     };
 }
@@ -57,12 +55,12 @@ pub fn value(state: Snapshot, selected: usize) []const u8 {
     return switch (selected) {
         0 => if (state.low_price_input_enabled) "on" else "off",
         1 => if (!state.decision_enabled) "Off" else state.decision_model orelse "Not set",
-        6 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
+        5 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
         // rows formats the exact endpoint text; empty means "formatted there".
-        8 => if (state.proxy_address == null) "Not configured" else "",
+        7 => if (state.proxy_address == null) "Not configured" else "",
         2 => if (state.limits.compaction_enabled) "on" else "off",
-        7 => if (state.memory_auto) "on" else "off",
-        3, 4, 5 => "s",
+        6 => if (state.memory_auto) "on" else "off",
+        3, 4 => "s",
         else => "",
     };
 }
@@ -71,12 +69,11 @@ pub fn description(selected: usize) []const u8 {
         0 => "Protect input from price surcharges; unknown pricing pauses. Flat pricing: no L.",
         1 => "Review commands, Memory and compaction. Enter selects Off or a logged-in model.",
         2 => "Automatic compaction only; manual /compact and hard preflight remain available.",
-        3 => "Command timeout in s (up to 3 decimals); cannot exceed configured command maximum.",
-        4 => "All inference requests, including decisions, in s (up to 3 decimals); maximum 86400 s (24 hours).",
-        5 => "Whole task timeout in s (up to 3 decimals); maximum 86400 s (24 hours).",
-        6 => "Read images through a separate helper returning text. Off unless explicitly selected.",
-        7 => "Automatically extract and maintain useful memory. On by default.",
-        8 => "Configure the proxy address and exact model routes. A new session applies it.",
+        3 => "Command timeout in s (up to 3 decimals).",
+        4 => "All inference requests, including decisions, in s (up to 3 decimals).",
+        5 => "Read images through a separate helper returning text. Off unless explicitly selected.",
+        6 => "Automatically extract and maintain useful memory. On by default.",
+        7 => "Configure the proxy address and exact model routes. A new session applies it.",
         else => "",
     };
 }
@@ -89,7 +86,6 @@ fn renderedValue(state: Snapshot, selected: usize, buffer: *[32]u8) ![]const u8 
     return switch (selected) {
         3 => try time.format(buffer, state.limits.command_timeout_ms),
         4 => try time.format(buffer, state.limits.request_timeout_ms),
-        5 => try time.format(buffer, state.limits.task_timeout_ms),
         else => value(state, selected),
     };
 }
@@ -110,13 +106,13 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, state: Snapshot, columns: usize, m
     for (start..start + visible) |index| {
         var buffer: [32]u8 = undefined;
         var endpoint: [endpoint_buffer_bytes]u8 = undefined;
-        const v = if (index == 8) try formatEndpoint(&endpoint, state) else try renderedValue(state, index, &buffer);
+        const v = if (index == 7) try formatEndpoint(&endpoint, state) else try renderedValue(state, index, &buffer);
         const gap = label_width - text.width(label(index));
         const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  {s}", .{ if (index == selected) "> " else "  ", label(index), padding[0..gap], v });
         defer a.free(raw);
         // Decision/Image/Proxy only open a read-only submenu; their current
         // value is not being saved. All saving root rows keep the full check.
-        if (index == selected) complete = if (index == 1 or index == 6 or index == 8)
+        if (index == selected) complete = if (index == 1 or index == 5 or index == 7)
             2 + text.width(label(index)) <= columns
         else
             text.width(raw) <= columns;

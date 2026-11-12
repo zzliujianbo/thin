@@ -93,7 +93,6 @@ const finish_timeout_ms: u32 = 60_000;
 const max_events: u16 = protocol.max_events;
 const max_history: u16 = protocol.max_history;
 /// Bounded local item queue: never buffer more than this between UI ticks.
-const max_pending: usize = 96;
 const max_listing_bytes: usize = 8 * 1024;
 const control_socket = "daemon.sock";
 /// A pending receipt whose owner state cannot be queried is never blindly
@@ -164,40 +163,6 @@ fn transport(_: anyerror) anyerror {
 // ---------------------------------------------------------------------------
 // Bounded JSON
 // ---------------------------------------------------------------------------
-
-/// Reject over-deep frames before allocating a parse tree. String- and
-/// escape-aware so braces inside text never count as nesting.
-fn boundedDepth(bytes: []const u8) bool {
-    const limit = protocol.max_json_depth + 8;
-    var depth: usize = 0;
-    var in_string = false;
-    var escaped = false;
-    for (bytes) |byte| {
-        if (in_string) {
-            if (escaped) {
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-        switch (byte) {
-            '"' => in_string = true,
-            '{', '[' => {
-                depth += 1;
-                if (depth > limit) return false;
-            },
-            '}', ']' => {
-                if (depth == 0) return false;
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    return depth == 0 and !in_string;
-}
 
 const Response = struct {
     doc: std.json.Parsed(std.json.Value),
@@ -417,7 +382,7 @@ fn valueBool(value: std.json.Value) ?bool {
 fn parseObject(a: std.mem.Allocator, bytes: []const u8) !Response {
     if (bytes.len == 0 or bytes.len > protocol.max_response) return error.ProtocolError;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.ProtocolError;
-    if (!boundedDepth(bytes)) return error.ProtocolError;
+    @import("../app/json_bound.zig").validate(a, bytes) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.ProtocolError;
     const doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.ProtocolError,
@@ -1471,7 +1436,6 @@ pub const Client = struct {
 
     fn pump(self: *Client) void {
         if (self.conn == null) return;
-        if (self.pending.items.len >= max_pending) return;
         if (self.dirty) {
             self.dirty = false;
             self.refreshSettings();
@@ -1609,7 +1573,8 @@ pub const Client = struct {
         self.stream = null;
         const need_baseline = self.need_history;
         self.rebuild();
-        defer old.deinit();
+        var keep_old = false;
+        defer if (!keep_old) old.deinit();
         if (self.stream_snapshot) |bytes| self.a.free(bytes);
         self.stream_snapshot = null;
         // Revocation is read from the real control socket, not guessed from an
@@ -1618,9 +1583,14 @@ pub const Client = struct {
         if (self.conn == null or self.epoch == 0) return;
         // Unconfirmed ranges belong to the SAME viewer and epoch: carry them to
         // the replacement connection instead of losing already-shown positions.
-        const carried = old.takeRanges();
-        self.stream = try StreamReceiver.startBound(self.a, self.io, old.endpoint, self.uid, self.epoch, if (need_baseline) null else self.cursor, old.expected_pid);
-        try self.stream.?.adoptRanges(carried);
+        self.stream = StreamReceiver.startBound(self.a, self.io, old.endpoint, self.uid, self.epoch, if (need_baseline) null else self.cursor, old.expected_pid) catch |err| {
+            self.stream = old;
+            keep_old = true;
+            return err;
+        };
+        var carried = old.takeRanges();
+        defer carried.deinit(self.a);
+        self.stream.?.adoptRanges(&carried);
         self.resume_snapshot_pending = !need_baseline;
     }
 
@@ -1664,7 +1634,6 @@ pub const Client = struct {
         // nothing: the UI already resets on the epoch switch, so no synthetic
         // content event is fabricated.
         const before = self.pending.items.len;
-        if (strict and entries.items.len > max_pending) return error.ProtocolError;
         for (entries.items) |entry| try self.pushEventMode(entry, strict);
         if (self.pending.items.len == before) return;
         for (0..self.pending.items.len - before) |offset| {
@@ -1708,7 +1677,6 @@ pub const Client = struct {
     }
 
     fn pushEventMode(self: *Client, entry: std.json.Value, strict: bool) !void {
-        if (self.pending.items.len >= max_pending) return if (strict) error.QueueFull else {};
         var owned_bytes: ?[]u8 = null;
         defer if (owned_bytes) |bytes| self.a.free(bytes);
         const json = switch (entry) {
@@ -1787,7 +1755,7 @@ pub const Client = struct {
         // An empty text is the typed contract of a manual compaction: the owner
         // builds the summary from history alone and no user prompt exists. Every
         // other kind still needs non-empty input.
-        if (text.len > protocol.max_text or (kind != .compact and text.len == 0)) return error.InputTooLarge;
+        if (kind != .compact and text.len == 0) return error.InputTooLarge;
         // Epoch 0 is the launcher before any session exists; the owner grants the
         // epoch together with the created session (checked below). Epoch 0 on a
         // live connection means this view lost control, so nothing is submitted.
@@ -1976,7 +1944,7 @@ pub const Client = struct {
 
     fn enqueueFn(context: *anyopaque, epoch: u64, kind: session_client.QueueKind, text: []const u8) anyerror!void {
         const self = fromContext(context);
-        if (text.len == 0 or text.len > protocol.max_text) return error.InputTooLarge;
+        if (text.len == 0) return error.InputTooLarge;
         var req = try self.request(.enqueue);
         defer req.deinit();
         try req.put("epoch", epoch);
@@ -3240,10 +3208,13 @@ fn parseLimits(value: std.json.Value, base: core_config.Limits) core_config.Limi
         .object => |map| map,
         else => return limits,
     };
-    inline for (.{ "command_timeout_ms", "command_max_timeout_ms", "read_bytes", "output_bytes", "request_timeout_ms", "task_timeout_ms" }) |name| {
+    inline for (.{ "command_timeout_ms", "request_timeout_ms" }) |name| {
         if (object.get(name)) |entry| {
             if (valueU64(entry)) |number| @field(limits, name) = @intCast(@min(number, std.math.maxInt(u32)));
         }
+    }
+    if (object.get("low_price_input")) |entry| {
+        if (valueBool(entry)) |flag| limits.low_price_input = flag;
     }
     if (object.get("compaction_enabled")) |entry| {
         if (valueBool(entry)) |flag| limits.compaction_enabled = flag;

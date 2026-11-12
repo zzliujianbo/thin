@@ -1,33 +1,53 @@
-test "ack ranges coalesce adjacency and never bridge a hole" {
+test "ack ranges grow coalesce adjacency and never bridge a hole" {
+    const a = std.testing.allocator;
     var ranges: AckRanges = .{};
-    try ranges.insert(0, 5, 0);
-    try ranges.insert(6, 9, 0);
-    try std.testing.expectEqual(@as(usize, 1), ranges.len);
-    try std.testing.expectEqual(AckRanges.Range{ .first = 0, .last = 9 }, ranges.items[0]);
-    try ranges.insert(20, 30, 0);
-    try ranges.insert(31, 40, 0);
-    try ranges.insert(50, 60, 0);
-    try std.testing.expectEqual(@as(usize, 3), ranges.len);
-    try std.testing.expectEqual(AckRanges.Range{ .first = 20, .last = 40 }, ranges.items[1]);
-    try std.testing.expectEqual(AckRanges.Range{ .first = 50, .last = 60 }, ranges.items[2]);
-    // A prefix that reaches the next range merges through it; a hole survives.
-    try ranges.insert(0, 10, 0);
-    try std.testing.expectEqual(AckRanges.Range{ .first = 0, .last = 10 }, ranges.items[0]);
-    try std.testing.expectEqual(@as(usize, 3), ranges.len);
+    defer ranges.deinit(a);
+    try ranges.insert(a, 0, 5, 0);
+    try ranges.insert(a, 6, 9, 0);
+    try std.testing.expectEqual(@as(usize, 1), ranges.count());
+    try std.testing.expectEqual(AckRanges.Range{ .first = 0, .last = 9 }, ranges.items.items[0]);
+    try ranges.insert(a, 20, 30, 0);
+    try ranges.insert(a, 31, 40, 0);
+    try ranges.insert(a, 50, 60, 0);
+    try std.testing.expectEqual(@as(usize, 3), ranges.count());
+    try std.testing.expectEqual(AckRanges.Range{ .first = 20, .last = 40 }, ranges.items.items[1]);
+    try std.testing.expectEqual(AckRanges.Range{ .first = 50, .last = 60 }, ranges.items.items[2]);
+    try ranges.insert(a, 0, 10, 0);
+    try std.testing.expectEqual(AckRanges.Range{ .first = 0, .last = 10 }, ranges.items.items[0]);
+    try std.testing.expectEqual(@as(usize, 3), ranges.count());
     var full: AckRanges = .{};
-    for (0..AckRanges.capacity) |index| try full.insert(index * 2 + 1, index * 2 + 1, 0);
-    const before = full;
-    try std.testing.expectError(error.QueueFull, full.insert(10_000, 10_000, 0));
-    try std.testing.expectEqual(AckRanges.capacity, full.len);
-    try std.testing.expectEqualSlices(AckRanges.Range, before.items[0..before.len], full.items[0..full.len]);
-    // In-flight head is immutable even when the new proof touches it; the
-    // remaining ranges are independently sorted and coalesced.
+    defer full.deinit(a);
+    for (0..256) |index| try full.insert(a, index * 2 + 1, index * 2 + 1, 0);
+    try full.insert(a, 10_000, 10_000, 0);
+    try std.testing.expectEqual(@as(usize, 257), full.count());
+    for (full.items.items[0..256], 0..) |range, index| try std.testing.expectEqual(AckRanges.Range{ .first = index * 2 + 1, .last = index * 2 + 1 }, range);
     var inflight: AckRanges = .{};
-    try inflight.insert(50, 60, 0);
-    try inflight.insert(80, 90, 1);
-    try inflight.insert(10, 49, 1);
-    try inflight.insert(70, 79, 1);
-    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 50, .last = 60 }, .{ .first = 10, .last = 49 }, .{ .first = 70, .last = 90 } }, inflight.items[0..inflight.len]);
+    defer inflight.deinit(a);
+    try inflight.insert(a, 50, 60, 0);
+    try inflight.insert(a, 80, 90, 1);
+    try inflight.insert(a, 10, 49, 1);
+    try inflight.insert(a, 70, 79, 1);
+    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 50, .last = 60 }, .{ .first = 10, .last = 49 }, .{ .first = 70, .last = 90 } }, inflight.items.items);
+}
+test "ACK range allocation failure preserves all previously admitted proof" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const fa = failing.allocator();
+    var ranges: AckRanges = .{};
+    defer ranges.deinit(fa);
+    try ranges.insert(fa, 1, 1, 0);
+    while (ranges.count() < ranges.items.capacity) {
+        const next = ranges.count() * 2 + 1;
+        try ranges.insert(fa, next, next, 0);
+    }
+    const before = try a.dupe(AckRanges.Range, ranges.items.items);
+    defer a.free(before);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, ranges.insert(fa, 10_000, 10_000, 0));
+    try std.testing.expectEqualSlices(AckRanges.Range, before, ranges.items.items);
+    // A merge requiring no allocation remains possible under the same fault.
+    try ranges.insert(fa, 2, 2, 0);
+    try std.testing.expectEqual(AckRanges.Range{ .first = 1, .last = 3 }, ranges.items.items[0]);
 }
 test "bound watch rejects a different kernel peer before sending watch" {
     const a = std.testing.allocator;
@@ -81,7 +101,7 @@ test "initial watch wait observes progress and cancellation on a real peer" {
     receiver_live = false;
     try std.testing.expect((try connection.readFrame(.{ .io = io, .timeout_ms = 2000 })) == null);
 }
-test "receiver task keeps reading without a consumer and stops while its queue is full" {
+test "receiver task retains pages beyond old queue limit and stops" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -102,7 +122,8 @@ test "receiver task keeps reading without a consumer and stops while its queue i
     defer request.deinit();
     try std.testing.expectEqual(protocol.Op.watch, request.op);
     try std.testing.expectEqual(@as(u64, 7), try request.u64Field("epoch"));
-    for (0..Receiver.max_count + 4) |index| {
+    const page_count = 68;
+    for (0..page_count) |index| {
         var page_buffer: [256]u8 = undefined;
         const page = try std.fmt.bufPrint(&page_buffer, "{{\"v\":{d},\"id\":1,\"ok\":true,\"epoch\":7,\"stream\":\"events\",\"from\":{d},\"through\":{d},\"events\":[{{\"t\":\"text\",\"v\":\"x\",\"seq\":{d}}}]}}", .{ protocol.version, index, index + 1, index + 1 });
         try connection.writeFrame(page, .{ .io = io, .timeout_ms = 1000 });
@@ -113,14 +134,14 @@ test "receiver task keeps reading without a consumer and stops while its queue i
         receiver.lock();
         count = receiver.count;
         receiver.unlock();
-        if (count == Receiver.max_count) break;
+        if (count == page_count) break;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
-    try std.testing.expectEqual(Receiver.max_count, count);
+    try std.testing.expectEqual(@as(usize, page_count), count);
     receiver.lock();
     const queued_bytes = receiver.bytes;
     receiver.unlock();
-    try std.testing.expect(queued_bytes > 0 and queued_bytes <= Receiver.max_bytes);
+    try std.testing.expect(queued_bytes > 0);
     // Never pop, never close the peer: only the independent stop wake can let
     // this task leave its backpressure wait.
     const start = std.Io.Clock.awake.now(io);
@@ -132,7 +153,7 @@ test "receiver task keeps reading without a consumer and stops while its queue i
     try std.testing.expect(receiver.done);
     try std.testing.expectEqual(error.Canceled, receiver.failure.?);
     var drained_bytes: usize = 0;
-    for (0..Receiver.max_count) |index| {
+    for (0..page_count) |index| {
         const frame = (try receiver.pop()) orelse return error.TestExpectedFrame;
         defer a.free(frame);
         var expected_buffer: [256]u8 = undefined;
@@ -151,62 +172,188 @@ test "adopting carried ACK ranges wakes receiver without bridging holes" {
     var receiver: Receiver = .{ .a = std.testing.allocator, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 7, .resume_wake = resume_wake, .ready = ready };
     defer std.debug.assert(std.c.pthread_mutex_destroy(&receiver.mutex) == .SUCCESS);
 
+    defer receiver.ack_ranges.deinit(std.testing.allocator);
     var carried: AckRanges = .{};
-    try carried.insert(2, 3, 0);
-    try carried.insert(5, 7, 0);
+    defer carried.deinit(std.testing.allocator);
+    try carried.insert(std.testing.allocator, 2, 3, 0);
+    try carried.insert(std.testing.allocator, 5, 7, 0);
     var descriptors = [_]std.c.pollfd{.{ .fd = receiver.resume_wake.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try std.testing.expectEqual(@as(c_int, 0), std.c.poll(&descriptors, 1, 0));
-    try receiver.adoptRanges(carried);
+    receiver.adoptRanges(&carried);
     try std.testing.expectEqual(@as(c_int, 1), std.c.poll(&descriptors, 1, 0));
-    try std.testing.expectEqual(@as(usize, 2), receiver.ack_ranges.len);
-    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 2, .last = 3 }, .{ .first = 5, .last = 7 } }, receiver.ack_ranges.items[0..receiver.ack_ranges.len]);
+    try std.testing.expectEqual(@as(usize, 2), receiver.ack_ranges.count());
+    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 2, .last = 3 }, .{ .first = 5, .last = 7 } }, receiver.ack_ranges.items.items[0..receiver.ack_ranges.count()]);
     receiver.resume_wake.drain();
     try std.testing.expectEqual(@as(c_int, 0), std.c.poll(&descriptors, 1, 0));
 
-    // An already claimed head must remain immutable, even if carried proof touches it.
+    try std.testing.expectEqual(@as(usize, 0), carried.count());
+    // New proof admitted behind an in-flight head cannot rewrite that head.
     receiver.ack_outstanding = true;
-    carried.clear();
-    try carried.insert(1, 2, 0);
-    try receiver.adoptRanges(carried);
-    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 2, .last = 3 }, .{ .first = 1, .last = 2 }, .{ .first = 5, .last = 7 } }, receiver.ack_ranges.items[0..receiver.ack_ranges.len]);
+    try receiver.acknowledgeRange(7, 1, 2);
+    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 2, .last = 3 }, .{ .first = 1, .last = 2 }, .{ .first = 5, .last = 7 } }, receiver.ack_ranges.items.items[0..receiver.ack_ranges.count()]);
 }
 test "failed ACK claim restores sorted unprotected ranges" {
     const a = std.testing.allocator;
     var receiver: Receiver = .{ .a = a, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 7, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
     defer receiver.resume_wake.deinit();
     defer receiver.ready.deinit();
-    try receiver.ack_ranges.insert(50, 60, 0);
+    defer receiver.ack_ranges.deinit(a);
+    try receiver.ack_ranges.insert(a, 50, 60, 0);
     receiver.ack_first = 50;
     receiver.ack_last = 60;
     receiver.ack_outstanding = true;
-    try receiver.ack_ranges.insert(10, 49, 1);
-    try receiver.ack_ranges.insert(70, 90, 1);
+    try receiver.ack_ranges.insert(std.testing.allocator, 10, 49, 1);
+    try receiver.ack_ranges.insert(std.testing.allocator, 70, 90, 1);
     receiver.lock();
     receiver.releaseAckClaimLocked();
     receiver.unlock();
     try std.testing.expect(!receiver.ackState().outstanding);
     try std.testing.expectEqual(@as(usize, 2), receiver.ackState().pending);
-    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 10, .last = 60 }, .{ .first = 70, .last = 90 } }, receiver.ack_ranges.items[0..receiver.ack_ranges.len]);
+    try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 10, .last = 60 }, .{ .first = 70, .last = 90 } }, receiver.ack_ranges.items.items[0..receiver.ack_ranges.count()]);
 }
-test "receiver queue is bounded and publishes owned frames before its failure" {
+test "stream classifier scans complete JSON escaped root keys and dynamic nesting without a DOM" {
+    const a = std.testing.allocator;
+    var receiver: Receiver = undefined;
+    receiver.a = a; // Classification reads only the allocator, never sockets.
+    try std.testing.expect(try receiver.isStreamPage("{\"str\\u0065am\":\"events\",\"events\":[]}"));
+    try std.testing.expect(try receiver.isStreamPage("{\"\\u0073tream\":\"snapshot\"}"));
+    try std.testing.expect(!try receiver.isStreamPage("{\"nested\":{\"stream\":\"events\"},\"text\":\"stream\"}"));
+    try std.testing.expect(!try receiver.isStreamPage("{\"streaming\":null}"));
+    try std.testing.expect(!try receiver.isStreamPage("{}"));
+    for ([_][]const u8{
+        "{\"stream\":\"events\"} trailing",
+        "{\"stream\":\"events\"}{}",
+        "{\"stream\":}",
+        "{\"stream\":\"events\",\"nested\":[1,]}",
+        "{\"stream\":\"events\",\"str\\u0065am\":\"snapshot\"}",
+        "{\"stream\":\"\xff\"}",
+        "[\"stream\"]",
+    }) |bytes| {
+        if (receiver.isStreamPage(bytes)) |_| return error.TestExpectedError else |_| {}
+    }
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(a);
+    try deep.appendSlice(a, "{\"stream\":\"events\",\"nested\":");
+    for (0..512) |_| try deep.append(a, '[');
+    try deep.appendSlice(a, "null");
+    for (0..512) |_| try deep.append(a, ']');
+    try deep.append(a, '}');
+    const Helper = struct {
+        fn scan(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var owner: Receiver = undefined;
+            owner.a = allocator;
+            try std.testing.expect(try owner.isStreamPage(bytes));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Helper.scan, .{deep.items});
+}
+test "ACK duplicate and escaped fields remain authoritative after non DOM classification" {
+    const a = std.testing.allocator;
+    var receiver: Receiver = .{ .a = a, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 7, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
+    defer receiver.resume_wake.deinit();
+    defer receiver.ready.deinit();
+    defer receiver.ack_ranges.deinit(a);
+    defer std.debug.assert(std.c.pthread_mutex_destroy(&receiver.mutex) == .SUCCESS);
+    try receiver.ack_ranges.insert(a, 1, 1, 0);
+    receiver.ack_id = 8;
+    receiver.ack_first = 1;
+    receiver.ack_last = 1;
+    receiver.ack_outstanding = true;
+    const duplicate = "{\"v\":5,\"id\":8,\"ok\":true,\"epoch\":7,\"ack\":true,\"a\\u0063k\":true,\"first\":1,\"sequence\":1,\"through\":1}";
+    try std.testing.expect(!try receiver.isStreamPage(duplicate));
+    try std.testing.expect(!receiver.applyAckReply(duplicate));
+    try std.testing.expect(receiver.ack_outstanding);
+    try std.testing.expectEqual(@as(usize, 1), receiver.ack_ranges.count());
+    const wrong_epoch = "{\"v\":5,\"id\":8,\"ok\":true,\"epoch\":8,\"ack\":true,\"first\":1,\"sequence\":1,\"through\":1}";
+    try std.testing.expect(!try receiver.isStreamPage(wrong_epoch));
+    try std.testing.expect(!receiver.applyAckReply(wrong_epoch));
+    try std.testing.expect(receiver.ack_outstanding);
+    const valid = "{\"v\":5,\"id\":8,\"ok\":true,\"epoch\":7,\"a\\u0063k\":true,\"first\":1,\"sequence\":1,\"through\":1}";
+    try std.testing.expect(!try receiver.isStreamPage(valid));
+    try std.testing.expect(receiver.applyAckReply(valid));
+    try std.testing.expect(!receiver.ack_outstanding);
+    try std.testing.expectEqual(@as(usize, 0), receiver.ack_ranges.count());
+}
+test "received frame FIFO amortizes prefixes and appends after partial consumption" {
     const a = std.testing.allocator;
     var receiver: Receiver = .{ .a = a, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 1, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
     defer receiver.resume_wake.deinit();
     defer receiver.ready.deinit();
-    defer for (receiver.frames) |frame| if (frame) |bytes| a.free(bytes);
+    defer std.debug.assert(std.c.pthread_mutex_destroy(&receiver.mutex) == .SUCCESS);
+    defer {
+        for (receiver.frames.items[receiver.head..]) |bytes| a.free(bytes);
+        receiver.frames.deinit(a);
+    }
+    const Row = struct {
+        fn publish(receiver_: *Receiver, id: usize) !void {
+            const bytes = try std.fmt.allocPrint(receiver_.a, "frame-{d}", .{id});
+            errdefer receiver_.a.free(bytes);
+            try receiver_.publish(bytes);
+        }
+        fn pop(receiver_: *Receiver, id: usize) !void {
+            const bytes = (try receiver_.pop()).?;
+            defer receiver_.a.free(bytes);
+            var text: [32]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&text, "frame-{d}", .{id}), bytes);
+        }
+    };
+    for (0..1000) |id| try Row.publish(&receiver, id);
+    for (0..300) |id| try Row.pop(&receiver, id);
+    try std.testing.expectEqual(@as(usize, 300), receiver.head);
+    try std.testing.expectEqual(@as(usize, 700), receiver.count);
+    for (1000..1300) |id| try Row.publish(&receiver, id);
+    try std.testing.expectEqual(@as(usize, 1000), receiver.count);
+    for (300..1300) |id| try Row.pop(&receiver, id);
+    try std.testing.expectEqual(@as(usize, 0), receiver.count);
+    try std.testing.expectEqual(@as(usize, 0), receiver.bytes);
+    try std.testing.expectEqual(@as(usize, 0), receiver.head);
+    try std.testing.expectEqual(@as(usize, 0), receiver.frames.items.len);
+    try std.testing.expect((try receiver.pop()) == null);
+    // Appending after an empty reset must not revive a consumed frame.
+    try Row.publish(&receiver, 1300);
+    try Row.pop(&receiver, 1300);
+    try Row.publish(&receiver, 1301); // Remaining suffix is cleanup-owned.
+}
+test "received frame publication OOM retains caller bytes" {
+    const a = std.testing.allocator;
+    var receiver: Receiver = .{ .a = a, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 1, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
+    defer receiver.resume_wake.deinit();
+    defer receiver.ready.deinit();
+    defer receiver.frames.deinit(a);
+    defer std.debug.assert(std.c.pthread_mutex_destroy(&receiver.mutex) == .SUCCESS);
+    const bytes = try a.dupe(u8, "caller owned");
+    defer a.free(bytes);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    receiver.a = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, receiver.publish(bytes));
+    receiver.a = a;
+    try std.testing.expectEqualStrings("caller owned", bytes);
+    try std.testing.expectEqual(@as(usize, 0), receiver.count);
+    try std.testing.expectEqual(@as(usize, 0), receiver.bytes);
+    try std.testing.expectEqual(@as(usize, 0), receiver.frames.items.len);
+}
+test "receiver queue grows and publishes owned frames before its failure" {
+    const a = std.testing.allocator;
+    var receiver: Receiver = .{ .a = a, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 1, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
+    defer receiver.resume_wake.deinit();
+    defer receiver.ready.deinit();
+    defer {
+        for (receiver.frames.items[receiver.head..]) |bytes| a.free(bytes);
+        receiver.frames.deinit(a);
+    }
     const first = try a.dupe(u8, "first");
-    receiver.publish(first);
+    try receiver.publish(first);
     receiver.failure = error.StreamGap;
     receiver.done = true;
     const got = (try receiver.pop()).?;
     defer a.free(got);
     try std.testing.expectEqual(first.ptr, got.ptr);
     try std.testing.expectError(error.StreamGap, receiver.pop());
-    for (0..Receiver.max_count) |_| receiver.publish(try a.dupe(u8, "x"));
-    try std.testing.expect(!receiver.room());
-    const one = (try receiver.pop()).?;
-    a.free(one);
-    try std.testing.expect(receiver.room());
+    for (0..128) |_| try receiver.publish(try a.dupe(u8, "x"));
+    for (0..128) |_| {
+        const one = (try receiver.pop()).?;
+        a.free(one);
+    }
 }
 test "watch socket carries selective ACK ranges and consumes their confirmations" {
     const a = std.testing.allocator;
@@ -316,31 +463,40 @@ test "watch socket carries selective ACK ranges and consumes their confirmations
     // Unconfirmed ranges survive a replacement receiver instead of being
     // silently dropped or widened.
     try receiver.acknowledgeRange(7, 70, 80);
-    const carried = receiver.takeRanges();
+    receiver.stop.cancel();
+    receiver.resume_wake.notify();
+    receiver.future.?.await(io);
+    receiver.future = null;
+    var carried = receiver.takeRanges();
+    defer carried.deinit(a);
+    const carried_count = carried.count();
     var replacement: Receiver = .{ .a = a, .io = io, .endpoint = &.{}, .uid = 0, .epoch = 7, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
     defer replacement.resume_wake.deinit();
     defer replacement.ready.deinit();
-    defer for (replacement.frames) |frame| if (frame) |bytes| a.free(bytes);
-    try replacement.adoptRanges(carried);
-    try std.testing.expectEqual(carried.len, replacement.ackState().pending);
+    defer replacement.ack_ranges.deinit(a);
+    defer replacement.frames.deinit(a);
+    replacement.adoptRanges(&carried);
+    try std.testing.expectEqual(@as(usize, 0), carried.count());
+    try std.testing.expectEqual(carried_count, replacement.ackState().pending);
 }
-test "ACK range admission is bounded and refuses without dropping proof" {
+test "ACK range admission grows without dropping proof" {
     const a = std.testing.allocator;
     var receiver: Receiver = .{ .a = a, .io = std.testing.io, .endpoint = &.{}, .uid = 0, .epoch = 7, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
     defer receiver.resume_wake.deinit();
     defer receiver.ready.deinit();
-    defer for (receiver.frames) |frame| if (frame) |bytes| a.free(bytes);
-    for (0..AckRanges.capacity) |index| {
+    defer {
+        for (receiver.frames.items[receiver.head..]) |bytes| a.free(bytes);
+        receiver.frames.deinit(a);
+    }
+    defer receiver.ack_ranges.deinit(a);
+    for (0..256) |index| {
         try receiver.acknowledgeRange(7, index * 2 + 1, index * 2 + 1);
     }
-    try std.testing.expectEqual(AckRanges.capacity, receiver.ackState().pending);
-    // A new hole cannot be admitted while the set is full; the existing proof
-    // is untouched so the caller can retry it later.
-    try std.testing.expectError(error.QueueFull, receiver.acknowledgeRange(7, 10_001, 10_001));
-    try std.testing.expectEqual(AckRanges.capacity, receiver.ackState().pending);
-    // An adjacent range still merges, so ordinary progress needs no new slot.
+    try std.testing.expectEqual(@as(usize, 256), receiver.ackState().pending);
+    try receiver.acknowledgeRange(7, 10_001, 10_001);
+    try std.testing.expectEqual(@as(usize, 257), receiver.ackState().pending);
     try receiver.acknowledgeRange(7, 2, 2);
-    try std.testing.expectEqual(AckRanges.capacity - 1, receiver.ackState().pending);
+    try std.testing.expectEqual(@as(usize, 256), receiver.ackState().pending);
     try std.testing.expectError(error.StaleControl, receiver.acknowledgeRange(8, 1, 2));
 }
 test "an unconfirmed ACK range survives a lost reply for the replacement" {
@@ -375,14 +531,16 @@ test "an unconfirmed ACK range survives a lost reply for the replacement" {
     }
     try std.testing.expect(receiver.done);
     try std.testing.expectEqual(@as(u64, 0), receiver.ackState().confirmed_through);
-    const carried = receiver.takeRanges();
-    try std.testing.expectEqual(@as(usize, 1), carried.len);
-    try std.testing.expectEqual(AckRanges.Range{ .first = 20, .last = 30 }, carried.items[0]);
+    var carried = receiver.takeRanges();
+    defer carried.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), carried.count());
+    try std.testing.expectEqual(AckRanges.Range{ .first = 20, .last = 30 }, carried.items.items[0]);
     var replacement: Receiver = .{ .a = a, .io = io, .endpoint = &.{}, .uid = 0, .epoch = 7, .resume_wake = try Wakeup.init(), .ready = try Wakeup.init() };
     defer replacement.resume_wake.deinit();
     defer replacement.ready.deinit();
-    defer for (replacement.frames) |item| if (item) |bytes| a.free(bytes);
-    try replacement.adoptRanges(carried);
+    defer replacement.ack_ranges.deinit(a);
+    defer replacement.frames.deinit(a);
+    replacement.adoptRanges(&carried);
     try std.testing.expectEqual(@as(usize, 1), replacement.ackState().pending);
-    try std.testing.expectEqual(AckRanges.Range{ .first = 20, .last = 30 }, replacement.ack_ranges.items[0]);
+    try std.testing.expectEqual(AckRanges.Range{ .first = 20, .last = 30 }, replacement.ack_ranges.items.items[0]);
 }

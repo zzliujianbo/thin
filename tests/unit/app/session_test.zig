@@ -473,7 +473,8 @@ test "codex metadata refresh borrows the exact configured alias and skips sends 
     const listed = LayeredMetadataFixture.row(&session.metadata_cache.directory, .openai_codex, "gpt-fixture");
     try std.testing.expectEqual(@as(?u32, 65536), listed.tokens);
     try std.testing.expectEqual(p.Protocol.responses, listed.protocol);
-    const saved = try metadata.load(&session.store.root);
+    var saved = try metadata.load(&session.store.root);
+    defer saved.deinit(session.store.root.allocator);
     try std.testing.expect(saved.refresh[@intCast(@backingInt(ProviderId.openai_codex))].successful);
     try std.testing.expect(session.metadata_job == null);
     // A pending reauthentication keeps the last good list and issues no send.
@@ -484,7 +485,9 @@ test "codex metadata refresh borrows the exact configured alias and skips sends 
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expectEqual(@as(usize, 2), Fixture.acquires.load(.monotonic));
     try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .openai_codex, "gpt-fixture").tokens);
-    try std.testing.expect(!(try metadata.load(&session.store.root)).refresh[@intCast(@backingInt(ProviderId.openai_codex))].successful);
+    var failed = try metadata.load(&session.store.root);
+    defer failed.deinit(session.store.root.allocator);
+    try std.testing.expect(!failed.refresh[@intCast(@backingInt(ProviderId.openai_codex))].successful);
 }
 test "new llm pending startup and custom login activate without inference" {
     var fixture = try SessionTestFixture.init();
@@ -659,7 +662,7 @@ test "changed credential and current budgets do not authenticate or reject check
     try std.testing.expectEqual(@as(u32, 131072), current_config.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 16384), current_config.model.output_tokens);
     try std.testing.expect(current_config.model.input_price_threshold == null);
-    try std.testing.expectEqual(@as(?u32, 12000), current_config.limits.max_input_tokens);
+    try std.testing.expect(current_config.limits.low_price_input);
     try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.responses, current_config.model.protocol);
     try std.testing.expect(!resumed.read_only);
     try std.testing.expect(try resumed.saveOnExit());
@@ -1187,6 +1190,7 @@ test "initial default adopts late public metadata without cycling or normalizing
     try std.testing.expectEqual(before.protocol, config.model.protocol);
     // Subsequent refreshes must not replace the now-accepted map.
     const accepted = config.model.reasoning;
+    session.metadata_cache.deinit(session.allocator);
     session.metadata_cache = .{};
     try std.testing.expectEqualStrings(next.name().?, session.app.?.config.value.model.reasoning_effort.?);
     _ = try Session.cycleEffort(&session);
@@ -1208,19 +1212,25 @@ test "provider reasoning source DeepSeek then Go Haiku applies global default wi
             var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
             defer session.deinit();
             try setGlobalEffortForTest(&session, wanted);
-            session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), try metadata.parseListing(a,
+            var deepseek_listing = try metadata.parseListing(a,
                 \\{"data":[{"id":"deepseek-flash","effort":{"supported_levels":["off","low","high","max"]}}]}
-            , .deepseek));
+            , .deepseek);
+            defer deepseek_listing.deinit(a);
+            session.metadata_cache.deinit(a);
+            session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), deepseek_listing);
             try session.connection().configureProvider(.deepseek, "fake-haiku-sequence-ds");
             try std.testing.expectEqualStrings("deepseek-flash", session.app.?.config.value.model.name);
             try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning_effort.?);
-            const go_unknown = try metadata.parseListing(a,
+            var go_unknown = try metadata.parseListing(a,
                 \\{"data":[{"id":"claude-haiku-5-5","protocol":"anthropic"}]}
             , .opencode_go);
+            defer go_unknown.deinit(a);
             var go_known = try metadata.parseListing(a,
                 \\{"data":[{"id":"claude-haiku-5-5","protocol":"anthropic","effort":{"format":"anthropic","supported_levels":["off","low","medium","high","max"]}}]}
             , .opencode_go);
+            defer go_known.deinit(a);
             publicReasoningFixture(&go_known, "claude-haiku-5-5");
+            session.metadata_cache.deinit(a);
             session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), if (late) go_unknown else go_known);
             try session.connection().configureProvider(.opencode_go, "fake-haiku-sequence-go");
             try std.testing.expectEqualStrings("deepseek-flash", session.app.?.config.value.model.name);
@@ -1230,6 +1240,7 @@ test "provider reasoning source DeepSeek then Go Haiku applies global default wi
                 try std.testing.expect(session.initial_default_pending);
                 try std.testing.expect(before.reasoning == null and before.reasoning_effort == null);
                 try std.testing.expectEqual(wanted, session.connection().current().pending_default_effort.?);
+                session.metadata_cache.deinit(a);
                 session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), go_known);
                 const borrowed = session.effortCandidate(session.app.?.config.value).model.reasoning.?.map.high.?;
                 try std.testing.expect(!(try session.completeInitialDefault(false)));
@@ -1257,6 +1268,7 @@ test "provider reasoning source DeepSeek then Go Haiku applies global default wi
             defer cfg.release(&disk);
             try std.testing.expectEqualStrings("opencode-go/claude-haiku-5-5", disk.value.registry.?.default);
             try std.testing.expect(disk.value.registry.?.find("opencode-go").?.patchFor("claude-haiku-5-5") == null);
+            session.metadata_cache.deinit(a);
             session.metadata_cache = .{};
             try std.testing.expect(!(try session.completeInitialDefault(true)));
             try std.testing.expectEqualStrings(wanted.name().?, session.app.?.config.value.model.reasoning_effort.?);
@@ -1286,14 +1298,19 @@ test "first activation defaults clamp without changing preference and own late c
             defer session.deinit();
             try setGlobalEffortForTest(&session, saved);
             var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"protocol\":\"responses\",\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\",\"max\"]}}]}", .opencode_go);
+            defer listing.deinit(a);
             publicReasoningFixture(&listing, "gpt-6-luna");
-            if (!late) session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
+            if (!late) {
+                session.metadata_cache.deinit(a);
+                session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
+            }
             try session.connection().configureProvider(.opencode_go, "fake-default-effort");
             const before = session.app.?.config.value.model;
             if (late) {
                 try std.testing.expect(session.initial_default_pending);
                 try std.testing.expectEqual(saved, session.connection().current().pending_default_effort.?);
                 try std.testing.expect(before.reasoning_effort == null);
+                session.metadata_cache.deinit(a);
                 session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
                 const borrowed = session.effortCandidate(session.app.?.config.value).model.reasoning.?.map.high.?;
                 try std.testing.expect(!(try session.completeInitialDefault(false)));
@@ -1316,6 +1333,7 @@ test "first activation defaults clamp without changing preference and own late c
             try std.testing.expectEqual(before.protocol, config.model.protocol);
             try std.testing.expectEqual(before.input_price_threshold, config.model.input_price_threshold);
             const accepted = config.model.reasoning;
+            session.metadata_cache.deinit(a);
             session.metadata_cache = .{};
             try std.testing.expect(!(try session.completeInitialDefault(true)));
             try std.testing.expect(Session.sameDeclaration(accepted, session.app.?.config.value.model.reasoning));
@@ -1339,7 +1357,9 @@ test "owner thinking selections merge only after join and preserve cache ownersh
     try session.connection().configureProvider(.opencode_go, "fixture-key");
     try session.connection().selectModel("opencode-go/gpt-6-luna");
     var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"protocol\":\"responses\",\"effort\":{\"supported_levels\":[\"low\",\"high\"]}}]}", .opencode_go);
+    defer listing.deinit(a);
     publicReasoningFixture(&listing, "gpt-6-luna");
+    session.metadata_cache.deinit(a);
     session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
     const app = session.app.?;
     const before = app.config.value.model;
@@ -1352,6 +1372,7 @@ test "owner thinking selections merge only after join and preserve cache ownersh
     try std.testing.expect(Session.sameDeclaration(before.reasoning, app.config.value.model.reasoning));
     const owned = app.thinking_control.get().?.reasoning.?.map.high.?;
     try std.testing.expect(borrowed.ptr != owned.ptr);
+    session.metadata_cache.deinit(a);
     session.metadata_cache = .{};
     try std.testing.expectEqualStrings("high", owned);
     session.read_only = true;
@@ -1389,7 +1410,9 @@ test "initial default stops after journal start and never overwrites an accepted
     app.journal.started = false;
     try std.testing.expect(!session.initial_default_pending);
     var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"protocol\":\"responses\",\"effort\":{\"supported_levels\":[\"low\",\"high\"]}}]}", .opencode_go);
+    defer listing.deinit(a);
     publicReasoningFixture(&listing, "gpt-6-luna");
+    session.metadata_cache.deinit(a);
     session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.opencode_go), listing);
     try std.testing.expect(!(try session.completeInitialDefault(true)));
     try std.testing.expect(app.config.value.model.reasoning == null);
@@ -1426,7 +1449,9 @@ test "effort action cannot borrow official reasoning for a proxy kind hint" {
     try env.put("HOME", home);
     var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
-    const listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
+    var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", .deepseek);
+    defer listing.deinit(a);
+    session.metadata_cache.deinit(a);
     session.metadata_cache = try metadata.commit(&session.store.root, metadata.bit(.deepseek), listing);
     try std.testing.expect(!(try session.completeInitialDefault(true)));
     try std.testing.expectError(error.ThinkingCapabilitiesUnknown, Session.cycleEffort(&session));
@@ -1508,11 +1533,13 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     MetadataFixture.calls.store(0, .monotonic);
     try session.connection().configureProvider(.deepseek, "fake-stale-first-key");
     var previous: metadata.Listing = .{ .directory_mask = metadata.bit(.deepseek) };
-    const previous_row = try previous.directory.upsert(.deepseek, "deepseek-flash");
+    defer previous.deinit(a);
+    const previous_row = try previous.directory.upsert(a, .deepseek, "deepseek-flash");
     previous_row.available = true;
     previous_row.protocol = .chat;
     previous_row.tokens = 65536;
     previous_row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .high = "high" } });
+    session.metadata_cache.deinit(a);
     session.metadata_cache = try metadata.commitAt(&session.store.root, metadata.bit(.deepseek), previous, 1000);
     session.metadata_wall_ms = 2000;
     try Session.refreshModels(&session);
@@ -1523,7 +1550,8 @@ test "manual metadata refresh filters obsolete credentials even with automatic r
     try std.testing.expect(session.metadata_job == null);
     try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .deepseek, "deepseek-flash").tokens);
     try std.testing.expectEqualStrings("high", LayeredMetadataFixture.row(&session.metadata_cache.directory, .deepseek, "deepseek-flash").reasoning.?.declaration().map.high.?);
-    const stale_disk = try metadata.load(&session.store.root);
+    var stale_disk = try metadata.load(&session.store.root);
+    defer stale_disk.deinit(session.store.root.allocator);
     try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&stale_disk.directory, .deepseek, "deepseek-flash").tokens);
     try std.testing.expectEqual(@as(?u64, 1000), session.metadata_cache.refresh[0].last_success_ms);
     try std.testing.expect(!session.metadata_cache.refresh[0].successful);
@@ -1584,7 +1612,9 @@ test "official results publish while models.dev retains an independent longer de
     session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
     LayeredMetadataFixture.official_effort.store(false, .release);
     try session.connection().configureProvider(.opencode_go, "fake-deadline-go");
-    const previous = try metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
+    var previous = try metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
+    defer previous.deinit(a);
+    session.metadata_cache.deinit(a);
     session.metadata_cache = try metadata.commit(&session.store.root, 0, previous);
     try Session.refreshModels(&session);
     const job = session.metadata_job.?;
@@ -1602,7 +1632,8 @@ test "official results publish while models.dev retains an independent longer de
     job.dev_started_ms -= models_dev_timeout_ms;
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == null);
-    const saved = try metadata.load(&session.store.root);
+    var saved = try metadata.load(&session.store.root);
+    defer saved.deinit(session.store.root.allocator);
     try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&saved.directory, .opencode_go, "claude-haiku-5-5").tokens);
     try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&saved.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
     try std.testing.expect(!Session.pollModels(&session, true)); // No tight automatic retry loop.
@@ -1653,7 +1684,8 @@ test "login with new credentials refreshes official metadata without waiting for
     try MetadataFixture.waitDone(session.io, &job.done);
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expectEqual(@as(?u32, 131072), LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").tokens);
-    const rotated_disk = try metadata.load(&session.store.root);
+    var rotated_disk = try metadata.load(&session.store.root);
+    defer rotated_disk.deinit(session.store.root.allocator);
     try std.testing.expectEqual(@as(?u32, 131072), LayeredMetadataFixture.row(&rotated_disk.directory, .opencode_go, "claude-haiku-5-5").tokens);
     try std.testing.expect(job.dev_future != null and session.metadata_login_pending == 0);
     job.dev_started_ms -= models_dev_timeout_ms + 1;
@@ -1691,7 +1723,8 @@ test "login refreshes only saved provider despite prior attempt and queues behin
     session.metadata_fetch = Fixture.fetch;
     session.metadata_dev_fetch = MetadataFixture.dev;
     Fixture.calls.store(0, .monotonic);
-    _ = try metadata.claim(&session.store.root, metadata.bit(.opencode_go), false);
+    var claim = try metadata.claim(&session.store.root, metadata.bit(.opencode_go), false);
+    defer claim.cache.deinit(a);
     try session.connection().configureProvider(.opencode_go, "fake-go-full");
     const original = session.connection().current().context_limit;
     try std.testing.expect(session.metadata_job == null);
@@ -1785,7 +1818,8 @@ test "manual refresh asynchronously discovers new IDs and preserves public proto
     var picker = @import("../ui/model_picker.zig").Picker.init(a);
     defer picker.deinit();
     picker.allow_custom = false;
-    const reloaded = try metadata.load(&session.store.root);
+    var reloaded = try metadata.load(&session.store.root);
+    defer reloaded.deinit(session.store.root.allocator);
     for (legacyMetadataTestProviders) |id| {
         const selector = try std.fmt.allocPrint(a, "{s}/future-official-id", .{id.slug()});
         defer a.free(selector);
@@ -1842,7 +1876,8 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
             break;
         }
     } else return error.MissingModelPickerRow;
-    const disk = try metadata.load(&session.store.root);
+    var disk = try metadata.load(&session.store.root);
+    defer disk.deinit(session.store.root.allocator);
     try std.testing.expectEqualStrings("disabled", LayeredMetadataFixture.row(&disk.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.off.?);
     {
         var again = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
@@ -1900,7 +1935,8 @@ test "dynamic models.dev refresh reaches model picker, cached reload and selecti
     try Session.refreshModels(&session);
     MetadataFixture.finish(&session);
     try std.testing.expect(Session.pollModels(&session, true));
-    const failed_refresh_disk = try metadata.load(&session.store.root);
+    var failed_refresh_disk = try metadata.load(&session.store.root);
+    defer failed_refresh_disk.deinit(session.store.root.allocator);
     try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&failed_refresh_disk.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
     try std.testing.expect(std.mem.find(u8, session.metadata_notice.?, "models.dev metadata refresh failed") != null);
 }
@@ -1919,11 +1955,11 @@ test "dynamic official IDs select for all providers and reject unknown protocols
     for (legacyMetadataTestProviders) |id| try session.connection().configureProvider(id, "fake-dynamic-key");
     session.metadata_cache.directory_mask = legacyMetadataTestMask;
     for (legacyMetadataTestProviders) |id| {
-        const row = try session.metadata_cache.directory.upsert(id, "new/vendor-model");
+        const row = try session.metadata_cache.directory.upsert(a, id, "new/vendor-model");
         row.available = true;
         row.tokens = 131072;
         row.protocol = if (id == .deepseek) .chat else .responses;
-        const unknown = try session.metadata_cache.directory.upsert(id, "new-unknown");
+        const unknown = try session.metadata_cache.directory.upsert(a, id, "new-unknown");
         unknown.available = true;
     }
     const models = try session.buildModels(session.global_config.?.value);
@@ -2034,7 +2070,7 @@ test "display candidates own names and explicit wires across cache and config re
     defer session.deinit();
     try session.connection().configureProvider(.opencode_go, "fake-owned-display-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
-    const row = try session.metadata_cache.directory.upsert(.opencode_go, "owned-cache-name");
+    const row = try session.metadata_cache.directory.upsert(a, .opencode_go, "owned-cache-name");
     row.available = true;
     row.protocol = .chat;
     var profile_name = "owned-profile".*;
@@ -2058,7 +2094,7 @@ test "display candidates own names and explicit wires across cache and config re
     try std.testing.expectEqual(@as(usize, 2), models.len);
     // A movable Session/cache and a released config arena are equivalent to
     // replacing these backing bytes. Published rows must own separate storage.
-    @memset(&session.metadata_cache.directory.names, 'X');
+    @memset(session.metadata_cache.directory.names, 'X');
     profile_name[0] = 'X';
     effort[0] = 'X';
     wire[0] = 'X';
@@ -2083,7 +2119,7 @@ test "raw explicit profile hides only the same provider dynamic identity" {
     try session.connection().configureProvider(.opencode_zen, "fake-zen-profile-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go) | metadata.bit(.opencode_zen);
     for ([_]ProviderId{ .opencode_go, .opencode_zen }) |id| {
-        const row = try session.metadata_cache.directory.upsert(id, "shared-profile");
+        const row = try session.metadata_cache.directory.upsert(a, id, "shared-profile");
         row.available = true;
         row.protocol = .chat;
     }
@@ -2117,7 +2153,7 @@ test "explicit user reasoning overrides metadata and survives default persistenc
     try model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &source.metadata_cache);
     var config = parsed.value;
     source.metadata_cache.directory_mask |= metadata.bit(.opencode_go);
-    const row = try source.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    const row = try source.metadata_cache.directory.upsert(a, .opencode_go, "gpt-6-luna");
     row.available = true;
     row.protocol = .responses;
     row.dev_present = true;
@@ -2147,7 +2183,10 @@ test "derived reasoning stays frozen and foreign profiles cannot revive it after
     var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     try source.connection().configureProvider(.opencode_go, "fake-provenance-go");
-    source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, @embedFile("models_dev_fixture.json")));
+    var listing = try metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
+    defer listing.deinit(a);
+    source.metadata_cache.deinit(a);
+    source.metadata_cache = try metadata.commit(&source.store.root, 0, listing);
     try source.connection().selectModel("opencode-go/gpt-6-luna");
     try source.connection().setEffort(.max);
     try std.testing.expectEqual(cfg.ReasoningSource.metadata, source.app.?.config.value.model.reasoning_source);
@@ -2171,7 +2210,10 @@ test "derived reasoning stays frozen and foreign profiles cannot revive it after
     const foreign_only =
         \\{"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"gpt-6-luna":{"reasoning":true,"provider":{"npm":"@ai-sdk/openai"}}}},"one":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["high"]}]}}},"two":{"npm":"@ai-sdk/openai","models":{"gpt-6-luna":{"reasoning_options":[{"type":"effort","values":["high"]}]}}}}
     ;
-    source.metadata_cache = try metadata.commit(&source.store.root, 0, try metadata.parseDev(a, foreign_only));
+    var foreign_listing = try metadata.parseDev(a, foreign_only);
+    defer foreign_listing.deinit(a);
+    source.metadata_cache.deinit(a);
+    source.metadata_cache = try metadata.commit(&source.store.root, 0, foreign_listing);
     const public_row = LayeredMetadataFixture.row(&source.metadata_cache.directory, .opencode_go, "gpt-6-luna");
     try std.testing.expect(public_row.dev_present and public_row.dev_reasoning == null);
     {
@@ -2203,6 +2245,7 @@ test "derived reasoning stays frozen and foreign profiles cannot revive it after
         try std.testing.expectEqual(presentation.ReasoningEffort.max, again.preferred_effort.?);
     }
     // Former preset maps (including Luna/Zen) also stay unknown with no source.
+    source.metadata_cache.deinit(a);
     source.metadata_cache = .{};
     for (catalog.entries) |entry| {
         const config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
@@ -2226,7 +2269,7 @@ test "provider reasoning source Go ignores legacy official effort" {
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
     const config: cfg.Config = .{ .provider = catalog.connection(.opencode_go), .model = entry.model };
     session.metadata_cache.directory_mask |= metadata.bit(.opencode_go);
-    const row = try session.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    const row = try session.metadata_cache.directory.upsert(a, .opencode_go, "gpt-6-luna");
     row.available = true;
     row.protocol = .responses;
     row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
@@ -2259,7 +2302,7 @@ test "explicit raw and qualified profiles override dynamic rows including explic
     try session.connection().configureProvider(.opencode_go, "fake-explicit-key");
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
     for ([_][]const u8{ "raw-override", "qualified-override", "visible-unknown" }) |name| {
-        const row = try session.metadata_cache.directory.upsert(.opencode_go, name);
+        const row = try session.metadata_cache.directory.upsert(a, .opencode_go, name);
         row.available = true;
     }
     const models = try session.buildModels(session.global_config.?.value);
@@ -2312,11 +2355,13 @@ test "pending auth retains trusted derived map while saving only cache backed de
     var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     var listing: metadata.Listing = .{};
+    defer listing.deinit(a);
     listing.directory_mask = metadata.bit(.deepseek);
-    const row = try listing.directory.upsert(.deepseek, "deepseek-flash");
+    const row = try listing.directory.upsert(a, .deepseek, "deepseek-flash");
     row.available = true;
     row.protocol = .chat;
     row.reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } });
+    source.metadata_cache.deinit(a);
     source.metadata_cache = try metadata.commit(&source.store.root, metadata.bit(.deepseek), listing);
     // Cache publication alone does not rewrite the pending resolved snapshot;
     // confirm the qualified candidate through the real new-selection path.
@@ -2349,7 +2394,7 @@ test "derived metadata protocol or format mismatch clears stale mapping and effo
     var source = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer source.deinit();
     const entry = catalog.find("opencode-go/gpt-6-luna").?;
-    const row = try source.metadata_cache.directory.upsert(.opencode_go, "gpt-6-luna");
+    const row = try source.metadata_cache.directory.upsert(a, .opencode_go, "gpt-6-luna");
     row.dev_present = true;
     row.dev_protocol = .responses;
     row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .map = .{ .high = "high" } });
@@ -2420,7 +2465,8 @@ test "outdated cache recovers through automatic or explicit refresh only" {
         try std.testing.expect(Session.pollModels(&session, true));
         try std.testing.expect(session.metadata_job == null);
         try std.testing.expectEqual(@as(usize, 1), MetadataFixture.calls.load(.monotonic));
-        const disk = try metadata.load(&session.store.root);
+        var disk = try metadata.load(&session.store.root);
+        defer disk.deinit(session.store.root.allocator);
         const row = disk.directory.rows[disk.directory.find(.deepseek, "deepseek-flash").?];
         try std.testing.expectEqual(@as(?u32, 1048576), row.tokens);
         try std.testing.expectEqual(@as(?bool, true), row.available);
@@ -2478,7 +2524,8 @@ test "future or damaged cache blocks cadence until the file is moved away" {
         try std.testing.expect(Session.pollModels(&session, true));
         try std.testing.expect(session.metadata_job == null);
         try std.testing.expectEqual(@as(usize, 1), MetadataFixture.calls.load(.monotonic));
-        const disk = try metadata.load(&session.store.root);
+        var disk = try metadata.load(&session.store.root);
+        defer disk.deinit(session.store.root.allocator);
         try std.testing.expect(disk.directory.find(.deepseek, "deepseek-flash") != null);
     }
 }

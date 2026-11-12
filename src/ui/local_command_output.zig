@@ -2,8 +2,7 @@
 //! treats output as Markdown/terminal instructions; canonical bytes are untouched.
 const std = @import("std");
 const clean = @import("../util/display_text.zig");
-pub const limit = 128 * 1024;
-pub const Output = struct { text: []const u8, clipped: bool };
+pub const Output = struct { text: []const u8 };
 const Bash = struct {
     stdout: ?[]const u8 = null,
     stderr: ?[]const u8 = null,
@@ -36,12 +35,8 @@ fn flat(input: []const u8) bool {
 const Buffer = struct {
     a: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
-    clipped: bool = false,
     fn put(self: *Buffer, s: []const u8) !void {
-        var n = @min(s.len, limit - self.bytes.items.len);
-        while (n > 0 and n < s.len and s[n] & 0xc0 == 0x80) n -= 1;
-        try self.bytes.appendSlice(self.a, s[0..n]);
-        self.clipped = self.clipped or n != s.len;
+        try self.bytes.appendSlice(self.a, s);
     }
     fn lineBreak(self: *Buffer) !void {
         if (self.bytes.items.len != 0 and self.bytes.items[self.bytes.items.len - 1] != '\n') try self.put("\n");
@@ -59,13 +54,8 @@ const Buffer = struct {
 };
 
 pub fn format(a: std.mem.Allocator, input: []const u8) !Output {
-    if (input.len > limit or !flat(input)) return literal(a, input);
-    // Explicit allocation bound independent of JSON token count; no arbitrary
-    // Value tree. Genuine allocation failure propagates rather than hiding OOM.
-    const scratch = try a.alloc(u8, input.len * 8 + 4096);
-    defer a.free(scratch);
-    var fixed = std.heap.FixedBufferAllocator.init(scratch);
-    const parsed = std.json.parseFromSlice(Bash, fixed.allocator(), input, .{ .ignore_unknown_fields = true, .max_value_len = limit }) catch |err| switch (err) {
+    if (!flat(input)) return literal(a, input);
+    const parsed = std.json.parseFromSlice(Bash, a, input, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return literal(a, input),
     };
@@ -87,13 +77,11 @@ pub fn format(a: std.mem.Allocator, input: []const u8) !Output {
     if (v.exit_code) |code| if (code != 0) try b.status(try std.fmt.bufPrint(&status_buffer, "Command exited with status {d}", .{code}));
     if (v.cleanup_failed == true) try b.status("Command cleanup failed");
     if (v.truncated == true) try b.status("[output truncated]");
-    const safe = try clean.sanitizePrefix(a, b.bytes.items, limit);
-    return .{ .text = safe.text, .clipped = b.clipped or safe.truncated };
+    const safe = try clean.sanitizeAll(a, b.bytes.items);
+    return .{ .text = safe };
 }
 
 fn literal(a: std.mem.Allocator, input: []const u8) !Output {
-    // Bound even malformed/oversized fallback work, preserving it as literal
-    // text (not a claimed execution status).
-    const safe = try clean.sanitizePrefix(a, input[0..@min(input.len, limit)], limit);
-    return .{ .text = safe.text, .clipped = safe.truncated or input.len > limit };
+    // Preserve malformed or unrelated input as literal text, not a status.
+    return .{ .text = try clean.sanitizeAll(a, input) };
 }

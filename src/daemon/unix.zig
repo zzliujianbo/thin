@@ -30,9 +30,8 @@ const metadata = @import("../platform/metadata.zig");
 const native = @import("../platform/ipc_native.zig");
 const protocol = @import("../core/protocol.zig");
 
-/// Upper bound of a single frame payload (4-byte big-endian length prefix).
-/// 中文：单帧载荷上限；业务展示快照仍需自行分页/裁剪到更小尺寸。
-pub const max_frame_len: usize = 1024 * 1024;
+/// Maximum representable payload of the four-byte wire length field.
+pub const max_frame_len: usize = std.math.maxInt(u32);
 /// Native sun_path capacity minus its terminating NUL (Linux 107, Darwin 103).
 pub const max_socket_path_len = native.max_socket_path_len;
 /// Owned NONBLOCK/CLOEXEC pair; Darwin also configures SO_NOSIGPIPE on both ends.
@@ -812,7 +811,7 @@ pub const Connection = struct {
     header: [header_size]u8 = @splat(0),
     header_read: usize = 0,
     declared: usize = 0,
-    body: []u8 = &.{},
+    body: std.ArrayList(u8) = .empty,
     body_read: usize = 0,
     write_progress: usize = 0,
     poisoned: bool = false,
@@ -850,28 +849,29 @@ pub const Connection = struct {
                 self.header_read += n;
             }
             const declared = std.mem.readInt(u32, &self.header, .big);
-            if (@as(usize, declared) > max_frame_len) {
-                self.poisoned = true;
-                return error.FrameTooLarge;
-            }
             self.declared = declared;
             self.state = .body;
         }
 
-        if (self.body.len != self.declared) self.body = try self.allocator.alloc(u8, self.declared);
+        var chunk: [step_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &chunk);
         while (self.body_read < self.declared) {
-            const maybe = try self.readAvailable(self.body[self.body_read..], &deadline);
+            const want = @min(chunk.len, self.declared - self.body_read);
+            const maybe = try self.readAvailable(chunk[0..want], &deadline);
             const n = maybe orelse {
                 self.freeBody();
                 self.clearFrame();
                 self.poisoned = true;
                 return error.TruncatedFrame;
             };
+            self.appendBody(chunk[0..n]) catch |err| {
+                self.poisoned = true;
+                return err;
+            };
             self.body_read += n;
         }
 
-        const frame = self.body;
-        self.body = &.{};
+        const frame = try self.takeBody();
         self.clearFrame();
         return frame;
     }
@@ -894,16 +894,13 @@ pub const Connection = struct {
             self.header_read += n;
             if (self.header_read < header_size) return .pending;
             self.declared = std.mem.readInt(u32, &self.header, .big);
-            if (self.declared > max_frame_len) {
-                self.poisoned = true;
-                return error.FrameTooLarge;
-            }
             self.state = .body;
         }
-        if (self.body.len != self.declared) self.body = try self.allocator.alloc(u8, self.declared);
         if (self.body_read < self.declared) {
-            const end = @min(self.declared, self.body_read + step_bytes);
-            const n = self.receiveStep(self.body[self.body_read..end]) catch |err| switch (err) {
+            var chunk: [step_bytes]u8 = undefined;
+            defer std.crypto.secureZero(u8, &chunk);
+            const want = @min(chunk.len, self.declared - self.body_read);
+            const n = self.receiveStep(chunk[0..want]) catch |err| switch (err) {
                 error.WouldBlock => return .pending,
                 else => return err,
             };
@@ -911,11 +908,14 @@ pub const Connection = struct {
                 self.poisoned = true;
                 return error.TruncatedFrame;
             }
+            self.appendBody(chunk[0..n]) catch |err| {
+                self.poisoned = true;
+                return err;
+            };
             self.body_read += n;
             if (self.body_read < self.declared) return .pending;
         }
-        const frame = self.body;
-        self.body = &.{};
+        const frame = try self.takeBody();
         self.clearFrame();
         return .{ .frame = frame };
     }
@@ -935,7 +935,8 @@ pub const Connection = struct {
         if (self.poisoned) return error.StreamPoisoned;
         if (self.writePending()) return error.WriteInProgress;
         if (payload.len > max_frame_len) return error.FrameTooLarge;
-        const frame = try self.allocator.alloc(u8, header_size + payload.len);
+        const frame_len = std.math.add(usize, header_size, payload.len) catch return error.FrameTooLarge;
+        const frame = try self.allocator.alloc(u8, frame_len);
         std.mem.writeInt(u32, frame[0..header_size], @intCast(payload.len), .big);
         @memcpy(frame[header_size..], payload);
         self.outgoing = frame;
@@ -1063,16 +1064,35 @@ pub const Connection = struct {
         self.state = .header;
     }
 
+    fn takeBody(self: *Connection) ![]u8 {
+        const result = try self.allocator.dupe(u8, self.body.items);
+        self.freeBody();
+        return result;
+    }
+
+    fn appendBody(self: *Connection, bytes: []const u8) !void {
+        const required = try std.math.add(usize, self.body.items.len, bytes.len);
+        if (required > self.body.capacity) {
+            var next: std.ArrayList(u8) = .empty;
+            try next.ensureTotalCapacity(self.allocator, required);
+            next.appendSliceAssumeCapacity(self.body.items);
+            self.wipePendingBody();
+            self.body.deinit(self.allocator);
+            self.body = next;
+        }
+        self.body.appendSliceAssumeCapacity(bytes);
+    }
+
     fn wipePendingBody(self: *Connection) void {
         // An incomplete login frame may already contain credential bytes, even
         // though no Request exists yet to run its normal secret cleanup.
-        std.crypto.secureZero(u8, self.body);
+        std.crypto.secureZero(u8, self.body.items);
     }
 
     fn freeBody(self: *Connection) void {
         self.wipePendingBody();
-        if (self.body.len != 0) self.allocator.free(self.body);
-        self.body = &.{};
+        self.body.deinit(self.allocator);
+        self.body = .empty;
     }
 };
 

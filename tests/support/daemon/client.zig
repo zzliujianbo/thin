@@ -506,7 +506,7 @@ fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     try testing.expectEqual(@as(u64, 7), try watch.u64Field("epoch"));
     switch (behavior) {
         .watch_eof => stream.close(),
-        .watch_reject => try stream.writeFrame("{\"v\":4,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
+        .watch_reject => try stream.writeFrame("{\"v\":5,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
         .watch_timeout => {},
         else => try writePeerInitial(a, io, &stream, id, project, owner, 7, switch (behavior) {
             .snapshot => .snapshot,

@@ -39,7 +39,7 @@ fn makeClient(a: std.mem.Allocator, io: Io, scenario: []const u8, timeout_ms: u3
     }
     const origin = try base(if (trust == .direct) "THIN_SYSTEMONE_HTTP" else if (trust == .mismatch_proxy) "THIN_SYSTEMONE_MISMATCH" else "THIN_SYSTEMONE_HTTPS", trust != .direct, trust == .mismatch_proxy);
     const text = try std.fmt.allocPrint(a,
-        \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"{s}/primary-never","api_key":"fake-primary-key","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"{s}/{s}","api_key":"fake-systemone-key","models":{{"jev-fixture":{{"protocol":"systemone"}}}}}}}}}},"decision":{{"model":"aux/jev-fixture","max_state_bytes":16384}},"limits":{{"request_timeout_ms":{d}}}}}
+        \\{{"llm":{{"default":"main/chat","providers":{{"main":{{"base_url":"{s}/primary-never","api_key":"fake-primary-key","models":{{"chat":{{"protocol":"chat","context_tokens":32768}}}}}},"aux":{{"base_url":"{s}/{s}","api_key":"fake-systemone-key","models":{{"jev-fixture":{{"protocol":"systemone"}}}}}}}}}},"decision":{{"model":"aux/jev-fixture"}},"limits":{{"request_timeout_ms":{d}}}}}
     , .{ try base("THIN_SYSTEMONE_HTTP", false, false), origin, scenario, timeout_ms });
     defer a.free(text);
     var parsed = try cfg.parse(a, text);

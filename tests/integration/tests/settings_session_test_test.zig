@@ -308,7 +308,7 @@ test "anchored auth protects original credentials after HOME and project path re
         try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(arena.allocator(), .{ .read_file = .{ .path = path } }, &cancel));
         try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(arena.allocator(), .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
     }
-    const original = try fixture.tmp.dir.readFileAlloc(io, "original/.thin/config.json", a, .limited(cfg.max_config_bytes));
+    const original = try fixture.tmp.dir.readFileAlloc(io, "original/.thin/config.json", a, .unlimited);
     defer a.free(original);
     try std.testing.expect(std.mem.indexOf(u8, original, "fake-owned-settings-key") != null);
     const replacement = try fixture.tmp.dir.readFileAlloc(io, "home/decoy.json", a, .limited(100));

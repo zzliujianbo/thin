@@ -21,7 +21,6 @@ pub fn apply(a: std.mem.Allocator, config: *cfg.Config, name: []const u8, enable
         return true;
     }
     if (!enabled) return false;
-    if (proxy.models.len >= 128) return error.TooManyProxyModels;
     const models = try a.alloc([]const u8, proxy.models.len + 1);
     @memcpy(models[0..proxy.models.len], proxy.models);
     models[proxy.models.len] = try a.dupe(u8, name);

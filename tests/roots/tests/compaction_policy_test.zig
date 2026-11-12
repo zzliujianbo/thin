@@ -84,6 +84,14 @@ fn configuration() cfg.Config {
     }, .limits = .{ .low_price_input = false } };
 }
 
+fn windowForInputBudget(budget: u32) u32 {
+    std.debug.assert(budget > 0);
+    const room = @as(u64, budget) + 1;
+    const window: u32 = @intCast(room + @min(cfg.Policy.safety_tokens, room / 7));
+    std.debug.assert(@as(u64, window) - cfg.Policy.safetyTokens(window) - 1 == budget);
+    return window;
+}
+
 // One-shot backing fault, armed by the decision fake after its response is
 // allocated. The summary can then run and observe the rollback after OOM.
 const RefineFault = struct {
@@ -144,6 +152,7 @@ const LongTurn = struct {
     decisions: usize = 0,
     summaries: usize = 0,
     normals: usize = 0,
+    expected_batch_count: ?usize = null,
     cancel: *p.Cancellation,
     answers: ?[]const []const u8 = null,
     expected_results: ?[]const p.ToolResult = null,
@@ -152,16 +161,13 @@ const LongTurn = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.decisions += 1;
         try std.testing.expect(input == .refine_outputs);
-        try std.testing.expect(input.refine_outputs.len > 0 and input.refine_outputs.len <= 8);
-        var bytes: usize = 0;
+        try std.testing.expect(input.refine_outputs.len > 0);
+        if (self.expected_batch_count) |count| try std.testing.expectEqual(count, input.refine_outputs.len);
         if (self.answers) |answers| try std.testing.expectEqual(input.refine_outputs.len, answers.len);
         for (input.refine_outputs, 0..) |item, i| {
-            bytes += item.text.len + item.id.len;
-            try std.testing.expect(item.text.len <= 8192);
             try std.testing.expect(std.mem.startsWith(u8, item.id, "bash-"));
             if (self.answers) |answers| try std.testing.expect(answers[i].len < item.text.len);
         }
-        try std.testing.expect(bytes <= 16384);
         switch (self.mode) {
             .failure => return error.FixtureDecisionUnavailable,
             .service_oom => return error.OutOfMemory,

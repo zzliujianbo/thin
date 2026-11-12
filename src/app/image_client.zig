@@ -120,7 +120,7 @@ pub const Client = struct {
         const head = self.transport.streamPost(a, self.endpoint, &.{
             .{ .name = "authorization", .value = bearer },
             .{ .name = "accept", .value = "application/json" },
-        }, payload, try sink.remaining(), codec.max_response_bytes, .{ .context = &sink, .write_fn = Sink.write, .check_fn = Sink.check }, cancel) catch |err| {
+        }, payload, try sink.remaining(), null, .{ .context = &sink, .write_fn = Sink.write, .check_fn = Sink.check }, cancel) catch |err| {
             if (self.isPoisoned() or err == error.CleanupFailed) return error.CleanupFailed;
             try sink.checkNow();
             return err;
@@ -163,7 +163,6 @@ const Sink = struct {
         const self: *Sink = @ptrCast(@alignCast(raw));
         try self.checkNow();
         if (head.status < 200 or head.status >= 300 or head.is_sse) return error.ImageHttpResponse;
-        if (bytes.len > codec.max_response_bytes -| self.body.items.len) return error.ImageResponseTooLarge;
         try self.body.appendSlice(self.a, bytes);
     }
 };

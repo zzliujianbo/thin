@@ -21,57 +21,44 @@ const Wakeup = @import("../platform/wakeup.zig").Wakeup;
 /// one. A full set refuses admission instead of dropping proof: the caller
 /// keeps the exact range for retry.
 pub const AckRanges = struct {
-    pub const capacity = 64;
     pub const Range = struct { first: u64, last: u64 };
 
-    items: [capacity]Range = undefined,
-    len: usize = 0,
+    items: std.ArrayList(Range) = .empty,
 
     pub fn clear(self: *AckRanges) void {
-        self.len = 0;
+        self.items.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *AckRanges, a: std.mem.Allocator) void {
+        self.items.deinit(a);
     }
 
     pub fn count(self: *const AckRanges) usize {
-        return self.len;
+        return self.items.items.len;
     }
 
     /// `skip` keeps a leading in-flight entry out of merging.
-    pub fn insert(self: *AckRanges, first: u64, last: u64, skip: usize) error{QueueFull}!void {
+    pub fn insert(self: *AckRanges, a: std.mem.Allocator, first: u64, last: u64, skip: usize) !void {
         std.debug.assert(last != 0 and first <= last);
-        std.debug.assert(skip <= self.len);
+        std.debug.assert(skip <= self.items.items.len);
         var merged = Range{ .first = first, .last = last };
         var start = skip;
-        while (start < self.len and self.items[start].last +| 1 < merged.first) : (start += 1) {}
+        while (start < self.items.items.len and self.items.items[start].last +| 1 < merged.first) : (start += 1) {}
         var end = start;
-        while (end < self.len and touches(self.items[end], merged)) : (end += 1) {
-            merged.first = @min(merged.first, self.items[end].first);
-            merged.last = @max(merged.last, self.items[end].last);
+        while (end < self.items.items.len and touches(self.items.items[end], merged)) : (end += 1) {
+            merged.first = @min(merged.first, self.items.items[end].first);
+            merged.last = @max(merged.last, self.items.items[end].last);
         }
         if (start == end) {
-            if (self.len == capacity) return error.QueueFull;
-            var i = self.len;
-            while (i > start) : (i -= 1) self.items[i] = self.items[i - 1];
-            self.len += 1;
+            try self.items.insert(a, start, merged);
         } else {
-            var src = end;
-            var dst = start + 1;
-            while (src < self.len) {
-                self.items[dst] = self.items[src];
-                src += 1;
-                dst += 1;
-            }
-            self.len -= end - start - 1;
+            self.items.items[start] = merged;
+            for (0..end - start - 1) |_| _ = self.items.orderedRemove(start + 1);
         }
-        self.items[start] = merged;
     }
 
     fn removeHead(self: *AckRanges) Range {
-        std.debug.assert(self.len != 0);
-        const head = self.items[0];
-        var i: usize = 1;
-        while (i < self.len) : (i += 1) self.items[i - 1] = self.items[i];
-        self.len -= 1;
-        return head;
+        return self.items.orderedRemove(0);
     }
 
     fn touches(left: Range, right: Range) bool {
@@ -80,8 +67,6 @@ pub const AckRanges = struct {
 };
 
 pub const Receiver = struct {
-    pub const max_count: usize = 64;
-    pub const max_bytes: usize = 2 * unix.max_frame_len;
     const setup_timeout_ms = 5_000;
 
     a: std.mem.Allocator,
@@ -109,7 +94,7 @@ pub const Receiver = struct {
     ready: Wakeup,
     future: ?std.Io.Future(void) = null,
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-    frames: [max_count]?[]u8 = @splat(null),
+    frames: std.ArrayList([]u8) = .empty,
     head: usize = 0,
     count: usize = 0,
     bytes: usize = 0,
@@ -157,9 +142,9 @@ pub const Receiver = struct {
             self.unlock();
             return error.StaleControl;
         }
-        self.ack_ranges.insert(first, last, if (self.ack_outstanding) 1 else 0) catch {
+        self.ack_ranges.insert(self.a, first, last, if (self.ack_outstanding) 1 else 0) catch |err| {
             self.unlock();
-            return error.QueueFull;
+            return err;
         };
         self.unlock();
         self.resume_wake.notify();
@@ -175,7 +160,7 @@ pub const Receiver = struct {
     pub fn ackState(self: *Receiver) AckState {
         self.lock();
         defer self.unlock();
-        return .{ .confirmed_through = self.ack_confirmed_through, .pending = self.ack_ranges.len, .outstanding = self.ack_outstanding };
+        return .{ .confirmed_through = self.ack_confirmed_through, .pending = self.ack_ranges.count(), .outstanding = self.ack_outstanding };
     }
 
     /// Copy the unconfirmed ranges for a replacement receiver. Callers use
@@ -183,20 +168,19 @@ pub const Receiver = struct {
     pub fn takeRanges(self: *Receiver) AckRanges {
         self.lock();
         defer self.unlock();
-        return self.ack_ranges;
+        const carried = self.ack_ranges;
+        self.ack_ranges = .{};
+        return carried;
     }
 
-    pub fn adoptRanges(self: *Receiver, carried: AckRanges) error{QueueFull}!void {
+    pub fn adoptRanges(self: *Receiver, carried: *AckRanges) void {
         self.lock();
-        var admitted = false;
-        defer {
-            self.unlock();
-            if (admitted) self.resume_wake.notify();
-        }
-        for (carried.items[0..carried.len]) |range| {
-            self.ack_ranges.insert(range.first, range.last, if (self.ack_outstanding) 1 else 0) catch return error.QueueFull;
-            admitted = true;
-        }
+        std.debug.assert(self.ack_ranges.count() == 0 and !self.ack_outstanding);
+        self.ack_ranges.deinit(self.a);
+        self.ack_ranges = carried.*;
+        carried.* = .{};
+        self.unlock();
+        self.resume_wake.notify();
     }
 
     /// Release a failed claim while holding the mutex. The protected head may
@@ -207,7 +191,7 @@ pub const Receiver = struct {
         const head = self.ack_ranges.removeHead();
         std.debug.assert(head.first == self.ack_first and head.last == self.ack_last);
         // Removing the head guarantees a free slot even at full capacity.
-        self.ack_ranges.insert(head.first, head.last, 0) catch unreachable;
+        self.ack_ranges.insert(self.a, head.first, head.last, 0) catch unreachable;
         self.ack_outstanding = false;
     }
 
@@ -222,11 +206,11 @@ pub const Receiver = struct {
             return;
         }
         self.lock();
-        if (self.ack_outstanding or self.ack_ranges.len == 0) {
+        if (self.ack_outstanding or self.ack_ranges.count() == 0) {
             self.unlock();
             return;
         }
-        const range = self.ack_ranges.items[0];
+        const range = self.ack_ranges.items.items[0];
         self.ack_id +%= 1;
         if (self.ack_id == 0) self.ack_id = 1;
         const id = self.ack_id;
@@ -247,25 +231,71 @@ pub const Receiver = struct {
         try conn.queueFrame(frame);
     }
 
-    /// A watch page always carries `"stream":"..."` at top level, and every
-    /// event value is JSON-escaped, so this marker cannot appear inside one.
-    fn isStreamPage(frame: []const u8) bool {
-        return std.mem.indexOf(u8, frame, "\"stream\":\"") != null;
+    /// Routing only: validate the complete JSON syntax without materializing a
+    /// DOM. Client.parseObject / applyAckReply remain authoritative for duplicate
+    /// fields, envelopes and epoch-bound consumption.
+    fn isStreamPage(self: *Receiver, frame: []const u8) !bool {
+        if (!std.unicode.utf8ValidateSlice(frame)) return error.ProtocolError;
+        var scanner = std.json.Scanner.initCompleteInput(self.a, frame);
+        defer scanner.deinit();
+        if (try scanner.next() != .object_begin) return error.ProtocolError;
+        var stream = false;
+        while (true) {
+            if (try scanner.peekNextTokenType() == .object_end) {
+                _ = try scanner.next();
+                break;
+            }
+            const key_is_stream = try streamKey(&scanner);
+            if (key_is_stream) {
+                if (stream) return error.ProtocolError;
+                stream = true;
+            }
+            switch (try scanner.peekNextTokenType()) {
+                .object_end, .array_end, .end_of_document => return error.ProtocolError,
+                else => try scanner.skipValue(),
+            }
+        }
+        if (try scanner.next() != .end_of_document) return error.ProtocolError;
+        return stream;
+    }
+
+    /// Compare decoded key fragments, including escaped Unicode, without
+    /// allocating key storage or imposing any key-length limit.
+    fn streamKey(scanner: *std.json.Scanner) !bool {
+        var matched: usize = 0;
+        var possible = true;
+        while (true) {
+            const token = try scanner.next();
+            switch (token) {
+                .string, .partial_string => |bytes| matchStreamKey(&matched, &possible, bytes),
+                .partial_string_escaped_1 => |bytes| matchStreamKey(&matched, &possible, &bytes),
+                .partial_string_escaped_2 => |bytes| matchStreamKey(&matched, &possible, &bytes),
+                .partial_string_escaped_3 => |bytes| matchStreamKey(&matched, &possible, &bytes),
+                .partial_string_escaped_4 => |bytes| matchStreamKey(&matched, &possible, &bytes),
+                else => return error.ProtocolError,
+            }
+            if (token == .string) return possible and matched == "stream".len;
+        }
+    }
+
+    fn matchStreamKey(matched: *usize, possible: *bool, bytes: []const u8) void {
+        if (!possible.*) return;
+        if (bytes.len > "stream".len - matched.* or !std.mem.eql(u8, bytes, "stream"[matched.*..][0..bytes.len])) {
+            possible.* = false;
+            return;
+        }
+        matched.* += bytes.len;
     }
 
     /// Consume the owner's ACK confirmation instead of forwarding it as a
     /// display frame. `false` is a protocol failure for this stream.
     fn applyAckReply(self: *Receiver, frame: []const u8) bool {
-        // The owner's reply is a fixed handful of fields; refuse to parse an
-        // arbitrarily large non-stream frame on this path.
-        if (frame.len > 512) return false;
-        var document = std.json.parseFromSlice(std.json.Value, self.a, frame, .{}) catch return false;
+        var document = std.json.parseFromSlice(std.json.Value, self.a, frame, .{ .duplicate_field_behavior = .@"error" }) catch return false;
         defer document.deinit();
         const object = switch (document.value) {
             .object => |value| value,
             else => return false,
         };
-        if (object.count() > 16) return false;
         // The confirmation is part of the same exact IPC version. A v1 or
         // foreign control frame can never retire a range.
         const version = integerField(object.get("v") orelse return false) orelse return false;
@@ -330,11 +360,11 @@ pub const Receiver = struct {
                 return failure;
             }
             if (self.count >= 2) {
-                const first = self.a.dupe(u8, self.frames[self.head].?) catch |err| {
+                const first = self.a.dupe(u8, self.frames.items[self.head]) catch |err| {
                     self.unlock();
                     return err;
                 };
-                const second = self.a.dupe(u8, self.frames[(self.head + 1) % max_count].?) catch |err| {
+                const second = self.a.dupe(u8, self.frames.items[self.head + 1]) catch |err| {
                     self.a.free(first);
                     self.unlock();
                     return err;
@@ -366,10 +396,17 @@ pub const Receiver = struct {
         self.ready.drain();
         self.lock();
         if (self.count != 0) {
-            const frame = self.frames[self.head].?;
-            self.frames[self.head] = null;
-            self.head = (self.head + 1) % max_count;
+            const frame = self.frames.items[self.head];
+            self.head += 1;
             self.count -= 1;
+            if (self.count == 0) {
+                self.frames.clearRetainingCapacity();
+                self.head = 0;
+            } else if (self.head >= self.count) {
+                std.mem.copyForwards([]u8, self.frames.items[0..self.count], self.frames.items[self.head..]);
+                self.frames.items.len = self.count;
+                self.head = 0;
+            }
             self.bytes -= frame.len;
             self.unlock();
             self.resume_wake.notify();
@@ -383,21 +420,12 @@ pub const Receiver = struct {
         return null;
     }
 
-    /// Reserve room for the largest legal frame BEFORE another read. The
-    /// partial frame adds at most max_frame_len beyond the published queue.
-    fn room(self: *Receiver) bool {
+    fn publish(self: *Receiver, frame: []u8) !void {
         self.lock();
         defer self.unlock();
-        return self.count < max_count and self.bytes <= max_bytes - unix.max_frame_len;
-    }
-
-    fn publish(self: *Receiver, frame: []u8) void {
-        self.lock();
-        std.debug.assert(self.count < max_count and self.bytes + frame.len <= max_bytes);
-        self.frames[(self.head + self.count) % max_count] = frame;
+        try self.frames.append(self.a, frame);
         self.count += 1;
         self.bytes += frame.len;
-        self.unlock();
         self.ready.notify();
     }
 
@@ -435,15 +463,24 @@ pub const Receiver = struct {
             // holds an inbound page behind it: both directions are bounded and
             // nonblocking on this one owned socket.
             try self.pumpAck(conn);
-            const can_read = self.room();
+            const can_read = true;
             const writing = conn.writePending();
             if (can_read) {
                 const was_partial = conn.header_read != 0;
                 switch (try conn.readStep()) {
                     .eof => return error.ConnectionClosed,
                     .frame => |frame| {
-                        if (isStreamPage(frame)) {
-                            self.publish(frame);
+                        const stream_page = self.isStreamPage(frame) catch |err| {
+                            std.crypto.secureZero(u8, frame);
+                            self.a.free(frame);
+                            return err;
+                        };
+                        if (stream_page) {
+                            self.publish(frame) catch |err| {
+                                std.crypto.secureZero(u8, frame);
+                                self.a.free(frame);
+                                return err;
+                            };
                         } else {
                             const accepted = self.applyAckReply(frame);
                             self.a.free(frame);
@@ -477,11 +514,12 @@ pub const Receiver = struct {
         self.resume_wake.notify();
         if (self.future) |*future| future.await(self.io);
         // No producer remains: queued frame ownership is now exclusively ours.
-        for (&self.frames) |*frame| if (frame.*) |bytes| {
+        for (self.frames.items[self.head..]) |bytes| {
             std.crypto.secureZero(u8, bytes);
             self.a.free(bytes);
-            frame.* = null;
-        };
+        }
+        self.frames.deinit(self.a);
+        self.ack_ranges.deinit(self.a);
         self.resume_wake.deinit();
         self.ready.deinit();
         std.debug.assert(std.c.pthread_mutex_destroy(&self.mutex) == .SUCCESS);

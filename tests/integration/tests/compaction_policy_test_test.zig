@@ -1,12 +1,11 @@
 test "prefix rewrite automatic and manual compaction sends canonical Anthropic tail without stale thinking" {
-    const old: [8000]u8 = @splat('x');
+    const old: [15000]u8 = @splat('x');
     for ([_]bool{ false, true }) |manual| {
         var config = configuration();
         config.model.protocol = .anthropic;
         config.model.reasoning.?.format = .anthropic;
-        config.model.context_tokens = 4096;
-        config.limits.safety_tokens = 100;
-        config.limits.compaction_trigger_percent = 60;
+        config.model.context_tokens = windowForInputBudget(6000);
+        try std.testing.expectEqual(@as(usize, 6000), c.inputBudget(config));
         var fake: PrefixFake = .{};
         var unused: Fake = .{};
         var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = PrefixFake.call }, unused.executor(), .{}, "");
@@ -108,7 +107,9 @@ test "compaction native sixteen same-user closed groups refinement rollback canc
         config.model.protocol = .anthropic;
         config.model.reasoning.?.format = .anthropic;
         var cancel: p.Cancellation = .{};
-        var fake: LongTurn = .{ .mode = mode, .cancel = &cancel };
+        // All fifteen selected closed groups are refined together; the
+        // sixteenth complete group remains the retained recent tail.
+        var fake: LongTurn = .{ .mode = mode, .cancel = &cancel, .expected_batch_count = 15 };
         var unused: Fake = .{};
         var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = LongTurn.call }, unused.executor(), .{}, "");
         defer runtime.deinit();
@@ -134,7 +135,10 @@ test "compaction native sixteen same-user closed groups refinement rollback canc
             }
             try std.testing.expectEqual(original.ptr, runtime.messages().ptr);
             try std.testing.expectEqualDeep(original, runtime.messages());
+            // compact() restores the previous display snapshot with the old
+            // canonical history. The terminal still accounts for a sent summary.
             try std.testing.expectEqual(@as(?u64, 777), runtime.last_context_tokens);
+            try std.testing.expectEqual(@as(u32, if (mode == .bad_summary) 1 else 0), result.usage.summary_calls);
         } else {
             try std.testing.expectEqual(r.Status.success, result.status);
             try std.testing.expect(c.hasSummaryPrefix(runtime.messages()));
@@ -216,8 +220,6 @@ test "automatic compaction refinement cleanup failure blocks fitting normal infe
     config.model.protocol = .anthropic;
     config.model.reasoning.?.format = .anthropic;
     config.model.context_tokens = 100000;
-    config.limits.compaction_trigger_percent = 10;
-    config.limits.compaction_target_percent = 5;
     var cancel: p.Cancellation = .{};
     var fake: LongTurn = .{ .mode = .cleanup_failure, .cancel = &cancel };
     var effects: Effects = .{};
@@ -239,7 +241,8 @@ test "automatic compaction refinement cleanup failure blocks fitting normal infe
     defer a.free(original_json);
     const estimator = runtime.estimator;
     const before = runtime.estimatedTokens();
-    try std.testing.expect(before > c.threshold(c.inputBudget(config), config.limits.compaction_trigger_percent));
+    config.model.context_tokens = windowForInputBudget(@intCast(before * 10 / 9));
+    try std.testing.expect(before > c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
     try c.checkInput(config, before + 100); // Old history plus the new goal still fits normal policy.
     for (0..2) |attempt| {
         const result = try runtime.run(if (attempt == 0) "new goal" else "blocked goal", &cancel);
@@ -288,15 +291,7 @@ test "compaction policy registry automatic explicit and disabled survive disk ro
         defer a.free(raw);
         try std.testing.expectError(error.UnknownField, cfg.parse(a, raw));
     }
-    var config = configuration();
-    try cfg.validate(config);
-    config.limits.model_refresh_ttl_ms = 0;
-    try std.testing.expectError(error.InvalidLimit, cfg.validate(config));
-    config.limits.model_refresh_ttl_ms = 604800001;
-    try std.testing.expectError(error.InvalidLimit, cfg.validate(config));
-    config.limits.model_refresh_ttl_ms = 14400000;
-    config.limits.model_refresh_cooldown_ms = 604800001;
-    try std.testing.expectError(error.InvalidLimit, cfg.validate(config));
+    try cfg.validate(configuration());
 }
 test "compaction policy summary input room is independent of output capacity" {
     var config = configuration();
@@ -304,7 +299,7 @@ test "compaction policy summary input room is independent of output capacity" {
         config.model.context_tokens = window;
         for ([_]?u32{ null, 20, 65536 }) |capacity| {
             config.model.output_tokens = capacity;
-            const room = window - config.limits.safety_tokens;
+            const room = window - cfg.Policy.safety_tokens;
             try std.testing.expectEqual(@as(usize, room - 1), c.inputBudgetFor(config, .summary));
             try c.checkInputFor(config, .summary, room - 1);
             try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, room));
@@ -316,8 +311,7 @@ test "compaction policy summary input room is independent of output capacity" {
 test "compaction policy disabled skips automatic summaries but enforces hard input budget" {
     for ([_]bool{ false, true }) |too_large| {
         var config = configuration();
-        config.model.context_tokens = 4096;
-        config.limits.safety_tokens = 100;
+        config.model.context_tokens = 8192;
         config.limits.compaction_enabled = false;
         var fake: Fake = .{};
         var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
@@ -412,8 +406,8 @@ test "compaction policy summary must be nonempty stop text and never executes to
 test "compaction policy exhausted automatic summary pauses without followup inference" {
     const old: [10000]u8 = @splat('x');
     var config = configuration();
-    config.model.context_tokens = 4096;
-    config.limits.safety_tokens = 100;
+    config.model.context_tokens = windowForInputBudget(4095);
+    try std.testing.expectEqual(@as(usize, 4095), c.inputBudget(config));
     var fake: Fake = .{ .exhausted = true };
     var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
     defer runtime.deinit();

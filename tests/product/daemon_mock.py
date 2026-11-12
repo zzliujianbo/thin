@@ -113,24 +113,22 @@ APPROVAL_ANSWER = 'daemon-approval-answer'
 SERVICE_PROMPT = 'daemon-owned-service-prompt'
 SERVICE_ANSWER = 'daemon-owned-service-answer'
 
-# This owned service finishes its own work for a while after SIGTERM. Only the
-# reclaim case writes it, so no other case gains a sleep, and the daemon must
-# wait for the worker that is cleaning the service up instead of killing that
-# worker on a fixed short grace. 3.5s is deliberately longer than the old
-# 2s shutdown grace plus the 1s TERM->KILL grace of the worker.
-SERVICE_STOP_DELAY = 3.5
-# Per-case limits of case 7 only: the worker needs its own grace (`cleanup_grace_ms`)
-# to release the service, and `cleanup_timeout_ms` must leave a KILL upgrade
-# strictly after the service's delay (min(grace, timeout/2) > 3.5s), so the
-# observable outcome is the worker waiting, never a silent early kill.
-SERVICE_LIMITS = {'cleanup_grace_ms': 4000, 'cleanup_timeout_ms': 12000}
+# Case 7 verifies cooperative service cleanup within the default one-second
+# TERM grace. A completion marker proves the handler finished before daemon
+# exit, rather than accepting an early forced kill. A separate Supervisor
+# regression is assigned to cover a worker beyond the old 3s watchdog.
+SERVICE_STOP_DELAY = 0.5
 
 SERVICE_SOURCE = '''\
 import os, signal, socket, sys, time
 marker, tag = sys.argv[1], sys.argv[2]
 
 def _stopping(signum, frame):
+    started = time.monotonic_ns()
     time.sleep(@STOP_DELAY@)
+    completed = time.monotonic_ns()
+    with open(marker + '.completed', 'w') as handle:
+        handle.write('%d %d %d\\n' % (os.getpid(), started, completed))
     os._exit(0)
 
 signal.signal(signal.SIGTERM, _stopping)
@@ -677,10 +675,8 @@ def write_config(home, url, limits=None):
     path = Path(home) / '.thin' / 'config.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     base_limits = {
-        'low_price_input': False, 'safety_tokens': 100,
-        'request_timeout_ms': 60000, 'task_timeout_ms': 120000,
-        'command_timeout_ms': 10000, 'cleanup_grace_ms': 300,
-        'cleanup_timeout_ms': 5000,
+        'low_price_input': False, 'request_timeout_ms': 60000,
+        'command_timeout_ms': 10000,
     }
     config = {
         'memory': {'auto': False},
@@ -1858,7 +1854,7 @@ def case_daemon_reclaim(app, base):
     # Absolute owned path: the cmdline ownership check matches this exactly.
     case.state['service_cmd'] = 'exec python3 -u %s %s daemon' % (
         shlex.quote(str(script)), SERVICE_MARKER)
-    case.start_model(service_plan, limits=SERVICE_LIMITS)
+    case.start_model(service_plan)
     service_pid = None
     try:
         daemon = case.start_daemon()
@@ -1878,15 +1874,22 @@ def case_daemon_reclaim(app, base):
         assert client.wait_exit('reclaim client exit', 25) == 0
 
         workers = children_of(daemon.proc.pid)
-        stopping = time.monotonic()
+        completed_marker = project / (SERVICE_MARKER + '.completed')
+        assert not completed_marker.exists(), 'service completed before shutdown'
+        stopping_ns = time.monotonic_ns()
         code = stop_daemon(case)
-        shutdown_seconds = round(time.monotonic() - stopping, 3)
-        # The service only exits SERVICE_STOP_DELAY after it was TERM'd by the
-        # worker, so a daemon that returned after the old 2s + 1s worker kill
-        # window cannot have waited for it.
+        returned_ns = time.monotonic_ns()
+        shutdown_seconds = round((returned_ns - stopping_ns) / 1e9, 3)
+        # The handler writes only after its actual cooperative cleanup. Requiring
+        # the marker and dead service immediately on return rejects early KILL
+        # or daemon exit without waiting for the owned service.
         assert_service_gone_now(service_pid, service_port, script)
-        assert shutdown_seconds > SERVICE_STOP_DELAY - 0.1, \
-            'daemon stopped in %.3fs, before the owned service cleanup finished' % shutdown_seconds
+        assert completed_marker.exists(), 'daemon returned before service cleanup completed'
+        marker_pid, started_ns, completed_ns = map(int, completed_marker.read_text().split())
+        assert marker_pid == service_pid, 'completion marker belongs to another process'
+        assert stopping_ns <= started_ns <= completed_ns <= returned_ns, 'invalid service cleanup timing'
+        assert completed_ns - started_ns >= int((SERVICE_STOP_DELAY - 0.05) * 1e9), \
+            'service cleanup did not run for its configured delay'
         wait_service_gone(service_pid, service_port)
         service_pid = None
         assert case.model.count() == 2, 'SIGTERM injected inference'

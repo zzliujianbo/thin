@@ -37,14 +37,16 @@ test "image codec rejects malformed, tool, limited and nontext responses" {
     }) |bad| try std.testing.expectError(error.InvalidImageResponse, decode(a, bad));
     try std.testing.expectError(error.ImageOutputLimit, decode(a, "{\"choices\":[{\"finish_reason\":\"length\"}]}"));
 }
-test "image codec rejects oversized text invalid usage and unsafe input" {
+test "image codec accepts large text but rejects invalid usage and unsafe input" {
     const a = std.testing.allocator;
-    const text = try a.alloc(u8, image.max_result_bytes + 1);
+    const text = try a.alloc(u8, 65537);
     defer a.free(text);
     @memset(text, 'x');
     const oversized = try std.fmt.allocPrint(a, "{{\"choices\":[{{\"finish_reason\":\"stop\",\"message\":{{\"role\":\"assistant\",\"content\":\"{s}\"}}}}]}}", .{text});
     defer a.free(oversized);
-    try std.testing.expectError(error.InvalidImageResponse, decode(a, oversized));
+    const decoded = try decode(a, oversized);
+    defer a.free(decoded.text);
+    try std.testing.expectEqualStrings(text, decoded.text);
     for ([_][]const u8{
         "{\"prompt_tokens\":-1}",
         "{\"completion_tokens\":1.5}",

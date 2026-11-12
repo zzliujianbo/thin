@@ -27,6 +27,21 @@ test "SSE rejects oversized and truncated events without dispatching" {
     try std.testing.expectEqual(@as(usize, 0), capture.values.items.len);
     try std.testing.expectError(error.EventTooLarge, decoder.feed(" more and more"));
 }
+test "SSE unlimited decoder accepts an event beyond the old cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var capture = Capture{ .allocator = arena.allocator() };
+    var decoder = Decoder.init(std.testing.allocator, null, capture.sink());
+    defer decoder.deinit();
+    const payload = try arena.allocator().alloc(u8, 1024 * 1024 + 1);
+    @memset(payload, 'x');
+    try decoder.feed("data: ");
+    try decoder.feed(payload);
+    try decoder.feed("\n\n");
+    try decoder.finish();
+    try std.testing.expectEqual(@as(usize, 1), capture.values.items.len);
+    try std.testing.expectEqualStrings(payload, capture.values.items[0]);
+}
 test "SSE empty data and lone CR delimiters are valid" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

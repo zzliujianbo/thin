@@ -57,7 +57,7 @@ const StopIdentity = struct {
 };
 
 /// 单条显示记录的字节上限（128 KiB）。超出部分只影响显示，不影响模型历史。
-const record_limit = 128 * 1024;
+const canonical_mirror_limit = 128 * 1024;
 
 /// Thinking is a bounded rolling display window, not a transcript: one visible
 /// row over a fixed conservative retained budget (the tail clamps terminals to
@@ -113,7 +113,7 @@ const Record = struct {
     /// Test-only evidence that a cached comparison skipped the exact scan.
     /// Outside test builds this is void: production ships no tracking storage.
     flow_scan_count: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
-    /// 原始文本（UTF-8），受 record_limit 约束。
+    /// Static text is complete; active assistant bodies use a bounded comparison mirror.
     body: std.ArrayList(u8) = .empty,
     /// 文本超过上限被截断；渲染时会附加提示。
     clipped: bool = false,
@@ -277,7 +277,7 @@ const Record = struct {
                 return err;
             };
             if (!self.mirror_full) {
-                var end = @min(record_limit - self.body.items.len, bytes.len);
+                var end = @min(canonical_mirror_limit - self.body.items.len, bytes.len);
                 while (end > 0 and end < bytes.len and bytes[end] & 0xc0 == 0x80) end -= 1;
                 try self.body.appendSlice(a, bytes[0..end]);
                 self.mirror_full = end < bytes.len;
@@ -285,13 +285,10 @@ const Record = struct {
             self.invalidate();
             return;
         }
-        // Static content changes invalidate an older frame's output candidate;
-        // incremental reasoning and assistant streams retain their owner generation.
-        if (self.kind != .reasoning) self.stream_generation +%= 1;
-        self.pending_output = false;
-        self.delivery_visible = 0;
-        self.delivery_complete = false;
         if (self.kind == .reasoning) {
+            self.pending_output = false;
+            self.delivery_visible = 0;
+            self.delivery_complete = false;
             // Incremental only: feed the new chunk into the bounded tail. No
             // 128 KiB body is retained or rescanned, and the tail owns its own
             // sanitizer state, rows and retained source window.
@@ -304,15 +301,12 @@ const Record = struct {
             self.invalidate();
             return;
         }
-        if (self.clipped) return;
-        var end = @min(record_limit - self.body.items.len, bytes.len);
-
-        // 向前回退到 UTF-8 字符边界（跳过 0b10xxxxxx 续字节），避免切断多字节字符。
-        while (end > 0 and end < bytes.len and bytes[end] & 0xc0 == 0x80) end -= 1;
-        try self.body.appendSlice(a, bytes[0..end]);
-
-        // 没有全部写入时标记 clipped，之后的追加直接忽略。
-        self.clipped = end < bytes.len;
+        try self.body.appendSlice(a, bytes);
+        // Publish the new generation only after the full allocation succeeds.
+        self.stream_generation +%= 1;
+        self.pending_output = false;
+        self.delivery_visible = 0;
+        self.delivery_complete = false;
         self.invalidate();
     }
 
@@ -408,13 +402,13 @@ const Record = struct {
         }
         // 截断时追加提示，但提示只用于显示，模型历史保持不变。
         const data = if (self.clipped and self.kind != .reasoning) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
-        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = 4096, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) switch (self.notice_level) {
+        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = null, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) switch (self.notice_level) {
             .plain => .muted,
             .warning => .warning,
             .failure => .failure,
         } else .normal });
         self.lines = rendered.lines;
-        self.excerpt = self.clipped or rendered.truncated or rendered.degraded or rendered.total_lines > rendered.lines.len;
+        self.excerpt = self.clipped or rendered.truncated or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
 
         // arena 所有权转移给 Record；之后由 invalidate 统一释放。
@@ -883,7 +877,7 @@ const Ui = struct {
     frame_model_epoch: ?u64 = null,
     frame_model_generation: ?u64 = null,
     last_input_ms: u64 = 0,
-    /// 对话显示记录；超过 64 条或约 1 MiB 时丢弃最旧的。
+    /// Owned display records; viewport limits do not retire source records.
     records: std.ArrayList(Record) = .empty,
     record_index: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     next_record_id: u64 = 1,
@@ -1738,15 +1732,8 @@ const Ui = struct {
         self.delivery_fences.shrinkRetainingCapacity(write);
     }
 
-    fn hasUnmetFence(self: *const Ui, record_id: u64) bool {
-        for (self.delivery_fences.items) |fence| {
-            if (!fence.proven and fence.record_id == record_id) return true;
-        }
-        return false;
-    }
-
     /// Authoritative REMOVAL (withdrawn canonical text, reasoning retired by UX,
-    /// or a guarded eviction): the sequence keeps its ordering but the record is
+    /// or another explicit removal): the sequence keeps its ordering but the record is
     /// gone, so only a fresh frame of the applied state can settle it.
     fn retargetDeliveryFences(self: *Ui, record_id: u64) void {
         if (record_id == 0) return;
@@ -1919,41 +1906,17 @@ const Ui = struct {
         self.retryDeliveryAck();
     }
 
-    // A tool_result may add caption, local output and truncation notice (3).
-    // assistant_committed can add a new body and withdrawal/truncation notice
-    // (at most 2). Each mirror is capped at record_limit (128 KiB), including
-    // formatted command output; reserve three full mirrors, not just wire bytes.
-    const event_record_reserve = 3;
-    const event_byte_reserve = event_record_reserve * record_limit;
-
     fn displayBackpressured(self: *const Ui) bool {
         // Live delivery fences are the first bound: at capacity no further event
         // may be polled, so an unprovable prefix is never dropped or fabricated.
         // Only proof that has NOT been handed over counts against capacity.
         if (self.unenqueuedFenceCount() >= delivery_fence_capacity) return true;
-        var count: usize = self.records.items.len;
-        var bytes: usize = 0;
-        for (self.records.items) |record| {
-            bytes += record.body.items.len;
-        }
         for (self.records.items) |record| {
             if (!record.output) if (record.stream) |stream| {
                 if (stream.pendingBytes() >= 64 * 1024 or stream.windowBytes() >= 128 * 1024) return true;
             };
         }
-        for (self.async_pending) |pending| if (pending) |value| {
-            if (value.record) |record| {
-                count += 1;
-                bytes += record.body.items.len;
-            }
-        };
-        return count + event_record_reserve > 64 or bytes + event_byte_reserve > 1024 * 1024;
-    }
-
-    fn reclaimDisplayCapacity(self: *Ui) void {
-        while (self.displayBackpressured() and self.canEvictOldest()) {
-            self.removeRecord(0);
-        }
+        return false;
     }
 
     /// Drain at most the existing per-tick event budget. The first poll may
@@ -1978,7 +1941,6 @@ const Ui = struct {
                     self.requestDraw();
                 }
             }
-            self.reclaimDisplayCapacity();
             if (self.displayBackpressured()) break;
             if (index == 0 or (if (self.remote()) |client| client.buffered() else false))
                 try self.pumpRemote();
@@ -2636,75 +2598,14 @@ const Ui = struct {
     }
 
     fn addRecord(self: *Ui, kind: Kind, data: []const u8, is_agent_row: bool) !usize {
-        // Prepare every fallible part before publishing an id or evicting any
-        // acknowledged record. A failed body allocation owns no display row.
+        // Prepare every fallible part before publishing an id.
+        // A failed body allocation owns no display row.
         try self.reserveRecord();
         var prepared = Record{ .kind = kind, .batch = self.restoring, .agent_row = is_agent_row };
         errdefer prepared.deinit(self.allocator);
         if (kind == .reasoning) try prepared.attachTail(self.allocator, @max(1, self.size.columns -| 1));
         try prepared.append(self.allocator, data);
 
-        var bytes: usize = 0;
-        var ordinary_count: usize = 0;
-        for (self.records.items) |record| {
-            if (self.restoring or !record.agent_row) {
-                bytes += record.body.items.len;
-                ordinary_count += 1;
-            }
-        }
-        const growth = if (self.restoring and (kind == .assistant or (kind == .tool and data.len == 0)))
-            record_limit
-        else
-            @min(data.len, record_limit);
-        if (self.restoring) {
-            // Completed restored rows consume their actual bytes. Only an
-            // assistant being constructed from blocks (or a tool caption
-            // appended immediately after add) needs a full mirror reservation.
-            while (true) {
-                const active_reserve: usize = if (self.draft) |i| blk: {
-                    const active = self.records.items[i];
-                    break :blk if (active.batch and active.kind == .assistant) record_limit -| active.body.items.len else 0;
-                } else 0;
-                if (self.records.items.len < 64 and bytes + active_reserve + growth <= 1024 * 1024) break;
-                var oldest: ?usize = null;
-                for (self.records.items, 0..) |record, index| {
-                    if (!record.batch or self.draft == index or self.reasoning == index or
-                        record.pending_output or record.pending_stream_rows != 0 or record.pending_flow_change) continue;
-                    var frame_owned = false;
-                    for (self.frame_records) |entry| if (entry.record_id == record.id) {
-                        frame_owned = true;
-                        break;
-                    };
-                    if (!frame_owned) {
-                        oldest = index;
-                        break;
-                    }
-                }
-                const index = oldest orelse return error.DisplayCapacity;
-                bytes -= self.records.items[index].body.items.len;
-                ordinary_count -= 1;
-                self.removeRecord(index);
-            }
-        }
-
-        // 丢弃最旧记录时同步修正 draft/reasoning 索引，避免指向错误的记录。
-        // An unprinted active body is never evicted: that would silently drop
-        // content the terminal has not received yet.
-        while (!self.restoring and self.records.items.len > 0 and (self.records.items.len >= 64 or (!is_agent_row and bytes + growth > 1024 * 1024))) {
-            if (!self.canEvictOldest()) break;
-            self.forgetRecord(0);
-            var removed = self.records.orderedRemove(0);
-            if (!removed.agent_row) {
-                bytes -= removed.body.items.len;
-                ordinary_count -= 1;
-            }
-            removed.deinit(self.allocator);
-            if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
-            if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-        }
-
-        if ((self.restoring or !is_agent_row) and (ordinary_count >= 64 or bytes + growth > 1024 * 1024))
-            return error.DisplayCapacity;
         self.records.appendAssumeCapacity(prepared);
         const index = self.records.items.len - 1;
         self.registerRecord(index) catch |err| {
@@ -2742,7 +2643,7 @@ const Ui = struct {
                 };
                 if (message.role == .user and message.blocks.len == 1 and message.blocks[0] == .text) {
                     const value = message.blocks[0].text;
-                    if (value.len != 0 and value.len <= @import("input_history.zig").History.max_entry_bytes and value[0] != '/') {
+                    if (value.len != 0 and value[0] != '/') {
                         const owned = try self.input_history.prepare(self.allocator, value);
                         self.input_history.commit(self.allocator, owned);
                     }
@@ -2982,8 +2883,7 @@ const Ui = struct {
     fn localCommandOutput(self: *Ui, data: []const u8, truncated: bool) !void {
         const output = try local_command_output.format(self.allocator, data);
         defer self.allocator.free(output.text);
-        const index = try self.add(.tool, output.text);
-        self.records.items[index].clipped = output.clipped;
+        _ = try self.add(.tool, output.text);
         // A runtime or Bridge cap can cut the JSON envelope itself. Preserve
         // that outer provenance even when the formatter falls back to literal.
         if (truncated) _ = try self.add(.notice, "Local command result was truncated; some output is unavailable.");
@@ -3210,7 +3110,7 @@ const Ui = struct {
                         (record.stream.?.visibleRows().len != 0 or record.stream_written != 0);
                     self.removeRecord(i);
                 } else {
-                    if (!clipped and blocks_complete and canonical.items.len <= record_limit) {
+                    if (!clipped and blocks_complete and canonical.items.len <= canonical_mirror_limit) {
                         const same = !record.clipped and !record.mirror_full and record.body.items.len == canonical.items.len and
                             std.mem.eql(u8, record.body.items, canonical.items);
                         if (!same) {
@@ -3765,7 +3665,7 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
-        const parent: usize = if (self.settings_model_picker == .image) 6 else if (self.anyProxyOpen()) 8 else 1;
+        const parent: usize = if (self.settings_model_picker == .image) 5 else if (self.anyProxyOpen()) 7 else 1;
         if (self.settingsModelOpen()) self.wipeEditor();
         if (self.proxyEditorBorrowed()) self.endProxyEditor();
         self.displayed_decision_fingerprint = null;
@@ -3790,7 +3690,6 @@ const Ui = struct {
             .memory_auto => "Auto memory",
             .command_timeout_ms => "Command timeout (s)",
             .request_timeout_ms => "All inference request timeout (s; including decisions)",
-            .task_timeout_ms => "Task timeout (s)",
         };
     }
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
@@ -3799,7 +3698,6 @@ const Ui = struct {
             .memory_auto => @intFromBool(state.memory_auto),
             .command_timeout_ms => state.limits.command_timeout_ms,
             .request_timeout_ms => state.limits.request_timeout_ms,
-            .task_timeout_ms => state.limits.task_timeout_ms,
         };
         self.settings_return_selected = self.settings_menu.selected;
         self.settings_value_picker = settings_value_module.Picker.init(key_, current, state.limits);
@@ -4236,9 +4134,9 @@ const Ui = struct {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
                 }
-                if (!self.settingsQueryOpen() and (self.settings_menu.selected == 1 or self.settings_menu.selected == 6)) {
+                if (!self.settingsQueryOpen() and (self.settings_menu.selected == 1 or self.settings_menu.selected == 5)) {
                     self.wipeEditor();
-                    self.settings_model_picker = if (self.settings_menu.selected == 6) .image else .decision;
+                    self.settings_model_picker = if (self.settings_menu.selected == 5) .image else .decision;
                     self.settings_menu.clear();
                     const selected_ref = if (self.settings_model_picker == .image)
                         (if (state.image_enabled) state.image_model else null)
@@ -4249,7 +4147,7 @@ const Ui = struct {
                     self.notice = "Ready";
                     return;
                 }
-                if (!self.settingsQueryOpen() and self.settings_menu.selected == 8) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 7) {
                     self.backToProxySubmenu(0);
                     return;
                 }
@@ -4870,7 +4768,6 @@ const Ui = struct {
     // All fallible display/history preparation precedes worker launch. Queued
     // prompts pass explicit text and never borrow or clear the current draft.
     fn startPrompt(self: *Ui, runtime: *r.Runtime, value: []const u8, kind: @TypeOf(@as(task.Job, undefined).kind)) !void {
-        self.reclaimDisplayCapacity();
         if (self.displayBackpressured()) return error.DisplayBackpressured;
         if (!self.queueOwnerMatches()) return error.QueueOwnerChanged;
         try self.bridge.reset();
@@ -4897,17 +4794,6 @@ const Ui = struct {
         try self.beginTaskOwnership();
         errdefer self.endTaskOwnership();
         const future = try Io.concurrent(self.io, task.Job.run, .{&self.job});
-        var bytes: usize = record.body.items.len;
-        for (self.records.items) |old| bytes += old.body.items.len;
-        while (self.records.items.len != 0 and (self.records.items.len >= 64 or bytes > 1024 * 1024)) {
-            if (!self.canEvictOldest()) break;
-            self.forgetRecord(0);
-            var removed = self.records.orderedRemove(0);
-            bytes -= removed.body.items.len;
-            removed.deinit(self.allocator);
-            if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
-            if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-        }
         self.records.appendAssumeCapacity(record);
         self.registerRecord(self.records.items.len - 1) catch |err| {
             var removed = self.records.pop().?;
@@ -4965,7 +4851,6 @@ const Ui = struct {
     /// adopts owner-reported activity. Returns false when nothing was accepted,
     /// in which case the draft and display are unchanged.
     fn remoteStart(self: *Ui, client: session_client.Client, kind: session_client.TaskKind, value: []const u8) !bool {
-        self.reclaimDisplayCapacity();
         if (kind != .compact and self.displayBackpressured()) {
             self.notice = "Display is catching up; draft kept";
             return false;
@@ -5019,17 +4904,6 @@ const Ui = struct {
     fn acceptRemote(self: *Ui, kind: session_client.TaskKind, record: *Record, history_entry: *?[]u8) void {
         // Called only for an accepted receipt, with all display storage prepared
         // before queue admission. Stream delivery is held until this point.
-        var bytes: usize = record.body.items.len;
-        for (self.records.items) |old| bytes += old.body.items.len;
-        while (self.records.items.len != 0 and (self.records.items.len >= 64 or bytes > 1024 * 1024)) {
-            if (!self.canEvictOldest()) break;
-            self.forgetRecord(0);
-            var removed = self.records.orderedRemove(0);
-            bytes -= removed.body.items.len;
-            removed.deinit(self.allocator);
-            if (self.draft) |i| self.draft = if (i == 0) null else i - 1;
-            if (self.reasoning) |i| self.reasoning = if (i == 0) null else i - 1;
-        }
         if (kind != .compact) {
             self.records.appendAssumeCapacity(record.*);
             record.* = .{ .kind = .user };
@@ -6241,7 +6115,6 @@ const Ui = struct {
         // The producer can finish after our per-tick drain limit. Once joined,
         // at most one bounded queue remains; consume it before accepting Submit.
         while (true) {
-            self.reclaimDisplayCapacity();
             if (self.displayBackpressured()) break;
             var item = self.bridge.pop() orelse break;
             defer item.deinit();
@@ -6360,17 +6233,6 @@ const Ui = struct {
         // intervening display record can never consume a pending reservation.
         try self.records.ensureUnusedCapacity(self.allocator, 2);
         try self.record_index.ensureUnusedCapacity(self.allocator, 2);
-    }
-
-    /// Never evict unacknowledged, active, or frame-owned display records.
-    fn canEvictOldest(self: *const Ui) bool {
-        if (self.records.items.len == 0) return false;
-        const record = &self.records.items[0];
-        return record.output and !(record.agent_row and record.agent_open) and self.draft != 0 and self.reasoning != 0 and
-            !record.pending_output and record.pending_stream_rows == 0 and !record.pending_flow_change and
-            // An unmet display fence owns its record: evicting it would erase
-            // the only evidence that could prove the event was shown.
-            !self.hasUnmetFence(record.id);
     }
 
     fn drawReady(self: *const Ui) bool {
@@ -7149,7 +7011,7 @@ const Ui = struct {
         self.display.setEffort(state.reasoning_effort);
         const normal_composer = !self.secret_mode and !self.secret_quarantine and !self.settings_open and !self.provider_open and self.model_picker == null;
         const empty_rendered: markdown.Rendered = .{ .lines = &.{}, .total_lines = 0, .truncated = false };
-        const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = 8192, .markdown = false }) else empty_rendered;
+        const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = null, .markdown = false }) else empty_rendered;
         if (self.permission) |*permission| {
             permission.clipped = permission.clipped or approval_lines.truncated or approval_lines.total_lines > approval_lines.lines.len;
             if (permission.clipped or permission.pasted) permission.choice = .deny;

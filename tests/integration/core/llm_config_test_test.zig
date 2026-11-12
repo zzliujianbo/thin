@@ -92,9 +92,9 @@ test "HTTP proxy rejects malformed hosts numbers fields lists and alias guesses"
     var names: [129][]const u8 = undefined;
     for (&names) |*name| name.* = "p/m";
     p.value.proxy.?.models = &names;
-    try t.expectError(error.TooManyProxyModels, cfg.validate(p.value));
+    try t.expectError(error.DuplicateProxyModel, cfg.validate(p.value));
 }
-test "HTTP proxy empty list explicit persistence and 128 exact dynamic IDs" {
+test "HTTP proxy empty list explicit persistence beyond 128 exact dynamic IDs" {
     const a = t.allocator;
     var p = try cfg.parse(a, proxy_prefix ++ ",\"proxy\":{\"address\":\"proxy.example\",\"port\":1}}");
     defer cfg.release(&p);
@@ -103,12 +103,12 @@ test "HTTP proxy empty list explicit persistence and 128 exact dynamic IDs" {
     const url = try p.value.proxy.?.url(a);
     defer a.free(url);
     try t.expectEqualStrings("http://proxy.example:1", url);
-    var names: [128][]const u8 = undefined;
+    var names: [129][]const u8 = undefined;
     for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(p.arena.allocator(), "p/dynamic/raw/{d}", .{i});
     p.value.proxy.?.models = &names;
     try cfg.validate(p.value);
-    try t.expect(p.value.proxyFor("p", "dynamic/raw/127") != null);
-    try t.expect(p.value.proxyFor("other", "dynamic/raw/127") == null);
+    try t.expect(p.value.proxyFor("p", "dynamic/raw/128") != null);
+    try t.expect(p.value.proxyFor("other", "dynamic/raw/128") == null);
     var copy = try cfg.clone(a, p.value);
     defer cfg.release(&copy);
     try t.expect(copy.value.proxy.?.models.ptr != names[0..].ptr);
@@ -149,9 +149,9 @@ test "optional global decision owns qualified model and sparsely persists" {
     const auxiliary = parsed.value.decision.?.modelLimits(parsed.value.limits.request_timeout_ms);
     try t.expectEqual(parsed.value.limits.request_timeout_ms, auxiliary.request_timeout_ms);
     try t.expect(!auxiliary.low_price_input);
-    try t.expectEqual(@as(u32, 8192), parsed.value.decision.?.max_input_tokens);
-    // Auxiliary limits retain input protection, not a local output ceiling.
-    try t.expectEqual(@as(?u32, 8192), auxiliary.max_input_tokens);
+    // Helper capability checks happen at request admission, not via persisted quotas.
+    try t.expectEqual(@as(usize, 2), @typeInfo(cfg.DecisionConfig).@"struct".field_names.len);
+    try t.expectEqual(@as(usize, 4), @typeInfo(cfg.Limits).@"struct".field_names.len);
     var copy = try cfg.clone(a, parsed.value);
     defer cfg.release(&copy);
     try t.expect(copy.value.decision.?.model.ptr != parsed.value.decision.?.model.ptr);
@@ -164,11 +164,10 @@ test "optional global decision owns qualified model and sparsely persists" {
     // Reference validation never invents a protocol/window or borrows chat capabilities.
     try t.expect(disk.value.registry.?.find("aux").?.patchFor("vendor/raw/id") == null);
     for ([_][]const u8{
-        "{}",                                                   "[]",                                                 "false",                                          "1",                                                 "\"aux/m\"",
-        "{\"model\":\"missing/m\"}",                            "{\"model\":\"m\"}",                                  "{\"model\":\"p/\"}",                             "{\"model\":1}",                                     "{\"model\":null}",
-        "{\"model\":\"p/m\",\"model\":\"p/n\"}",                "{\"model\":\"p/m\",\"extra\":true}",                 "{\"model\":\"p/m\",\"max_input_tokens\":1}",     "{\"model\":\"p/m\",\"max_input_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":0}",
-        "{\"model\":\"p/m\",\"max_output_tokens\":1024}",       "{\"model\":\"p/m\",\"max_output_tokens\":16777217}", "{\"model\":\"p/m\",\"max_output_tokens\":null}", "{\"model\":\"p/m\",\"max_output_tokens\":true}",    "{\"model\":\"p/m\",\"max_output_tokens\":-1}",
-        "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
+        "{}",                                             "[]",                                             "false",                                        "1",                                                    "\"aux/m\"",
+        "{\"model\":\"missing/m\"}",                      "{\"model\":\"m\"}",                              "{\"model\":\"p/\"}",                           "{\"model\":1}",                                        "{\"model\":null}",
+        "{\"model\":\"p/m\",\"model\":\"p/n\"}",          "{\"model\":\"p/m\",\"extra\":true}",             "{\"model\":\"p/m\",\"max_output_tokens\":0}",  "{\"model\":\"p/m\",\"max_output_tokens\":1024}",       "{\"model\":\"p/m\",\"max_output_tokens\":16777217}",
+        "{\"model\":\"p/m\",\"max_output_tokens\":null}", "{\"model\":\"p/m\",\"max_output_tokens\":true}", "{\"model\":\"p/m\",\"max_output_tokens\":-1}", "{\"model\":\"p/m\",\"max_output_tokens\":4294967296}",
     }) |value| {
         const raw = try std.mem.concat(a, u8, &.{ prefix, ",\"decision\":", value, "}" });
         defer a.free(raw);
@@ -178,9 +177,17 @@ test "optional global decision owns qualified model and sparsely persists" {
             return error.ExpectedRejection;
         } else |_| {}
     }
-    copy.value.decision.?.max_input_tokens = 1;
-    try t.expectError(error.InvalidLimit, cfg.clone(a, copy.value));
-    copy.value.decision.?.max_input_tokens = 2;
+    for ([_][]const u8{ "1", "16777217" }) |retired| {
+        const raw = try std.mem.concat(a, u8, &.{ prefix, ",\"decision\":{\"model\":\"p/m\",\"max_input_tokens\":", retired, "}}" });
+        defer a.free(raw);
+        var migrated = try cfg.parse(a, raw);
+        defer cfg.release(&migrated);
+        try t.expectEqualStrings("p/m", migrated.value.decision.?.model);
+        var latest: std.Io.Writer.Allocating = .init(a);
+        defer latest.deinit();
+        try cfg.writeDisk(migrated.value, &latest.writer);
+        try t.expect(std.mem.find(u8, latest.written(), "max_input_tokens") == null);
+    }
     copy.value.limits.request_timeout_ms = 3600000;
     try cfg.validate(copy.value);
     copy.value.registry = null;
@@ -231,10 +238,14 @@ test "disabled decision roundtrip preserves declared protocol credentials shared
     try cfg.writeDisk(copy.value, &out.writer);
     try t.expect(std.mem.find(u8, out.written(), "decision_enabled") == null);
     try t.expect(std.mem.find(u8, out.written(), "runtime-only-model") == null);
+    try t.expect(std.mem.find(u8, out.written(), "max_input_tokens") == null);
+    try t.expect(std.mem.find(u8, out.written(), "max_state_bytes") == null);
     const encoded = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
     defer encoded.deinit();
     const decision_object = encoded.value.object.get("decision").?.object;
-    try t.expectEqual(@as(usize, 4), decision_object.count());
+    try t.expectEqual(@as(usize, 2), decision_object.count());
+    try t.expect(decision_object.get("max_input_tokens") == null);
+    try t.expect(decision_object.get("max_state_bytes") == null);
     try t.expect(decision_object.get("max_output_tokens") == null);
     try t.expect(decision_object.get("backend") == null);
     try t.expect(decision_object.get("request_timeout_ms") == null);
@@ -252,12 +263,12 @@ test "disabled decision roundtrip preserves declared protocol credentials shared
     try t.expect(!parsed.value.decisionActive());
     try t.expect(!disk.value.decisionActive());
 }
-test "SystemOne exact model declaration owns protocol and byte bounds without primary guesses" {
+test "SystemOne exact model declaration owns protocol and normalizes retired byte quotas" {
     const prefix = "{\"llm\":{\"default\":\"main/chat\",\"providers\":{\"main\":{\"base_url\":\"https://api.deepseek.com\"},\"aux\":{\"base_url\":\"https://native-fixture.invalid/v1\",\"models\":{\"judge/raw\":{\"protocol\":\"systemone\"}}}}}";
     var p = try cfg.parse(t.allocator, prefix ++ ",\"decision\":{\"model\":\"aux/judge/raw\",\"max_state_bytes\":8192}}");
     defer cfg.release(&p);
     try t.expect(p.value.registry.?.find("aux").?.patchFor("judge/raw").?.protocol == .systemone);
-    try t.expectEqual(@as(u32, 8192), p.value.decision.?.max_state_bytes);
+    try t.expectEqualStrings("aux/judge/raw", p.value.decision.?.model);
     try t.expect(p.value.registry.?.find("aux").?.patchFor("judge/raw").?.context_tokens == null);
     var copy = try cfg.clone(t.allocator, p.value);
     defer cfg.release(&copy);
@@ -267,18 +278,13 @@ test "SystemOne exact model declaration owns protocol and byte bounds without pr
     var roundtrip = try cfg.parse(t.allocator, out.written());
     defer cfg.release(&roundtrip);
     try t.expectEqualDeep(copy.value.decision, roundtrip.value.decision);
-    for ([_][]const u8{
-        "{\"model\":\"aux/m\",\"max_state_bytes\":0}",
-        "{\"model\":\"aux/m\",\"max_state_bytes\":65537}",
-        "{\"model\":\"aux/m\",\"max_state_bytes\":2.0}",
-    }) |bad| {
-        const text = try std.mem.concat(t.allocator, u8, &.{ prefix, ",\"decision\":", bad, "}" });
+    try t.expect(std.mem.find(u8, out.written(), "max_state_bytes") == null);
+    for ([_][]const u8{ "0", "65537", "2.0", "\"old\"", "null" }) |retired| {
+        const text = try std.mem.concat(t.allocator, u8, &.{ prefix, ",\"decision\":{\"model\":\"aux/m\",\"max_state_bytes\":", retired, "}}" });
         defer t.allocator.free(text);
-        if (cfg.parse(t.allocator, text)) |parsed| {
-            var unexpected = parsed;
-            cfg.release(&unexpected);
-            return error.ExpectedRejection;
-        } else |_| {}
+        var migrated = try cfg.parse(t.allocator, text);
+        defer cfg.release(&migrated);
+        try t.expectEqualStrings("aux/m", migrated.value.decision.?.model);
     }
     const providers = @constCast(copy.value.registry.?.providers);
     providers[1].connection.base_url = "https://opencode.ai/zen/go/v1";
@@ -494,7 +500,7 @@ test "absent and null global reasoning preferences stay sparse" {
 test "llm registry allocation failure paths release all owned arenas" {
     try t.checkAllAllocationFailures(t.allocator, allocationCase, .{});
 }
-test "llm registry count limits and default need not be manually declared" {
+test "llm registry grows beyond old counts and default need not be manually declared" {
     var out: std.Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"llm\":{\"default\":\"p0/raw/id\",\"providers\":{");
@@ -503,7 +509,10 @@ test "llm registry count limits and default need not be manually declared" {
         try out.writer.print("\"p{d}\":{{\"base_url\":\"https://x\"}}", .{i});
     }
     try out.writer.writeAll("}}}");
-    try t.expectError(error.TooManyProviders, cfg.parse(t.allocator, out.written()));
+    var providers = try cfg.parse(t.allocator, out.written());
+    defer cfg.release(&providers);
+    try t.expectEqual(@as(usize, 17), providers.value.registry.?.providers.len);
+    try t.expectEqualStrings("p0/raw/id", providers.value.registry.?.default);
     out.clearRetainingCapacity();
     try out.writer.writeAll("{\"llm\":{\"default\":\"p/missing\",\"providers\":{\"p\":{\"base_url\":\"https://x\",\"models\":{");
     for (0..64) |i| {
@@ -517,7 +526,10 @@ test "llm registry count limits and default need not be manually declared" {
     try t.expect(p.value.registry.?.providers[0].models.len == 64);
     out.writer.end = prefix_len;
     try out.writer.writeAll(",\"extra\":{}}}}}}");
-    try t.expectError(error.TooManyModels, cfg.parse(t.allocator, out.written()));
+    var expanded = try cfg.parse(t.allocator, out.written());
+    defer cfg.release(&expanded);
+    try t.expectEqual(@as(usize, 65), expanded.value.registry.?.providers[0].models.len);
+    try t.expectEqualStrings("p/missing", expanded.value.registry.?.default);
 }
 test "disk schema requires llm and rejects every former root and runtime field" {
     try t.expectError(error.MissingField, cfg.parse(t.allocator, "{}"));
@@ -532,7 +544,19 @@ test "disk schema requires llm and rejects every former root and runtime field" 
 }
 test "registry limits and model patches reject coerced numeric and boolean values" {
     const prefix = "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://x\"}}},\"limits\":";
-    for ([_][]const u8{ "{\"max_rounds\":\"50\"}", "{\"read_bytes\":1.0}", "{\"max_input_tokens\":\"90000\"}", "{\"low_price_input\":\"false\"}", "{\"read_bytes\":null}", "{\"unknown\":1}" }) |limits| {
+    for ([_][]const u8{ "{\"max_rounds\":\"50\"}", "{\"read_bytes\":1.0}", "{\"max_input_tokens\":\"90000\"}", "{\"read_bytes\":null}" }) |limits| {
+        const raw = try std.mem.concat(t.allocator, u8, &.{ prefix, limits, "}" });
+        defer t.allocator.free(raw);
+        var migrated = try cfg.parse(t.allocator, raw);
+        defer cfg.release(&migrated);
+        var latest: std.Io.Writer.Allocating = .init(t.allocator);
+        defer latest.deinit();
+        try cfg.writeDisk(migrated.value, &latest.writer);
+        inline for (.{ "max_rounds", "read_bytes", "max_input_tokens" }) |retired| {
+            try t.expect(std.mem.find(u8, latest.written(), retired) == null);
+        }
+    }
+    for ([_][]const u8{ "{\"low_price_input\":\"false\"}", "{\"low_price_input\":null}", "{\"compaction_enabled\":0}", "{\"command_timeout_ms\":1.0}", "{\"command_timeout_ms\":\"1\"}", "{\"request_timeout_ms\":null}", "{\"unknown\":1}" }) |limits| {
         const raw = try std.mem.concat(t.allocator, u8, &.{ prefix, limits, "}" });
         defer t.allocator.free(raw);
         if (cfg.parse(t.allocator, raw)) |value| {

@@ -22,17 +22,19 @@ test "subagent tool progress roundtrip and malformed wire" {
     const long = try a.alloc(u8, 2050);
     defer a.free(long);
     @memset(long, 'x');
-    const clipped = try encodeEvent(a, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "subagent", .subagent_progress = long } });
-    defer a.free(clipped);
-    var bounded = try decodeEvent(a, clipped);
-    defer bounded.deinit();
-    try std.testing.expect(bounded.display_truncated);
-    try std.testing.expectEqual(@as(usize, 2048), bounded.event.tool_view.subagent_progress.?.len);
+    const complete = try encodeEvent(a, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "subagent", .subagent_progress = long } });
+    defer a.free(complete);
+    var decoded_long = try decodeEvent(a, complete);
+    defer decoded_long.deinit();
+    try std.testing.expect(!decoded_long.display_truncated);
+    try std.testing.expectEqualStrings(long, decoded_long.event.tool_view.subagent_progress.?);
     for ([_][]const u8{
         "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"display\":null,\"sprog\":1}",
         "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"display\":null,\"sprog\":{}}",
         "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1.0,\"idx\":0,\"display\":null,\"sprog\":null}",
         "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0.0,\"display\":null,\"sprog\":null}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":null,\"sprog\":\"duplicate\"}",
+        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":null} trailing",
     }) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
 }
 test "every runtime display event round-trips through the wire" {
@@ -139,19 +141,19 @@ test "tool_view decodes its display fields instead of an unsupported event" {
 test "u64 values above i64.max survive number_string decoding" {
     const a = std.testing.allocator;
     const high = std.math.maxInt(u64);
-    var request = try parseRequest(a, "{\"v\":4,\"id\":18446744073709551615,\"op\":\"ping\"}");
+    var request = try parseRequest(a, "{\"v\":5,\"id\":18446744073709551615,\"op\":\"ping\"}");
     defer request.deinit();
     try std.testing.expectEqual(high, request.id);
     try std.testing.expectEqual(Op.ping, request.op);
 
     // Quoted digits, floats, exponents and negatives are not integers.
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1.0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1e3,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":-1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":1.0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":1e3,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":-1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
 
     const encoded = try encodeEvent(a, .{ .tool_started = .{
         .id = high,
@@ -169,7 +171,7 @@ test "u64 values above i64.max survive number_string decoding" {
 }
 test "numeric and enum request fields reject wrong types instead of defaulting" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":4,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
+    var request = try parseRequest(a, "{\"v\":5,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
     defer request.deinit();
     try std.testing.expectError(error.BadRequest, request.u64Field("epoch"));
     try std.testing.expectError(error.BadRequest, request.u64Field("absent"));
@@ -182,16 +184,16 @@ test "numeric and enum request fields reject wrong types instead of defaulting" 
 }
 test "proxy_address accepts an empty clear and maps endpoint rejections to invalid_input" {
     const a = std.testing.allocator;
-    var cleared = try parseRequest(a, "{\"v\":4,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
+    var cleared = try parseRequest(a, "{\"v\":5,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
     defer cleared.deinit();
     try std.testing.expectEqual(Op.proxy_address, cleared.op);
     try std.testing.expectEqualStrings("", try cleared.stringField("value", 320));
 
     // A missing, null or non-string `value` is a bad request, never a clear.
     for ([_][]const u8{
-        "{\"v\":4,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
-        "{\"v\":4,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
-        "{\"v\":4,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":5,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":5,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":5,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
     }) |json| {
         var request = try parseRequest(a, json);
         defer request.deinit();
@@ -217,13 +219,13 @@ test "proxy_model request keeps the full u64 epoch and rejects loose parameters"
     try std.testing.expectEqual(true, try request.requiredBool("enabled"));
 
     // Absent, stringly or numeric enable flags are bad requests, not defaults.
-    var loose = try parseRequest(a, "{\"v\":4,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
+    var loose = try parseRequest(a, "{\"v\":5,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
     defer loose.deinit();
     try std.testing.expectError(error.BadRequest, loose.requiredBool("enabled"));
-    var stringly = try parseRequest(a, "{\"v\":4,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
+    var stringly = try parseRequest(a, "{\"v\":5,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
     defer stringly.deinit();
     try std.testing.expectError(error.BadRequest, stringly.requiredBool("enabled"));
-    var numeric_epoch = try parseRequest(a, "{\"v\":4,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
+    var numeric_epoch = try parseRequest(a, "{\"v\":5,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
     defer numeric_epoch.deinit();
     try std.testing.expectError(error.BadRequest, numeric_epoch.u64Field("epoch"));
 }
@@ -243,8 +245,8 @@ test "decode rejects duplicate keys, deep nesting, quoted numbers and bad kinds"
     var deep = std.ArrayList(u8).empty;
     defer deep.deinit(a);
     try deep.appendSlice(a, "{\"t\":\"text\",\"v\":");
-    for (0..max_json_depth) |_| try deep.append(a, '[');
-    for (0..max_json_depth) |_| try deep.append(a, ']');
+    for (0..128) |_| try deep.append(a, '[');
+    for (0..128) |_| try deep.append(a, ']');
     try deep.append(a, '}');
     try std.testing.expectError(error.BadRequest, decodeEvent(a, deep.items));
 }
@@ -265,30 +267,28 @@ test "event metadata markers control epoch and canonical completeness" {
     defer a.free(again);
     try std.testing.expectEqualStrings(json, again);
 }
-test "assistant block overflow is bounded and marked incomplete" {
+test "assistant decoding retains blocks beyond former cap" {
     const a = std.testing.allocator;
-    const json = try manyBlocksJson(a, max_blocks + 1);
+    const json = try manyBlocksJson(a, 257);
     defer a.free(json);
     var decoded = try decodeEvent(a, json);
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(usize, max_blocks), decoded.event.assistant_committed.len);
-    try std.testing.expect(!decoded.canonical_complete);
-    try std.testing.expect(decoded.display_truncated);
+    try std.testing.expectEqual(@as(usize, 257), decoded.event.assistant_committed.len);
+    try std.testing.expect(decoded.canonical_complete);
+    try std.testing.expect(!decoded.display_truncated);
 }
-test "assistant encoding marks a bounded block list incomplete" {
+test "assistant encoding retains blocks beyond former cap" {
     const a = std.testing.allocator;
-    const blocks = try a.alloc(p.Block, max_blocks + 1);
+    const blocks = try a.alloc(p.Block, 257);
     defer a.free(blocks);
     for (blocks) |*block| block.* = .{ .text = "b" };
     const json = try encodeEvent(a, .{ .assistant_committed = blocks });
     defer a.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"disp_trunc\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"canon_complete\":false") != null);
     var decoded = try decodeEvent(a, json);
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(usize, max_blocks), decoded.event.assistant_committed.len);
-    try std.testing.expect(!decoded.canonical_complete);
-    try std.testing.expect(decoded.display_truncated);
+    try std.testing.expectEqual(@as(usize, 257), decoded.event.assistant_committed.len);
+    try std.testing.expect(decoded.canonical_complete);
+    try std.testing.expect(!decoded.display_truncated);
 }
 test "assistant decoding owns blocks in the document arena under allocation failure" {
     const a = std.testing.allocator;
@@ -352,7 +352,7 @@ test "terminal events require complete usage and keep tool timing and keys" {
 }
 test "login key copy is wiped before the request arena is released" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
+    var request = try parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
     defer request.deinit();
     const secret = request.field("key").?.string;
     try std.testing.expectEqualStrings("sk-secret", secret);
@@ -436,16 +436,17 @@ test "tool caption and execution wire round trips and rejects malformed fields" 
     var sequenced = try decodeEvent(a, "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":null,\"seq\":18446744073709551615,\"epoch\":1,\"disp_trunc\":false,\"canon_complete\":true}");
     sequenced.deinit();
 }
-test "wire version 4 is required and older packets are rejected" {
+test "wire version 5 is required and older packets are rejected" {
     const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(u16, 4), version);
-    var accepted = try parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\"}");
+    try std.testing.expectEqual(@as(u16, 5), version);
+    var accepted = try parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"ping\"}");
     accepted.deinit();
     // No compatibility path for old or future peers.
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":1,\"id\":1,\"op\":\"ping\"}"));
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":2,\"id\":1,\"op\":\"ping\"}"));
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":1,\"op\":\"ping\"}"));
     // Every reply envelope carries the same exact version.
     var out = Out.init(a);
     defer out.deinit();
@@ -455,6 +456,55 @@ test "wire version 4 is required and older packets are rejected" {
     var doc = try parseWholeReply(a, bytes);
     defer doc.deinit();
     try std.testing.expectEqual(@as(i64, version), doc.value.object.get("v").?.integer);
+}
+test "implicit root builder handles empty roots nested values and allocation failure" {
+    const Helper = struct {
+        fn build(a: std.mem.Allocator) !void {
+            var out = Out.init(a);
+            defer out.deinit();
+            try out.buf.append(a, '{');
+            try out.field("v", version);
+            try out.beginObject("nested");
+            try out.beginArray("items");
+            try out.beginObjectElement();
+            try out.field("name", "first");
+            try out.endObject();
+            try out.beginObjectElement();
+            try out.field("name", "second");
+            try out.endObject();
+            try out.endArray();
+            try out.endObject();
+            try out.field("after", true);
+            const bytes = try out.finish();
+            defer a.free(bytes);
+            var doc = try parseWholeReply(a, bytes);
+            defer doc.deinit();
+            const root = doc.value.object;
+            try std.testing.expectEqual(@as(i64, version), root.get("v").?.integer);
+            try std.testing.expect(root.get("after").?.bool);
+            const items = root.get("nested").?.object.get("items").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), items.len);
+            try std.testing.expectEqualStrings("second", items[1].object.get("name").?.string);
+        }
+    };
+    const a = std.testing.allocator;
+    try std.testing.checkAllAllocationFailures(a, Helper.build, .{});
+    var empty = Out.init(a);
+    defer empty.deinit();
+    try empty.buf.append(a, '{');
+    const bytes = try empty.finish();
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{}", bytes);
+    // Force the new root-state allocation to fail after the opening brace.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var root = Out.init(a);
+    defer root.deinit();
+    try root.buf.append(a, '{');
+    root.a = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, root.field("v", version));
+    try std.testing.expectEqualStrings("{", root.buf.items);
+    try std.testing.expectEqual(@as(usize, 0), root.comma.items.len);
+    root.a = a;
 }
 test "response builder rejects unbalanced output and oversized keys" {
     const a = std.testing.allocator;
@@ -557,31 +607,20 @@ test "snapshot previews stay comma-separated and parse as one whole frame" {
     try std.testing.expectEqualStrings("follow_up", list.items[1].object.get("kind").?.string);
     try std.testing.expectEqualStrings("second", list.items[1].object.get("text").?.string);
 }
-test "an oversized frame is rejected without freeing the caller-owned buffer" {
+test "response builder preserves payload beyond old frame limit" {
     const a = std.testing.allocator;
-    // A valid JSON string literal just past the frame bound, appended raw so
-    // `value` cannot clip it first.
-    const big = try a.alloc(u8, max_response + 2);
+    const big = try a.alloc(u8, 1024 * 1024 + 123);
     defer a.free(big);
     @memset(big, 'x');
-    big[0] = '"';
-    big[big.len - 1] = '"';
     var out = Out.init(a);
-    // The caller always defers deinit; finish must not free or poison the Out.
     defer out.deinit();
     try out.ok(11);
-    try out.rawField("payload", big);
-    if (out.finish()) |bytes| {
-        // Never dump the oversized payload; just release and fail.
-        a.free(bytes);
-        try std.testing.expect(false);
-    } else |err| {
-        try std.testing.expectEqual(error.InputTooLarge, err);
-    }
-    // Still consistent afterwards: balanced and owning its own buffer, released
-    // exactly once by this function's `defer out.deinit()`.
-    try std.testing.expectEqual(@as(usize, 0), out.depth);
-    try std.testing.expect(out.buf.items.len > max_response);
+    try out.field("payload", big);
+    const bytes = try out.finish();
+    defer a.free(bytes);
+    var doc = try parseWholeReply(a, bytes);
+    defer doc.deinit();
+    try std.testing.expectEqualStrings(big, doc.value.object.get("payload").?.string);
 }
 test "private startup exit codes roundtrip and never widen" {
     const cases = [_]struct { code: u8, err: anyerror }{

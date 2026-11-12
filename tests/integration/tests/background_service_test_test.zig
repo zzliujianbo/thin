@@ -6,8 +6,8 @@ test "completion is retained by exact id and duration is frozen" {
     defer arena.deinit();
     const a = arena.allocator();
     const cancel: p.Cancellation = .{};
-    const first = try receiptId(a, try startJson(&f, a, "exit 0", 2000, 1024, &cancel));
-    const second = try receiptId(a, try startJson(&f, a, "exit 7", 2000, 1024, &cancel));
+    const first = try receiptId(a, try startJson(&f, a, "exit 0", 2000, &cancel));
+    const second = try receiptId(a, try startJson(&f, a, "exit 7", 2000, &cancel));
     _ = try waitTerminal(&f, a, first, &cancel);
     _ = try waitTerminal(&f, a, second, &cancel);
     const one = f.service.peekCompletion().?;
@@ -36,7 +36,7 @@ test "known key hides entire command even beyond clipped prefix" {
     const command = try std.fmt.allocPrint(a, ": {s}test-secret", .{padding});
     const before = f.service.service().caption(command);
     try std.testing.expectEqualStrings("[command hidden]", before.slice());
-    const id = try receiptId(a, try startJson(&f, a, command, 2000, 1024, &cancel));
+    const id = try receiptId(a, try startJson(&f, a, command, 2000, &cancel));
     const lookup = f.service.service().command(id).?;
     try std.testing.expectEqualStrings("[command hidden]", lookup.slice());
     _ = try waitTerminal(&f, a, id, &cancel);
@@ -55,7 +55,7 @@ test "twelve cumulative starts, six live services and exact pagination" {
     var short_ids: [6][]const u8 = undefined;
     for (0..6) |i| {
         const command = try std.fmt.allocPrint(a, "printf SHORT_{d}", .{i});
-        const receipt = try startJson(&fixture, a, command, 5000, 65536, &cancel);
+        const receipt = try startJson(&fixture, a, command, 5000, &cancel);
         short_ids[i] = try receiptId(a, receipt);
         if (i > 0) try std.testing.expect(!std.mem.eql(u8, short_ids[i], short_ids[i - 1]));
     }
@@ -64,7 +64,7 @@ test "twelve cumulative starts, six live services and exact pagination" {
     var live_pids: [6]u64 = undefined;
     for (0..6) |i| {
         const command = try std.fmt.allocPrint(a, "printf LIVE_{d}; exec sleep 30", .{i});
-        const receipt = try startJson(&fixture, a, command, 5000, 65536, &cancel);
+        const receipt = try startJson(&fixture, a, command, 5000, &cancel);
         live_ids[i] = try receiptId(a, receipt);
     }
 
@@ -134,7 +134,7 @@ test "handoff survives caller cancellation, one stop leaves siblings running" {
     var pids: [6]u64 = undefined;
     for (0..6) |i| {
         const command = try std.fmt.allocPrint(a, "printf SIB_{d}; exec sleep 30", .{i});
-        const receipt = try startJson(&fixture, a, command, 5000, 65536, &cancel);
+        const receipt = try startJson(&fixture, a, command, 5000, &cancel);
         ids[i] = try receiptId(a, receipt);
         const status = try controlJson(&fixture, a, .{ .action = .status, .id = ids[i] }, &cancel);
         pids[i] = pidOf(try statusService(a, status));
@@ -191,9 +191,8 @@ test "logs use absolute raw cursors, bounded budgets and safe escaping" {
     const a = arena.allocator();
     var cancel: p.Cancellation = .{};
 
-    // 200 raw bytes on stdout and stderr exceed a 64-byte ring, so old bytes are
-    // overwritten and available_from advances.
-    const receipt = try startJson(&fixture, a, "head -c 200 /dev/zero | tr '\\0' A; head -c 200 /dev/zero | tr '\\0' B >&2", 5000, 64, &cancel);
+    // Both streams retain all bytes beyond the former page budget.
+    const receipt = try startJson(&fixture, a, "head -c 20000 /dev/zero | tr '\\0' A; head -c 20000 /dev/zero | tr '\\0' B >&2", 5000, &cancel);
     const id = try receiptId(a, receipt);
     const terminal = try waitTerminal(&fixture, a, id, &cancel);
     try std.testing.expect(!std.mem.eql(u8, stateOf(terminal), "running"));
@@ -203,14 +202,17 @@ test "logs use absolute raw cursors, bounded budgets and safe escaping" {
     const err = zero.object.get("stderr").?.object;
     const out_total: u64 = @intCast(out.get("total_bytes").?.integer);
     const err_total: u64 = @intCast(err.get("total_bytes").?.integer);
-    try std.testing.expectEqual(@as(u64, 200), out_total);
-    try std.testing.expectEqual(@as(u64, 200), err_total);
+    try std.testing.expectEqual(@as(u64, 20000), out_total);
+    try std.testing.expectEqual(@as(u64, 20000), err_total);
+    const all = try controlJson(&fixture, a, .{ .action = .logs, .id = id, .limit = 50000 }, &cancel);
+    try std.testing.expectEqual(@as(usize, 20000), all.object.get("stdout").?.object.get("text").?.string.len);
+    try std.testing.expectEqual(@as(usize, 20000), all.object.get("stderr").?.object.get("text").?.string.len);
     const out_available: u64 = @intCast(out.get("available_from").?.integer);
     const err_available: u64 = @intCast(err.get("available_from").?.integer);
-    try std.testing.expect(out_available > 0);
-    try std.testing.expect(err_available > 0);
-    try std.testing.expect(out.get("lost_bytes").?.integer > 0);
-    try std.testing.expect(err.get("lost_bytes").?.integer > 0);
+    try std.testing.expectEqual(@as(u64, 0), out_available);
+    try std.testing.expectEqual(@as(u64, 0), err_available);
+    try std.testing.expectEqual(@as(i64, 0), out.get("lost_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), err.get("lost_bytes").?.integer);
     const out_next: u64 = @intCast(out.get("next_offset").?.integer);
     try std.testing.expect(out_next <= out_total);
     try std.testing.expect(out_next > out_available);
@@ -234,7 +236,7 @@ test "logs use absolute raw cursors, bounded budgets and safe escaping" {
     // Unsafe bytes and backslashes are escaped in text while the cursors keep
     // counting the original bytes. Tab/newline are printable by the shared
     // renderer, so only the invalid byte and backslash grow the text.
-    const unsafe_receipt = try startJson(&fixture, a, "printf 'a\\377b\\\\c\\td\\n'", 5000, 4096, &cancel);
+    const unsafe_receipt = try startJson(&fixture, a, "printf 'a\\377b\\\\c\\td\\n'", 5000, &cancel);
     const unsafe_id = try receiptId(a, unsafe_receipt);
     _ = try waitTerminal(&fixture, a, unsafe_id, &cancel);
     const escaped = try controlJson(&fixture, a, .{ .action = .logs, .id = unsafe_id, .stdout_offset = 0, .stderr_offset = 0, .limit = 4096 }, &cancel);
@@ -248,15 +250,15 @@ test "logs use absolute raw cursors, bounded budgets and safe escaping" {
     try std.testing.expect(text.len > raw_total);
     try std.testing.expectEqual(raw_total, @as(u64, @intCast(escaped_out.get("next_offset").?.integer)));
 
-    // Tiny/zero capacities must be reported truthfully, never as full output.
-    const tiny_receipt = try startJson(&fixture, a, "printf 0123456789", 5000, 0, &cancel);
+    // Short output remains available in full.
+    const tiny_receipt = try startJson(&fixture, a, "printf 0123456789", 5000, &cancel);
     const tiny_id = try receiptId(a, tiny_receipt);
     _ = try waitTerminal(&fixture, a, tiny_id, &cancel);
     const tiny = try controlJson(&fixture, a, .{ .action = .logs, .id = tiny_id, .stdout_offset = 0, .stderr_offset = 0, .limit = 4096 }, &cancel);
     const tiny_out = tiny.object.get("stdout").?.object;
     try std.testing.expectEqual(@as(u64, 10), @as(u64, @intCast(tiny_out.get("total_bytes").?.integer)));
-    try std.testing.expectEqualStrings("", tiny_out.get("text").?.string);
-    try std.testing.expect(tiny_out.get("lost_bytes").?.integer >= 10);
+    try std.testing.expectEqualStrings("0123456789", tiny_out.get("text").?.string);
+    try std.testing.expectEqual(@as(i64, 0), tiny_out.get("lost_bytes").?.integer);
 }
 test "non-zero exit and stdin EOF are observed, not guessed" {
     var fixture: Fixture = undefined;
@@ -269,7 +271,7 @@ test "non-zero exit and stdin EOF are observed, not guessed" {
 
     // `cat` sees EOF immediately because stdin is /dev/null; the shell then
     // exits 7, which status must report without treating it as a tool failure.
-    const receipt = try startJson(&fixture, a, "cat >/dev/null; exit 7", 5000, 4096, &cancel);
+    const receipt = try startJson(&fixture, a, "cat >/dev/null; exit 7", 5000, &cancel);
     const id = try receiptId(a, receipt);
     const terminal = try waitTerminal(&fixture, a, id, &cancel);
     try std.testing.expectEqualStrings("exited", stateOf(terminal));
@@ -286,7 +288,7 @@ test "pre-cancel leaves no retained service; handshake cancel and startup timeou
 
     var canceled_before: p.Cancellation = .{};
     canceled_before.cancel();
-    const pre_cancel_result = try startText(&fixture, a, "printf NEVER", 5000, 4096, &canceled_before);
+    const pre_cancel_result = try startText(&fixture, a, "printf NEVER", 5000, &canceled_before);
     try std.testing.expect(pre_cancel_result.is_error and pre_cancel_result.canceled);
     var cancel: p.Cancellation = .{};
     const after_pre_cancel = try controlJson(&fixture, a, .{ .action = .list }, &cancel);
@@ -298,16 +300,16 @@ test "pre-cancel leaves no retained service; handshake cancel and startup timeou
     var handshake_cancel: p.Cancellation = .{};
     const thread = try std.Thread.spawn(.{}, cancelAfter, .{ &handshake_cancel, 30 });
     defer thread.join();
-    const handshake_result = try startText(&fixture, a, "printf HANDSHAKE", 5000, 4096, &handshake_cancel);
+    const handshake_result = try startText(&fixture, a, "printf HANDSHAKE", 5000, &handshake_cancel);
     try std.testing.expect(handshake_result.is_error and handshake_result.canceled);
     const after_handshake = try controlJson(&fixture, a, .{ .action = .list }, &cancel);
     try std.testing.expectEqual(@as(i64, 0), after_handshake.object.get("total").?.integer);
 
     // A startup timeout is a failed start, not cancellation, and does not
     // poison the manager for later ordinary starts.
-    const timeout_result = try startText(&fixture, a, "printf TIMEOUT", 20, 4096, &cancel);
+    const timeout_result = try startText(&fixture, a, "printf TIMEOUT", 20, &cancel);
     try std.testing.expect(timeout_result.is_error and !timeout_result.canceled);
-    const still_usable = try startJson(&fixture, a, "printf AFTER_TIMEOUT", 5000, 4096, &cancel);
+    const still_usable = try startJson(&fixture, a, "printf AFTER_TIMEOUT", 5000, &cancel);
     const usable_id = try receiptId(a, still_usable);
     _ = try waitTerminal(&fixture, a, usable_id, &cancel);
 }
@@ -334,12 +336,12 @@ test "deterministic construction OOM fails before spawn and leaves no owned serv
     defer arena.deinit();
     const a = arena.allocator();
 
-    if (oom_service.service().start(a, startArgs("printf OOM", 5000, 4096), &cancel)) |_| {
+    if (oom_service.service().start(a, startArgs("printf OOM", 5000), &cancel)) |_| {
         return error.ExpectedOutOfMemory;
     } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
 
     failing.fail_index = std.math.maxInt(usize);
-    const recovered = try oom_service.service().start(a, startArgs("printf RECOVERED", 5000, 4096), &cancel);
+    const recovered = try oom_service.service().start(a, startArgs("printf RECOVERED", 5000), &cancel);
     try std.testing.expect(!recovered.is_error);
     const receipt = try std.json.parseFromSliceLeaky(std.json.Value, a, recovered.text, .{ .allocate = .alloc_always });
     const id = try receiptId(a, receipt);
@@ -355,7 +357,7 @@ test "receipt allocator OOM leaves no registered job and no dependency leak" {
     const a = arena.allocator();
 
     var output = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const result = fixture.service.service().start(output.allocator(), startArgs("printf RECEIPT_OOM", 5000, 4096), &cancel);
+    const result = fixture.service.service().start(output.allocator(), startArgs("printf RECEIPT_OOM", 5000), &cancel);
     try std.testing.expectError(error.OutOfMemory, result);
     try std.testing.expectEqual(@as(usize, 0), output.allocated_bytes);
 
@@ -383,7 +385,7 @@ test "owned construction failure indices stay leak-free and recoverable" {
             .root = &fixture.root,
             .environment = &fixture.env,
         };
-        const failed = fixture.service.service().start(a, startArgs("printf CONSTRUCT_FAIL", 5000, 4096), &cancel);
+        const failed = fixture.service.service().start(a, startArgs("printf CONSTRUCT_FAIL", 5000), &cancel);
         try std.testing.expectError(error.OutOfMemory, failed);
         try std.testing.expectEqual(@as(usize, 0), fixture.service.jobs.items.len);
 
@@ -391,7 +393,7 @@ test "owned construction failure indices stay leak-free and recoverable" {
         const listed = try controlJson(&fixture, a, .{ .action = .list }, &cancel);
         try std.testing.expectEqual(@as(i64, 0), listed.object.get("total").?.integer);
 
-        const recovered = try startJson(&fixture, a, "printf CONSTRUCT_OK", 5000, 4096, &cancel);
+        const recovered = try startJson(&fixture, a, "printf CONSTRUCT_OK", 5000, &cancel);
         const id = try receiptId(a, recovered);
         _ = try waitTerminal(&fixture, a, id, &cancel);
         const stopped = try controlJson(&fixture, a, .{ .action = .stop, .id = id }, &cancel);
@@ -421,7 +423,7 @@ test "future creation failure leaves no registered job" {
         .environment = &fixture.env,
     };
 
-    const failed = fixture.service.service().start(a, startArgs("printf NO_FUTURE", 5000, 4096), &cancel);
+    const failed = fixture.service.service().start(a, startArgs("printf NO_FUTURE", 5000), &cancel);
     try std.testing.expectError(error.ConcurrencyUnavailable, failed);
     try std.testing.expectEqual(@as(usize, 0), fixture.service.jobs.items.len);
 
@@ -441,7 +443,6 @@ test "TERM-ignoring service is escalated to KILL without caller cancellation" {
     const started = try fixture.service.service().start(a, .{
         .command = "trap '' TERM; printf KILL-READY; while :; do :; done",
         .startup_timeout_ms = 5000,
-        .log_bytes = 4096,
         .term_grace_ms = 40,
         .cleanup_timeout_ms = 3000,
     }, &cancel);
@@ -468,7 +469,7 @@ test "stopping an already exited job keeps its exit record" {
     const a = arena.allocator();
     var cancel: p.Cancellation = .{};
 
-    const receipt = try startJson(&fixture, a, "cat >/dev/null; exit 7", 5000, 4096, &cancel);
+    const receipt = try startJson(&fixture, a, "cat >/dev/null; exit 7", 5000, &cancel);
     const id = try receiptId(a, receipt);
     const terminal = try waitTerminal(&fixture, a, id, &cancel);
     try std.testing.expectEqualStrings("exited", stateOf(terminal));
@@ -497,7 +498,7 @@ test "graceful stop keeps both TERM cleanup streams in the log ring" {
 
     // The trap writes to both pipes and exits 0, so a stopped job still owns
     // real post-TERM bytes on stdout and stderr.
-    const receipt = try startJson(&fixture, a, "trap 'printf STOPPING-OUT; printf STOPPING-ERR >&2; exit 0' TERM; printf LOG-READY; while :; do :; done", 5000, 65536, &cancel);
+    const receipt = try startJson(&fixture, a, "trap 'printf STOPPING-OUT; printf STOPPING-ERR >&2; exit 0' TERM; printf LOG-READY; while :; do :; done", 5000, &cancel);
     const id = try receiptId(a, receipt);
 
     // The live marker proves the trap is installed, not merely that a process exists.

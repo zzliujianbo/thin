@@ -53,7 +53,7 @@ test "image client failed destruction explicitly retains a wiped retryable owner
     client.transport.unreaped_pid = null; // Release only our injected sentinel.
     try client.deinit();
 }
-test "image client sink bounds JSON and rechecks deadline cancel before spawn" {
+test "image client sink grows JSON and rechecks deadline cancel before spawn" {
     var cancel: p.Cancellation = .{};
     var sink: Sink = .{ .a = std.testing.allocator, .io = std.testing.io, .start = std.Io.Clock.awake.now(std.testing.io), .timeout_ms = 10000, .cancel = &cancel };
     defer sink.body.deinit(sink.a);
@@ -63,9 +63,11 @@ test "image client sink bounds JSON and rechecks deadline cancel before spawn" {
     try std.testing.expectEqualStrings("{\"a\":1}", sink.body.items);
     try std.testing.expectError(error.ImageHttpResponse, Sink.write(&sink, .{ .status = 302, .is_sse = false }, "secret body"));
     try std.testing.expectError(error.ImageHttpResponse, Sink.write(&sink, .{ .status = 200, .is_sse = true }, "data: {}"));
-    const large = try sink.a.alloc(u8, codec.max_response_bytes);
+    const large = try sink.a.alloc(u8, 65537);
     defer sink.a.free(large);
-    try std.testing.expectError(error.ImageResponseTooLarge, Sink.write(&sink, .{ .status = 200, .is_sse = false }, large));
+    @memset(large, 'x');
+    try Sink.write(&sink, .{ .status = 200, .is_sse = false }, large);
+    try std.testing.expectEqual(large.len + 7, sink.body.items.len);
     sink.timeout_ms = 0;
     try std.testing.expectError(error.Timeout, Sink.check(&sink));
     cancel.cancel();

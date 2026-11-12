@@ -7,7 +7,7 @@ test "exact edit executes atomically on existing owned files" {
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     var edit_config = configuration;
@@ -18,10 +18,6 @@ test "exact edit executes atomically on existing owned files" {
     var cancel: p.Cancellation = .{};
     try root.writeMode("edit.txt", "中文🙂\none\ntwo\n", false, 0o640);
     const executor = tools.executor();
-    const text_edit = @import("../tools/text_edit.zig");
-    var excessive: [text_edit.max_edits + 1]text_edit.Edit = undefined;
-    for (&excessive) |*item| item.* = .{ .old_text = "x", .new_text = "y" };
-    try std.testing.expectError(error.TooManyEdits, tools.execute(temp, .{ .edit_file = .{ .path = "edit.txt", .edits = &excessive } }, &cancel));
     const prepared = try executor.prepare_fn(executor.context, temp, .{ .id = "e", .name = "edit_file", .arguments = "{\"path\":\"edit.txt\",\"edits\":[{\"old_text\":\"中文🙂\",\"new_text\":\"你好\"},{\"old_text\":\"two\",\"new_text\":\"二\"}]}" });
     const result = try executor.execute_fn(executor.context, temp, prepared, &cancel);
     try std.testing.expect(!result.is_error);
@@ -35,13 +31,49 @@ test "exact edit executes atomically on existing owned files" {
     const bad = try executor.prepare_fn(executor.context, temp, .{ .id = "bad", .name = "edit_file", .arguments = "{\"path\":\"edit.txt\",\"edits\":[{\"old_text\":\"one\",\"new_text\":\"changed\"},{\"old_text\":\"missing\",\"new_text\":\"x\"}]}" });
     try std.testing.expectError(error.EditNotFound, executor.execute_fn(executor.context, temp, bad, &cancel));
     try std.testing.expectEqualStrings("你好\none\n二\n", (try root.read(temp, "edit.txt", 0, 100)).data);
+    // Cross the former 128-edit limit with unique, non-overlapping matches.
+    const edits = try temp.alloc(@import("../tools/text_edit.zig").Edit, 129);
+    var original: std.ArrayList(u8) = .empty;
+    var expected: std.ArrayList(u8) = .empty;
+    for (edits, 0..) |*item, i| {
+        const before = try std.fmt.allocPrint(temp, "old-{d:0>3}\n", .{i});
+        const after = try std.fmt.allocPrint(temp, "new-{d:0>3}\n", .{i});
+        item.* = .{ .old_text = before, .new_text = after };
+        try original.appendSlice(temp, before);
+        try expected.appendSlice(temp, after);
+    }
+    try root.writeMode("many-edits.txt", original.items, false, 0o640);
+    const many = try tools.execute(temp, .{ .edit_file = .{ .path = "many-edits.txt", .edits = edits } }, &cancel);
+    try std.testing.expect(!many.is_error);
+    try std.testing.expectEqualStrings(expected.items, (try root.read(temp, "many-edits.txt", 0, expected.items.len)).data);
     try std.testing.expectError(error.ProtectedSessionFile, executor.prepare_fn(executor.context, temp, .{ .id = "p", .name = "edit_file", .arguments = "{\"path\":\".thin/sessions/log\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}" }));
-    edit_config.limits.max_response_bytes = 4;
-    try std.testing.expectError(error.FileTooLarge, executor.execute_fn(executor.context, temp, prepared, &cancel));
-    edit_config.limits.max_response_bytes = configuration.limits.max_response_bytes;
     cancel.cancel();
     try std.testing.expect((try executor.execute_fn(executor.context, temp, prepared, &cancel)).canceled);
     try std.testing.expectEqualStrings("你好\none\n二\n", (try root.read(temp, "edit.txt", 0, 100)).data);
+}
+test "file tools preserve content beyond former response quota" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(a, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    var store = mem.Store.init(&root);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = &environment };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const content = try temp.alloc(u8, 8 * 1024 * 1024 + 1);
+    @memset(content, 'x');
+    var cancel: p.Cancellation = .{};
+    const written = try tools.execute(temp, .{ .write_file = .{ .path = "large.txt", .content = content } }, &cancel);
+    try std.testing.expect(!written.is_error);
+    const read = try tools.execute(temp, .{ .read_file = .{ .path = "large.txt", .limit = content.len } }, &cancel);
+    try std.testing.expect(!read.is_error and !read.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, read.text, content) != null);
 }
 test "executor selects decision-aware descriptions without changing tool parameters" {
     const a = std.testing.allocator;
@@ -51,7 +83,7 @@ test "executor selects decision-aware descriptions without changing tool paramet
     const n = try tmp.dir.realPath(std.testing.io, &buffer);
     var root = try fs.Root.open(a, std.testing.io, buffer[0..n]);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     var config = configuration;
@@ -92,7 +124,7 @@ test "file observations reflect actual returned ranges and pre-write snapshot ch
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = &environment };
@@ -144,7 +176,7 @@ test "tools validate containment and Memory namespace before approval" {
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = &environment };
@@ -203,7 +235,7 @@ test "session and log reads retain file safety and credential guards without per
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = undefined };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -255,7 +287,7 @@ test "session and log reads retain file safety and credential guards without per
     try std.testing.expectEqual(@as(?u64, 9), j.uint(j.get(partial_value, "offset")));
     try std.testing.expectEqual(@as(?u64, 12), j.uint(j.get(partial_value, "next_offset")));
     try std.testing.expect(partial.truncated and partial.file_stats.?.partial);
-    try std.testing.expectError(error.InvalidReadLimit, executor.prepare_fn(executor.context, temp, .{ .id = "large", .name = "read_file", .arguments = "{\"path\":\".thin/logs/fake.jsonl\",\"limit\":99999999}" }));
+    _ = try executor.prepare_fn(executor.context, temp, .{ .id = "large", .name = "read_file", .arguments = "{\"path\":\".thin/logs/fake.jsonl\",\"limit\":99999999}" });
 
     // Binary resume frames are NOT converted to text or exempted from validation.
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/sessions/binary.session", .data = "frame\x00bytes" });
@@ -309,7 +341,7 @@ test "external text reads allow absolute and parent paths without opening write 
     const project = try std.fs.path.join(temp, &.{ home, "project" });
     var root = try fs.Root.open(a, io, project);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = undefined, .auth_path = try std.fs.path.join(temp, &.{ home, "auth.json" }) };
     const executor = tools.executor();
     var cancel: p.Cancellation = .{};
@@ -379,7 +411,7 @@ test "migrated text read guards prepare and execute" {
     const temp = arena.allocator();
     var root = try fs.Root.open(a, io, try std.fs.path.join(temp, &.{ home, "project" }));
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = undefined, .auth_path = try std.fs.path.join(temp, &.{ home, "stage/auth.json" }) };
     const executor = tools.executor();
     var cancel: p.Cancellation = .{};
@@ -422,7 +454,7 @@ test "missing batch reads defer and recheck protection" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temp = arena.allocator();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = undefined };
     const executor = tools.executor();
     var cancel: p.Cancellation = .{};
@@ -462,7 +494,7 @@ test "absolute read aliases anchor without folding symlink parents" {
     try tmp.dir.rename("project", tmp.dir, "retired", io);
     try tmp.dir.createDirPath(io, "project");
     try tmp.dir.writeFile(io, .{ .sub_path = "project/anchor.txt", .data = "replacement inode" });
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = undefined };
     const executor = tools.executor();
     var cancel: p.Cancellation = .{};
@@ -503,7 +535,7 @@ test "actual file and command tool results preserve UTF8 and exact continuation 
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(a, io, buffer[0..n]);
     defer root.deinit();
-    var store = mem.Store.init(&root, .{});
+    var store = mem.Store.init(&root);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
 
@@ -568,7 +600,7 @@ test "mutating file and Memory tool allocation failures precede commits" {
         const n = try tmp.dir.realPath(io, &path);
         var root = try fs.Root.open(a, io, path[0..n]);
         defer root.deinit();
-        var store = mem.Store.init(&root, .{});
+        var store = mem.Store.init(&root);
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         var tools = t.Tools{ .root = &root, .memory = &store, .config = &configuration, .environment = &env };
@@ -637,7 +669,7 @@ test "tools prepare review inputs without side effects and use ordinary command 
     defer root.deinit();
     var config = configuration;
     config.limits.command_timeout_ms = 500;
-    var store = mem.Store.init(&root, config.limits);
+    var store = mem.Store.init(&root);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     var tools = t.Tools{ .root = &root, .memory = &store, .config = &config, .environment = &environment };

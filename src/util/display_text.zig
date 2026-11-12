@@ -34,14 +34,24 @@ fn printableEnd(input: []const u8, start: usize, room: usize) usize {
     return i;
 }
 
+/// Complete owned UTF-8 display copy with the same scalar policy as sanitizePrefix.
+pub fn sanitizeAll(a: std.mem.Allocator, input: []const u8) ![]const u8 {
+    return (try sanitizeImpl(a, input, null)).text;
+}
+
 /// Owned bounded safe prefix, without a text marker. The flag is metadata so
 /// a renderer can discard a possibly incomplete final cluster before clipping.
 pub fn sanitizePrefix(a: std.mem.Allocator, input: []const u8, max_bytes: usize) !Prefix {
+    return sanitizeImpl(a, input, max_bytes);
+}
+
+fn sanitizeImpl(a: std.mem.Allocator, input: []const u8, max_bytes: ?usize) !Prefix {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     var i: usize = 0;
     while (i < input.len) {
-        const end = printableEnd(input, i, max_bytes - out.items.len);
+        const room = if (max_bytes) |bound| bound - out.items.len else input.len - i;
+        const end = printableEnd(input, i, room);
         if (end != i) {
             try out.appendSlice(a, input[i..end]);
             i = end;
@@ -54,7 +64,9 @@ pub fn sanitizePrefix(a: std.mem.Allocator, input: []const u8, max_bytes: usize)
         }
         var buf: [4]u8 = undefined;
         const n = try std.unicode.utf8Encode(displayCodepoint(r.cp), &buf);
-        if (out.items.len > max_bytes or n > max_bytes - out.items.len) break;
+        if (max_bytes) |bound| {
+            if (n > bound - out.items.len) break;
+        }
         try out.appendSlice(a, buf[0..n]);
         i = r.end;
     }

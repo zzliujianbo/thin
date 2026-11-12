@@ -14,11 +14,7 @@ const preference = effort => JSON.stringify({version:1,reasoning_effort:effort})
 // Seed the declaration writer's non-null implementation defaults explicitly so
 // global saves can retain strict whole-document equality, not loose subsets.
 const limitDefaults = {
-  command_timeout_ms:300000,command_max_timeout_ms:3600000,read_bytes:65536,output_bytes:32768,
-  input_margin_tokens:5000,max_tool_calls:128,model_refresh_ttl_ms:14400000,model_refresh_cooldown_ms:300000,
-  cleanup_grace_ms:1000,cleanup_timeout_ms:5000,core_bytes:2048,index_bytes:8192,shard_bytes:32768,
-  compaction_enabled:true,compaction_trigger_percent:80,compaction_target_percent:50,
-  max_response_bytes:8388608,max_event_bytes:1048576,
+  command_timeout_ms:300000, compaction_enabled:true,
 };
 
 export async function settingsRegressions({app,pty,execute,send}) {
@@ -82,7 +78,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
         // Match the declaration-only writer's sparse nullable mappings while
         // retaining strict /login baseline equality for all declared models.
         const completeMap = Object.fromEntries(['off','minimal','low','medium','high','xhigh','max'].filter(level => map[level] != null).map(level => [level,map[level]]));
-        configBytes = JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',reasoning_effort:globalEffort,providers:{local:{base_url:url,api_key:null,kind:null,chat_max_tokens:false,api_key_env:pending?'':'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768,reasoning_effort:effort,...(unknown?{}:{reasoning:{format,map:completeMap}})}}}}},limits:{...limitDefaults,low_price_input:false,safety_tokens:100,request_timeout_ms:10000,task_timeout_ms:20000}});
+        configBytes = JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',reasoning_effort:globalEffort,providers:{local:{base_url:url,api_key:null,kind:null,chat_max_tokens:false,api_key_env:pending?'':'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768,reasoning_effort:effort,...(unknown?{}:{reasoning:{format,map:completeMap}})}}}}},limits:{...limitDefaults,low_price_input:false,request_timeout_ms:10000}});
         await writeFile(configPath,configBytes,{mode:0o600});
       }
       const legacyFixtures = new Map();

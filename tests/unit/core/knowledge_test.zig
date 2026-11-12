@@ -1,3 +1,19 @@
+test "capture retains sources beyond historical count and byte thresholds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = try a.alloc(u8, 5000);
+    @memset(source, 'x');
+    var capture: Capture = .{ .allocator = a };
+    for (0..30) |_| capture.add(.user, source);
+    try std.testing.expect(!capture.incomplete);
+    try std.testing.expectEqual(@as(usize, 30), capture.sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capture.omitted_sources);
+    for (capture.sources.items, 0..) |entry, i| {
+        try std.testing.expectEqual(i, entry.id);
+        try std.testing.expectEqualStrings(source, entry.text);
+    }
+}
 test "service filters borrowed candidates without mutation" {
     const Fake = struct {
         fn extract(_: *anyopaque, _: std.mem.Allocator, _: Material, _: *const p.Cancellation) ![]const Candidate {

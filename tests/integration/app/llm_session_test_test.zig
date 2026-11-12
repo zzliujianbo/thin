@@ -77,13 +77,15 @@ test "restored known price history has no L without ready runtime for missing ke
         var store = try Store.openExisting(a, io, home);
         defer store.deinit();
         var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fixture\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go);
+        defer listing.deinit(a);
         listing.dev_done = true;
         const row = &listing.directory.rows[0];
         row.dev_present = true;
         row.dev_protocol = .chat;
         row.dev_context_tokens = 65536;
         row.dev_input_price_threshold = 20000;
-        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+        var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+        defer committed.deinit(a);
     }
     var id: @import("session_id.zig").Id = undefined;
     {
@@ -118,7 +120,8 @@ test "publication current capabilities stay isolated by model and route" {
     );
     defer cfg.release(&parsed);
     var cache: metadata.Cache = .{};
-    const row = try cache.directory.upsert(.opencode_go, "fresh");
+    defer cache.deinit(a);
+    const row = try cache.directory.upsert(a, .opencode_go, "fresh");
     row.available = true;
     row.protocol = .responses;
     row.tokens = 1000000;
@@ -158,7 +161,10 @@ test "publication Session current capability changes do not reject history loadi
     {
         var store = try Store.openExisting(a, std.testing.io, home);
         defer store.deinit();
-        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), try metadata.parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go));
+        var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go);
+        defer listing.deinit(a);
+        var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+        defer committed.deinit(a);
     }
     var id: @import("session_id.zig").Id = undefined;
     {
@@ -169,8 +175,10 @@ test "publication Session current capability changes do not reject history loadi
         try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "signed route fixture" }} });
         try std.testing.expect(try source.saveOnExit());
         var changed = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fresh\",\"protocol\":\"responses\",\"context_window\":1000000}]}", .opencode_go);
+        defer changed.deinit(a);
         changed.directory.rows[0].output_tokens = 128000;
-        _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), changed);
+        var committed = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), changed);
+        defer committed.deinit(a);
     }
     var selection_only = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .restore_selection = id });
     defer selection_only.deinit();
@@ -342,13 +350,13 @@ test "llm Session directory fields merge per alias and auth preserves all declar
     var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
-    const row = try session.metadata_cache.directory.upsert(.opencode_go, "shared");
+    const row = try session.metadata_cache.directory.upsert(a, .opencode_go, "shared");
     row.available = true;
     row.tokens = 1000000;
     row.protocol = .responses;
     row.dev_protocol = .responses;
     row.dev_output_tokens = 128000;
-    const extra = try session.metadata_cache.directory.upsert(.opencode_go, "extra");
+    const extra = try session.metadata_cache.directory.upsert(a, .opencode_go, "extra");
     extra.available = true;
     extra.tokens = 65536;
     extra.protocol = .chat;
@@ -547,15 +555,17 @@ test "llm Session manual effort and resolved metadata map stay frozen across sta
         var store = try Store.openExisting(a, std.testing.io, home);
         defer store.deinit();
         var listing: metadata.Listing = .{};
+        defer listing.deinit(a);
         listing.directory_mask = metadata.bit(.opencode_go);
-        const row = try listing.directory.upsert(.opencode_go, "gpt-5.6-luna");
+        const row = try listing.directory.upsert(a, .opencode_go, "gpt-5.6-luna");
         row.available = true;
         row.protocol = preset.model.protocol;
         listing.dev_done = true;
         row.dev_present = true;
         row.dev_protocol = preset.model.protocol;
         row.dev_reasoning = try @import("model_directory.zig").Profile.from(.{ .format = .standard, .map = .{ .low = "low", .high = "high" } });
-        _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+        var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+        defer committed.deinit(a);
     }
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -567,6 +577,7 @@ test "llm Session manual effort and resolved metadata map stay frozen across sta
     try std.testing.expectEqualStrings("high", session.app.?.config.value.model.reasoning.?.map.high.?);
     // Owner cache replacement models a completed refresh losing capabilities.
     // UI/Shift+Tab must still use the accepted owned map, not latest metadata.
+    session.metadata_cache.deinit(a);
     session.metadata_cache = .{};
     try std.testing.expect(session.connection().current().effort_levels.contains(.high));
     try std.testing.expect(session.connection().current().effort_levels.contains(.low));
@@ -598,7 +609,8 @@ test "llm Session dynamic history loads after lost window and delisting without 
             var store = try Store.openExisting(a, std.testing.io, home);
             defer store.deinit();
             var listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go) };
-            const row = try listing.directory.upsert(.opencode_go, "cached.protochat");
+            defer listing.deinit(a);
+            const row = try listing.directory.upsert(a, .opencode_go, "cached.protochat");
             row.available = true;
             row.protocol = .chat;
             row.tokens = 1000000;
@@ -607,7 +619,8 @@ test "llm Session dynamic history loads after lost window and delisting without 
             row.dev_output_tokens = output;
             row.dev_input_price_threshold = if (output != null) 200000 else null;
             listing.dev_done = true;
-            _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+            var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+            defer committed.deinit(a);
         }
         var id: @import("session_id.zig").Id = undefined;
         {
@@ -627,14 +640,17 @@ test "llm Session dynamic history loads after lost window and delisting without 
             // Keep protocol evidence so empty-chat restore fails specifically
             // for the unknown window, not an unrelated unavailable route.
             var listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go) };
-            const row = try listing.directory.upsert(.opencode_go, "cached.protochat");
+            defer listing.deinit(a);
+            const row = try listing.directory.upsert(a, .opencode_go, "cached.protochat");
             row.available = false;
             row.dev_present = true;
             row.dev_protocol = .chat;
             row.dev_output_tokens = 4096;
             row.dev_input_price_threshold = 100000;
             listing.dev_done = true;
-            _ = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), listing);
+            var committed = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), listing);
+            defer committed.deinit(a);
+            source.metadata_cache.deinit(a);
             source.metadata_cache = try metadata.load(&source.store.root);
             try source.connection().selectModel("cached.protochat");
             try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, source.app.?.config.value.model.input_price_threshold);
@@ -659,8 +675,10 @@ test "llm Session dynamic history loads after lost window and delisting without 
             // A later refresh removes the row and every models.dev capability.
             var store = try Store.openExisting(a, std.testing.io, home);
             defer store.deinit();
-            const listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go), .dev_done = true };
-            _ = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+            var listing: metadata.Listing = .{ .directory_mask = metadata.bit(.opencode_go), .dev_done = true };
+            defer listing.deinit(a);
+            var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
+            defer committed.deinit(a);
             var restored = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .resume_session = id });
             defer restored.deinit();
             const connection = restored.connection();

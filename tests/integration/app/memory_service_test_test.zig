@@ -362,7 +362,7 @@ test "primary retrieve and parent reportFailure never rewrite an active job outc
     try std.testing.expectEqual(@as(u64, 1), before.active.?.id);
     try std.testing.expectEqual(.extracting, before.active.?.phase);
 
-    const reference = try owner.retrieve(a, input, 8192);
+    const reference = try owner.retrieve(a, input);
     a.free(reference);
     owner.reportFailure(error.Busy);
     try std.testing.expectEqual(@as(u16, @intFromError(error.Busy)), owner.failure.load(.acquire));
@@ -536,10 +536,10 @@ test "mixed sources and candidates save only committed safe entries" {
             try std.testing.expectEqualStrings("Set api_key in .env at /app/config", material.sources[4].text);
             return alloc.dupe(k.Candidate, &.{
                 .{ .category = .preferences, .topic = "bad topic", .content = "invalid" },
-                .{ .category = .preferences, .topic = "conflict", .content = "must not overwrite" },
                 .{ .category = .preferences, .topic = "secret", .content = "owned-memory-fixture-key" },
                 .{ .category = .preferences, .topic = "bearer-secret", .content = "Bearer abc.def" },
                 .{ .category = .preferences, .topic = "good", .content = "  A useful fact.  " },
+                .{ .category = .preferences, .topic = "conflict", .content = "must not overwrite" },
             });
         }
     };
@@ -561,7 +561,7 @@ test "mixed sources and candidates save only committed safe entries" {
     try std.testing.expectEqual(@as(usize, 1), mixed.calls);
     try std.testing.expectEqual(@as(u32, 2), terminal.saved_count);
     try std.testing.expectEqualStrings("Bearer abc.def · A useful fact.", terminal.summary.text());
-    try std.testing.expect(terminal.result == .saved);
+    try std.testing.expect(terminal.result == .failed);
     const saved = try owner.store.read(a, "preferences-good");
     defer a.free(saved.content);
     defer a.free(saved.version);
@@ -596,8 +596,6 @@ test "automatic Memory saves every candidate without a total index budget" {
     defer root.deinit();
     var config = try fixtureConfig(a);
     defer cfg.release(&config);
-    // The legacy field must not reject the eighth candidate.
-    config.value.limits.index_bytes = 1;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     const owner = try Coordinator.create(a, io, &root, config.value, &env);

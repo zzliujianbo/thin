@@ -10,11 +10,8 @@ const c = std.c;
 const Input = @import("../platform/anonymous_input.zig").Input;
 
 const script = "exec /usr/bin/curl --disable --config -";
-const max_body = 65536;
-const max_payload = 256 * 1024;
 const max_field = 8192;
 const max_key = 16384;
-const max_config = 2 * 1024 * 1024;
 /// Shared private curl transport: explicit inference routing never inherits
 /// proxy/no_proxy variables. The legacy auxiliary transport seam may still
 /// opt into its filtered environment for owned transport tests.
@@ -113,9 +110,7 @@ pub const Client = struct {
 
         const result = self.runWithInput(a, config, .{
             .raw_output = true,
-            // process splits the combined budget equally across stdout/stderr.
-            // Reserve the full body + four-byte status suffix on stdout.
-            .output_bytes = 2 * (max_body + 4),
+            .output_bytes = null,
             .timeout_ms = timeout_ms,
             .term_grace_ms = 200,
             .cleanup_timeout_ms = 5000,
@@ -139,7 +134,7 @@ pub const Client = struct {
 
     /// Incremental HTTP body delivery on the process owner's thread. A complete
     /// SSE event is not a successful response until curl exits zero and is reaped.
-    pub fn streamPost(self: *Client, a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: u32, sink: BodySink, cancel: *const protocol.Cancellation) !StreamHead {
+    pub fn streamPost(self: *Client, a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, sink: BodySink, cancel: *const protocol.Cancellation) !StreamHead {
         if (self.poisoned) return error.CleanupFailed;
         try checkCancel(self.io, cancel);
         const config = try makeStreamConfig(a, url, headers, payload, timeout_ms, body_limit, self.proxy_url);
@@ -149,7 +144,7 @@ pub const Client = struct {
         const result = try self.runWithInput(a, config, .{
             .raw_output = true,
             .stdout_sink = .{ .context = &parser, .write_fn = StreamParser.write },
-            .output_bytes = 8192,
+            .output_bytes = null,
             .timeout_ms = timeout_ms,
             .term_grace_ms = 200,
             .cleanup_timeout_ms = 5000,
@@ -288,7 +283,7 @@ fn validate(url: []const u8, key: []const u8, payload: []const u8, timeout_ms: u
         uri.host == null or uri.host.?.isEmpty() or uri.user != null or uri.password != null or
         uri.query != null or uri.fragment != null) return error.InvalidUrl;
     if (timeout_ms == 0) return error.InvalidTimeout;
-    if (payload.len == 0 or payload.len > max_payload or payload[0] == '@' or
+    if (payload.len == 0 or payload[0] == '@' or
         !std.unicode.utf8ValidateSlice(payload)) return error.InvalidPayload;
     // curl's config escape alphabet is smaller than JSON's: it accepts \n,
     // \r and \t, but NOT JSON's \b, \f or \u0000. Never silently change a body.
@@ -309,15 +304,16 @@ fn field(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
 fn makeConfigRouted(a: std.mem.Allocator, url: []const u8, key: []const u8, payload: []const u8, timeout_ms: u32, explicit_route: bool, proxy_url: ?[]const u8) ![]u8 {
     try validate(url, key, payload, timeout_ms);
     const prefix = "authorization: Bearer ";
-    const capacity = 6 * (url.len + prefix.len + key.len + payload.len + (if (proxy_url) |u| u.len else @as(usize, 0))) + 4096;
-    if (capacity > max_config) return error.InvalidPayload;
+    var size: usize = 0;
+    for ([_]usize{ url.len, prefix.len, key.len, payload.len, if (proxy_url) |u| u.len else 0 }) |n| size = std.math.add(usize, size, n) catch return error.OutOfMemory;
+    const capacity = std.math.add(usize, std.math.mul(usize, size, 6) catch return error.OutOfMemory, 4096) catch return error.OutOfMemory;
     const buffer = try a.alloc(u8, capacity);
     errdefer wipeFree(a, buffer);
     // Initialize unused bytes as well; no stale allocator content enters stdin.
     @memset(buffer, 0);
     var w = std.Io.Writer.fixed(buffer);
     try w.writeAll(
-        "silent\nhttp1.1\ngloboff\nretry = 0\nmax-filesize = 65536\n" ++
+        "silent\nhttp1.1\ngloboff\nretry = 0\n" ++
             "proto = \"=http,https\"\nproto-redir = \"=https\"\n" ++
             "user-agent = \"thin\"\nrequest = \"POST\"\n" ++
             "header = \"content-type: application/json\"\nheader = \"accept: application/json\"\n",
@@ -354,21 +350,23 @@ fn writeRoute(w: *std.Io.Writer, proxy_url: ?[]const u8) !void {
     try field(w, "noproxy", if (proxy_url == null) "*" else "");
 }
 
-fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: u32, proxy_url: ?[]const u8) ![]u8 {
-    // The main model may have a much larger input than the auxiliary codec.
-    // This is a transport byte bound, not an invented model context capacity.
-    if (payload.len == 0 or payload.len > 32 * 1024 * 1024 or payload[0] == '@' or !std.unicode.utf8ValidateSlice(payload)) return error.InvalidPayload;
+fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, proxy_url: ?[]const u8) ![]u8 {
+    if (payload.len == 0 or payload[0] == '@' or !std.unicode.utf8ValidateSlice(payload)) return error.InvalidPayload;
     for (payload) |byte| if (byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') return error.InvalidPayload;
     try validate(url, "validated-separately", "{}", timeout_ms);
-    if (body_limit == 0 or headers.len > 16) return error.InvalidPayload;
+    if (body_limit != null and body_limit.? == 0 or headers.len > 16) return error.InvalidPayload;
     var header_bytes: usize = 0;
     for (headers) |h| {
         if (h.name.len == 0 or h.name.len > 128 or h.value.len > max_key + 32 or !controlFree(h.value)) return error.InvalidHeader;
         if (!headerName(h.name)) return error.InvalidHeader;
-        header_bytes += h.name.len + h.value.len + 2;
+        header_bytes = std.math.add(usize, header_bytes, h.name.len) catch return error.OutOfMemory;
+        header_bytes = std.math.add(usize, header_bytes, h.value.len) catch return error.OutOfMemory;
+        header_bytes = std.math.add(usize, header_bytes, 2) catch return error.OutOfMemory;
     }
     if (proxy_url) |proxy| try validate(proxy, "route", "{}", 1);
-    const capacity = 6 * (url.len + payload.len + header_bytes + (if (proxy_url) |u| u.len else @as(usize, 0))) + 4096;
+    var size: usize = 0;
+    for ([_]usize{ url.len, payload.len, header_bytes, if (proxy_url) |u| u.len else 0 }) |n| size = std.math.add(usize, size, n) catch return error.OutOfMemory;
+    const capacity = std.math.add(usize, std.math.mul(usize, size, 6) catch return error.OutOfMemory, 4096) catch return error.OutOfMemory;
     const buffer = try a.alloc(u8, capacity);
     errdefer wipeFree(a, buffer);
     @memset(buffer, 0);
@@ -386,7 +384,7 @@ fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.
     try field(&w, "max-time", try std.fmt.bufPrint(&number, "{d}.{d:0>3}", .{ timeout_ms / 1000, timeout_ms % 1000 }));
     const connect_ms = @min(timeout_ms, 10000);
     try field(&w, "connect-timeout", try std.fmt.bufPrint(&number, "{d}.{d:0>3}", .{ connect_ms / 1000, connect_ms % 1000 }));
-    try field(&w, "max-filesize", try std.fmt.bufPrint(&number, "{d}", .{body_limit}));
+    if (body_limit) |limit| try field(&w, "max-filesize", try std.fmt.bufPrint(&number, "{d}", .{limit}));
     return buffer;
 }
 
@@ -394,7 +392,7 @@ fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.
 /// accepted here. CONNECT headers are suppressed and interim heads are bounded.
 const StreamParser = struct {
     sink: BodySink,
-    body_limit: usize,
+    body_limit: ?u32,
     body_bytes: usize = 0,
     header_bytes: usize = 0,
     head_count: u8 = 0,
@@ -440,8 +438,8 @@ const StreamParser = struct {
         }
         if (offset == bytes.len) return;
         const body = bytes[offset..];
-        if (body.len > self.body_limit - self.body_bytes) return error.CurlResponseTooLarge;
-        self.body_bytes += body.len;
+        if (self.body_limit) |limit| if (body.len > @as(usize, limit) -| self.body_bytes) return error.CurlResponseTooLarge;
+        self.body_bytes = std.math.add(usize, self.body_bytes, body.len) catch return error.OutOfMemory;
         try self.sink.write_fn(self.sink.context, self.head.?, body);
     }
 };
@@ -457,7 +455,7 @@ fn parseResponse(a: std.mem.Allocator, result: process.Result) !Response {
         else => return error.DecisionTransport,
     }
     const bytes = result.stdout;
-    if (bytes.len < 4 or bytes.len - 4 > max_body or result.stdout_bytes != bytes.len) return error.DecisionTransport;
+    if (bytes.len < 4 or result.stdout_bytes != bytes.len) return error.DecisionTransport;
     const suffix = bytes[bytes.len - 4 ..];
     if (suffix[0] != '\n') return error.DecisionTransport;
     for (suffix[1..]) |digit| if (!std.ascii.isDigit(digit)) return error.DecisionTransport;

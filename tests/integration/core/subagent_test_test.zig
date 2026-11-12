@@ -5,14 +5,12 @@ test "subagent request validation enforces utf8 nul and byte bounds" {
     try std.testing.expectError(error.InvalidSubagentTask, sub.validate(.{ .task = "" }));
     try std.testing.expectError(error.InvalidSubagentTask, sub.validate(.{ .task = "a\x00b" }));
     try std.testing.expectError(error.InvalidSubagentTask, sub.validate(.{ .task = "\xff" }));
-    var task: [sub.max_task_bytes + 1]u8 = @splat('a');
-    try std.testing.expectError(error.InvalidSubagentTask, sub.validate(.{ .task = &task }));
-    try sub.validate(.{ .task = task[0..sub.max_task_bytes] });
+    const task: [8193]u8 = @splat('a');
+    try sub.validate(.{ .task = &task });
     try std.testing.expectError(error.InvalidSubagentContext, sub.validate(.{ .task = "ok", .context = "a\x00b" }));
     try std.testing.expectError(error.InvalidSubagentContext, sub.validate(.{ .task = "ok", .context = "\xff" }));
-    var context: [sub.max_context_bytes + 1]u8 = @splat('b');
-    try std.testing.expectError(error.InvalidSubagentContext, sub.validate(.{ .task = "ok", .context = &context }));
-    try sub.validate(.{ .task = "ok", .context = context[0..sub.max_context_bytes] });
+    const context: [16385]u8 = @splat('b');
+    try sub.validate(.{ .task = "ok", .context = &context });
 }
 test "job, query, send, cancel and message validation is strict and bounded" {
     try sub.validateQuery(.{ .id = "job-1" });
@@ -28,9 +26,8 @@ test "job, query, send, cancel and message validation is strict and bounded" {
     try std.testing.expectError(error.InvalidSubagentMessage, sub.validateSend(.{ .id = "job-1", .message = "" }));
     try std.testing.expectError(error.InvalidSubagentMessage, sub.validateSend(.{ .id = "job-1", .message = "\xff" }));
     try std.testing.expectError(error.InvalidSubagentMessage, sub.validateSend(.{ .id = "job-1", .message = "a\x00b" }));
-    var long_message: [sub.max_message_bytes + 1]u8 = @splat('m');
-    try std.testing.expectError(error.InvalidSubagentMessage, sub.validateSend(.{ .id = "job-1", .message = &long_message }));
-    try sub.validateSend(.{ .id = "job-1", .message = long_message[0..sub.max_message_bytes] });
+    const long_message: [4097]u8 = @splat('m');
+    try sub.validateSend(.{ .id = "job-1", .message = &long_message });
 
     try sub.validateCancel(.{ .id = "job-1" });
     try std.testing.expectError(error.InvalidSubagentId, sub.validateCancel(.{ .id = "" }));
@@ -48,14 +45,14 @@ test "report bounding is utf8 aligned and explicit" {
     try std.testing.expect(!short.truncated);
     try std.testing.expectError(error.InvalidSubagentReport, sub.boundReport(a, "\xff"));
 
-    // A 3-byte scalar straddles the cap: keep the prefix, drop the split scalar.
-    var buffer: [sub.max_report_bytes + 3]u8 = @splat('a');
-    buffer[sub.max_report_bytes - 1] = 0xe4;
-    buffer[sub.max_report_bytes] = 0xb8;
-    buffer[sub.max_report_bytes + 1] = 0xad;
+    // A 3-byte scalar crosses the former cap and remains intact.
+    var buffer: [16387]u8 = @splat('a');
+    buffer[16383] = 0xe4;
+    buffer[16384] = 0xb8;
+    buffer[16385] = 0xad;
     const bounded = try sub.boundReport(a, &buffer);
-    try std.testing.expect(bounded.truncated);
-    try std.testing.expectEqual(sub.max_report_bytes - 1, bounded.text.len);
+    try std.testing.expect(!bounded.truncated);
+    try std.testing.expectEqualStrings(&buffer, bounded.text);
     try std.testing.expect(std.unicode.utf8ValidateSlice(bounded.text));
 }
 test "service wrappers are optional and cleanup outranks cancellation" {
@@ -206,39 +203,38 @@ test "normal stop reminder is a context message and not user or memory evidence"
     try std.testing.expectEqual(@as(usize, 1), hint_contexts);
     try std.testing.expectEqual(@as(usize, 1), user_messages);
 }
-test "three stop reminders then SubagentInteractionRequired pauses the root" {
+test "four stop reminders complete without a synthetic reminder quota" {
     var config = fixtureConfig();
     var model: ModelFake = .{};
-    // One more hint than allowed proves the 4th stop is rejected, not appended.
+    // Cross the former three-reminder quota, then the finite host completes.
     var life: Lifecycle = .{ .hints = 4 };
     var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
     defer instance.deinit();
     instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .submit_fn = Lifecycle.finalize };
     var cancel: p.Cancellation = .{};
     const terminal = try instance.run("wait for child", &cancel);
-    try std.testing.expectEqual(runtime.Status.paused, terminal.status);
-    try std.testing.expectEqual(error.SubagentInteractionRequired, terminal.detail.?);
-    try std.testing.expect(runtime.policyPause(terminal.detail));
-    // Initial stop + 3 reminder rounds; the 4th stop returns the pause error.
-    try std.testing.expectEqual(@as(usize, 4), model.calls);
-    // The 4th hint is generated by the host but rejected before being appended.
+    try std.testing.expectEqual(runtime.Status.success, terminal.status);
+    try std.testing.expect(terminal.detail == null);
+    try std.testing.expectEqual(@as(usize, 5), model.calls);
+    // Every generated hint was retained before the final successful stop.
     try std.testing.expectEqual(@as(usize, 4), life.hint_calls);
     try std.testing.expectEqual(@as(usize, 1), life.ends);
-    try std.testing.expectEqual(@as(usize, 0), life.finalized);
+    try std.testing.expectEqual(@as(usize, 1), life.finalized);
+    try std.testing.expectEqual(@as(usize, 1), life.finished);
+    try std.testing.expect(!life.order_violation);
     try std.testing.expectEqual(@as(usize, 0), life.user_committed_events);
     var hint_contexts: usize = 0;
     for (instance.messages()) |message| {
         if (message.role == .context and std.mem.indexOf(u8, message.blocks[0].text, "Child job job-1") != null) hint_contexts += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), hint_contexts);
+    try std.testing.expectEqual(@as(usize, 4), hint_contexts);
 }
 test "end task runs once on success failure cancel and paused before memory and finished" {
     for ([_]LifecyclePlan{ .success, .failure, .canceled, .paused }) |plan| {
         var config = fixtureConfig();
         var model: ModelFake = .{ .plan = if (plan == .failure) .failure else .success };
-        // A paused root keeps its accepted goal without a model-output failure:
-        // the host's fourth stop hint returns SubagentInteractionRequired.
-        var life: Lifecycle = if (plan == .paused) .{ .hints = 4 } else .{};
+        // An explicit host interaction request, not a counter, pauses the root.
+        var life: Lifecycle = if (plan == .paused) .{ .before_error = error.SubagentInteractionRequired } else .{};
         var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
         defer instance.deinit();
         instance.memory_hooks = .{ .context = &life, .retrieve_fn = Lifecycle.retrieve, .submit_fn = Lifecycle.finalize };
@@ -281,21 +277,24 @@ test "end task cleanup failure poisons and outranks success and cancellation" {
         try std.testing.expectEqual(@as(usize, 1), life.finished);
     }
 }
-test "tool progress does not extend the stop reminder budget" {
+test "tool progress and repeated stop hints finish without a reminder budget" {
     var config = fixtureConfig();
     var model: ModelFake = .{ .plan = .tool_once };
-    var life: Lifecycle = .{ .hints = 99 };
+    var life: Lifecycle = .{ .hints = 5 };
     var instance = try runtime.Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &model, .call_fn = ModelFake.call }, lifecycleExecutor(&life), .{ .context = &life, .emit_fn = Lifecycle.emit }, "");
     defer instance.deinit();
     var cancel: p.Cancellation = .{};
     const terminal = try instance.run("work", &cancel);
-    try std.testing.expectEqual(runtime.Status.paused, terminal.status);
-    try std.testing.expectEqual(error.SubagentInteractionRequired, terminal.detail.?);
-    // The tool round is not a reminder reset: exactly three context hints exist.
+    try std.testing.expectEqual(runtime.Status.success, terminal.status);
+    try std.testing.expect(terminal.detail == null);
+    try std.testing.expectEqual(@as(usize, 7), model.calls);
+    // One tool round, all five hints, then the finite model stop.
     var hint_contexts: usize = 0;
     for (instance.messages()) |message| {
         if (message.role == .context and std.mem.indexOf(u8, message.blocks[0].text, "Child job job-1") != null) hint_contexts += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), hint_contexts);
+    try std.testing.expectEqual(@as(usize, 5), hint_contexts);
     try std.testing.expectEqual(@as(usize, 1), life.ends);
+    try std.testing.expectEqual(@as(usize, 1), life.finished);
+    try std.testing.expect(!life.order_violation);
 }

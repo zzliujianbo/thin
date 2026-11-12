@@ -52,14 +52,10 @@ test "unlimited round counter saturates without imposing a hidden limit" {
     var task: Runtime.Task = .{ .rounds = std.math.maxInt(u16) };
     task.countRound();
     try std.testing.expectEqual(@as(u32, 65536), task.rounds);
-    try std.testing.expect(!task.roundLimitReached(null));
-    try std.testing.expect(task.roundLimitReached(4096));
     task.rounds = std.math.maxInt(u32) - 1;
     task.countRound();
     task.countRound();
     try std.testing.expectEqual(std.math.maxInt(u32), task.rounds);
-    try std.testing.expect(!task.roundLimitReached(null));
-    try std.testing.expect(task.roundLimitReached(50));
     var usage: UsageTotals = .{ .normal_calls = std.math.maxInt(u32), .summary_calls = std.math.maxInt(u32) };
     usage.add(.normal, zeroUsage());
     usage.add(.summary, zeroUsage());
@@ -91,8 +87,6 @@ test "runtime checkpoint restore ignores archived policy poison and estimator wi
     state.output_tokens = 0;
     state.output_budget_frozen = true;
     state.input_budget_frozen = true;
-    state.max_input_tokens = 0;
-    state.input_margin_tokens = std.math.maxInt(u32);
     state.poisoned = true;
     state.permission_id = 999;
     state.estimator.per_mille = 0;
@@ -100,7 +94,6 @@ test "runtime checkpoint restore ignores archived policy poison and estimator wi
     try std.testing.expect(!runtime.poisoned);
     try std.testing.expectEqual(@as(u64, 0), runtime.permission_id);
     try std.testing.expectEqual(@as(u64, 1000), runtime.estimator.per_mille);
-    try std.testing.expectEqual(@as(?u32, null), config.limits.max_input_tokens);
     try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
     try std.testing.expectEqualStrings("restored", runtime.system);
     const restored = try runtime.checkpoint();
@@ -235,7 +228,6 @@ test "compatible restored history sends under current budgets without any archiv
     var state = try runtime.checkpoint();
     state.context_tokens = 1;
     state.output_tokens = 0;
-    state.max_input_tokens = 0;
     state.messages = &.{
         .{ .role = .user, .blocks = &.{.{ .text = "previous goal" }} },
         .{ .role = .assistant, .blocks = &.{.{ .text = "old" }}, .replay = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .json = "{\"role\":\"assistant\",\"content\":\"old\"}" } },
@@ -246,7 +238,6 @@ test "compatible restored history sends under current budgets without any archiv
     try std.testing.expectEqual(Status.success, terminal.status);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(u32, 65536), config.model.context_tokens);
-    try std.testing.expectEqual(@as(?u32, null), config.limits.max_input_tokens);
 }
 test "restored incomplete tool history never executes old tools or calls a fake model" {
     const Stub = struct {
@@ -445,13 +436,13 @@ test "memory reference preserves latest primary usage while input safety estimat
         const estimate = runtime.estimatedTokens();
         var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer scratch.deinit();
-        runtime.appendMemoryReference(scratch.allocator(), "reference A");
+        try runtime.appendMemoryReference(scratch.allocator(), "reference A");
         try std.testing.expectEqualDeep(snapshot, runtime.contextSnapshot());
         try std.testing.expect(runtime.estimatedTokens() > estimate);
         const count = runtime.history.items.len;
-        runtime.appendMemoryReference(scratch.allocator(), "reference A");
+        try runtime.appendMemoryReference(scratch.allocator(), "reference A");
         try std.testing.expectEqual(count, runtime.history.items.len);
-        runtime.appendMemoryReference(scratch.allocator(), "reference B");
+        try runtime.appendMemoryReference(scratch.allocator(), "reference B");
         try std.testing.expectEqual(count + 1, runtime.history.items.len);
         try std.testing.expectEqualDeep(snapshot, runtime.contextSnapshot());
         try std.testing.expectEqual(@as(usize, 0), stub.calls);

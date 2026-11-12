@@ -21,7 +21,6 @@ const changes = {
   compaction:['limits','compaction_enabled',false],
   command:['limits','command_timeout_ms',120000],
   request:['limits','request_timeout_ms',60000],
-  task:['limits','task_timeout_ms',900000],
 };
 
 export async function settingsValuesRegressions({app, pty, execute, send}) {
@@ -121,15 +120,9 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
           output_tokens:8192,reasoning:{format:'standard',map:{off:'none',high:'high'}}}}),
         aux:provider('aux',AUX_KEY,{[AUX]:{protocol:'chat',context_tokens:4096}}),
       }},
-      limits:{command_timeout_ms:123456,command_max_timeout_ms:3600000,
-        read_bytes:65536,output_bytes:32768,low_price_input:false,input_margin_tokens:5000,
-        safety_tokens:100,max_tool_calls:128,task_timeout_ms:30000,request_timeout_ms:10000,
-        model_refresh_ttl_ms:14400000,model_refresh_cooldown_ms:300000,
-        cleanup_grace_ms:1000,cleanup_timeout_ms:5000,core_bytes:2048,index_bytes:8192,
-        shard_bytes:32768,compaction_enabled:true,compaction_trigger_percent:80,
-        compaction_target_percent:50,max_response_bytes:8388608,max_event_bytes:1048576},
-      decision:{enabled:true,model:`aux/${AUX}`,
-        max_input_tokens:8192,max_state_bytes:16384},
+      limits:{command_timeout_ms:123456,low_price_input:false,
+        request_timeout_ms:10000,compaction_enabled:true},
+      decision:{enabled:true,model:`aux/${AUX}`},
     };
     previousBytes = JSON.stringify(expected);
     await writeFile(configPath,previousBytes,{mode:0o600});

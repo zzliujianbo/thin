@@ -27,7 +27,7 @@ test "explicit decision protocol round trips with shared timeout" {
     const decision = tree.value.object.get("decision").?.object;
     try std.testing.expect(decision.get("backend") == null);
     try std.testing.expect(decision.get("request_timeout_ms") == null);
-    try std.testing.expectEqual(@as(usize, 4), decision.count());
+    try std.testing.expectEqual(@as(usize, 2), decision.count());
     var again = try parse(std.testing.allocator, out.written());
     defer release(&again);
     try std.testing.expectEqual(protocol.Protocol.systemone, again.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
@@ -43,13 +43,19 @@ test "decision rejects removed fields even when disabled without protocol migrat
         .{ "{\"model\":\"p/m\",\"model\":\"p/m\"}", error.DuplicateField },
         .{ "{\"model\":\"p/m\",\"backend\":\"model\",\"backend\":\"systemone\"}", error.DuplicateField },
         .{ "{\"model\":\"p/m\",\"request_timeout_ms\":1,\"request_timeout_ms\":2}", error.DuplicateField },
-        .{ "{\"model\":\"p/m\",\"max_state_bytes\":1.5}", error.InvalidNumber },
     };
     inline for (cases) |case| {
         const raw = try std.mem.concat(a, u8, &.{ decision_test_prefix, case[0], "}" });
         defer a.free(raw);
         try std.testing.expectError(case[1], parse(a, raw));
     }
+    var migrated = try parse(a, decision_test_prefix ++ "{\"model\":\"p/m\",\"max_state_bytes\":1.5,\"max_input_tokens\":\"old\"}}");
+    defer release(&migrated);
+    var latest: std.Io.Writer.Allocating = .init(a);
+    defer latest.deinit();
+    try writeDisk(migrated.value, &latest.writer);
+    try std.testing.expect(std.mem.find(u8, latest.written(), "max_state_bytes") == null);
+    try std.testing.expect(std.mem.find(u8, latest.written(), "max_input_tokens") == null);
     var parsed = try parse(a, decision_test_prefix ++ "{\"model\":\"p/m\"}}");
     defer release(&parsed);
     try std.testing.expectEqual(protocol.Protocol.chat, parsed.value.registry.?.find("p").?.patchFor("m").?.protocol.?);
@@ -57,21 +63,24 @@ test "decision rejects removed fields even when disabled without protocol migrat
 }
 test "SystemOne has no required generative window but retains field and budget safety" {
     var model: Model = .{ .name = "reviewer", .protocol = .systemone, .context_tokens = 0 };
-    try validateModel(model, .{});
+    try validateModel(model);
     model.reasoning_effort = "off";
-    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model, .{}));
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model));
     model.reasoning_effort = null;
     model.reasoning = .{ .map = .{ .high = "high" } };
-    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model, .{}));
+    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model));
     model.reasoning = null;
     model.output_tokens = 0;
-    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
+    try std.testing.expectError(error.InvalidBudget, validateModel(model));
     model.output_tokens = null;
-    model.context_tokens = 16 * 1024 * 1024 + 1;
-    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
+    model.context_tokens = std.math.maxInt(u32);
+    model.output_tokens = std.math.maxInt(u32);
+    model.input_price_threshold = std.math.maxInt(u32);
+    model.input_price_flat_limit = std.math.maxInt(u32);
+    try validateModel(model);
     model.context_tokens = 0;
     model.protocol = .chat;
-    try std.testing.expectError(error.InvalidBudget, validateModel(model, .{}));
+    try std.testing.expectError(error.InvalidBudget, validateModel(model));
 }
 test "runtime-only config clones retain derived maps but cannot write disk" {
     var active = testConfig();
@@ -311,8 +320,7 @@ test "minimal JSON uses defaults and owns strings" {
     try std.testing.expectEqualStrings("test-model", parsed.value.model.name);
     try std.testing.expectEqualStrings("TEST_KEY", parsed.value.provider.api_key_env);
     try std.testing.expectEqual(@as(u32, 300000), parsed.value.limits.command_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 65536), parsed.value.limits.read_bytes);
-    try std.testing.expectEqual(@as(u32, 32768), parsed.value.limits.output_bytes);
+    try std.testing.expectEqual(@as(u32, 300000), parsed.value.limits.request_timeout_ms);
     try std.testing.expectEqual(protocol.Protocol.auto, parsed.value.model.protocol);
 }
 test "explicit protocol reasoning and limits overrides own their strings" {
@@ -328,40 +336,31 @@ test "explicit protocol reasoning and limits overrides own their strings" {
     const patch = parsed.value.registry.?.find("p").?.patchFor("custom").?;
     try std.testing.expectEqual(protocol.Protocol.responses, patch.protocol.?);
     try std.testing.expectEqualStrings("high", patch.reasoning_effort.?);
-    try std.testing.expectEqual(@as(?u16, 10), parsed.value.limits.max_rounds);
+    try std.testing.expect(parsed.value.limits.low_price_input);
 }
-test "round limits missing null and legacy numbers survive config serialization" {
+test "retired round limits are accepted on ingress but never serialized" {
     const a = std.testing.allocator;
     const prefix = "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\"}}},\"limits\":";
-    const cases = [_]struct { json: []const u8, expected: ?u16 }{
-        .{ .json = "{}", .expected = null },
-        .{ .json = "{\"max_rounds\":null}", .expected = null },
-        .{ .json = "{\"max_rounds\":1}", .expected = 1 },
-        .{ .json = "{\"max_rounds\":50}", .expected = 50 },
-        .{ .json = "{\"max_rounds\":4096}", .expected = 4096 },
-    };
-    try std.testing.expectEqual(@as(?u16, null), testConfig().limits.max_rounds);
+    const cases = [_][]const u8{ "{}", "{\"max_rounds\":null}", "{\"max_rounds\":1}", "{\"max_rounds\":50}", "{\"max_rounds\":4096}" };
     for (cases) |case| {
-        const input = try std.mem.concat(a, u8, &.{ prefix, case.json, "}" });
+        const input = try std.mem.concat(a, u8, &.{ prefix, case, "}" });
         defer a.free(input);
         var parsed = try parse(a, input);
         defer release(&parsed);
-        try std.testing.expectEqual(case.expected, parsed.value.limits.max_rounds);
         var copied = try clone(a, parsed.value);
         defer release(&copied);
-        try std.testing.expectEqual(case.expected, copied.value.limits.max_rounds);
+        try std.testing.expectEqual(parsed.value.limits.command_timeout_ms, copied.value.limits.command_timeout_ms);
         var disk: std.Io.Writer.Allocating = .init(a);
         defer disk.deinit();
         try writeDisk(parsed.value, &disk.writer);
         var restored = try parse(a, disk.written());
         defer release(&restored);
-        try std.testing.expectEqual(case.expected, restored.value.limits.max_rounds);
+        try std.testing.expect(std.mem.indexOf(u8, disk.written(), "max_rounds") == null);
+        try std.testing.expectEqual(parsed.value.limits.command_timeout_ms, restored.value.limits.command_timeout_ms);
     }
-    for ([_][]const u8{ "{\"max_rounds\":0}", "{\"max_rounds\":4097}" }) |limits| {
-        const input = try std.mem.concat(a, u8, &.{ prefix, limits, "}" });
-        defer a.free(input);
-        try std.testing.expectError(error.InvalidLimit, parse(a, input));
-    }
+    const unknown = try std.mem.concat(a, u8, &.{ prefix, "{\"typo\":1}}" });
+    defer a.free(unknown);
+    try std.testing.expectError(error.UnknownField, parse(a, unknown));
 }
 test "strict JSON rejects missing unknown duplicate and TOML fields" {
     const a = std.testing.allocator;
@@ -391,13 +390,28 @@ test "reject invalid URL and header injection" {
     c.model.name = "";
     try std.testing.expectError(error.InvalidModel, validate(c));
 }
-test "budget ratios and bounded limits" {
+test "positive capabilities and operational limits" {
     var c = testConfig();
     // Input preflight retains physical context safety without an output policy.
     c.model.context_tokens = 6144;
     try validate(c);
-    c.model.context_tokens = c.limits.safety_tokens + 1;
-    try std.testing.expectError(error.InvalidBudget, validate(c));
+    c.model.context_tokens = Policy.safety_tokens + 1;
+    try validate(c);
+    c.model.context_tokens = 2;
+    try validate(c);
+    inline for (.{ 0, 1 }) |tokens| {
+        c.model.context_tokens = tokens;
+        try std.testing.expectError(error.InvalidBudget, validate(c));
+    }
+    c.model.context_tokens = std.math.maxInt(u32);
+    c.model.output_tokens = std.math.maxInt(u32);
+    c.model.input_price_threshold = std.math.maxInt(u32);
+    c.model.input_price_flat_limit = std.math.maxInt(u32);
+    try validate(c);
+    try std.testing.expectEqual(@as(u32, 0), Policy.safetyTokens(2));
+    try std.testing.expectEqual(@as(u32, 512), Policy.safetyTokens(4096));
+    try std.testing.expectEqual(@as(u32, 4096), Policy.safetyTokens(32768));
+    try std.testing.expectEqual(@as(u32, 4096), Policy.safetyTokens(std.math.maxInt(u32)));
 
     c = testConfig();
     // A declared model output capability remains positive, independently of context.
@@ -405,16 +419,8 @@ test "budget ratios and bounded limits" {
     try std.testing.expectError(error.InvalidBudget, validate(c));
     c = testConfig();
 
-    // 压缩目标不能不低于触发阈值。
-    c.limits.compaction_target_percent = 80;
-    try std.testing.expectError(error.InvalidCompactionRatio, validate(c));
-    c = testConfig();
-    c.limits.compaction_trigger_percent = 100;
-    try std.testing.expectError(error.InvalidCompactionRatio, validate(c));
-
     // Numeric zero is invalid; false intentionally disables automatic compaction.
     inline for (@typeInfo(Limits).@"struct".field_names) |field| {
-        if (comptime std.mem.eql(u8, field, "index_bytes")) continue;
         c = testConfig();
         if (@TypeOf(@field(c.limits, field)) == bool) {
             @field(c.limits, field) = false;
@@ -425,22 +431,12 @@ test "budget ratios and bounded limits" {
         }
     }
 
-    // 超过硬上限的大小字段必须报错。index_bytes is retained only for
-    // configuration compatibility and deliberately has no total budget.
-    inline for (.{ "core_bytes", "read_bytes", "shard_bytes", "max_response_bytes" }) |field| {
-        c = testConfig();
-        @field(c.limits, field) = std.math.maxInt(u32);
-        try std.testing.expectError(error.InvalidLimit, validate(c));
-    }
     c = testConfig();
-    c.limits.index_bytes = std.math.maxInt(u32);
+    c.limits.command_timeout_ms = 86400001;
+    c.limits.request_timeout_ms = 86400001;
     try validate(c);
-    c = testConfig();
-
-    c.limits.command_timeout_ms = c.limits.command_max_timeout_ms + 1;
-    try std.testing.expectError(error.InvalidLimit, validate(c));
 }
-test "load owns data after file removal and enforces 64 KiB" {
+test "load owns data after file removal and accepts files beyond 64 KiB" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -456,18 +452,15 @@ test "load owns data after file removal and enforces 64 KiB" {
     try std.testing.expectEqualStrings("https://example.invalid/v1", parsed.value.provider.base_url);
     try std.testing.expectEqualStrings("test-model", parsed.value.model.name);
 
-    // 超过 64 KiB 一个字节，应当被拒绝。
-    const oversized = try a.alloc(u8, max_config_bytes + 1);
+    // A valid file beyond the former limit remains loadable.
+    const oversized = try a.alloc(u8, 64 * 1024 + 1);
     defer a.free(oversized);
     @memset(oversized, ' ');
     @memcpy(oversized[0..fixture.len], fixture);
     try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = oversized });
-    try std.testing.expectError(error.ConfigTooLarge, load(a, io, path));
-
-    // 恰好 64 KiB 的文件应当可以正常加载（前面是合法 JSON，后面用空白补齐）。
-    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = oversized[0..max_config_bytes] });
-    const exact = try load(a, io, path);
-    defer exact.deinit();
+    const large = try load(a, io, path);
+    defer large.deinit();
+    try std.testing.expectEqualStrings("test-model", large.value.model.name);
 }
 test "fake environment returns independent key and credential-free errors" {
     const a = std.testing.allocator;

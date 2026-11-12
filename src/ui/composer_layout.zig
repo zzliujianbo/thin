@@ -135,7 +135,6 @@ pub const Movement = struct { cursor: usize, preferred_column: usize };
 /// Build the same sanitized/tab-expanded display as the composer, with stops
 /// only at original grapheme boundaries. Never move into a tab/emoji/UTF8 byte.
 pub fn moveVertical(a: std.mem.Allocator, raw: []const u8, cursor: usize, columns: usize, forward: bool, preferred: ?usize) !Movement {
-    if (raw.len > 65536) return error.InputTooLong;
     const Offset = struct { raw: usize, display: usize };
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(a);

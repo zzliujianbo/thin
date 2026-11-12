@@ -112,7 +112,7 @@ pub fn instruction(input: Input) []const u8 {
         // Generative summaries and native score-guided extraction deliberately
         // retain distinct capability/output contracts, not a fake common codec.
         .refine_outputs => base ++ "\n" ++
-            \\For refine_outputs: return {"items":[{"id":"exact input ID","text":"summary"}]} with one entry per input ID, preferably in input order. IDs are opaque: copy them exactly. Preserve operational facts, paths/line numbers, versions, counts, differences, errors, key stack traces, unresolved problems, execution state and truncation markers. Condense repeated progress/warnings, not distinct diagnostics. Text must be nonempty UTF-8, at most 8192 bytes and no longer than its original. Do not invent success, guess missing output or omit failure details.
+            \\For refine_outputs: return {"items":[{"id":"exact input ID","text":"summary"}]} with one entry per input ID, preferably in input order. IDs are opaque: copy them exactly. Preserve operational facts, paths/line numbers, versions, counts, differences, errors, key stack traces, unresolved problems, execution state and truncation markers. Condense repeated progress/warnings, not distinct diagnostics. Text must be nonempty UTF-8 and no longer than its original. Do not invent success, guess missing output or omit failure details.
         ,
     };
 }
@@ -128,7 +128,6 @@ pub fn validateInput(input: Input) !void {
             if (v.risk) |risk| if (!validText(risk)) return error.InvalidDecisionInput;
         },
         .refine_outputs => |items| {
-            if (items.len > 8) return error.InvalidDecisionInput;
             for (items, 0..) |item, i| {
                 if (!validText(item.id) or !validText(item.text)) return error.InvalidDecisionInput;
                 for (items[0..i]) |previous| if (std.mem.eql(u8, previous.id, item.id)) return error.InvalidDecisionInput;
@@ -175,7 +174,6 @@ fn boundedNesting(text: []const u8) bool {
             '"' => quoted = true,
             '{', '[' => {
                 depth += 1;
-                if (depth > 8) return false;
             },
             '}', ']' => {
                 if (depth == 0) return false;
@@ -189,7 +187,7 @@ fn boundedNesting(text: []const u8) bool {
 
 pub fn parseOutput(a: std.mem.Allocator, input: Input, text: []const u8) !Output {
     try validateInput(input);
-    if (text.len > 65536 or !std.unicode.utf8ValidateSlice(text) or !boundedNesting(text)) return error.InvalidDecisionOutput;
+    if (!std.unicode.utf8ValidateSlice(text) or !boundedNesting(text)) return error.InvalidDecisionOutput;
     const trimmed = std.mem.trim(u8, text, " \r\n\t");
     if (trimmed.len == 0 or trimmed[0] != '{') return error.InvalidDecisionOutput;
     var tree = try std.json.parseFromSlice(std.json.Value, a, text, .{ .duplicate_field_behavior = .@"error" });
@@ -211,7 +209,9 @@ pub fn parseOutput(a: std.mem.Allocator, input: Input, text: []const u8) !Output
                 }
                 a.free(items);
             }
-            var seen: [8]bool = @splat(false);
+            const seen = try a.alloc(bool, originals.len);
+            defer a.free(seen);
+            @memset(seen, false);
             for (value.array.items) |entry| {
                 const obj = try fields(entry, &.{ "id", "text" });
                 const id = try string(obj.get("id").?);
@@ -222,7 +222,7 @@ pub fn parseOutput(a: std.mem.Allocator, input: Input, text: []const u8) !Output
                     break;
                 };
                 const index = found orelse return error.InvalidDecisionOutput;
-                if (seen[index] or summary.len > 8192 or summary.len > originals[index].text.len) return error.InvalidDecisionOutput;
+                if (seen[index] or summary.len > originals[index].text.len) return error.InvalidDecisionOutput;
                 seen[index] = true;
                 const owned_id = try a.dupe(u8, id);
                 errdefer a.free(owned_id);

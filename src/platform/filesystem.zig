@@ -223,7 +223,7 @@ pub const Root = struct {
         return self.readBinaryGuarded(allocator, path, limit, null);
     }
 
-    pub fn readBinaryGuarded(self: *Root, allocator: std.mem.Allocator, path: []const u8, limit: usize, guard: ?ReadGuard) ![]u8 {
+    pub fn readBinaryGuarded(self: *Root, allocator: std.mem.Allocator, path: []const u8, limit: ?usize, guard: ?ReadGuard) ![]u8 {
         var parent_ = try self.parent(path);
         defer parent_.deinit();
         if (guard) |policy| try policy.check(parent_, null);
@@ -234,7 +234,7 @@ pub const Root = struct {
         const file = fileFromFd(fd);
         const before = try file.stat(self.io);
         if (before.kind != .file) return error.NotRegularFile;
-        if (before.size > limit) return error.FileTooLarge;
+        if (limit) |bound| if (before.size > bound) return error.FileTooLarge;
         const data = try allocator.alloc(u8, @intCast(before.size));
         errdefer allocator.free(data);
         if (try file.readPositionalAll(self.io, data, 0) != data.len) return error.FileChanged;
@@ -283,8 +283,9 @@ pub const Root = struct {
         // bytes. Alignment and validation use the same fd and byte buffer.
         const before: usize = @intCast(@min(offset, 3));
         const window_offset = offset - before;
-        const capacity = std.math.add(usize, limit, before + 3) catch return error.InvalidLimit;
-        const count: usize = @intCast(@min(stat.size - window_offset, @as(u64, capacity)));
+        const available = stat.size - window_offset;
+        const wanted = std.math.add(u64, @intCast(limit), before + 3) catch available;
+        const count = std.math.cast(usize, @min(available, wanted)) orelse return error.FileTooLarge;
         const buffer = try allocator.alloc(u8, count);
         defer allocator.free(buffer);
 

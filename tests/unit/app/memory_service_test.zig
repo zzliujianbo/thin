@@ -16,7 +16,7 @@ test "completed jobs retain full FIFO values beyond last snapshot" {
     defer fixture.deinit();
     var context: u8 = 0;
     fixture.owner.service_override = .{ .context = &context, .extract_fn = Fake.extract };
-    const reference = try fixture.owner.retrieve(a, "first saved fact", 8192);
+    const reference = try fixture.owner.retrieve(a, "first saved fact");
     a.free(reference);
     const one = try NotificationTestFixture.enqueue(fixture.owner, "first saved fact");
     const two = try NotificationTestFixture.enqueue(fixture.owner, "second saved fact");
@@ -298,7 +298,7 @@ test "coordinator diagnostics pair extraction and writes" {
     owner.service_override = .{ .context = &fake, .extract_fn = Fake.extract };
     const text = "I prefer concise explanations in all code reviews.";
     var cancel: p.Cancellation = .{};
-    const reference = try owner.retrieve(a, text, 8192);
+    const reference = try owner.retrieve(a, text);
     a.free(reference);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -316,7 +316,7 @@ test "coordinator diagnostics pair extraction and writes" {
     try std.testing.expectEqual(@as(?u32, 1), events.records[4].candidate_index);
     events.len = 0;
     fake.fail = true;
-    const again = try owner.retrieve(a, text, 8192);
+    const again = try owner.retrieve(a, text);
     a.free(again);
     const uncertain = owner.finalize(&capture, .chat, &cancel);
     try std.testing.expectEqual(State.uncertain, uncertain.state);
@@ -326,7 +326,7 @@ test "coordinator diagnostics pair extraction and writes" {
     events.len = 0;
     fake.fail = false;
     fake.cancel = true;
-    const last = try owner.retrieve(a, text, 8192);
+    const last = try owner.retrieve(a, text);
     a.free(last);
     const canceled = owner.finalize(&capture, .chat, &cancel);
     try std.testing.expectEqual(State.canceled, canceled.state);
@@ -343,7 +343,7 @@ test "coordinator diagnostics pair extraction and writes" {
     try std.testing.expectEqual(State.failed, blocked.state);
     try std.testing.expect(blocked.err.? == error.CleanupFailed);
     try std.testing.expect(owner.isPoisoned());
-    try std.testing.expectError(error.CleanupFailed, owner.retrieve(a, text, 8192));
+    try std.testing.expectError(error.CleanupFailed, owner.retrieve(a, text));
 }
 test "Codex memory secret registration and incomplete source fail closed" {
     const a = std.testing.allocator;

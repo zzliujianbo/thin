@@ -26,10 +26,7 @@ pub const Picker = struct {
     pub fn init(key: Key, current: ?u32, limits: cfg.Limits) Picker {
         var result: Picker = .{ .key = key, .current = current, .limits = limits };
         if (key == .compaction_enabled or key == .memory_auto) return result; // Boolean stays in the parent.
-        const presets: []const u32 = switch (key) {
-            .task_timeout_ms => &.{ 300000, 900000, 1800000, 3600000, 86400000 },
-            else => &.{ 30000, 60000, 300000, 900000, 3600000 },
-        };
+        const presets: []const u32 = &.{ 30000, 60000, 300000, 900000, 3600000 };
         for (presets) |n| {
             result.validate(n) catch continue;
             result.add(n);
@@ -122,12 +119,6 @@ pub const Picker = struct {
         if (self.key == .compaction_enabled or self.key == .memory_auto) return error.InvalidKey;
         const value = n orelse return error.InvalidValue;
         if (value == 0) return error.InvalidValue;
-        const maximum: u32 = switch (self.key) {
-            .command_timeout_ms => self.limits.command_max_timeout_ms,
-            .request_timeout_ms, .task_timeout_ms => 86400000,
-            .compaction_enabled, .memory_auto => unreachable,
-        };
-        if (value > maximum) return error.InvalidValue;
     }
 };
 

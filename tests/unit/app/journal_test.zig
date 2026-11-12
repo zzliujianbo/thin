@@ -1,3 +1,7 @@
+// Fixture read windows, not product limits.
+const record_limit: usize = 32 * 1024 * 1024;
+const text_limit: usize = 1024 * 1024;
+
 test "selection snapshots are lazy ordered and save the last switch without another submission" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -62,7 +66,7 @@ test "journal retains multiple keys and redacts overlapping and encoded credenti
     try journal.rememberKey("fake-key-longer");
     try journal.rememberKey("other-key");
     try journal.rememberKey("other-key");
-    try std.testing.expectEqual(@as(usize, 2), journal.known_key_count);
+    try std.testing.expectEqual(@as(usize, 2), journal.known_keys.items.len);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temp = arena.allocator();
@@ -70,12 +74,12 @@ test "journal retains multiple keys and redacts overlapping and encoded credenti
     const encoded = try journal.jsonText(temp, "{\"key\":\"other\\u002dkey\"}");
     try std.testing.expectEqualStrings("{\"key\":\"[redacted]\"}", encoded.text);
     try std.testing.expectError(error.InvalidApiKey, journal.rememberKey("bad\nkey"));
-    for (2..journal.known_keys.len) |index| {
+    for (2..24) |index| {
         var buffer: [40]u8 = undefined;
         try journal.rememberKey(try std.fmt.bufPrint(&buffer, "fake-rotation-{d}", .{index}));
     }
-    try std.testing.expectError(error.TooManySessionCredentials, journal.rememberKey("fake-excess"));
-    try journal.rememberKey("other-key"); // Dedup remains allowed at the bound.
+    try journal.rememberKey("fake-excess");
+    try journal.rememberKey("other-key"); // Dedup remains allowed.
     try std.testing.expectEqualStrings("[redacted]", try journal.safe(temp, "other-key"));
 }
 test "journal recursively redacts encoded JSON content without reformatting untouched text" {
@@ -110,6 +114,9 @@ test "journal recursively redacts encoded JSON content without reformatting unto
     const keyed_output = try journal.jsonValue(a, keyed_input);
     const decoded_key = try std.json.parseFromSlice(std.json.Value, a, keyed_output.value.object.keys()[0], .{});
     try std.testing.expectEqualStrings("[redacted]", decoded_key.value.object.get("secret").?.string);
+    const collision = try std.fmt.allocPrint(a, "{{{s}:1,\"[redacted]\":2}}", .{try std.json.Stringify.valueAlloc(a, key, .{})});
+    try std.testing.expectError(error.RedactedKeyCollision, journal.jsonValue(a, collision));
+    try std.testing.expectError(error.DuplicateField, journal.jsonValue(a, "{\"x\":1,\"x\":2}"));
 }
 test "journal omits duplicated permission body and redacts JSON encoded call identifiers" {
     var tmp = std.testing.tmpDir(.{});
@@ -159,7 +166,7 @@ test "journal omits duplicated permission body and redacts JSON encoded call ide
     try std.testing.expect(permission_seen);
     try std.testing.expectEqual(@as(usize, 2), ids);
 }
-test "journal small records use stack scratch and large retry preserves envelope" {
+test "journal growable records preserve envelope and propagate OOM" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -173,15 +180,14 @@ test "journal small records use stack scratch and large retry preserves envelope
     journal.began_ms = std.Io.Clock.awake.now(root.io).toMilliseconds();
     try journal.record(arena.allocator(), "state", .{ .state = r.State.calling_model });
     try journal.record(arena.allocator(), "usage", p.Usage{ .input_tokens = 123 });
-    try std.testing.expectEqual(@as(usize, 0), counted.allocations);
-    try std.testing.expectEqual(@as(usize, 0), counted.allocated_bytes);
+    try std.testing.expect(counted.allocations > 0);
 
     const payload: [8192]u8 = @splat('x');
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, journal.record(failing.allocator(), "large", .{ .text = &payload }));
     try std.testing.expectEqual(@as(u64, 2), journal.seq);
     try journal.record(arena.allocator(), "large", .{ .text = &payload });
-    try std.testing.expect(counted.allocated_bytes >= record_limit - 64);
+    try std.testing.expect(counted.allocated_bytes >= payload.len);
     journal.flush();
     try std.testing.expectEqual(null, journal.failure());
     const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
@@ -428,16 +434,15 @@ test "journal is lazy and storage failure is sticky" {
     journal.flush();
     try std.testing.expect(journal.worker == null);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
-    journal.store.limits.record_bytes = 0;
+    try root.dir.writeFile(std.testing.io, .{ .sub_path = ".thin", .data = "not a directory" });
     journal.observer().notify(.{ .submitted = "failure" });
     journal.flush();
     try std.testing.expect(journal.worker == null);
-    try std.testing.expectEqual(error.InvalidLimits, journal.failure().?);
-    journal.store.limits.record_bytes = record_limit;
+    const failure = journal.failure().?;
     journal.observer().notify(.{ .submitted = "still failed" });
-    try std.testing.expectEqual(error.InvalidLimits, journal.failure().?);
+    try std.testing.expectEqual(failure, journal.failure().?);
     try std.testing.expect(journal.seq <= 2);
-    try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
+    try std.testing.expectEqual(std.Io.File.Kind.file, (try root.dir.statFile(root.io, ".thin", .{})).kind);
 }
 test "journal text and encoded record size boundaries persist through store" {
     var tmp = std.testing.tmpDir(.{});
@@ -472,18 +477,10 @@ test "journal text and encoded record size boundaries persist through store" {
         if (!std.mem.eql(u8, obj.get("event").?.string, "user")) continue;
         users += 1;
         const data = obj.get("data").?.object;
-        if (users == 3) {
-            try std.testing.expect(data.get("omitted").?.bool);
-            try std.testing.expectEqualStrings(omitted, data.get("text").?.string);
-        } else {
-            const expected = if (users == 1) payload[0..medium_len] else payload[0..text_limit];
-            try std.testing.expect(!data.get("omitted").?.bool);
-            try std.testing.expectEqualSlices(u8, expected, data.get("text").?.string);
-            if (users == 2) {
-                try std.testing.expect(line.len > 2 * 1024 * 1024);
-                try std.testing.expect(line.len < record_limit);
-            }
-        }
+        const expected = if (users == 1) payload[0..medium_len] else if (users == 2) payload[0..text_limit] else payload;
+        try std.testing.expect(!data.get("omitted").?.bool);
+        try std.testing.expectEqualSlices(u8, expected, data.get("text").?.string);
+        if (users == 2) try std.testing.expect(line.len > 2 * 1024 * 1024);
     }
     try std.testing.expectEqual(@as(usize, 3), users);
 }
@@ -509,13 +506,23 @@ test "journal bounded UTF8 payload and oversized encoded record continue" {
     try std.testing.expectEqual(null, journal.failure());
     const content = try root.read(std.testing.allocator, journal.store.path(), 0, record_limit);
     defer std.testing.allocator.free(content.data);
-    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"omitted\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content.data, "record_limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content.data, "record_limit") == null);
     try std.testing.expect(std.mem.indexOf(u8, content.data, "\"event\":\"finished\"") != null);
     var lines = std.mem.splitScalar(u8, content.data, '\n');
+    var large_record_seen = false;
     while (lines.next()) |line| {
-        if (line.len > 0) try std.testing.expect(try std.json.validate(std.testing.allocator, line));
+        if (line.len == 0) continue;
+        try std.testing.expect(try std.json.validate(std.testing.allocator, line));
+        if (line.len > 5 * 1024 * 1024) {
+            const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+            defer doc.deinit();
+            const data = doc.value.object.get("data").?.object;
+            try std.testing.expectEqualSlices(u8, control, data.get("call_id").?.string);
+            try std.testing.expectEqualSlices(u8, control, data.get("name").?.string);
+            large_record_seen = true;
+        }
     }
+    try std.testing.expect(large_record_seen);
 }
 test "journal nested omissions and real filesystem failure are explicit" {
     var tmp = std.testing.tmpDir(.{});
@@ -532,9 +539,10 @@ test "journal nested omissions and real filesystem failure are explicit" {
     nested[70] = '0';
     @memset(nested[71..], ']');
     const json = try journal.jsonValue(arena.allocator(), &nested);
-    try std.testing.expect(json.dropped);
+    try std.testing.expect(!json.dropped);
     const text = try journal.jsonText(arena.allocator(), &nested);
-    try std.testing.expect(text.omitted and text.truncated);
+    try std.testing.expect(!text.omitted and !text.truncated);
+    try std.testing.expectEqualStrings(&nested, text.text);
     const quoted = try journal.jsonText(arena.allocator(), "\"fake-key\"");
     try std.testing.expectEqualStrings("\"[redacted]\"", quoted.text);
     var numeric = try Journal.init(std.testing.allocator, &root, "1234567890");
@@ -567,16 +575,14 @@ test "memory diagnostic retains originating turn and drops on producer contentio
     observer_.notify(.{ .submitted = "second" });
     sink.emit(.{ .stage = .memory_finalize });
     journal.lock();
-    const item = journal.queue[(journal.head + journal.count - 1) % Journal.physical_limit].diagnostic;
+    const item = journal.queue.items[journal.queue.items.len - 1].diagnostic;
     journal.unlock();
     try std.testing.expectEqual(@as(u64, 1), item.turn);
     try std.testing.expectEqual(@as(u64, 42), item.record.memory_job_id.?);
     try std.testing.expectEqual(sink.origin.?.began_ms, item.record.origin.?.began_ms);
     try std.testing.expect(item.elapsed_ms >= 0);
-    std.debug.assert(std.c.pthread_mutex_lock(&journal.producer_mutex) == .SUCCESS);
     sink.emit(.{ .stage = .memory_finalize });
-    std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
-    try std.testing.expectEqual(@as(u64, 1), journal.diagnostic_dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), journal.diagnostic_dropped.load(.monotonic));
     journal.diagnostic_span.store(std.math.maxInt(u64) - 1, .monotonic);
     try std.testing.expectEqual(std.math.maxInt(u64), sink.next());
     try std.testing.expectEqual(@as(u64, 0), sink.next());
@@ -595,17 +601,15 @@ test "diagnostic admission is isolated and unstarted sink is inert" {
     try std.testing.expect(journal.worker == null and !journal.started);
     journal.test_stall.store(true, .release);
     journal.observer().notify(.{ .submitted = "test" });
-    journal.lock();
     sink.emit(.{ .stage = .checkpoint });
-    journal.unlock();
-    try std.testing.expectEqual(@as(u64, 1), journal.diagnostic_dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), journal.diagnostic_dropped.load(.monotonic));
     try std.testing.expectEqual(null, journal.failure());
     const before = journal.seq;
     journal.observer().notify(.{ .event = .{ .state = .calling_model } });
     try std.testing.expectEqual(before + 1, journal.seq);
     try std.testing.expectEqual(null, journal.failure());
-    for (0..Journal.diagnostic_limit + 1) |_| sink.emit(.{ .stage = .checkpoint });
-    try std.testing.expectEqual(@as(u64, 2), journal.diagnostic_dropped.load(.monotonic));
+    for (0..129) |_| sink.emit(.{ .stage = .checkpoint });
+    try std.testing.expectEqual(@as(u64, 0), journal.diagnostic_dropped.load(.monotonic));
     journal.observer().notify(.{ .event = .{ .state = .calling_model } });
     try std.testing.expectEqual(null, journal.failure());
     journal.test_stall.store(false, .release);
@@ -706,7 +710,7 @@ test "journal flush resumes and finish drains joins and rejects subsequent recor
     defer std.testing.allocator.free(content.data);
     try std.testing.expect(std.mem.indexOf(u8, content.data, "\"event\":\"finished\"") != null);
 }
-test "journal stalled writer notify is independent queue full is sticky and finish cancels joins" {
+test "journal stalled writer grows queue and finish cancels joins" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -717,23 +721,23 @@ test "journal stalled writer notify is independent queue full is sticky and fini
     journal.test_stall.store(true, .release);
     const observer = journal.observer();
     observer.notify(.{ .submitted = "queued without disk" });
-    for (0..Journal.queue_limit) |_| observer.notify(.{ .event = .{ .state = .calling_model } });
+    for (0..256) |_| observer.notify(.{ .event = .{ .state = .calling_model } });
     // All callbacks returned even though the writer cannot perform any I/O.
     // Observer is void: log failures/cancellation cannot replace this terminal.
     const terminal: r.Event = .{ .finished = .{ .status = .success } };
     observer.notify(.{ .event = terminal });
     try std.testing.expectEqual(.success, terminal.finished.status);
-    try std.testing.expectEqual(error.LogQueueFull, journal.failure().?);
-    try std.testing.expectEqual(@as(u64, Journal.queue_limit), journal.seq);
+    try std.testing.expectEqual(null, journal.failure());
+    try std.testing.expect(journal.seq > 256);
     journal.lock();
     const count = journal.outstanding;
     const bytes = journal.bytes;
     journal.unlock();
-    try std.testing.expectEqual(Journal.queue_limit, count);
-    try std.testing.expect(bytes <= Journal.byte_limit);
+    try std.testing.expect(count > 128);
+    try std.testing.expect(bytes > 0);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
     journal.finish();
-    try std.testing.expectEqual(error.LogQueueFull, journal.failure().?);
+    try std.testing.expectEqual(error.LogFlushTimeout, journal.failure().?);
     try std.testing.expect(journal.done and journal.worker == null);
     try std.testing.expectEqual(@as(usize, 0), journal.outstanding);
     try std.testing.expectEqual(@as(usize, 0), journal.bytes);
@@ -760,7 +764,7 @@ test "journal flush and finish timeouts cancel stalled writer without leaking" {
         try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
     }
 }
-test "journal queue full drains complete prefix when writer progresses" {
+test "journal expanded queue drains complete ordered records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
@@ -775,14 +779,14 @@ test "journal queue full drains complete prefix when writer progresses" {
     journal.test_stall.store(true, .release);
     // Allow one extra accepted record if the writer had already passed its
     // stall check; the next iteration observes the atomic stall.
-    for (0..Journal.queue_limit + 2) |_| {
+    for (0..256) |_| {
         journal.observer().notify(.{ .event = .{ .state = .calling_model } });
     }
-    try std.testing.expectEqual(error.LogQueueFull, journal.failure().?);
+    try std.testing.expectEqual(null, journal.failure());
     const accepted = journal.seq;
     journal.test_stall.store(false, .release);
     journal.finish();
-    try std.testing.expectEqual(error.LogQueueFull, journal.failure().?);
+    try std.testing.expectEqual(null, journal.failure());
     try std.testing.expect(journal.worker == null and journal.done);
     const content = try root.read(std.testing.allocator, path, 0, record_limit);
     defer std.testing.allocator.free(content.data);
@@ -797,23 +801,23 @@ test "journal queue full drains complete prefix when writer progresses" {
     }
     try std.testing.expectEqual(accepted, seq);
 }
-test "journal queue budgets include popped inflight bytes and entries" {
+test "journal queue retains large popped inflight bytes and entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
     defer journal.deinit();
-    // No writer: deterministically hold the full byte budget in flight.
-    const data = try std.testing.allocator.alloc(u8, Journal.byte_limit);
+    // No writer: retain more than the old byte budget in flight.
+    const data = try std.testing.allocator.alloc(u8, 8 * 1024 * 1024 + 1);
     @memset(data, 0);
     try journal.enqueue(data);
     const inflight = journal.pop().?;
     const extra = try std.testing.allocator.dupe(u8, "{}");
-    defer std.testing.allocator.free(extra);
-    try std.testing.expectError(error.LogQueueFull, journal.enqueue(extra));
-    try std.testing.expectEqual(@as(usize, 1), journal.outstanding);
+    try journal.enqueue(extra);
+    try std.testing.expectEqual(@as(usize, 2), journal.outstanding);
     journal.release(inflight);
+    journal.release(journal.pop().?);
     try std.testing.expectEqual(@as(usize, 0), journal.bytes);
 }
 test "Memory closeout journal concurrent producers preserve origin sequences and drop accounting" {
@@ -835,13 +839,8 @@ test "Memory closeout journal concurrent producers preserve origin sequences and
     other.memory_job_id = 43;
     const origin = old.origin.?;
     var producers: CloseoutProducers = .{ .journal = &journal, .sink = old };
-    std.debug.assert(std.c.pthread_mutex_lock(&journal.producer_mutex) == .SUCCESS);
-    const thread = std.Thread.spawn(.{}, CloseoutProducers.run, .{&producers}) catch |err| {
-        std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
-        return err;
-    };
+    const thread = try std.Thread.spawn(.{}, CloseoutProducers.run, .{&producers});
     const drop_seen = CloseoutProducers.wait(&producers.dropped, root.io);
-    std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
     // Both producers remain alive until both have finished their work.
     producers.go.store(true, .release);
     observer_.notify(.{ .submitted = "t2" });
@@ -864,7 +863,7 @@ test "Memory closeout journal concurrent producers preserve origin sequences and
     try std.testing.expect(drop_seen and overlap_seen and aux_seen and producers.aux_ok);
     try std.testing.expectEqual(null, journal.failure());
     const forced_and_contention_drops = journal.diagnostic_dropped.load(.acquire);
-    try std.testing.expect(forced_and_contention_drops >= 1);
+    try std.testing.expectEqual(@as(u64, 0), forced_and_contention_drops);
 
     // With the worker stalled and both producers joined, this marker must be
     // accepted after turn 3 and provides a bounded check of origin timing.
@@ -949,7 +948,87 @@ test "Memory closeout journal concurrent producers preserve origin sequences and
         }
     }
     try std.testing.expect(saw_new_turn and saw_marker and saw_final);
-    try std.testing.expectEqual(@as(u64, 2 * 2 * CloseoutProducers.n + 2), diagnostic_count + final_dropped);
+    try std.testing.expectEqual(@as(u64, 2 * 2 * CloseoutProducers.n + 1), diagnostic_count + final_dropped);
+}
+test "deep JSON redaction is iterative and preserves full structure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(a, &root, "deep-secret");
+    defer journal.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const depth = 2048;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(a);
+    try source.appendNTimes(a, '[', depth);
+    try source.appendSlice(a, "\"deep-secret\"");
+    try source.appendNTimes(a, ']', depth);
+    const result = try journal.jsonText(aa, source.items);
+    try std.testing.expect(!result.omitted and !result.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "deep-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "[redacted]") != null);
+    try std.testing.expectEqual(depth * 2 + "\"[redacted]\"".len, result.text.len);
+    try std.testing.expect(try std.json.validate(a, result.text));
+    const args = try journal.jsonValue(aa, source.items);
+    const encoded = try Journal.encodeJson(aa, args.value);
+    try std.testing.expectEqualStrings(result.text, encoded);
+    const observer = journal.observer();
+    observer.notify(.{ .submitted = "deep fixture" });
+    observer.notify(.{ .event = .{ .assistant_committed = &.{.{ .tool_call = .{ .id = "id", .name = "fixture", .arguments = source.items } }} } });
+    journal.flush();
+    try std.testing.expectEqual(null, journal.failure());
+    const file = try root.read(a, journal.store.path(), 0, record_limit);
+    defer a.free(file.data);
+    try std.testing.expect(std.mem.indexOf(u8, file.data, "deep-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, file.data, "[redacted]") != null);
+    var lines = std.mem.splitScalar(u8, file.data, '\n');
+    while (lines.next()) |line| if (line.len != 0) try std.testing.expect(try std.json.validate(a, line));
+}
+test "contended diagnostic admission fails explicitly within deadline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
+    defer journal.deinit();
+    journal.observer().notify(.{ .submitted = "fixture" });
+    journal.flush();
+    journal.test_flush_timeout_ms = 20;
+    std.debug.assert(std.c.pthread_mutex_lock(&journal.producer_mutex) == .SUCCESS);
+    const start = std.Io.Clock.awake.now(root.io);
+    journal.diagnosticSink().emit(.{ .stage = .checkpoint });
+    const elapsed = start.untilNow(root.io, .awake).toMilliseconds();
+    std.debug.assert(std.c.pthread_mutex_unlock(&journal.producer_mutex) == .SUCCESS);
+    try std.testing.expect(elapsed >= 20 and elapsed < 1000);
+    try std.testing.expectEqual(error.LogProducerTimeout, journal.failure().?);
+    try std.testing.expectEqual(@as(u64, 0), journal.diagnostic_dropped.load(.monotonic));
+}
+test "diagnostic allocation failure is reported rather than dropped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var journal = try Journal.init(failing.allocator(), &root, "fake-key");
+    defer journal.deinit();
+    journal.test_stall.store(true, .release);
+    journal.test_flush_timeout_ms = 20;
+    journal.observer().notify(.{ .submitted = "fixture" });
+    try std.testing.expectEqual(null, journal.failure());
+    failing.fail_index = failing.alloc_index;
+    const sink = journal.diagnosticSink();
+    for (0..256) |_| {
+        if (journal.failure() != null) break;
+        sink.emit(.{ .stage = .checkpoint });
+    }
+    try std.testing.expectEqual(error.OutOfMemory, journal.failure().?);
+    try std.testing.expectEqual(@as(u64, 0), journal.diagnostic_dropped.load(.monotonic));
+    journal.test_stall.store(false, .release);
+    journal.finish();
 }
 test "journal allocation failure never escapes observer" {
     var tmp = std.testing.tmpDir(.{});

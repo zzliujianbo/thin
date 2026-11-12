@@ -5,8 +5,6 @@ const providers = @import("../core/providers.zig");
 const thinking = @import("../core/thinking.zig");
 const Protocol = @import("../core/protocol.zig").Protocol;
 
-pub const max_models = 1536;
-pub const max_name_bytes = 128 * 1024;
 const level_names = [_][]const u8{ "off", "minimal", "low", "medium", "high", "xhigh", "max" };
 
 pub const OffWire = enum { absent, off, none, disabled };
@@ -54,8 +52,9 @@ pub const Profile = struct {
 
 pub const Record = struct {
     provider: providers.Id,
-    offset: u32,
-    len: u16,
+    offset: usize,
+    len: usize,
+    next_hash: ?usize = null,
     tokens: ?u32 = null,
     output_tokens: ?u32 = null,
     dev_output_tokens: ?u32 = null,
@@ -77,36 +76,75 @@ pub const Record = struct {
 };
 
 pub fn validateId(id: []const u8) !void {
-    if (id.len == 0 or id.len > 256 or std.mem.trim(u8, id, " \t\r\n").len == 0) return error.InvalidMetadata;
+    if (id.len == 0 or std.mem.trim(u8, id, " \t\r\n").len == 0) return error.InvalidMetadata;
     for (id) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidMetadata;
 }
 
 pub const Directory = struct {
     count: usize = 0,
     used: usize = 0,
-    rows: [max_models]Record = undefined,
-    names: [max_name_bytes]u8 = undefined,
+    rows: []Record = &.{},
+    names: []u8 = &.{},
+    index: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
-    pub fn upsert(self: *Directory, provider: providers.Id, id: []const u8) !*Record {
+    fn growth(current: usize, needed: usize) usize {
+        const extra = current / 2 + 1;
+        const expanded = std.math.add(usize, current, extra) catch needed;
+        return @max(needed, expanded);
+    }
+
+    fn keyHash(provider: providers.Id, id: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(provider.slug());
+        h.update("/");
+        h.update(id);
+        return h.final();
+    }
+
+    pub fn deinit(self: *Directory, a: std.mem.Allocator) void {
+        a.free(self.rows);
+        a.free(self.names);
+        self.index.deinit(a);
+        self.* = .{};
+    }
+
+    pub fn clone(self: *const Directory, a: std.mem.Allocator) !Directory {
+        const rows = try a.dupe(Record, self.rows[0..self.count]);
+        errdefer a.free(rows);
+        const names = try a.dupe(u8, self.names[0..self.used]);
+        errdefer a.free(names);
+        return .{ .rows = rows, .names = names, .index = try self.index.clone(a), .count = self.count, .used = self.used };
+    }
+
+    pub fn upsert(self: *Directory, a: std.mem.Allocator, provider: providers.Id, id: []const u8) !*Record {
         try validateId(id);
         if (self.find(provider, id)) |index| return &self.rows[index];
         const slug = provider.slug();
-        const len = slug.len + 1 + id.len;
-        if (self.count >= max_models or len > max_name_bytes - self.used) return error.MetadataTooLarge;
+        const len = try std.math.add(usize, try std.math.add(usize, slug.len, 1), id.len);
+        const new_used = try std.math.add(usize, self.used, len);
+        const new_count = try std.math.add(usize, self.count, 1);
+        const hash = keyHash(provider, id);
+        try self.index.ensureUnusedCapacity(a, 1);
+        if (new_used > self.names.len) self.names = try a.realloc(self.names, growth(self.names.len, new_used));
+        if (new_count > self.rows.len) self.rows = try a.realloc(self.rows, growth(self.rows.len, new_count));
         const offset = self.used;
         @memcpy(self.names[offset..][0..slug.len], slug);
         self.names[offset + slug.len] = '/';
         @memcpy(self.names[offset + slug.len + 1 ..][0..id.len], id);
-        self.rows[self.count] = .{ .provider = provider, .offset = @intCast(offset), .len = @intCast(len) };
-        self.used += len;
-        self.count += 1;
+        self.rows[self.count] = .{ .provider = provider, .offset = offset, .len = len, .next_hash = self.index.get(hash) };
+        self.index.putAssumeCapacity(hash, self.count);
+        self.used = new_used;
+        self.count = new_count;
         return &self.rows[self.count - 1];
     }
 
     /// Exact raw ID lookup. A slash inside a raw ID is not a selector separator.
     pub fn find(self: *const Directory, provider: providers.Id, id: []const u8) ?usize {
-        for (self.rows[0..self.count], 0..) |row, index| {
+        var next = self.index.get(keyHash(provider, id));
+        while (next) |index| {
+            const row = self.rows[index];
             if (row.provider == provider and std.mem.eql(u8, self.name(index), id)) return index;
+            next = row.next_hash;
         }
         return null;
     }
@@ -120,13 +158,15 @@ pub const Directory = struct {
         return self.selector(index)[self.rows[index].provider.slug().len + 1 ..];
     }
 
-    pub fn copyRecord(self: *Directory, other: *const Directory, index: usize) !void {
+    pub fn copyRecord(self: *Directory, a: std.mem.Allocator, other: *const Directory, index: usize) !void {
         const source = other.rows[index];
-        const dest = try self.upsert(source.provider, other.name(index));
+        const dest = try self.upsert(a, source.provider, other.name(index));
         const offset = dest.offset;
         const len = dest.len;
+        const next_hash = dest.next_hash;
         dest.* = source;
         dest.offset = offset;
         dest.len = len;
+        dest.next_hash = next_hash;
     }
 };

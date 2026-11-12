@@ -576,7 +576,7 @@ def run(app, columns, observe_saved=False):
                 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                 'api_key': KEY,
                 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}},
-            'limits': {'low_price_input': False, 'request_timeout_ms': 40000, 'task_timeout_ms': 120000},
+            'limits': {'low_price_input': False, 'request_timeout_ms': 40000},
         }
         config_path = home / '.thin/config.json'
         config_bytes = json.dumps(config).encode()
@@ -829,13 +829,13 @@ def run(app, columns, observe_saved=False):
             complete_checkpoint = False
             for checkpoint in checkpoints:
                 raw = checkpoint.read_bytes()
-                assert 17 <= len(raw) <= 17 + 4096 + 16 * 1024 * 1024, 'checkpoint byte bound'
-                assert raw[:8] == b'THINRSM\x00' and raw[8] == 2, 'checkpoint framing/version'
-                selection_len, payload_len = struct.unpack_from('<II', raw, 9)
-                assert 0 < selection_len <= 4096 and 0 < payload_len <= 16 * 1024 * 1024
-                assert len(raw) == 17 + selection_len + payload_len, 'incomplete checkpoint'
-                selection = json.loads(raw[17:17 + selection_len])
-                payload = json.loads(raw[17 + selection_len:])
+                assert len(raw) >= 21, 'incomplete checkpoint header'
+                assert raw[:8] == b'THINRSM\x00' and raw[8] == 3, 'checkpoint framing/version'
+                selection_len, payload_len = struct.unpack_from('<IQ', raw, 9)
+                assert selection_len > 0 and payload_len > 0, 'empty checkpoint section'
+                assert len(raw) == 21 + selection_len + payload_len, 'incomplete checkpoint'
+                selection = json.loads(raw[21:21 + selection_len])
+                payload = json.loads(raw[21 + selection_len:])
                 assert_no_ui_memory_notice(selection, 'checkpoint selection')
                 assert_no_ui_memory_notice(payload, 'checkpoint')
                 messages = payload['messages']
@@ -877,11 +877,16 @@ def run_controller(app, name):
         # Never forward captured output: assertion messages may contain terminal
         # rows, model text or credentials. Only fixed case/status metadata leaves.
         try:
-            controller.communicate(timeout=180)
+            _, captured_stderr = controller.communicate(timeout=180)
         except subprocess.TimeoutExpired:
             print(f'FAIL memory-background controller case={name} timeout=180', file=sys.stderr)
             raise
         if controller.returncode != 0:
+            # Forward only our exact source-location diagnostic, never child
+            # stderr, exception text, terminal output or protocol payloads.
+            for line in captured_stderr.splitlines():
+                if re.fullmatch(rb'FAIL test-memory-background location=[A-Za-z0-9_-]+\.py:[1-9][0-9]*', line):
+                    print(line.decode('ascii'), file=sys.stderr)
             print(f'FAIL memory-background controller case={name} code={controller.returncode}',
                   file=sys.stderr)
             raise AssertionError('owned case controller failed')
@@ -932,7 +937,17 @@ if __name__ == '__main__':
     try:
         main()
     except (Exception, KeyboardInterrupt) as error:
-        # No traceback/exception message: existing assertions can include
-        # captured terminal/model/request bytes. A failure still exits nonzero.
+        # Only the last traceback frame in this allowlisted product directory
+        # is safe to print. Never print exception messages or source/PTY bytes.
+        location = None
+        frame = error.__traceback__
+        product_dir = Path(__file__).resolve().parent
+        while frame is not None:
+            source = Path(frame.tb_frame.f_code.co_filename).resolve()
+            if source.parent == product_dir and re.fullmatch(r'[A-Za-z0-9_-]+\.py', source.name):
+                location = f'{source.name}:{frame.tb_lineno}'
+            frame = frame.tb_next
+        if location is not None:
+            print(f'FAIL test-memory-background location={location}', file=sys.stderr)
         print(f'FAIL test-memory-background: {type(error).__name__}', file=sys.stderr)
         sys.exit(1)

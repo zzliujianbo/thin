@@ -647,10 +647,8 @@ def write_config(home, url):
             'api_key': KEY,
             'models': {MODEL: {'protocol': 'chat', 'context_tokens': 32768}},
         }}},
-        'limits': {'low_price_input': False, 'safety_tokens': 100,
-                   'request_timeout_ms': 10000, 'task_timeout_ms': 30000,
-                   'command_timeout_ms': 8000, 'cleanup_grace_ms': 200,
-                   'cleanup_timeout_ms': 4000},
+        'limits': {'low_price_input': False, 'request_timeout_ms': 10000,
+                   'command_timeout_ms': 8000},
     }
     path = home / '.thin' / 'config.json'
     payload = (json.dumps(config) + '\n').encode()

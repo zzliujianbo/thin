@@ -113,7 +113,6 @@ fn encodeMode(a: std.mem.Allocator, req: p.Request, codex: bool) ![]u8 {
 /// 校验回放的原生 output：数量上限、id 唯一、status 必须为 completed，function_call 参数必须是合法 JSON。
 fn validateOutput(output: j.Value) !void {
     const items = try c.list(output);
-    if (items.len > c.max_items) return error.InputLimit;
 
     // 用哈希集合检测重复的 item id 与 call_id；集合使用 page_allocator 并在函数结束时释放。
     var ids = std.StringHashMap(void).init(std.heap.page_allocator);
@@ -129,7 +128,6 @@ fn validateOutput(output: j.Value) !void {
             if (!c.eq(j.string(status) orelse return error.InvalidEvent, "completed")) return error.IncompleteOutput;
         }
         if (c.eq(kind, "function_call")) {
-            if (calls.count() >= c.max_tools) return error.InputLimit;
             try c.checkUnique(&calls, try c.text(item, "call_id"));
             if ((try c.text(item, "name")).len == 0) return error.InvalidEvent;
             try c.arguments(try c.text(item, "arguments"));
@@ -172,10 +170,6 @@ pub const Stream = struct {
     scope: p.ReplayScope,
     /// 向上层发送 usage 快照与草稿事件的回调。
     sink: p.ModelSink,
-    /// 已输入的字节数与事件数，用于 c.max_bytes 和 65536 的上限保护。
-    bytes: usize = 0,
-    /// 已处理的事件数（见 bytes 注释）。
-    events: usize = 0,
     /// 是否已观察到实际内容（文本、推理或工具调用），供上层判断失败后能否重试。
     observed: bool = false,
     /// 是否已收到 response.completed。
@@ -219,9 +213,6 @@ pub const Stream = struct {
         // 已出错或已 finish 的流不再接受输入。
         if (self.poisoned or self.committed) return error.InvalidStreamState;
         if (self.scope.protocol != .responses) return error.ReplayScopeMismatch;
-        self.bytes += data.len + event.len;
-        self.events += 1;
-        if (self.bytes > c.max_bytes or self.events > 65536) return error.InputLimit;
 
         // [DONE] 只是结束标记；如果之前没有收到 completed 或 failed，说明流被截断。
         if (c.eq(data, "[DONE]")) {
@@ -311,11 +302,9 @@ pub const Stream = struct {
             const kind = try c.text(native, "type");
             if (id.len == 0) return error.InvalidEvent;
             for (self.items.items) |item| if (item.index == index or c.eq(item.id, id)) return error.DuplicateItem;
-            if (self.items.items.len >= c.max_items) return error.InputLimit;
 
             var item = Item{ .index = index, .id = try self.a.dupe(u8, id), .kind = try self.a.dupe(u8, kind) };
             if (c.eq(kind, "function_call")) {
-                if (self.toolCount() >= c.max_tools) return error.InputLimit;
                 const call_id = try c.text(native, "call_id");
                 const name = try c.text(native, "name");
                 if (call_id.len == 0 or name.len == 0) return error.InvalidEvent;
@@ -488,9 +477,8 @@ pub const Stream = struct {
     }
 };
 
-/// 读取并校验事件中的 output_index；超过 c.max_items 时拒绝，防止资源耗尽。
+/// Read and validate the representable output index.
 fn outputIndex(v: j.Value) !usize {
     const n = j.uint(j.get(v, "output_index")) orelse return error.InvalidEvent;
-    if (n >= c.max_items) return error.InputLimit;
-    return @intCast(n);
+    return std.math.cast(usize, n) orelse error.InvalidEvent;
 }

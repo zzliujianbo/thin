@@ -206,9 +206,11 @@ test "responses text drafts commit final native order and guard identities" {
     try std.testing.expectError(error.InvalidStreamState, bad.finish());
     var event_mismatch = Stream.init(a, test_support.response_scope, .{});
     try std.testing.expectError(error.EventTypeMismatch, event_mismatch.feed("response.completed", "{\"type\":\"response.created\"}"));
-    var limit = Stream.init(a, test_support.response_scope, .{});
-    limit.events = 65536;
-    try std.testing.expectError(error.InputLimit, limit.feed("", "{}"));
+    var unlimited = Stream.init(a, test_support.response_scope, .{});
+    for (0..65537) |_| try unlimited.feed("", "{\"type\":\"response.in_progress\"}");
+    try unlimited.feed("", "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}");
+    const unlimited_result = (try unlimited.finish()).success;
+    try std.testing.expectEqual(p.Finish.stop, unlimited_result.finish);
 
     req.messages = &.{ .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "a", .item_id = "fc", .name = "lookup", .arguments = "{}" } }} }, .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "a", .text = "done" } }} } };
     _ = try encode(a, req);

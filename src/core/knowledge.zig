@@ -1,15 +1,9 @@
 //! Bounded, provider-independent automatic-memory contract. No disk or network.
 const std = @import("std");
 const p = @import("protocol.zig");
-pub const max_sources = 24;
-pub const max_source_bytes = 4096;
-pub const max_material_bytes = 24576;
-pub const max_candidates = 8;
-pub const max_content_bytes = 2048;
-pub const max_retrieval_bytes = 8192;
 pub const Category = enum { preferences, project, environment, solutions, pitfalls };
 pub const EvidenceKind = enum { user, tool, assistant };
-pub const Evidence = struct { id: u16, kind: EvidenceKind, text: []const u8 };
+pub const Evidence = struct { id: usize, kind: EvidenceKind, text: []const u8 };
 pub const Related = struct { category: Category, topic: []const u8, content: []const u8, version: []const u8 };
 pub const Material = struct {
     id: []const u8,
@@ -38,7 +32,6 @@ pub const Service = struct {
         if (cancel.isRequested()) return error.Canceled;
         const result = try self.extract_fn(self.context, a, material, cancel);
         if (cancel.isRequested()) return error.Canceled;
-        if (material.sources.len > max_sources or result.len > max_candidates) return error.InvalidMemoryCandidate;
         var filtered: std.ArrayList(Candidate) = .empty;
         for (result) |candidate| {
             validateCandidate(material, candidate) catch continue;
@@ -54,7 +47,7 @@ pub const Service = struct {
     }
 };
 pub fn validateCandidate(material: Material, candidate: Candidate) !void {
-    if (candidate.topic.len == 0 or candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.trim(u8, candidate.content, " \t\r\n").len == 0 or candidate.content.len > max_content_bytes or !std.unicode.utf8ValidateSlice(candidate.content) or std.mem.findScalar(u8, candidate.content, 0) != null or sensitiveMaterial(candidate.topic) or sensitiveMaterial(candidate.content)) return error.InvalidMemoryCandidate;
+    if (candidate.topic.len == 0 or candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.trim(u8, candidate.content, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(candidate.content) or std.mem.findScalar(u8, candidate.content, 0) != null or sensitiveMaterial(candidate.topic) or sensitiveMaterial(candidate.content)) return error.InvalidMemoryCandidate;
     for (candidate.topic, 0..) |c, i| {
         if (!(c >= 'a' and c <= 'z') and !(c >= '0' and c <= '9') and !(i != 0 and c == '-' and candidate.topic[i - 1] != '-')) return error.InvalidMemoryCandidate;
     }
@@ -94,13 +87,7 @@ pub const Capture = struct {
     pub fn add(self: *Capture, kind: EvidenceKind, text: []const u8) void {
         if (self.incomplete or text.len == 0) return;
         if (kind == .assistant or !std.unicode.utf8ValidateSlice(text) or sensitiveMaterial(text)) {
-            self.omitted_sources += 1;
-            return;
-        }
-        if (self.sources.items.len == max_sources or text.len > max_source_bytes or self.bytes + text.len > max_material_bytes) {
-            // Omit whole oversized sources; report the omission to extraction.
-            // An omitted tool log cannot support an invented evidence quote.
-            self.omitted_sources += 1;
+            self.omitted_sources +|= 1;
             return;
         }
         const copy = self.allocator.dupe(u8, text) catch {
@@ -112,6 +99,6 @@ pub const Capture = struct {
             self.incomplete = true;
             return;
         };
-        self.bytes += text.len;
+        self.bytes +|= text.len;
     }
 };

@@ -47,9 +47,8 @@ pub const Completed = struct {
 };
 
 pub const Communication = struct {
-    pub const command_capacity = 8;
+    /// Maximum display items processed per frontend turn, not a storage bound.
     pub const display_capacity = 64;
-    pub const display_budget = 8 * 1024 * 1024;
     client: *Client,
     a: std.mem.Allocator,
     io: std.Io,
@@ -58,18 +57,12 @@ pub const Communication = struct {
     ready: Wakeup,
     future: ?std.Io.Future(void) = null,
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-    requests: [command_capacity]?*action.Owned = @splat(null),
-    request_head: usize = 0,
-    request_count: usize = 0,
-    completions: [command_capacity]?Completed = @splat(null),
-    completion_head: usize = 0,
-    completion_count: usize = 0,
+    requests: std.ArrayList(*action.Owned) = .empty,
+    completions: std.ArrayList(Completed) = .empty,
     outstanding: usize = 0,
     next_ticket: u64 = 0,
-    displays: [display_capacity]?Display = @splat(null),
+    displays: std.ArrayList(Display) = .empty,
     display_head: usize = 0,
-    display_count: usize = 0,
-    display_bytes: usize = 0,
     failure: ?anyerror = null,
     /// Bounded, nonblocking UI admission of already-displayed ranges. Adjacent
     /// ranges coalesce; a hole is never bridged and never reduced to a max.
@@ -132,17 +125,16 @@ pub const Communication = struct {
     /// Normal commands cannot consume the two slots reserved for stop/approval
     /// barriers. Accepted requests retain capacity through completion removal.
     pub fn submit(self: *Communication, generation: u64, epoch: u64, value: action.Action) !u64 {
-        const urgent = switch (value) {
-            .cancel, .cancel_clear, .confirming, .approve => true,
-            else => false,
-        };
-        const limit: usize = if (urgent) command_capacity else command_capacity - 2;
         self.lock();
-        const rejected: ?anyerror = if (self.stop.isRequested()) error.Canceled else if (self.outstanding >= limit) error.QueueFull else if (self.next_ticket == std.math.maxInt(u64)) error.TicketExhausted else null;
+        const rejected: ?anyerror = if (self.stop.isRequested()) error.Canceled else if (self.next_ticket == std.math.maxInt(u64)) error.TicketExhausted else null;
         if (rejected) |err| {
             self.unlock();
             return err;
         }
+        self.completions.ensureTotalCapacity(self.a, self.outstanding + 1) catch |err| {
+            self.unlock();
+            return err;
+        };
         self.next_ticket += 1;
         const ticket = self.next_ticket;
         self.outstanding += 1;
@@ -159,8 +151,10 @@ pub const Communication = struct {
             self.unlock();
             return error.Canceled;
         }
-        self.requests[(self.request_head + self.request_count) % command_capacity] = request;
-        self.request_count += 1;
+        self.requests.append(self.a, request) catch |err| {
+            self.unlock();
+            return err;
+        };
         self.unlock();
         self.wake.notify();
         return ticket;
@@ -169,29 +163,32 @@ pub const Communication = struct {
     pub fn popCompletion(self: *Communication) ?Completed {
         self.lock();
         defer self.unlock();
-        if (self.completion_count == 0) return null;
-        const result = self.completions[self.completion_head].?;
-        self.completions[self.completion_head] = null;
-        self.completion_head = (self.completion_head + 1) % command_capacity;
-        self.completion_count -= 1;
+        if (self.completions.items.len == 0) return null;
+        const result = self.completions.orderedRemove(0);
         self.outstanding -= 1;
         return result;
     }
 
     pub fn popDisplay(self: *Communication) !?Display {
         self.lock();
-        if (self.display_count == 0) {
+        if (self.display_head == self.displays.items.len) {
             const failure = self.failure;
             self.failure = null;
             self.unlock();
             if (failure) |err| return err;
             return null;
         }
-        const result = self.displays[self.display_head].?;
-        self.displays[self.display_head] = null;
-        self.display_head = (self.display_head + 1) % display_capacity;
-        self.display_count -= 1;
-        self.display_bytes -= result.bytes();
+        const result = self.displays.items[self.display_head];
+        self.display_head += 1;
+        const live = self.displays.items.len - self.display_head;
+        if (live == 0) {
+            self.displays.clearRetainingCapacity();
+            self.display_head = 0;
+        } else if (self.display_head >= live) {
+            std.mem.copyForwards(Display, self.displays.items[0..live], self.displays.items[self.display_head..]);
+            self.displays.items.len = live;
+            self.display_head = 0;
+        }
         self.unlock();
         self.wake.notify();
         return result;
@@ -200,7 +197,7 @@ pub const Communication = struct {
     pub fn buffered(self: *Communication) bool {
         self.lock();
         defer self.unlock();
-        return self.display_count != 0;
+        return self.display_head != self.displays.items.len;
     }
 
     /// Cumulative prefix admission retained for existing callers.
@@ -227,9 +224,9 @@ pub const Communication = struct {
             self.ack_ranges.clear();
             self.ack_accepted = 0;
         }
-        self.ack_ranges.insert(first, last, self.ack_accepted) catch {
+        self.ack_ranges.insert(self.a, first, last, self.ack_accepted) catch |err| {
             self.unlock();
-            return error.QueueFull;
+            return err;
         };
         self.unlock();
         self.wake.notify();
@@ -242,14 +239,14 @@ pub const Communication = struct {
     fn forwardAck(self: *Communication) void {
         while (true) {
             self.lock();
-            if (self.ack_accepted >= self.ack_ranges.len) {
+            if (self.ack_accepted >= self.ack_ranges.count()) {
                 self.ack_ranges.clear();
                 self.ack_accepted = 0;
                 self.unlock();
                 return;
             }
             const epoch = self.ack_epoch;
-            const range = self.ack_ranges.items[self.ack_accepted];
+            const range = self.ack_ranges.items.items[self.ack_accepted];
             self.unlock();
             self.client.admitAckRange(epoch, range.first, range.last) catch |err| switch (err) {
                 // The view/epoch is gone or the admission was malformed; its
@@ -264,7 +261,7 @@ pub const Communication = struct {
                 },
                 // A reconnecting stream or its full range set is backpressure:
                 // keep the exact proof here and retry on a later round.
-                error.Unavailable, error.QueueFull => return,
+                else => return,
             };
             self.lock();
             defer self.unlock();
@@ -276,12 +273,8 @@ pub const Communication = struct {
     fn takeRequest(self: *Communication) ?*action.Owned {
         self.lock();
         defer self.unlock();
-        if (self.request_count == 0) return null;
-        const request = self.requests[self.request_head].?;
-        self.requests[self.request_head] = null;
-        self.request_head = (self.request_head + 1) % command_capacity;
-        self.request_count -= 1;
-        return request;
+        if (self.requests.items.len == 0) return null;
+        return self.requests.orderedRemove(0);
     }
 
     fn synchronizeIdentity(self: *Communication) void {
@@ -296,7 +289,6 @@ pub const Communication = struct {
     fn view(self: *Communication, ordered: bool) !View {
         const projection = try self.client.exportProjection();
         errdefer projection.deinit();
-        if (projection.arena.queryCapacity() > display_budget - @sizeOf(Display)) return error.InputTooLarge;
         return .{ .generation = self.generation, .revision = self.client.publication_revision, .watermark = if (ordered) self.client.cursor else self.client.cache_floor, .projection = projection, .ordered = ordered };
     }
 
@@ -330,45 +322,38 @@ pub const Communication = struct {
             completed.completion.failure = error.PublicationUnavailable;
         }
         self.lock();
-        std.debug.assert(self.completion_count < command_capacity);
-        self.completions[(self.completion_head + self.completion_count) % command_capacity] = completed;
-        self.completion_count += 1;
+        self.completions.appendAssumeCapacity(completed);
         self.unlock();
         self.ready.notify();
     }
 
-    fn publish(self: *Communication, item: Display) bool {
+    fn publish(self: *Communication, item: Display) !void {
         self.lock();
         defer self.unlock();
-        if (item.value == .event and self.display_count != 0) {
-            const tail = &self.displays[(self.display_head + self.display_count - 1) % display_capacity].?;
+        if (item.value == .event and self.display_head != self.displays.items.len) {
+            const tail = &self.displays.items[self.displays.items.len - 1];
             if (tail.generation == item.generation and tail.value == .event) {
-                const before = tail.bytes();
-                const allowance = tail.value.event.storage.len + (display_budget - self.display_bytes);
-                if (tail.value.event.appendText(&item.value.event, allowance) catch false) {
-                    self.display_bytes = self.display_bytes - before + tail.bytes();
+                // Bound only the coalescing batch, allowing geometric growth.
+                // An oversized source or full batch stays a complete next item.
+                if (try tail.value.event.appendText(&item.value.event, session.max_item_bytes)) {
                     var consumed = item;
                     consumed.deinit();
                     self.ready.notify();
-                    return true;
+                    return;
                 }
             }
         }
-        if (self.display_count == display_capacity or item.bytes() > display_budget - self.display_bytes) return false;
-        self.displays[(self.display_head + self.display_count) % display_capacity] = item;
-        self.display_count += 1;
-        self.display_bytes += item.bytes();
+        try self.displays.append(self.a, item);
         self.ready.notify();
-        return true;
     }
 
-    fn flushPending(self: *Communication) bool {
+    fn flushPending(self: *Communication) !bool {
         if (self.pending_view) |view_| {
-            if (!self.publish(view_)) return false;
+            try self.publish(view_);
             self.pending_view = null;
         }
         if (self.pending_event) |event| {
-            if (!self.publish(event)) return false;
+            try self.publish(event);
             self.pending_event = null;
         }
         return true;
@@ -379,7 +364,7 @@ pub const Communication = struct {
         // matching completion publishes the identity first; old-view stream
         // work may still progress while the identity remains unchanged.
         if (self.command_inflight and (self.hold_configuration or !std.meta.eql(Identity.of(self.client), self.identity))) return false;
-        if (!self.flushPending()) return false;
+        if (!try self.flushPending()) return false;
         var event = try self.client.nextDisplay();
         errdefer if (event) |*item| item.deinit();
         self.synchronizeIdentity();
@@ -390,7 +375,10 @@ pub const Communication = struct {
             self.revision = self.client.publication_revision;
             self.stream_revision = self.client.stream_publication_revision;
         }
-        if (event) |item| self.pending_event = .{ .generation = self.generation, .value = .{ .event = item } };
+        if (event) |item| {
+            self.pending_event = .{ .generation = self.generation, .value = .{ .event = item } };
+            event = null;
+        }
         return self.flushPending();
     }
 
@@ -485,9 +473,13 @@ pub const Communication = struct {
         self.client.wait_cancel = null;
         self.client.wait_progress_context = null;
         self.client.wait_progress_fn = null;
-        for (self.requests) |request| if (request) |owned| owned.deinit();
-        for (&self.completions) |*completion| if (completion.*) |*owned| owned.deinit();
-        for (&self.displays) |*display| if (display.*) |*owned| owned.deinit();
+        for (self.requests.items) |owned| owned.deinit();
+        self.requests.deinit(self.a);
+        for (self.completions.items) |*owned| owned.deinit();
+        self.completions.deinit(self.a);
+        for (self.displays.items[self.display_head..]) |*owned| owned.deinit();
+        self.displays.deinit(self.a);
+        self.ack_ranges.deinit(self.a);
         if (self.pending_view) |*owned| owned.deinit();
         if (self.pending_event) |*owned| owned.deinit();
         self.wake.deinit();

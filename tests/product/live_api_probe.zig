@@ -63,10 +63,8 @@ fn run(init: std.process.Init) !u8 {
     defer thin.config.release(&parsed);
     var config = parsed.value;
 
-    // 只在内存中收紧等待及字节上限，不修改用户文件或更换模型/协议/推理档位。
+    // 只在内存中收紧等待，不修改用户文件或更换模型/协议/推理档位。
     config.limits.request_timeout_ms = @min(config.limits.request_timeout_ms, 60000);
-    config.limits.max_response_bytes = @min(config.limits.max_response_bytes, 2 * 1024 * 1024);
-    config.limits.max_event_bytes = @min(config.limits.max_event_bytes, config.limits.max_response_bytes);
 
     const key = try thin.config.resolveApiKey(a, config, init.environ_map);
     defer {

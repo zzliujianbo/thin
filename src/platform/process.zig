@@ -1,4 +1,4 @@
-//! 子进程执行器（Linux/Darwin + libc）：通过 /bin/bash -c 运行脚本，有界捕获 stdout/stderr，
+//! 子进程执行器（Linux/Darwin + libc）：通过 /bin/bash -c 运行脚本，按需捕获 stdout/stderr，
 //! 并以进程组为单位做 TERM -> KILL 的有界清理，保证取消或超时后不遗留后台进程。
 
 const std = @import("std");
@@ -43,8 +43,9 @@ pub const LaunchNotify = struct {
 pub const Options = struct {
     /// 命令 deadline；null 仅关闭此 deadline，取消和有界清理始终有效。
     timeout_ms: ?u32 = 300000,
-    /// stdout 与 stderr 合计的捕获预算（字节），超出部分以首尾加省略标记保留。
-    output_bytes: u32 = 32768,
+    /// null captures both streams completely; a finite shared budget retains
+    /// head/tail, and zero discards capture while still draining both pipes.
+    output_bytes: ?usize = null,
     /// Raw incremental stdout, independent of raw_output. With a sink stdout is
     /// counted/drained but never retained; Result.stdout is empty. stderr keeps
     /// its usual half of output_bytes. First callback error stops delivery and
@@ -89,7 +90,7 @@ pub const Options = struct {
     raw_output: bool = false,
 };
 
-/// 运行结果。stdout/stderr 为有界输出（默认安全文本，raw_output 时为原始字节），由调用方传入的 allocator 分配，需由调用方释放。
+/// 运行结果。stdout/stderr 默认完整捕获（安全文本，raw_output 时为原始字节），由调用方释放。
 pub const Result = struct {
     /// stdout（默认转义；raw_output 保留原始字节；均按预算截断）。
     /// stdout_sink 非空时始终为空，原始字节只交给 callback。
@@ -124,6 +125,9 @@ pub const Result = struct {
 const Capture = struct {
     /// 固定容量缓冲区，由调用方分配。
     data: []u8,
+    allocator: std.mem.Allocator = undefined,
+    unlimited: bool = false,
+    dynamic: std.ArrayList(u8) = .empty,
     /// 收到的原始字节总数（饱和累加），用于统计真实输出量。
     total: u64 = 0,
     /// tail 环形缓冲的下一个写入位置。
@@ -141,7 +145,12 @@ const Capture = struct {
     }
 
     /// 追加字节：前 headSize 个原始字节进入 head；之后的字节写入 tail 环形缓冲，覆盖最旧数据。
-    fn add(self: *Capture, bytes: []const u8) void {
+    fn add(self: *Capture, bytes: []const u8) !void {
+        if (self.unlimited) {
+            try self.dynamic.appendSlice(self.allocator, bytes);
+            self.total = std.math.add(u64, self.total, bytes.len) catch return error.OutputTooLarge;
+            return;
+        }
         const h = self.headSize();
         const tail = self.data[h..];
         for (bytes) |b| {
@@ -237,6 +246,7 @@ const Capture = struct {
     /// Exact retained bytes, without UTF-8 decoding or terminal escaping.
     /// Any dropped byte is recorded even with a zero-byte output budget.
     fn rawRender(self: *Capture, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.unlimited) return allocator.dupe(u8, self.dynamic.items);
         const h = self.headSize();
         const head_len: usize = @intCast(@min(self.total, h));
         const tail = self.data[h..][0..self.tail_len];
@@ -261,6 +271,7 @@ const Capture = struct {
 
     /// 生成最终输出：未省略时编码全部保留内容；超预算或有丢弃时编码为 head + "[...]" + tail。返回值由 allocator 分配。
     fn render(self: *Capture, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.unlimited) return renderSafeText(allocator, self.dynamic.items);
         const h = self.headSize();
         const head_len: usize = @intCast(@min(self.total, h));
         const tail = self.data[h..][0..self.tail_len];
@@ -322,7 +333,14 @@ pub fn safeTextWidth(bytes: []const u8) usize {
 /// 用与 `Capture.render` 相同的转义规则编码一段原始字节，返回 allocator 分配的文本。
 /// 不截断输入；调用方负责先按预算切分（见 `safeTextFit`）。
 pub fn renderSafeText(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    const dst = try allocator.alloc(u8, safeTextWidth(bytes));
+    var width: usize = 0;
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const t = Capture.token(bytes[pos..]);
+        width = std.math.add(usize, width, t.width) catch return error.OutputTooLarge;
+        pos += t.raw;
+    }
+    const dst = try allocator.alloc(u8, width);
     errdefer allocator.free(dst);
     var offset: usize = 0;
     var used: usize = 0;
@@ -408,7 +426,7 @@ fn drain(fd: c.fd_t, capture: *Capture, sink: ?*SinkState) !void {
             if (sink) |state| {
                 capture.total +|= bytes.len;
                 state.write(bytes);
-            } else capture.add(bytes);
+            } else try capture.add(bytes);
         } else if (n == 0) {
             capture.eof = true;
             return;
@@ -595,10 +613,14 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     } else null;
     const stdout_sink: ?*SinkState = if (out_sink_state) |*state| state else null;
     const stderr_sink: ?*SinkState = if (err_sink_state) |*state| state else null;
-    var out: Capture = .{ .data = if (stdout_sink != null) empty[0..] else try allocator.alloc(u8, (options.output_bytes + @as(u64, 1)) / 2) };
-    defer allocator.free(out.data);
-    var err: Capture = .{ .data = if (stderr_sink != null) empty[0..] else try allocator.alloc(u8, options.output_bytes / 2) };
-    defer allocator.free(err.data);
+    const out_limit: usize = if (stdout_sink != null) 0 else if (options.output_bytes) |n| n / 2 + n % 2 else 0;
+    const err_limit: usize = if (stderr_sink != null) 0 else if (options.output_bytes) |n| n / 2 else 0;
+    var out: Capture = .{ .data = if (out_limit == 0) empty[0..] else try allocator.alloc(u8, out_limit), .allocator = allocator, .unlimited = stdout_sink == null and options.output_bytes == null };
+    defer if (out_limit != 0) allocator.free(out.data);
+    defer out.dynamic.deinit(allocator);
+    var err: Capture = .{ .data = if (err_limit == 0) empty[0..] else try allocator.alloc(u8, err_limit), .allocator = allocator, .unlimited = stderr_sink == null and options.output_bytes == null };
+    defer if (err_limit != 0) allocator.free(err.data);
+    defer err.dynamic.deinit(allocator);
 
     // 计时起点，用于超时与清理期限（spawn 之前记录）。
     const start = std.Io.Clock.awake.now(io);
@@ -671,7 +693,7 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
         // 启动握手与输出共享同一有界循环，不在 exec 错误管道上同步等待。
         if (launch_status == .pending) {
             launch_status = spawn.status(child.exec_error) catch |e| blk: {
-                failure = e;
+                if (failure == null) failure = e;
                 break :blk .failed;
             };
             if (launch_status == .failed and failure == null) failure = error.SpawnFailed;
@@ -688,17 +710,17 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
         }
         // 每轮先排空两路管道，避免子进程因管道写满而阻塞。
         if (out_ready) drain(child.stdout, &out, stdout_sink) catch |e| {
-            failure = e;
+            if (failure == null) failure = e;
             out_ready = false;
         };
         if (err_ready) drain(child.stderr, &err, stderr_sink) catch |e| {
-            failure = e;
+            if (failure == null) failure = e;
             err_ready = false;
         };
 
         // 非阻塞检查退出；出错时记录，所有权丢失则停止。
         if (!exited) exited = observedExit(pid) catch |e| blk: {
-            failure = e;
+            if (failure == null) failure = e;
             if (e == error.ChildOwnershipLost) ownership = false;
             break :blk false;
         };
@@ -781,7 +803,7 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
         // Bounded libc poll is deliberately not an Io cancellation point.
         // 5ms 超时：兼顾退出与取消的响应速度，又避免忙等。
         const rc = c.poll(&fds, fds.len, 5);
-        if (rc < 0 and std.posix.errno(rc) != .INTR) failure = error.PollFailed;
+        if (rc < 0 and std.posix.errno(rc) != .INTR and failure == null) failure = error.PollFailed;
     }
 
     // No group signals below this line, including error/defer paths.
@@ -815,6 +837,8 @@ fn runExecutable(allocator: std.mem.Allocator, io: std.Io, root: []const u8, scr
     // 清理确认成功后，才把之前记录的 I/O 或轮询错误返回。
     // Callback failure is sticky and separate from later pipe/poll/cleanup
     // errors. Never return it before TERM/KILL/reap or mask cleanup_failed.
+    // A failed dynamic capture must not be hidden by a concurrent sink error.
+    if (failure) |e| if (e == error.OutOfMemory) return e;
     if (stdout_sink) |state| {
         if (state.failure) |e| return e;
     }

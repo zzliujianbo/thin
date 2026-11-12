@@ -61,15 +61,18 @@ test "decision response exact suffix status errors overflow and incomplete rejec
     try std.testing.expectError(error.Timeout, parseResponse(a, result));
     result.cleanup_failed = true;
     try std.testing.expectError(error.CleanupFailed, parseResponse(a, result));
-    const oversized = try a.alloc(u8, max_body + 5);
-    defer a.free(oversized);
-    @memset(oversized, 'x');
-    @memcpy(oversized[oversized.len - 4 ..], "\n200");
-    try std.testing.expectError(error.DecisionTransport, parseResponse(a, fakeResult(oversized)));
-    @memcpy(oversized[max_body..][0..4], "\n200");
-    const at_limit = try parseResponse(a, fakeResult(oversized[0 .. max_body + 4]));
-    defer at_limit.deinit(a);
-    try std.testing.expectEqual(@as(usize, max_body), at_limit.body.len);
+    // The response body crosses the retired 64 KiB cap; status framing and
+    // byte accounting remain strict independently of body size.
+    const large = try a.alloc(u8, 65537 + 4);
+    defer a.free(large);
+    @memset(large, 'x');
+    @memcpy(large[large.len - 4 ..], "\n200");
+    const response_large = try parseResponse(a, fakeResult(large));
+    defer response_large.deinit(a);
+    try std.testing.expectEqualStrings(large[0 .. large.len - 4], response_large.body);
+    var mismatched = fakeResult(large);
+    mismatched.stdout_bytes -= 1;
+    try std.testing.expectError(error.DecisionTransport, parseResponse(a, mismatched));
 }
 test "decision environment allowlist cancellation and poison reject before spawn" {
     const a = std.testing.allocator;

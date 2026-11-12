@@ -46,8 +46,8 @@ test "preferences pure edits enforce shared validation without partial mutation"
     var parsed = try cfg.parse(a, reviewed);
     defer cfg.release(&parsed);
     for (main_edits) |edit| try preference.apply(&parsed.value, edit.key, edit.value);
-    try preference.apply(&parsed.value, .request_timeout_ms, 86400000);
-    try preference.apply(&parsed.value, .task_timeout_ms, 86400000);
+    try preference.apply(&parsed.value, .request_timeout_ms, 86400001);
+    try preference.apply(&parsed.value, .command_timeout_ms, 3600001);
     const invalid = [_]Edit{
         .{ .key = .memory_auto, .value = null },
         .{ .key = .memory_auto, .value = 2 },
@@ -55,13 +55,8 @@ test "preferences pure edits enforce shared validation without partial mutation"
         .{ .key = .compaction_enabled, .value = 2 },
         .{ .key = .command_timeout_ms, .value = null },
         .{ .key = .command_timeout_ms, .value = 0 },
-        .{ .key = .command_timeout_ms, .value = 3600001 },
         .{ .key = .request_timeout_ms, .value = null },
         .{ .key = .request_timeout_ms, .value = 0 },
-        .{ .key = .request_timeout_ms, .value = 86400001 },
-        .{ .key = .task_timeout_ms, .value = null },
-        .{ .key = .task_timeout_ms, .value = 0 },
-        .{ .key = .task_timeout_ms, .value = 86400001 },
     };
     for (invalid) |edit| {
         const before = parsed.value;
@@ -73,26 +68,27 @@ test "preferences pure edits enforce shared validation without partial mutation"
     try std.testing.expectEqual(@as(u32, 500), parsed.value.limits.request_timeout_ms);
     try std.testing.expect(parsed.value.decision == null);
 }
-test "preferences active clone preserves unrelated frozen limits and rejects invalid active budget" {
+test "preferences active clone preserves frozen capability and rejects invalid model window" {
     var declaration = try cfg.parse(a, plain);
     defer cfg.release(&declaration);
     var active = declaration.value;
-    active.limits.max_input_tokens = 12000;
-    active.limits.input_margin_tokens = 777;
-    active.limits.command_max_timeout_ms = 20000;
-    try preference.apply(&declaration.value, .command_timeout_ms, 30000);
-    try std.testing.expectError(error.InvalidLimit, profiles.activeClone(a, active, declaration.value));
     try preference.apply(&declaration.value, .command_timeout_ms, 10000);
-    // A valid timeout edit must still reject invalid frozen input constraints.
-    active.limits.max_input_tokens = active.limits.input_margin_tokens;
+    // A valid timeout edit must still reject an invalid frozen model window.
+    const context_tokens = active.model.context_tokens;
     try preference.apply(&declaration.value, .request_timeout_ms, 12345);
-    try std.testing.expectError(error.InvalidBudget, profiles.activeClone(a, active, declaration.value));
-    active.limits.max_input_tokens = 12000;
+    for ([_]u32{ 0, 1 }) |invalid_context| {
+        active.model.context_tokens = invalid_context;
+        if (profiles.activeClone(a, active, declaration.value)) |value| {
+            var unexpected = value;
+            cfg.release(&unexpected);
+            return error.ExpectedInvalidBudget;
+        } else |err| try std.testing.expectEqual(error.InvalidBudget, err);
+    }
+    active.model.context_tokens = context_tokens;
     var candidate = try profiles.activeClone(a, active, declaration.value);
     defer cfg.release(&candidate);
-    try std.testing.expectEqual(@as(?u32, 12000), candidate.value.limits.max_input_tokens);
-    try std.testing.expectEqual(@as(u32, 777), candidate.value.limits.input_margin_tokens);
-    try std.testing.expectEqual(@as(u32, 20000), candidate.value.limits.command_max_timeout_ms);
+    try std.testing.expectEqual(context_tokens, candidate.value.model.context_tokens);
+    try std.testing.expectEqual(@as(u32, 10000), candidate.value.limits.command_timeout_ms);
     try std.testing.expectEqual(@as(u32, 12345), candidate.value.limits.request_timeout_ms);
     try std.testing.expect(candidate.value.memory.auto);
     try preference.apply(&declaration.value, .memory_auto, 0);
@@ -226,12 +222,16 @@ test "preferences invalid guards CAS and active validation never publish or save
     app.runtime.poisoned = true;
     try std.testing.expectError(error.UnsafeToContinue, set(&session, .compaction_enabled, 0));
     app.runtime.poisoned = false;
-    // Declaration passes; invalid frozen input constraints must reject pre-save.
-    const input_limit = app.config.value.limits.max_input_tokens;
-    app.config.value.limits.max_input_tokens = app.config.value.limits.input_margin_tokens;
-    try std.testing.expectError(error.InvalidBudget, set(&session, .request_timeout_ms, 20000));
-    try std.testing.expectEqual(@as(u32, 300000), app.config.value.limits.request_timeout_ms);
-    app.config.value.limits.max_input_tokens = input_limit;
+    // Declaration passes; an invalid frozen model window must reject pre-save.
+    const context_tokens = app.config.value.model.context_tokens;
+    for ([_]u32{ 0, 1 }) |invalid_context| {
+        app.config.value.model.context_tokens = invalid_context;
+        try std.testing.expectError(error.InvalidBudget, set(&session, .request_timeout_ms, 20000));
+        try std.testing.expectEqual(@as(u32, 300000), app.config.value.limits.request_timeout_ms);
+        try std.testing.expect(app.config.arena == arena and session.global_config.?.arena == global);
+        try std.testing.expect(app.client.authorization.ptr == auth);
+    }
+    app.config.value.model.context_tokens = context_tokens;
     const unchanged = try disk(&session);
     defer a.free(unchanged);
     try std.testing.expectEqualStrings(initial, unchanged);
@@ -270,16 +270,23 @@ test "preferences no App pending ownership validation and CAS" {
     try std.testing.expectEqualDeep(session.global_config.?.value.limits, session.connection().current().limits);
     const initial = try disk(&session);
     defer a.free(initial);
-    session.pending.?.value.limits.command_max_timeout_ms = 15000;
-    try std.testing.expectError(error.InvalidLimit, set(&session, .command_timeout_ms, 20000));
+    const context_tokens = session.pending.?.value.model.context_tokens;
+    const initial_pending_arena = session.pending.?.arena;
+    for ([_]u32{ 0, 1 }) |invalid_context| {
+        session.pending.?.value.model.context_tokens = invalid_context;
+        try std.testing.expectError(error.InvalidBudget, set(&session, .command_timeout_ms, 20000));
+        try std.testing.expect(session.app == null and session.pending.?.arena == initial_pending_arena);
+        try std.testing.expectEqual(@as(u32, 10000), session.pending.?.value.limits.command_timeout_ms);
+    }
+    session.pending.?.value.model.context_tokens = context_tokens;
     const unchanged = try disk(&session);
     defer a.free(unchanged);
     try std.testing.expectEqualStrings(initial, unchanged);
     const pending_arena = session.pending.?.arena;
     try session.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
-    try std.testing.expectError(error.AuthVersionConflict, set(&session, .task_timeout_ms, 50000));
+    try std.testing.expectError(error.AuthVersionConflict, set(&session, .command_timeout_ms, 50000));
     try std.testing.expect(session.pending.?.arena == pending_arena);
-    try std.testing.expectEqual(@as(u32, 40000), session.pending.?.value.limits.task_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 10000), session.pending.?.value.limits.command_timeout_ms);
 }
 test "preferences missing route clone owns strings and releases partial allocations" {
     try std.testing.checkAllAllocationFailures(a, pendingCloneAllocationCase, .{});
@@ -341,16 +348,18 @@ test "preferences restored missing provider preserves pending history while savi
     try std.testing.expectEqualStrings("other/judge", saved.value.decision.?.model);
     const before = try disk(&restored);
     defer a.free(before);
-    // An unresolved route does not excuse invalid frozen input constraints.
-    const input_limit = restored.pending.?.value.limits.max_input_tokens;
-    restored.pending.?.value.limits.max_input_tokens = restored.pending.?.value.limits.input_margin_tokens;
-    try std.testing.expectError(error.InvalidBudget, set(&restored, .request_timeout_ms, 20000));
-    try std.testing.expectEqual(@as(u32, 60000), restored.pending.?.value.limits.request_timeout_ms);
-    try std.testing.expect(connection.initial_history_fn.?(connection.context).ptr == history.ptr);
+    // An unresolved route does not excuse an invalid frozen model window.
+    const context_tokens = restored.pending.?.value.model.context_tokens;
+    for ([_]u32{ 0, 1 }) |invalid_context| {
+        restored.pending.?.value.model.context_tokens = invalid_context;
+        try std.testing.expectError(error.InvalidBudget, set(&restored, .request_timeout_ms, 20000));
+        try std.testing.expectEqual(@as(u32, 60000), restored.pending.?.value.limits.request_timeout_ms);
+        try std.testing.expect(connection.initial_history_fn.?(connection.context).ptr == history.ptr);
+    }
     const unchanged = try disk(&restored);
     defer a.free(unchanged);
     try std.testing.expectEqualStrings(before, unchanged);
-    restored.pending.?.value.limits.max_input_tokens = input_limit;
+    restored.pending.?.value.model.context_tokens = context_tokens;
     const arena = restored.pending.?.arena;
     try restored.store.root.writeMode(cfg.file_name, "{}", true, 0o600);
     try std.testing.expectError(error.AuthVersionConflict, set(&restored, .request_timeout_ms, 30000));

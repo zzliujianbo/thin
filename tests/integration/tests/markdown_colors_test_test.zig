@@ -337,11 +337,24 @@ test "plain mode does not invent a trailing empty row" {
     try std.testing.expectEqualStrings("line", result.lines[0]);
 }
 test "allocation failures preserve decoder and release owned resources" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    // Strict fault indices must not depend on allocator-layout-dependent remaps.
     var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(backing.allocator(), allocationCase, .{});
     try std.testing.checkAllAllocationFailures(backing.allocator(), appendHeldCrAllocationCase, .{});
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+
+    // The no-remap count bounds the normal path, where successful growth can
+    // eliminate allocations. Still check every induced failure and ownership.
+    var nofail = std.testing.FailingAllocator.init(backing.allocator(), .{});
+    try allocationCase(nofail.allocator());
+    const bound = nofail.alloc_index;
+    try std.testing.expect(bound > 0);
+    try std.testing.expectEqual(nofail.allocated_bytes, nofail.freed_bytes);
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    _ = try sweepNormalAllocationCase(bound, false);
+    // A fresh fixed-buffer layout makes growth reproducible independently of
+    // the heap's current bucket occupancy, while running the same callback.
+    try std.testing.expect(try sweepNormalAllocationCase(bound, true));
 }
 test "finish allocation failures retain held CR and UTF8 for retry" {
     // Force growth through allocation so staging and source publication both

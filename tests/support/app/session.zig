@@ -84,7 +84,6 @@ fn seedSessionTestHistory(session: *Session) !void {
         .output_budget_frozen = true,
         .input_budget_frozen = true,
         .input_price_threshold = 100000,
-        .max_input_tokens = 80000,
         .permission_id = 19,
         .messages = &.{
             .{ .role = .user, .blocks = &.{.{ .text = "saved question" }} },
@@ -135,13 +134,14 @@ fn writeOfficialMetadataTestConfig(dir: std.Io.Dir, id: ProviderId) !void {
 
 const MetadataFixture = struct {
     var calls: std.atomic.Value(usize) = .init(0);
-    fn fetch(_: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+    fn fetch(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
         _ = calls.fetchAdd(1, .monotonic);
         if (key == null or !std.mem.startsWith(u8, key.?, "fake-")) return error.InvalidFixtureKey;
         var values: metadata.Listing = .{};
+        errdefer values.deinit(a);
         values.directory_mask = metadata.bit(id);
         for (catalog.entries) |entry| if (entry.provider == id) {
-            const row = try values.directory.upsert(id, entry.model.name);
+            const row = try values.directory.upsert(a, id, entry.model.name);
             row.tokens = 1048576;
             row.available = true;
             row.protocol = entry.model.protocol;
@@ -207,7 +207,8 @@ const MetadataPublicationFixture = struct {
         session.initial_default_pending = false;
         session.metadata_wall_ms = 1000;
         const mask = metadata.bit(.deepseek) | metadata.dev_bit;
-        const claim = try metadata.claimAt(&session.store.root, mask, manual, 1000, .{});
+        var claim = try metadata.claimAt(&session.store.root, mask, manual, 1000, .{});
+        defer claim.cache.deinit(a);
         try std.testing.expectEqual(mask, claim.mask);
         const job = try a.create(MetadataJob);
         job.* = .{
@@ -236,22 +237,34 @@ const MetadataPublicationFixture = struct {
             job.future = try std.Io.concurrent(io, hold, .{io});
         }
         const previous_models = session.display_models;
-        const previous_cache = session.metadata_cache;
-        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const previous_mask = session.metadata_cache.directory_mask;
+        const previous_refresh = session.metadata_cache.refresh;
+        var previous_directory = try session.metadata_cache.directory.clone(a);
+        defer previous_directory.deinit(a);
+        // The official stage now clones an owned directory before publication.
+        // Let that exact prefix allocate successfully, then fault buildModels.
+        var clone_probe = std.testing.FailingAllocator.init(a, .{});
+        if (official_first and fault == .display) {
+            var cloned = try job.listing.directory.clone(clone_probe.allocator());
+            cloned.deinit(clone_probe.allocator());
+        }
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = clone_probe.alloc_index });
         {
             const session_allocator = session.allocator;
-            const root_allocator = session.store.root.allocator;
             defer session.allocator = session_allocator;
-            defer session.store.root.allocator = root_allocator;
-            // Cache fault hits real commitClaimedAt -> load allocation, after
-            // published is marked. Display fault hits the real buildModels,
-            // after a successful on-disk commit. Neither needs a production seam.
-            switch (fault) {
-                .cache => session.store.root.allocator = failing.allocator(),
-                .display => session.allocator = failing.allocator(),
-                .none => {},
+            if (fault == .cache) {
+                // Exercise an actual filesystem failure, not the removed cache
+                // size cap. Restore the durable claim before the next stage.
+                const dir = session.store.root.dir;
+                try dir.rename(metadata.file_name, dir, "publication-backup.json", io);
+                defer dir.rename("publication-backup.json", dir, metadata.file_name, io) catch @panic("restore publication fixture");
+                try dir.createDir(io, metadata.file_name, .default_dir);
+                defer dir.deleteDir(io, metadata.file_name) catch @panic("remove publication fault directory");
+                try std.testing.expect(Session.pollModels(&session, true));
+            } else {
+                if (fault == .display) session.allocator = failing.allocator();
+                try std.testing.expect(Session.pollModels(&session, true));
             }
-            try std.testing.expect(Session.pollModels(&session, true));
         }
         try std.testing.expect(session.metadata_job == job);
         try std.testing.expectEqual(official_first, job.official_published);
@@ -266,9 +279,14 @@ const MetadataPublicationFixture = struct {
                 try std.testing.expectEqualStrings(notice, session.metadata_notice orelse return error.MissingFailureNotice);
             } else try std.testing.expect(session.metadata_notice == null);
             try std.testing.expect(session.display_models.ptr == previous_models.ptr);
-            try std.testing.expectEqualDeep(previous_cache, session.metadata_cache);
+            try std.testing.expectEqual(previous_mask, session.metadata_cache.directory_mask);
+            try std.testing.expectEqualDeep(previous_refresh, session.metadata_cache.refresh);
+            const current = &session.metadata_cache.directory;
+            try std.testing.expectEqualDeep(previous_directory.rows[0..previous_directory.count], current.rows[0..current.count]);
+            try std.testing.expectEqualSlices(u8, previous_directory.names[0..previous_directory.used], current.names[0..current.used]);
         }
-        const first_saved = try metadata.load(&session.store.root);
+        var first_saved = try metadata.load(&session.store.root);
+        defer first_saved.deinit(session.store.root.allocator);
         const first_index: usize = if (official_first) @intCast(@backingInt(ProviderId.deepseek)) else ProviderId.all.len;
         try std.testing.expectEqual(fault != .cache, first_saved.refresh[first_index].successful);
         try std.testing.expectEqual(@as(u16, 0), metadataNoticeTtl(session.metadata_notice));
@@ -282,7 +300,8 @@ const MetadataPublicationFixture = struct {
         try std.testing.expect(Session.pollModels(&session, true));
         try std.testing.expect(session.metadata_job == null);
         // The second stage really committed successfully, not another failure.
-        const saved = try metadata.load(&session.store.root);
+        var saved = try metadata.load(&session.store.root);
+        defer saved.deinit(session.store.root.allocator);
         if (official_first) {
             try std.testing.expect(saved.refresh[ProviderId.all.len].successful);
         } else {
@@ -322,7 +341,7 @@ const LayeredMetadataFixture = struct {
     fn devFail(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
         return error.FixtureOffline;
     }
-    fn row(records: *const directory.Directory, provider: ProviderId, raw_id: []const u8) directory.Record {
+    fn row(records: *const @import("model_directory.zig").Directory, provider: ProviderId, raw_id: []const u8) @import("model_directory.zig").Record {
         return records.rows[records.find(provider, raw_id).?];
     }
 };

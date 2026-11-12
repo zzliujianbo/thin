@@ -420,7 +420,7 @@ test "settings prepare owns latest declaration and extends redaction without pub
     try std.testing.expectEqualStrings("fake-prepare-only-key", prepared.decision.?.key.?);
     try std.testing.expectEqualStrings("fake-prepare-only-key", prepared.decision.?.source.value.registry.?.find("route").?.connection.api_key.?);
     var remembered = false;
-    for (app.journal.known_keys[0..app.journal.known_key_count]) |key|
+    for (app.journal.known_keys.items) |key|
         remembered = remembered or std.mem.eql(u8, key, "fake-prepare-only-key");
     try std.testing.expect(remembered);
     try std.testing.expect(app.config.arena == config_arena and app.runtime.executor.schemas.ptr == schema);

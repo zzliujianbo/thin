@@ -21,7 +21,6 @@ const session_metadata = @import("../core/session_metadata.zig");
 const resume_codec = @import("resume_codec.zig");
 const checkpoint = @import("../core/checkpoint.zig");
 const metadata = @import("model_metadata.zig");
-const directory = @import("model_directory.zig");
 const model_resolver = @import("model_resolver.zig");
 const fs = @import("../platform/filesystem.zig");
 const decision_selection = @import("decision_selection.zig");
@@ -170,11 +169,12 @@ const MetadataJob = struct {
             const index: usize = @intCast(@backingInt(id));
             const bit = @as(u8, 1) << @intCast(index);
             if (self.requested & bit == 0 or self.keys[index] == null) continue;
-            const values = self.fetch(self.allocator, self.io, id, self.keys[index]) catch |err| {
+            var values = self.fetch(self.allocator, self.io, id, self.keys[index]) catch |err| {
                 if (err == error.Canceled) return;
                 continue;
             };
-            metadata.mergeOfficial(&self.listing, &values, id) catch continue;
+            defer values.deinit(self.allocator);
+            metadata.mergeOfficial(self.allocator, &self.listing, &values, id) catch continue;
             self.succeeded |= bit;
         }
         self.runCodex();
@@ -201,8 +201,9 @@ const MetadataJob = struct {
         var credential = source.acquire(self.allocator, alias, &self.codex_cancel, acquire_ms) catch return;
         defer credential.deinit(self.allocator);
         const fetch_ms = self.codexRemaining() orelse return;
-        const values = self.codex_fetch(self.allocator, self.io, &credential, &self.codex_cancel, fetch_ms) catch return;
-        metadata.mergeOfficial(&self.listing, &values, .openai_codex) catch return;
+        var values = self.codex_fetch(self.allocator, self.io, &credential, &self.codex_cancel, fetch_ms) catch return;
+        defer values.deinit(self.allocator);
+        metadata.mergeOfficial(self.allocator, &self.listing, &values, .openai_codex) catch return;
         self.succeeded |= metadata.bit(.openai_codex);
     }
     /// Owner-only teardown; the caller has already joined the official future.
@@ -232,6 +233,8 @@ const MetadataJob = struct {
         if (self.dev_future) |*future| future.cancel(self.io);
         self.wipeKeys();
         self.releaseCodex();
+        self.listing.deinit(self.allocator);
+        self.dev_listing.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -274,7 +277,7 @@ pub const Session = struct {
     display_image_models: []cfg.Model = &.{},
     // cfg registry parsing/validation rejects more than 16 providers. Names
     // borrow the global registry arena; current() rebuilds after each save.
-    display_providers: [16]tui.ModelProvider = undefined,
+    display_providers: []tui.ModelProvider = &.{},
     selected_alias: ?[]u8 = null,
     credential_revisions: [ProviderId.all.len]u64 = @splat(0),
     active_revision: u64 = 0,
@@ -303,8 +306,8 @@ pub const Session = struct {
     last_memory_view: @import("../core/memory_status.zig").View = .{},
     last_subagent_view: @import("../core/subagent_status.zig").View = .{},
     active_context_official: bool = false,
-    display_origins: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
-    display_disabled: [64 + directory.max_models + catalog.entries.len]bool = @splat(false),
+    display_origins: []bool = &.{},
+    display_disabled: []bool = &.{},
 
     resume_lease: ?resume_store.Lease = null,
     saved_title: session_metadata.Title = .{},
@@ -580,6 +583,10 @@ pub const Session = struct {
         self.codex_job = null;
         self.releaseLoadedHistory();
         if (self.metadata_job) |job| job.destroy();
+        self.metadata_cache.deinit(self.allocator);
+        self.allocator.free(self.display_providers);
+        self.allocator.free(self.display_origins);
+        self.allocator.free(self.display_disabled);
         self.freeDisplayModels(self.display_models);
         self.freeDisplayModels(self.display_decision_models);
         self.freeDisplayModels(self.display_image_models);
@@ -1100,9 +1107,8 @@ pub const Session = struct {
         try self.startMetadata(self.configuredMask(self.global_config.?.value), true);
     }
 
-    fn refreshPolicy(self: *const Session) metadata.Policy {
-        const limits = self.global_config.?.value.limits;
-        return .{ .ttl_ms = limits.model_refresh_ttl_ms, .cooldown_ms = limits.model_refresh_cooldown_ms };
+    fn refreshPolicy(_: *const Session) metadata.Policy {
+        return .{ .ttl_ms = cfg.Policy.model_refresh_ttl_ms, .cooldown_ms = cfg.Policy.model_refresh_cooldown_ms };
     }
 
     fn metadataNow(self: *const Session) u64 {
@@ -1124,7 +1130,8 @@ pub const Session = struct {
         // neither gate the public source nor consume fresh official credentials.
         // Claim before launching: first-run failures/timeouts must not create an
         // automatic retry on every start, and concurrent sessions share the claim.
-        const claim = try metadata.claimAt(&self.store.root, requested | metadata.dev_bit, manual, self.metadataNow(), self.refreshPolicy());
+        var claim = try metadata.claimAt(&self.store.root, requested | metadata.dev_bit, manual, self.metadataNow(), self.refreshPolicy());
+        defer claim.cache.deinit(self.allocator);
         // A successful claim means storage is a valid current-format cache again,
         // so an earlier unreadable-cache block no longer applies. Failures above
         // return before this point and keep the cadence disabled.
@@ -1172,7 +1179,8 @@ pub const Session = struct {
                 self.allocator.free(bytes);
             };
         };
-        const claim = try metadata.claimAt(&self.store.root, requested, true, self.metadataNow(), self.refreshPolicy());
+        var claim = try metadata.claimAt(&self.store.root, requested, true, self.metadataNow(), self.refreshPolicy());
+        defer claim.cache.deinit(self.allocator);
         for (ProviderId.all) |id| {
             // Codex is repopulated from its own Manager after this join.
             if (id == .openai_codex) continue;
@@ -1218,6 +1226,8 @@ pub const Session = struct {
         job.official_published = false;
         job.started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds());
         job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
+        var old_listing = previous_listing;
+        old_listing.deinit(self.allocator);
         job.manual = true;
         self.metadata_cache.refresh = claim.cache.refresh;
         self.metadata_login_pending &= ~claim.mask;
@@ -1292,9 +1302,15 @@ pub const Session = struct {
             const dev_ready = job.dev_future == null and !job.dev_published;
             if (!official_ready and !dev_ready) return default_changed;
             var listing: metadata.Listing = .{};
+            defer listing.deinit(self.allocator);
             var succeeded: u8 = 0;
             if (official_ready) {
-                listing = job.listing;
+                listing.directory_mask = job.listing.directory_mask;
+                listing.dev_done = job.listing.dev_done;
+                listing.directory = job.listing.directory.clone(self.allocator) catch {
+                    self.metadata_notice = job.publicationFailed("Metadata cache could not be saved; previous values kept");
+                    return true;
+                };
                 // Filtering is independent of automatic login refresh. Even
                 // with auto refresh disabled, a manual job may use an old key.
                 succeeded = job.succeeded;
@@ -1307,7 +1323,7 @@ pub const Session = struct {
             }
             if (dev_ready) {
                 job.dev_published = true;
-                metadata.mergeDev(&listing, &job.dev_listing) catch {
+                metadata.mergeDev(self.allocator, &listing, &job.dev_listing) catch {
                     self.metadata_notice = job.publicationFailed("Metadata cache could not be saved; previous values kept");
                     return true;
                 };
@@ -1322,15 +1338,17 @@ pub const Session = struct {
                 listing.dev_done = false;
                 job.dev_listing.dev_done = false;
             }
-            const previous = self.metadata_cache;
+            var previous = self.metadata_cache;
             self.metadata_cache = publication.cache;
             const models = self.buildModels(self.global_config.?.value) catch {
+                self.metadata_cache.deinit(self.allocator);
                 self.metadata_cache = previous;
                 self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
             };
             const decision_models = self.buildDecisionModels(self.global_config.?.value) catch {
                 self.freeDisplayModels(models);
+                self.metadata_cache.deinit(self.allocator);
                 self.metadata_cache = previous;
                 self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
@@ -1338,10 +1356,12 @@ pub const Session = struct {
             const image_models = self.buildImageModels(self.global_config.?.value) catch {
                 self.freeDisplayModels(models);
                 self.freeDisplayModels(decision_models);
+                self.metadata_cache.deinit(self.allocator);
                 self.metadata_cache = previous;
                 self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
             };
+            previous.deinit(self.allocator);
             self.freeDisplayModels(self.display_models);
             self.freeDisplayModels(self.display_decision_models);
             self.freeDisplayModels(self.display_image_models);
@@ -1481,8 +1501,12 @@ pub const Session = struct {
                         try self.appendRegistryCandidate(&models, global, provider.name, entry.model.name);
                 };
             }
-            return models.toOwnedSlice(self.allocator);
         }
+        if (global.registry) |registry| {
+            if (registry.providers.len > self.display_providers.len) self.display_providers = try self.allocator.realloc(self.display_providers, registry.providers.len);
+        }
+        if (models.items.len > self.display_origins.len) self.display_origins = try self.allocator.realloc(self.display_origins, models.items.len);
+        if (models.items.len > self.display_disabled.len) self.display_disabled = try self.allocator.realloc(self.display_disabled, models.items.len);
         return models.toOwnedSlice(self.allocator);
     }
 
@@ -1532,7 +1556,6 @@ pub const Session = struct {
         const a = arena.allocator();
         const selector = try std.fmt.allocPrint(a, "{s}/{s}", .{ provider, raw_id });
         for (models.items) |model| if (std.mem.eql(u8, model.name, selector)) return;
-        if (models.items.len == self.display_disabled.len) return error.TooManyModels;
         const resolved = model_resolver.resolve(a, global, &self.metadata_cache, provider, raw_id, false) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {

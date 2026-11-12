@@ -18,14 +18,13 @@ const main_edits = [_]Edit{
     .{ .key = .compaction_enabled, .value = 0 },
     .{ .key = .command_timeout_ms, .value = 10000 },
     .{ .key = .request_timeout_ms, .value = 20000 },
-    .{ .key = .task_timeout_ms, .value = 40000 },
 };
 fn set(session: *Session, key: preference.Key, value: ?u32) !void {
     const c = session.connection();
     try c.preference_fn.?(c.context, key, value);
 }
 fn disk(session: *Session) ![]const u8 {
-    return (try session.store.root.read(a, cfg.file_name, 0, cfg.max_config_bytes)).data;
+    return try session.store.root.readBinaryGuarded(a, cfg.file_name, null, null);
 }
 fn seed(home: []const u8, bytes: []const u8) !void {
     var store = try Store.open(a, io, home);

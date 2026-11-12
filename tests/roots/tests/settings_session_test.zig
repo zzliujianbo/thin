@@ -71,7 +71,7 @@ const Fixture = struct {
     }
 
     fn bytes(self: *Fixture) ![]u8 {
-        return self.tmp.dir.readFileAlloc(io, "home/.thin/config.json", a, .limited(cfg.max_config_bytes));
+        return self.tmp.dir.readFileAlloc(io, "home/.thin/config.json", a, .unlimited);
     }
 
     fn expectDefaults(self: *Fixture, selector: []const u8, preference: ?[]const u8) !void {

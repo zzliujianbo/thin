@@ -18,7 +18,6 @@ const FakeBackground = struct {
     cleanup_failed: bool = false,
     last_command: []const u8 = "",
     last_startup_ms: u32 = 0,
-    last_log_bytes: u32 = 0,
     last_grace_ms: u32 = 0,
     last_cleanup_ms: u32 = 0,
     last_query: background.Query = .{ .action = .list },
@@ -42,7 +41,6 @@ const FakeBackground = struct {
         self.calls += 1;
         self.last_command = s.command;
         self.last_startup_ms = s.startup_timeout_ms;
-        self.last_log_bytes = s.log_bytes;
         self.last_grace_ms = s.term_grace_ms;
         self.last_cleanup_ms = s.cleanup_timeout_ms;
         return .{ .text = self.start_text, .cleanup_failed = self.cleanup_failed };

@@ -71,13 +71,9 @@ const Entry = struct {
 /// Bounded FIFO of already-encoded events. Owns each json buffer; evicts the
 /// oldest entries when the count or byte budget would be exceeded.
 const Ring = struct {
-    const max_count_default: usize = 1024;
-
     allocator: std.mem.Allocator,
     items: std.ArrayList(Entry) = .empty,
     bytes: usize = 0,
-    max_count: usize = max_count_default,
-    budget: usize = 2 * 1024 * 1024,
     /// Only actual eviction establishes a gap: history-only sequence positions
     /// need not appear in this ring at all.
     evicted_through: u64 = 0,
@@ -92,12 +88,6 @@ const Ring = struct {
         // The caller retains ownership unless append succeeds.
         try self.items.append(self.allocator, .{ .seq = seq, .json = json });
         self.bytes +|= json.len;
-        while (self.items.items.len > 1 and (self.items.items.len > self.max_count or self.bytes > self.budget)) {
-            const oldest = self.items.orderedRemove(0);
-            self.evicted_through = oldest.seq;
-            self.bytes -= oldest.json.len;
-            self.allocator.free(oldest.json);
-        }
     }
 
     fn oldestSeq(self: *const Ring) ?u64 {
@@ -119,8 +109,6 @@ const LiveRing = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(Entry) = .empty,
     bytes: usize = 0,
-    max_count: usize = 1024,
-    budget: usize = 2 * 1024 * 1024,
     /// Contiguous retirement watermark: every position up to here is proven.
     reclaimed_through: u64 = 0,
     /// Highest position any proven range retired. It may be ahead of
@@ -132,10 +120,6 @@ const LiveRing = struct {
         for (self.items.items) |entry| self.allocator.free(entry.json);
         self.items.deinit(self.allocator);
         self.* = undefined;
-    }
-
-    fn canFit(self: *const LiveRing, len: usize) bool {
-        return self.items.items.len < self.max_count and len <= self.budget and self.bytes <= self.budget - len;
     }
 
     fn oldestSeq(self: *const LiveRing) ?u64 {
@@ -156,7 +140,6 @@ const LiveRing = struct {
 
     fn push(self: *LiveRing, seq: u64, json: []u8) !void {
         if (seq <= self.reclaimed_through or (self.items.items.len != 0 and seq <= self.items.items[self.items.items.len - 1].seq)) return error.InvalidSequence;
-        if (!self.canFit(json.len)) return error.RingFull;
         try self.items.append(self.allocator, .{ .seq = seq, .json = json });
         self.bytes += json.len;
     }
@@ -201,7 +184,6 @@ const LiveRing = struct {
 /// event at `seq`. Marks belong only to the current uncommitted run.
 const DraftMark = struct { seq: u64, text: usize, reasoning: usize };
 const DraftCut = struct { text: usize, reasoning: usize };
-const max_draft_marks: usize = 2048;
 
 /// Bounded streaming text accumulator for the in-progress assistant draft.
 const Draft = struct {
@@ -214,19 +196,10 @@ const Draft = struct {
         self.truncated = false;
     }
 
-    fn append(self: *Draft, bytes: []const u8) void {
-        if (self.buf.items.len >= protocol.max_text) {
+    fn append(self: *Draft, bytes: []const u8) !void {
+        self.buf.appendSlice(self.allocator, bytes) catch |err| {
             self.truncated = true;
-            return;
-        }
-        const room = protocol.max_text - self.buf.items.len;
-        var n = @min(room, bytes.len);
-        if (n < bytes.len) {
-            while (n > 0 and (bytes[n] & 0xc0) == 0x80) n -= 1;
-            self.truncated = true;
-        }
-        self.buf.appendSlice(self.allocator, bytes[0..n]) catch {
-            self.truncated = true;
+            return err;
         };
     }
 
@@ -258,14 +231,6 @@ const Receipt = struct {
     accepted: bool = false,
     task: u64 = 0,
 };
-
-const max_tool_name: usize = 256;
-/// The Bridge copies at most `item_budget` bytes of text per event, so the
-/// owned approval detail can never legitimately be larger. Keeping the whole
-/// value is what lets a reconnecting viewer read the real dangerous command
-/// tail before it answers; a smaller display bound would silently authorize a
-/// command the viewer cannot see.
-const max_tool_description: usize = bridge_mod.item_budget;
 
 const Controller = struct {
     epoch: u64,
@@ -455,20 +420,14 @@ pub const SessionHost = struct {
 
     fn admitMemoryCompletion(self: *SessionHost, source: anytype) MemoryAdmission {
         const terminal = source.peekMemoryCompletion() orelse return .empty;
-        if (!self.events.canFit(1)) return .blocked;
         const event: r.Event = .{ .memory_completed = terminal };
         const json = protocol.encodeEventMeta(self.allocator, event, .{}) catch return .unavailable;
-        if (!self.events.canFit(json.len)) {
-            self.allocator.free(json);
-            return .blocked;
-        }
         self.commitObserved(event, false, true, json) catch |err| {
             self.allocator.free(json);
-            // OOM and a full ring are retryable; neither may prevent controls or
-            // discard the independently owned completion. Invalid sequence is
-            // a host invariant violation, as it is for primary events.
-            if (err != error.OutOfMemory and err != error.RingFull) self.fatal = err;
-            return if (err == error.RingFull) .blocked else .unavailable;
+            // Allocation failure retains the independently owned completion.
+            // Invalid sequence is a host invariant violation.
+            if (err != error.OutOfMemory) self.fatal = err;
+            return .unavailable;
         };
         const taken = source.takeMemoryCompletion();
         std.debug.assert(taken != null);
@@ -479,17 +438,12 @@ pub const SessionHost = struct {
     /// Another job may finish after peek; never take an unspecified head.
     fn admitBackgroundCompletion(self: *SessionHost, source: anytype) MemoryAdmission {
         const terminal = source.peekBackgroundCompletion() orelse return .empty;
-        if (!self.events.canFit(1)) return .blocked;
         const event: r.Event = .{ .background_completed = terminal };
         const json = protocol.encodeEventMeta(self.allocator, event, .{}) catch return .unavailable;
-        if (!self.events.canFit(json.len)) {
-            self.allocator.free(json);
-            return .blocked;
-        }
         self.commitObserved(event, false, true, json) catch |err| {
             self.allocator.free(json);
-            if (err != error.OutOfMemory and err != error.RingFull) self.fatal = err;
-            return if (err == error.RingFull) .blocked else .unavailable;
+            if (err != error.OutOfMemory) self.fatal = err;
+            return .unavailable;
         };
         source.takeBackgroundCompletion(terminal.id);
         return .admitted;
@@ -518,14 +472,6 @@ pub const SessionHost = struct {
                 self.pending_event = .{ .item = item, .json = json };
             }
             const pending = &self.pending_event.?;
-            if (!self.events.canFit(pending.json.len)) {
-                // Joining never discards still-unacknowledged Bridge events.
-                if (self.task) |*owned| if (!owned.joined and owned.job.done.load(.acquire)) {
-                    owned.future.await(self.io);
-                    owned.joined = true;
-                };
-                return;
-            }
             self.commitObserved(pending.item.event, pending.item.display_truncated, pending.item.canonical_complete, pending.json) catch |err| {
                 self.fatal = err;
                 return;
@@ -575,7 +521,6 @@ pub const SessionHost = struct {
     fn dispatchNext(self: *SessionHost) void {
         if (self.closing or self.fatal != null) return;
         if (self.task != null or self.pending_event != null or self.pending_terminal != null) return;
-        if (!self.events.canFit(protocol.max_text * 3 + 8192)) return;
         if (self.session.app == null or self.session.read_only) return;
         if (self.session.app) |app| if (app.runtime.busy.load(.acquire) or app.runtime.poisoned) return;
         const lease = self.inbox.claimNext() orelse return;
@@ -652,20 +597,14 @@ pub const SessionHost = struct {
 
     /// Exact draft boundary for the ordered cutoff. See `DraftMark`.
     fn recordDraftMark(self: *SessionHost, seq: u64) void {
-        if (self.draft_marks.items.len >= max_draft_marks) {
-            // The cut can no longer be derived for every future cutoff. Keep the
-            // draft out of baselines and report shortened history instead of
-            // duplicating or reordering retained live bytes.
-            self.draft_marks_exact = false;
-            self.draft_marks.clearRetainingCapacity();
-        }
         self.draft_marks.append(self.allocator, .{
             .seq = seq,
             .text = self.partial_text.buf.items.len,
             .reasoning = self.partial_reasoning.buf.items.len,
-        }) catch {
+        }) catch |err| {
             self.draft_marks_exact = false;
             self.draft_marks.clearRetainingCapacity();
+            self.fatal = err;
         };
     }
 
@@ -714,8 +653,12 @@ pub const SessionHost = struct {
             .permission_cleared => |id| {
                 if (self.pending_permission == id) self.clearPending();
             },
-            .text => |bytes| self.partial_text.append(bytes),
-            .reasoning => |bytes| self.partial_reasoning.append(bytes),
+            .text => |bytes| self.partial_text.append(bytes) catch |err| {
+                self.fatal = err;
+            },
+            .reasoning => |bytes| self.partial_reasoning.append(bytes) catch |err| {
+                self.fatal = err;
+            },
             .assistant_committed => {
                 self.partial_text.reset();
                 self.partial_reasoning.reset();
@@ -767,15 +710,10 @@ pub const SessionHost = struct {
     /// authority for whether this id can still be answered.
     fn setPending(self: *SessionHost, id: u64, tool_name: []const u8, description: []const u8, display_truncated: bool) void {
         self.clearPending();
-        const name_len = boundedLen(tool_name, max_tool_name);
-        const desc_len = boundedLen(description, max_tool_description);
-        // The Bridge's display budget and this host's own bound are the same
-        // budget, so clipping is remembered from either of them: a detail that
-        // is not the complete request must never be approved as if it were.
-        self.pending_detail_incomplete = display_truncated or name_len < tool_name.len or desc_len < description.len;
+        self.pending_detail_incomplete = display_truncated;
         self.pending_permission = id;
-        self.pending_name = self.allocator.dupe(u8, tool_name[0..name_len]) catch null;
-        self.pending_desc = self.allocator.dupe(u8, description[0..desc_len]) catch null;
+        self.pending_name = self.allocator.dupe(u8, tool_name) catch null;
+        self.pending_desc = self.allocator.dupe(u8, description) catch null;
         if (self.pending_name == null or self.pending_desc == null) {
             // Without the real detail a reconnect cannot show what it approves.
             self.clearPending();
@@ -817,7 +755,6 @@ pub const SessionHost = struct {
             self.pending_terminal = .{ .terminal = terminal, .json = json };
         }
         const pending = self.pending_terminal.?;
-        if (!self.events.canFit(pending.json.len)) return;
         const seq = self.next_seq;
         self.events.push(seq, pending.json) catch |err| {
             self.fatal = err;
@@ -865,14 +802,12 @@ pub const SessionHost = struct {
     /// count and bytes; native replay, configuration and credentials never
     /// cross this conversion.
     fn seedHistory(self: *SessionHost, messages: []const p.Message) void {
-        const max_seed_events: usize = 512;
         var seeded: usize = 0;
         var bytes: usize = 0;
         var user_id: u64 = 0;
         var text_buf = std.ArrayList(u8).empty;
         defer text_buf.deinit(self.allocator);
         for (messages) |message| {
-            if (seeded >= max_seed_events or bytes > protocol.max_response / 2) break;
             switch (message.role) {
                 .context => continue,
                 .user => {
@@ -882,9 +817,14 @@ pub const SessionHost = struct {
                             .text => |value| value,
                             else => continue,
                         };
-                        if (text_buf.items.len != 0) text_buf.append(self.allocator, '\n') catch return;
-                        text_buf.appendSlice(self.allocator, text) catch return;
-                        if (text_buf.items.len >= protocol.max_text) break;
+                        if (text_buf.items.len != 0) text_buf.append(self.allocator, '\n') catch |err| {
+                            self.fatal = err;
+                            return;
+                        };
+                        text_buf.appendSlice(self.allocator, text) catch |err| {
+                            self.fatal = err;
+                            return;
+                        };
                     }
                     if (text_buf.items.len == 0) continue;
                     user_id +%= 1;
@@ -1498,7 +1438,7 @@ pub const SessionHost = struct {
                     if (position > covered + 1) incomplete = true;
                     const wire = try std.fmt.allocPrint(a, "{s},\"seq\":{d}}}", .{ rows[row_index].json[0 .. rows[row_index].json.len - 1], position });
                     defer a.free(wire);
-                    if (count == protocol.max_events or out.buf.items.len + wire.len + 32 > budget) {
+                    if (count == protocol.max_events or (count != 0 and out.buf.items.len + wire.len + 32 > budget)) {
                         more = true;
                         break :scan;
                     }
@@ -1514,7 +1454,7 @@ pub const SessionHost = struct {
             if (position > covered + 1) incomplete = true;
             const wire = try std.fmt.allocPrint(a, "{s},\"seq\":{d}}}", .{ lives[live_index].json[0 .. lives[live_index].json.len - 1], position });
             defer a.free(wire);
-            if (count == protocol.max_events or out.buf.items.len + wire.len + 32 > budget) {
+            if (count == protocol.max_events or (count != 0 and out.buf.items.len + wire.len + 32 > budget)) {
                 more = true;
                 break :scan;
             }
@@ -1569,7 +1509,7 @@ pub const SessionHost = struct {
                 }
                 // Real encoded size, not the ring capacity: a single large tool
                 // result must not push a legal frame over the transport bound.
-                if (used + entry.json.len + 1 > budget) {
+                if (taken != 0 and used + entry.json.len + 1 > budget) {
                     cut = true;
                     break;
                 }
@@ -1604,9 +1544,8 @@ pub const SessionHost = struct {
         var synthetic: [6]?[]u8 = @splat(null);
         defer for (&synthetic) |*item| if (item.*) |json| a.free(json);
         var synthetic_count: usize = 0;
-        var synthetic_bytes: usize = 0;
         {
-            var scratch = SyntheticWriter{ .host = self, .a = a, .list = &synthetic, .count = &synthetic_count, .bytes = &synthetic_bytes };
+            var scratch = SyntheticWriter{ .a = a, .list = &synthetic, .count = &synthetic_count };
             // A streaming baseline is the ordered cutoff `base`; any live delta
             // after it is delivered by the merged events page, so the synthetic
             // draft must hold exactly the bytes retired at or before `base`.
@@ -1614,30 +1553,23 @@ pub const SessionHost = struct {
                 .text = self.partial_text.buf.items.len,
                 .reasoning = self.partial_reasoning.buf.items.len,
             };
-            if (cut.text != 0) scratch.addWith(.{ .text = self.partial_text.buf.items[0..cut.text] }, true, self.partial_text.truncated);
-            if (cut.reasoning != 0) scratch.addWith(.{ .reasoning = self.partial_reasoning.buf.items[0..cut.reasoning] }, true, self.partial_reasoning.truncated);
-            if (self.phase) |phase| scratch.add(.{ .state = phase }, true);
-            if (self.context) |context| scratch.add(.{ .context_snapshot = context }, true);
+            if (cut.text != 0) try scratch.addWith(.{ .text = self.partial_text.buf.items[0..cut.text] }, true, self.partial_text.truncated);
+            if (cut.reasoning != 0) try scratch.addWith(.{ .reasoning = self.partial_reasoning.buf.items[0..cut.reasoning] }, true, self.partial_reasoning.truncated);
+            if (self.phase) |phase| try scratch.add(.{ .state = phase }, true);
+            if (self.context) |context| try scratch.add(.{ .context_snapshot = context }, true);
             // Replay the real owned approval detail, never an empty placeholder.
             if (self.pending_permission != null and self.pending_name != null and self.pending_desc != null) {
                 // The rebuilt row keeps the stored clipping flag, so a viewer
                 // that reconnects knows the detail is not the whole request.
-                scratch.addWith(
+                try scratch.addWith(
                     .{ .permission = .{ .id = self.pending_permission.?, .tool_name = self.pending_name.?, .description = self.pending_desc.? } },
                     true,
                     self.pending_detail_incomplete,
                 );
             }
-            if (self.task == null) if (self.last_terminal) |terminal| scratch.add(.{ .finished = terminal }, true);
-            synthetic_bytes = scratch.total;
+            if (self.task == null) if (self.last_terminal) |terminal| try scratch.add(.{ .finished = terminal }, true);
         }
-
-        const budget = if (protocol.max_response > response_reserve + synthetic_bytes)
-            protocol.max_response - response_reserve - synthetic_bytes
-        else
-            0;
         const entries = self.history.items.items;
-        var used: usize = 0;
         var end = entries.len;
         if (stream_epoch != null) {
             // Only positions at or below the ordered cutoff belong to the
@@ -1645,14 +1577,10 @@ pub const SessionHost = struct {
             // merged events pages in exact sequence order.
             while (end > 0 and entries[end - 1].seq > base) end -= 1;
         }
+        _ = limit; // No continuation exists for a shortened baseline.
         var start: usize = end;
-        var taken: usize = 0;
-        while (start > 0 and taken < limit) {
-            const entry = entries[start - 1];
-            if (used + entry.json.len + 1 > budget) break;
-            used += entry.json.len + 1;
+        while (start > 0) {
             start -= 1;
-            taken += 1;
         }
         const draft_shortened = stream_epoch != null and self.draftCut(base) == null;
         const truncated = start != 0 or self.history.evicted_through != 0 or
@@ -1684,24 +1612,21 @@ pub const SessionHost = struct {
     /// Owns the encoded synthetic history rows so their exact byte count can
     /// reserve room before canonical selection.
     const SyntheticWriter = struct {
-        host: *SessionHost,
         a: std.mem.Allocator,
         list: *[6]?[]u8,
         count: *usize,
-        bytes: *usize,
-        total: usize = 0,
 
-        fn add(self: *SyntheticWriter, event: r.Event, enable: bool) void {
-            self.addWith(event, enable, false);
+        fn add(self: *SyntheticWriter, event: r.Event, enable: bool) !void {
+            try self.addWith(event, enable, false);
         }
 
-        fn addWith(self: *SyntheticWriter, event: r.Event, enable: bool, truncated: bool) void {
-            if (!enable or self.count.* >= self.list.len) return;
+        fn addWith(self: *SyntheticWriter, event: r.Event, enable: bool, truncated: bool) !void {
+            if (!enable) return;
+            std.debug.assert(self.count.* < self.list.len);
             const meta = protocol.EventMeta{ .epoch = 0, .truncated = truncated, .canonical_complete = true };
-            const json = encodeSynthetic(self.a, event, meta) catch return;
+            const json = try encodeSynthetic(self.a, event, meta);
             self.list[self.count.*] = json;
             self.count.* += 1;
-            self.total += json.len + 1;
         }
     };
 
@@ -1712,7 +1637,7 @@ pub const SessionHost = struct {
         // detection for a request whose acknowledgment was lost.
         if (receipt_id == 0) return errorReply(a, request.id, error.BadRequest);
         const kind = request.stringEnum(protocol.TaskKind, "kind") catch return errorReply(a, request.id, error.BadRequest);
-        const text = request.stringField("text", protocol.max_text) catch |err| return errorReply(a, request.id, err);
+        const text = request.stringField("text", null) catch |err| return errorReply(a, request.id, err);
         const digest = submitDigest(kind, text);
 
         self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
@@ -1828,7 +1753,7 @@ pub const SessionHost = struct {
     fn handleEnqueue(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
         const epoch = request.u64Field("epoch") catch return errorReply(a, request.id, error.BadRequest);
         const kind = request.stringEnum(protocol.QueueKind, "kind") catch return errorReply(a, request.id, error.BadRequest);
-        const text = request.stringField("text", protocol.max_text) catch |err| return errorReply(a, request.id, err);
+        const text = request.stringField("text", null) catch |err| return errorReply(a, request.id, err);
         self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
         const queued = self.inbox.enqueue(self.allocator, kind.toInbox(), text) catch |err| return errorReply(a, request.id, err);
         var out = protocol.Out.init(a);
@@ -1962,20 +1887,8 @@ pub const SessionHost = struct {
 
         try out.beginObject("limits");
         try out.field("command_timeout_ms", state.limits.command_timeout_ms);
-        try out.field("command_max_timeout_ms", state.limits.command_max_timeout_ms);
-        try out.field("read_bytes", state.limits.read_bytes);
-        try out.field("output_bytes", state.limits.output_bytes);
-        try out.field("max_input_tokens", state.limits.max_input_tokens);
         try out.field("low_price_input", state.limits.low_price_input);
-        try out.field("input_margin_tokens", state.limits.input_margin_tokens);
-        try out.field("safety_tokens", state.limits.safety_tokens);
         try out.field("request_timeout_ms", state.limits.request_timeout_ms);
-        try out.field("task_timeout_ms", state.limits.task_timeout_ms);
-        // Published so a spawning owner can bound its TERM->KILL cleanup to the
-        // configured budgets instead of an unconditional 30s fallback. Plain
-        // numbers only; no raw config and no credential bytes.
-        try out.field("cleanup_grace_ms", state.limits.cleanup_grace_ms);
-        try out.field("cleanup_timeout_ms", state.limits.cleanup_timeout_ms);
         try out.field("compaction_enabled", state.limits.compaction_enabled);
         try out.endObject();
 
@@ -2004,9 +1917,8 @@ pub const SessionHost = struct {
 
     /// Bounded model catalog projection: names plus capability numbers only.
     fn encodeModels(out: *protocol.Out, name: []const u8, models: []const cfg.Model, official: ?[]const bool, disabled: ?[]const bool) !void {
-        const limit: usize = @min(models.len, 256);
         try out.beginArray(name);
-        for (models[0..limit], 0..) |model, i| {
+        for (models, 0..) |model, i| {
             try out.beginObjectElement();
             try out.field("name", model.name);
             try out.field("context_tokens", model.context_tokens);
@@ -2022,18 +1934,17 @@ pub const SessionHost = struct {
         // strict parser.
         var flag_buffer: [64]u8 = undefined;
         const flag = try std.fmt.bufPrint(&flag_buffer, "{s}_truncated", .{name});
-        try out.field(flag, models.len > limit);
+        try out.field(flag, false);
     }
 
     /// Bounded proxy allowlist projection: model names only. The list is a
     /// public setting, so a truncated tail is reported instead of silently
     /// shortened; an empty list stays a real JSON array.
     fn encodeProxyModels(out: *protocol.Out, names: []const []const u8) !void {
-        const limit: usize = @min(names.len, max_proxy_models);
         try out.beginArray("proxy_models");
-        for (names[0..limit]) |name| try out.arrayValue(name);
+        for (names) |name| try out.arrayValue(name);
         try out.endArray();
-        try out.field("proxy_models_truncated", names.len > limit);
+        try out.field("proxy_models_truncated", false);
     }
 
     fn handleModelSelect(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
@@ -2293,8 +2204,6 @@ fn providerFromSlug(slug: []const u8) ?providers.Id {
 }
 
 const allowed = [_][]const u8{ "deepseek", "opencode-zen", "opencode-go" };
-/// Publication bound for the proxy allowlist, mirroring the model catalogs.
-const max_proxy_models: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Isolated lifecycle test (temp HOME/project, no network, no real config)

@@ -13,7 +13,8 @@ test "automatic Memory headless log-off captures user and complete tool only onc
     try std.testing.expect(runtime.memory_capture == null);
     try std.testing.expectEqual(@as(u32, 2), terminal.usage.normal_calls);
     try std.testing.expectEqual(@as(u32, 0), terminal.usage.summary_calls);
-    try std.testing.expect(fake.maxbytes <= 8192);
+    try std.testing.expectEqualStrings("project facts A", fake.reference);
+    try std.testing.expect(std.mem.endsWith(u8, lastReference(&runtime), fake.reference));
 }
 test "automatic Memory excludes errored canceled truncated cleanup and sensitive tool material" {
     for ([_]r.Execution{
@@ -127,18 +128,17 @@ test "automatic Memory validates input before retrieve and command compact never
     try std.testing.expectEqual(@as(usize, 0), fake.retrieves);
     try std.testing.expectEqual(@as(usize, 0), fake.completes);
 }
-test "automatic Memory retrieval budget reserves incoming text and respects calibrated context room" {
-    var fake = Fake{};
+test "automatic Memory retains a complete reference beyond the old retrieval budget" {
+    const reference: [9000]u8 = @splat('x');
+    var fake = Fake{ .reference = &reference };
     var config = configValue();
     var runtime = try fake.init(&config);
     defer runtime.deinit();
     runtime.estimator.per_mille = 2000;
-    const query = "small user input";
-    config.limits.max_input_tokens = @intCast(runtime.estimatedTokens() + 400);
     var cancel: p.Cancellation = .{};
-    _ = try runtime.run(query, &cancel);
-    try std.testing.expect(fake.maxbytes < 400);
-    try std.testing.expect(fake.maxbytes <= 8192);
+    const terminal = try runtime.run("small user input", &cancel);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expect(std.mem.endsWith(u8, lastReference(&runtime), &reference));
     try std.testing.expectEqual(@as(usize, 1), fake.retrieves);
 }
 test "automatic Memory unsafe retrieval poisons Runtime before any primary request" {
@@ -157,19 +157,25 @@ test "automatic Memory unsafe retrieval poisons Runtime before any primary reque
         try std.testing.expectEqual(@as(usize, 1), fake.retrieves);
     }
 }
-test "automatic Memory zero retrieval budget still snapshots generation without appending" {
+test "automatic Memory reports actual context failure without replacing full reference with empty" {
     var fake = Fake{};
     var config = configValue();
     var runtime = try fake.init(&config);
     defer runtime.deinit();
-    config.limits.max_input_tokens = 1;
+    config.model.context_tokens = 2; // Smallest valid model: one input token of room.
+    try std.testing.expectEqual(@as(usize, 1), @import("../core/context.zig").inputBudget(config));
     var cancel: p.Cancellation = .{};
-    _ = try runtime.run("valid task", &cancel);
+    const first = try runtime.run("valid task", &cancel);
+    try std.testing.expectEqual(r.Status.failed, first.status);
+    try std.testing.expectEqual(@as(?anyerror, error.ContextTooLarge), first.detail);
     try std.testing.expectEqual(@as(usize, 1), fake.retrieves);
-    try std.testing.expectEqual(@as(usize, 0), fake.maxbytes);
-    try std.testing.expectEqual(@as(usize, 0), referenceCount(&runtime));
-    _ = try runtime.run("second task", &cancel);
+    try std.testing.expectEqual(@as(usize, 1), referenceCount(&runtime));
+    try std.testing.expect(std.mem.endsWith(u8, lastReference(&runtime), fake.reference));
+    const second = try runtime.run("second task", &cancel);
+    try std.testing.expectEqual(r.Status.failed, second.status);
+    try std.testing.expectEqual(@as(?anyerror, error.ContextTooLarge), second.detail);
     try std.testing.expectEqual(@as(usize, 2), fake.retrieves);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), fake.completes);
 }
 test "automatic Memory restore consults current Store instead of trusting saved context" {
@@ -200,7 +206,7 @@ test "automatic Memory survives compaction arena replacement and reinserts refer
     var cancel: p.Cancellation = .{};
     _ = try runtime.run("old task", &cancel);
     const a = runtime.arena.allocator();
-    const old_text: [6500]u8 = @splat('x');
+    const old_text: [40_000]u8 = @splat('x');
     try runtime.history.append(a, try p.textMessage(a, .user, &old_text));
     try runtime.history.append(a, try p.cloneMessage(a, .{
         .role = .assistant,
@@ -208,11 +214,9 @@ test "automatic Memory survives compaction arena replacement and reinserts refer
         .replay = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .anthropic }, .json = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"old signed thought\",\"signature\":\"old\"},{\"type\":\"text\",\"text\":\"old verified answer\"}]}", .retain_turn = true },
     }));
     const old_arena = runtime.history.items.ptr;
-    // Trigger a real summary below the hard request gate; do not make the
-    // summary itself exceed the explicit input ceiling.
-    config.limits.max_input_tokens = 12000;
-    config.limits.compaction_trigger_percent = 20;
-    config.limits.compaction_target_percent = 10;
+    // Cross the internal compaction trigger while the summary request still
+    // fits the declared model window; no manual input quota is involved.
+    config.model.context_tokens = 20000;
     const terminal = try runtime.run("current durable fact", &cancel);
     try std.testing.expectEqual(@as(?anyerror, null), terminal.detail);
     try std.testing.expectEqual(r.Status.success, terminal.status);
@@ -263,7 +267,7 @@ test "automatic Memory expected version requires same topic category Related and
     material.related = &.{};
     try k.validateCandidate(material, candidate);
 }
-test "automatic Memory Capture bounded omitted UTF8 assistant sensitive and OOM" {
+test "automatic Memory Capture keeps complete sources but omits invalid assistant and sensitive data with OOM safety" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var capture = k.Capture{ .allocator = arena.allocator() };
@@ -273,10 +277,11 @@ test "automatic Memory Capture bounded omitted UTF8 assistant sensitive and OOM"
     capture.add(.tool, "\xff");
     capture.add(.tool, &@as([4097]u8, @splat('x')));
     capture.add(.user, "verified durable fact");
-    try std.testing.expectEqual(@as(usize, 2), capture.sources.items.len);
-    try std.testing.expectEqual(@as(usize, 4), capture.omitted_sources);
+    try std.testing.expectEqual(@as(usize, 3), capture.sources.items.len);
+    try std.testing.expectEqual(@as(usize, 3), capture.omitted_sources);
     try std.testing.expectEqualStrings("read /home/user/.ssh/id_rsa", capture.sources.items[0].text);
-    try std.testing.expectEqualStrings("verified durable fact", capture.sources.items[1].text);
+    try std.testing.expectEqualStrings(&@as([4097]u8, @splat('x')), capture.sources.items[1].text);
+    try std.testing.expectEqualStrings("verified durable fact", capture.sources.items[2].text);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var oom = k.Capture{ .allocator = failing.allocator() };
     oom.add(.user, "fact");

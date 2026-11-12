@@ -215,14 +215,14 @@ test "communication delivers real stream frames during a delayed control reply a
     var request_ = try protocol.parseRequest(a, request_bytes);
     defer request_.deinit();
     try testing.expect(request_.op == .cancel or request_.op == .poll_metadata);
-    try stream.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
-    try stream.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"snapshot\",\"through\":0,\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"phase\":\"calling_model\",\"task\":1,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2000 });
+    try stream.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2000 });
     const event_bytes = try protocol.encodeEvent(a, .{ .text = "delayed-control-live-body" });
     defer a.free(event_bytes);
     // Mandatory wire sequence: the page entry carries the owner's position.
     const sequenced = try std.fmt.allocPrint(a, "{s},\"seq\":1}}", .{event_bytes[0 .. event_bytes.len - 1]});
     defer a.free(sequenced);
-    const page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":1,\"events\":[{s}]}}", .{sequenced});
     defer a.free(page);
     try stream.writeFrame(page, .{ .io = io, .timeout_ms = 2000 });
     const deadline = std.Io.Clock.awake.now(io);
@@ -302,8 +302,8 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     try testing.expect((try watch_request.optionalU64("since")) == null);
-    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
 
     const first_page = try readyPage(a, 0, 1, &.{1}, "a");
     defer a.free(first_page);
@@ -343,7 +343,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
     // no per-event FIFO reaches the owner.
     // UTF-8 plus a CR-bearing delta: the CR boundary must stay a separate
     // unacknowledged item across the reconnect, never absorbed into the other.
-    const second_page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
+    const second_page = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":1,\"through\":3,\"events\":[{{\"t\":\"text\",\"v\":\"中\",\"seq\":2}},{{\"t\":\"text\",\"v\":\"\\r\",\"seq\":3}}]}}", .{});
     defer a.free(second_page);
     try watch.writeFrame(second_page, .{ .io = io, .timeout_ms = 2_000 });
     var received: usize = 0;
@@ -425,7 +425,7 @@ test "frontend ACK rides the bound watch socket, coalesces and resumes without a
 
     // Same viewer: snapshot at the cursor is redundant, the delta continues the
     // owned stream with no synthetic history reset and no duplicate.
-    try resumed.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try resumed.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":3,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
     const delta = try readyPage(a, 3, 4, &.{4}, "d");
     defer a.free(delta);
     try resumed.writeFrame(delta, .{ .io = io, .timeout_ms = 2_000 });
@@ -476,8 +476,8 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
     const hello = try protocol.encodeEvent(a, .{ .user_committed = .{ .id = 1, .text = "hello" } });
     defer a.free(hello);
-    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    const baseline = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
+    try watch.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":5,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    const baseline = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":2,\"through\":2,\"truncated\":false,\"entries\":[{s}]}}", .{hello});
     defer a.free(baseline);
     try watch.writeFrame(baseline, .{ .io = io, .timeout_ms = 2_000 });
 
@@ -497,7 +497,7 @@ test "new viewer baseline rows precede ordered pages and gaps are surfaced" {
 
     // Positions 4 and 5 follow the baseline cutoff; position 3 is gone (a
     // selectively retired control event), so the page must say so.
-    const page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":2,\"through\":5,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"A\",\"seq\":4}},{{\"t\":\"user\",\"id\":2,\"v\":\"again\",\"seq\":5}}]}}", .{});
     defer a.free(page);
     try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
     var received: usize = 0;
@@ -553,23 +553,42 @@ test "coalesced live span is acknowledged as one exact first/last range" {
     var watch_request = try protocol.parseRequest(a, raw_watch);
     defer watch_request.deinit();
     try testing.expectEqual(protocol.Op.watch, watch_request.op);
-    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
-    try watch.writeFrame("{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"through\":0,\"stream\":\"snapshot\",\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"busy\":true,\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}}", .{ .io = io, .timeout_ms = 2_000 });
+    try watch.writeFrame("{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"baseline\",\"base\":0,\"through\":0,\"entries\":[]}", .{ .io = io, .timeout_ms = 2_000 });
     // Three consecutive raw deltas (positions 4..6) that the display queue
     // coalesces into one payload. Earlier positions were already shortened.
-    const page = try std.fmt.allocPrint(a, "{{\"v\":4,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
+    const page = try std.fmt.allocPrint(a, "{{\"v\":5,\"id\":1,\"ok\":true,\"epoch\":5,\"stream\":\"events\",\"from\":0,\"through\":6,\"incomplete\":true,\"events\":[{{\"t\":\"text\",\"v\":\"a\",\"seq\":4}},{{\"t\":\"text\",\"v\":\"b\",\"seq\":5}},{{\"t\":\"text\",\"v\":\"c\",\"seq\":6}}]}}", .{});
     defer a.free(page);
     try watch.writeFrame(page, .{ .io = io, .timeout_ms = 2_000 });
 
-    // Wait until every decoded item reached the display queue, where the three
-    // payloads coalesce into one item carrying the full raw interval.
+    // A decoded cursor is not a publication fence: the last item can still be
+    // between Client and Communication. Wait on the owned queue under its lock,
+    // without consuming the first delta before the complete run is published.
+    const communication = frontend.?.communication;
     const merged_deadline = std.Io.Clock.awake.now(io);
+    var published = false;
     while (merged_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
-        if (client.pending.items.len == 0 and client.cursor == 6) break;
-        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        communication.ready.drain();
+        published = ready: {
+            std.debug.assert(std.c.pthread_mutex_lock(&communication.mutex) == .SUCCESS);
+            defer std.debug.assert(std.c.pthread_mutex_unlock(&communication.mutex) == .SUCCESS);
+            for (communication.displays.items[communication.display_head..]) |display| {
+                if (display.value != .event) continue;
+                const item = display.value.event;
+                if (item.event == .text and item.delivery_epoch == 5 and
+                    item.delivery_first_sequence == 4 and item.delivery_sequence == 6 and
+                    std.mem.eql(u8, item.event.text, "abc")) break :ready true;
+            }
+            break :ready false;
+        };
+        if (published) break;
+        const remaining = 2_000 - merged_deadline.untilNow(io, .awake).toMilliseconds();
+        if (remaining <= 0) break;
+        var wake = [_]std.c.pollfd{.{ .fd = communication.ready.fd, .events = std.c.POLL.IN, .revents = 0 }};
+        const result = std.c.poll(&wake, wake.len, @intCast(remaining));
+        if (result < 0 and std.c._errno().* != @backingInt(std.c.E.INTR)) return error.PollFailed;
     }
-    try testing.expectEqual(@as(usize, 0), client.pending.items.len);
-    try testing.expectEqual(@as(u64, 6), client.cursor);
+    try testing.expect(published);
     var merged: ?session_client.Item = null;
     const poll_deadline = std.Io.Clock.awake.now(io);
     while (poll_deadline.untilNow(io, .awake).toMilliseconds() < 2_000) {
@@ -1360,7 +1379,7 @@ test "real host settings reply projects providers flags price states and pending
     host.connection.context = &view;
 
     // The real owner frame, not a hand-written fixture object.
-    var request = try protocol.parseRequest(a, "{\"v\":4,\"id\":60,\"op\":\"settings\"}");
+    var request = try protocol.parseRequest(a, "{\"v\":5,\"id\":60,\"op\":\"settings\"}");
     defer request.deinit();
     const frame = try host.dispatch(a, &request, 7, true);
     defer a.free(frame);
@@ -1424,19 +1443,15 @@ test "real host settings reply projects providers flags price states and pending
     // A missing field or a wrong type is a protocol failure here, never a
     // silent zero that the real Host settings would otherwise pass.
     const decoded_request_timeout_ms = valueU64(limits_object.get("request_timeout_ms") orelse return error.ProtocolError) orelse return error.ProtocolError;
-    const decoded_task_timeout_ms = valueU64(limits_object.get("task_timeout_ms") orelse return error.ProtocolError) orelse return error.ProtocolError;
+    const decoded_command_timeout_ms = valueU64(limits_object.get("command_timeout_ms") orelse return error.ProtocolError) orelse return error.ProtocolError;
     try std.testing.expectEqual(@as(u64, client.pubcfg.limits.request_timeout_ms), decoded_request_timeout_ms);
-    try std.testing.expectEqual(@as(u64, client.pubcfg.limits.task_timeout_ms), decoded_task_timeout_ms);
-    try std.testing.expect(client.pubcfg.limits.request_timeout_ms != 0 and client.pubcfg.limits.task_timeout_ms != 0);
+    try std.testing.expectEqual(@as(u64, client.pubcfg.limits.command_timeout_ms), decoded_command_timeout_ms);
+    try std.testing.expect(client.pubcfg.limits.request_timeout_ms != 0 and client.pubcfg.limits.command_timeout_ms != 0);
 }
 test "limits decode the request and task budgets with the strict u32 rule" {
     const base = core_config.Limits{
         .command_timeout_ms = 1_000,
-        .command_max_timeout_ms = 2_000,
-        .read_bytes = 3_000,
-        .output_bytes = 4_000,
         .request_timeout_ms = 300_000,
-        .task_timeout_ms = 1_800_000,
     };
     const Decoder = struct {
         fn limits(text: []const u8, start: core_config.Limits) !core_config.Limits {
@@ -1447,28 +1462,26 @@ test "limits decode the request and task budgets with the strict u32 rule" {
     };
 
     // Non-default budgets decode next to the limits already handled inline.
-    const decoded = try Decoder.limits("{\"request_timeout_ms\":10000,\"task_timeout_ms\":20000,\"command_timeout_ms\":123456}", base);
+    const decoded = try Decoder.limits("{\"request_timeout_ms\":10000,\"command_timeout_ms\":123456}", base);
     try std.testing.expectEqual(@as(u32, 10_000), decoded.request_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 20_000), decoded.task_timeout_ms);
     try std.testing.expectEqual(@as(u32, 123_456), decoded.command_timeout_ms);
 
     // A larger configured pair is decoded exactly, not clamped by the base.
-    const raised = try Decoder.limits("{\"request_timeout_ms\":60000,\"task_timeout_ms\":900000}", base);
+    const raised = try Decoder.limits("{\"request_timeout_ms\":60000,\"command_timeout_ms\":900000}", base);
     try std.testing.expectEqual(@as(u32, 60_000), raised.request_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 900_000), raised.task_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 900_000), raised.command_timeout_ms);
 
     // Unparsable text, null, and a negative number keep the inherited values.
-    const junk = try Decoder.limits("{\"request_timeout_ms\":\"abc\",\"task_timeout_ms\":null}", base);
+    const junk = try Decoder.limits("{\"request_timeout_ms\":\"abc\",\"command_timeout_ms\":null}", base);
     try std.testing.expectEqual(@as(u32, 300_000), junk.request_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 1_800_000), junk.task_timeout_ms);
-    const negative = try Decoder.limits("{\"request_timeout_ms\":-1,\"task_timeout_ms\":-1}", base);
+    try std.testing.expectEqual(@as(u32, 1_000), junk.command_timeout_ms);
+    const negative = try Decoder.limits("{\"request_timeout_ms\":-1,\"command_timeout_ms\":-1}", base);
     try std.testing.expectEqual(@as(u32, 300_000), negative.request_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 1_800_000), negative.task_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 1_000), negative.command_timeout_ms);
 
     // A non-object limits value leaves every field at its base value.
     const missing = try Decoder.limits("null", base);
     try std.testing.expectEqual(@as(u32, 300_000), missing.request_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 1_800_000), missing.task_timeout_ms);
     try std.testing.expectEqual(@as(u32, 1_000), missing.command_timeout_ms);
 }
 test "lost window resets to an owned history snapshot then resumes deltas" {
@@ -1766,6 +1779,38 @@ test "stale control epoch pages are dropped instead of rendered" {
     try client.readEvents();
     try std.testing.expectEqual(@as(u64, 0), client.pending.items.len);
 }
+test "request builder owns implicit root and fails locally before socket writes" {
+    const Helper = struct {
+        fn build(a: std.mem.Allocator, client: *Client) !void {
+            const saved = client.a;
+            client.a = a;
+            defer client.a = saved;
+            var request_ = try client.request(.submit);
+            defer request_.deinit();
+            try request_.put("epoch", @as(u64, 5));
+            try request_.put("req", @as(u64, 99));
+            try request_.put("kind", "prompt");
+            try request_.put("text", "complete 中文 input");
+            const bytes = try request_.out.finish();
+            defer a.free(bytes);
+            var parsed = try protocol.parseRequest(a, bytes);
+            defer parsed.deinit();
+            try testing.expectEqual(protocol.Op.submit, parsed.op);
+            try testing.expectEqual(request_.id, parsed.id);
+            try testing.expectEqual(@as(u64, 99), try parsed.u64Field("req"));
+            try testing.expectEqualStrings("complete 中文 input", try parsed.stringField("text", null));
+        }
+    };
+    const a = testing.allocator;
+    var pair = try pairOf(a);
+    defer pair.deinit();
+    try testing.checkAllAllocationFailures(a, Helper.build, .{pair.client});
+    // Building, including every failed allocation, must not transmit a prefix.
+    try testing.expect((try pair.server.readStep()) == .pending);
+    try testing.expectEqual(@as(usize, 0), pair.server.header_read);
+    try testing.expect(pair.client.conn != null);
+    try testing.expectEqual(@as(u64, 5), pair.client.epoch);
+}
 test "approve and withdraw carry their own payload ids" {
     const a = testing.allocator;
     var pair = try pairOf(a);
@@ -1820,7 +1865,7 @@ test "version and id are checked before ok/err, then the view is dropped" {
     // A wrong id cannot be attributed to this request, so `ok` is irrelevant:
     // the frame is rejected as protocol error and the view is dropped.
     const wait = unix.Wait{ .io = std.testing.io, .timeout_ms = 5_000 };
-    try pair.server.writeFrame("{\"v\":4,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
+    try pair.server.writeFrame("{\"v\":5,\"id\":9,\"ok\":false,\"err\":\"busy\"}", wait);
     try std.testing.expectError(error.ProtocolError, client.readResponse(2, quick_timeout_ms));
     try std.testing.expect(client.conn == null);
     try std.testing.expectEqual(@as(u64, 0), client.epoch);
@@ -2156,12 +2201,20 @@ test "cycle effort preserves closed capability errors through RPC" {
     try testing.expectEqual(error.RemoteFailure, wireError(protocol.codeFromName("not_a_wire_code")));
     try testing.expectEqual(protocol.ErrorCode.internal, protocol.errorCode(error.Unexpected));
 }
-test "over-deep or malformed frames are rejected before parsing" {
+test "deep valid frames use dynamic validation and malformed grammar is rejected" {
     const a = testing.allocator;
-    try std.testing.expect(boundedDepth("{\"v\":1,\"id\":1,\"ok\":true}"));
-    try std.testing.expect(boundedDepth("{\"a\":\"}}}}[[[[\"}"));
-    var deep: [80]u8 = @splat('[');
-    try std.testing.expect(!boundedDepth(&deep));
+    const json = @import("../app/json_bound.zig");
+    try json.validate(a, "{\"v\":1,\"id\":1,\"ok\":true}");
+    try json.validate(a, "{\"a\":\"}}}}[[[[\"}");
+    var deep: [167]u8 = undefined;
+    @memcpy(deep[0..5], "{\"a\":");
+    @memset(deep[5..85], '[');
+    deep[85] = '0';
+    @memset(deep[86..166], ']');
+    deep[166] = '}';
+    var parsed = try parseObject(a, &deep);
+    defer parsed.deinit();
+    try std.testing.expectError(error.ProtocolError, parseObject(a, deep[5..85]));
     try std.testing.expectError(error.ProtocolError, parseObject(a, "not json"));
     try std.testing.expectError(error.ProtocolError, parseObject(a, "[1,2,3]"));
 }

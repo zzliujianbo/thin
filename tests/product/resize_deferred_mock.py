@@ -120,7 +120,7 @@ def run(app):
             assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
             (home / '.thin').mkdir(parents=True)
             project.mkdir()
-            config = {'memory': {'auto': False}, 'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_RESIZE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'safety_tokens': 100, 'request_timeout_ms': 20000, 'task_timeout_ms': 30000}}
+            config = {'memory': {'auto': False}, 'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_RESIZE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'request_timeout_ms': 20000}}
             path = home / '.thin/config.json'
             path.write_text(json.dumps(config))
             path.chmod(0o600)

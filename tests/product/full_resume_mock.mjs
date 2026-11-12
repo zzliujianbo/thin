@@ -116,12 +116,12 @@ export async function fullResumeRegressions({app, pty, execute}) {
       for (const path of [snapshotPath, markerPath]) assert.equal((await stat(path)).mode & 0o777, 0o600);
       assert.equal((await stat(sessions)).mode & 0o777, 0o700);
       const stateOf = bytes => {
-        assert.equal(bytes[8], 2, 'only current frame format is valid');
-        const selection = JSON.parse(bytes.subarray(17, 17 + bytes.readUInt32LE(9)).toString());
+        assert.equal(bytes[8], 3, 'new saves use the current frame format');
+        const selection = JSON.parse(bytes.subarray(21, 21 + bytes.readUInt32LE(9)).toString());
         assert.equal(selection.version, 2);
         assert.equal(Object.hasOwn(selection, 'session'), false);
         assert(Object.hasOwn(selection, 'provider_name'));
-        const state = JSON.parse(bytes.subarray(17 + bytes.readUInt32LE(9)).toString());
+        const state = JSON.parse(bytes.subarray(21 + bytes.readUInt32LE(9)).toString());
         assert.equal(state.version, 2);
         return state;
       };
@@ -176,7 +176,7 @@ export async function fullResumeRegressions({app, pty, execute}) {
       await put(corrupted);
       await run('resume-failure', id, 'InvalidJson');
       const versioned = Buffer.from(clean);
-      const payloadOffset = 17 + versioned.readUInt32LE(9);
+      const payloadOffset = 21 + versioned.readUInt32LE(9);
       const versionAt = versioned.indexOf('"version":2', payloadOffset);
       assert(versionAt >= payloadOffset);
       versioned[versionAt + '"version":'.length] = '1'.charCodeAt(0);

@@ -1,6 +1,6 @@
 test "subagent start returns an id and get collects isolated report usage and no artifacts" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     try fix.root.write("fixture.txt", "child-only-file", false);
     const parent_arena = fix.parent_runtime.arena.allocator();
@@ -37,7 +37,7 @@ test "subagent start returns an id and get collects isolated report usage and no
 test "subagent inherits the parent effective protocol for chat responses and anthropic" {
     const a = std.testing.allocator;
     for ([_]p.Protocol{ .chat, .responses, .anthropic }) |protocol| {
-        const fix = try Fixture.create(a, std.testing.io, .auto, protocol, 1_000_000);
+        const fix = try Fixture.create(a, std.testing.io, .auto, protocol);
         defer fix.deinit();
         var fake: FakeModel = .{ .io = std.testing.io };
         fix.withModel(&fake);
@@ -50,17 +50,14 @@ test "subagent inherits the parent effective protocol for chat responses and ant
         try std.testing.expectEqual(protocol, fake.request_protocol);
     }
 }
-test "one root starts twelve children and only a bounded collected cache evicts" {
+test "one root retains all twelve collected children" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = io };
     fix.withModel(&fake);
 
-    // Host-side re-read cache bound; it must never be a start or concurrency
-    // limit, and it never hides an uncollected job.
-    const cached_views: usize = 4;
     const rounds: usize = 12;
     var ids: [rounds][]u8 = undefined;
     var started: usize = 0;
@@ -80,16 +77,11 @@ test "one root starts twelve children and only a bounded collected cache evicts"
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    // The most recent collected views are still readable...
-    for (ids[rounds - cached_views ..]) |id| {
+    // Every collected result remains readable throughout this root.
+    for (ids) |id| {
         var again = try fix.getResult(id, true);
         defer again.deinit(a);
         try std.testing.expect(!again.is_error);
-    }
-    // ...while an evicted, already-collected id fails closed as unknown instead
-    // of returning a stale sibling view.
-    for (ids[0 .. rounds - cached_views]) |id| {
-        try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = id }, &fix.parent_cancel));
     }
 
     // Health is not a quota gate and a start is never refused because an older
@@ -106,11 +98,11 @@ test "one root starts twelve children and only a bounded collected cache evicts"
     fix.service.beginTask(&fix.parent_cancel);
     try std.testing.expectError(error.UnknownSubagentId, fix.service.service().get(arena.allocator(), .{ .id = ids[rounds - 1] }, &fix.parent_cancel));
 }
-test "subagent long CJK report truncates at a UTF-8 boundary" {
+test "subagent long CJK report remains complete" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
-    var long: [subagent.max_report_bytes + 8]u8 = undefined;
+    var long: [16384 + 8]u8 = undefined;
     var i: usize = 0;
     while (i + 3 <= long.len) : (i += 3) {
         long[i] = 0xe4;
@@ -127,13 +119,12 @@ test "subagent long CJK report truncates at a UTF-8 boundary" {
     defer parsed.deinit();
     const report = parsed.value.object.get("report").?.string;
     try std.testing.expect(std.unicode.utf8ValidateSlice(report));
-    try std.testing.expect(report.len <= subagent.max_report_bytes);
-    try std.testing.expect(report.len > 0);
-    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+    try std.testing.expectEqualStrings(&long, report);
+    try std.testing.expect(!parsed.value.object.get("truncated").?.bool);
 }
 test "cleanup failure outranks encoding OOM and retained owner drops job borrows" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io };
     fix.withModel(&fake);
@@ -186,7 +177,7 @@ test "cleanup failure outranks encoding OOM and retained owner drops job borrows
 }
 test "pure encoding OOM is reported as a failure not a success" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io };
     fix.withModel(&fake);
@@ -208,7 +199,7 @@ test "pure encoding OOM is reported as a failure not a success" {
 test "parent cancellation reaches the child and only then marks the result canceled" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
     fix.withModel(&fake);
@@ -230,7 +221,7 @@ test "parent cancellation reaches the child and only then marks the result cance
 }
 test "single-child cancellation returns canceled JSON without canceling the parent" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
     fix.withModel(&fake);
@@ -250,14 +241,16 @@ test "single-child cancellation returns canceled JSON without canceling the pare
     // Canceling collected the job, so the parent may finish normally.
     try fix.service.checkReady();
 }
-test "child local timeout fails the child without canceling the parent task" {
+test "child local cancellation stops the child without canceling the parent task" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 20);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
     fix.withModel(&fake);
-    const id = try fix.start(.{ .task = "outlive the child deadline" });
+    const id = try fix.start(.{ .task = "wait for child-local cancellation" });
     defer a.free(id);
+    try waitFlag(std.testing.io, &fake.entered, 1_000);
+    fix.service.current.?.cancel.cancel();
     var result = try fix.getResult(id, true);
     defer result.deinit(a);
     try std.testing.expect(result.is_error);
@@ -267,16 +260,15 @@ test "child local timeout fails the child without canceling the parent task" {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const value = parsed.value;
-    // Product semantics: a watchdog timeout is a failed child, not a canceled
-    // one, and it never cancels the parent task.
-    try std.testing.expectEqualStrings("failed", value.object.get("status").?.string);
-    try std.testing.expectEqualStrings("TaskTimeout", value.object.get("detail").?.string);
+    // Child-local cancellation never cancels the parent accepted task.
+    try std.testing.expectEqualStrings("canceled", value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("Canceled", value.object.get("detail").?.string);
     try std.testing.expect(!fix.parent_runtime.poisoned);
 }
 test "parent steering skips an unstarted child tool and reaches the next child request" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     try fix.root.write("sentinel.txt", "SENTINEL-ORIGINAL", false);
     var fake: FakeModel = .{ .io = io, .behavior = .steer_skip_write };
@@ -304,7 +296,7 @@ test "parent steering skips an unstarted child tool and reaches the next child r
 }
 test "child question stays visible until the parent reply commits" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io, .behavior = .ask_parent };
     fix.withModel(&fake);
@@ -336,16 +328,15 @@ test "child question stays visible until the parent reply commits" {
     try std.testing.expectEqualStrings("answered", done.value.object.get("report").?.string);
     try std.testing.expect(fake.saw_reply);
 }
-test "child progress is bounded to eight unread messages and acked after encode" {
+test "child progress grows beyond eight unread messages and is acked after encode" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io, .behavior = .progress_flood };
     fix.withModel(&fake);
     const id = try fix.start(.{ .task = "post progress" });
     defer a.free(id);
-    // Ack nothing until the child has already seen the full queue, so its ninth
-    // post is deterministically rejected instead of racing this loop's acks.
+    // Ack nothing until the child has posted all nine messages.
     try waitFlag(std.testing.io, &fake.progress_flood_checked, 1_000);
     var total: usize = 0;
     var rounds: usize = 0;
@@ -353,26 +344,24 @@ test "child progress is bounded to eight unread messages and acked after encode"
         var snapshot = try fix.get(id, true);
         defer snapshot.deinit();
         const delivered = snapshot.value.object.get("messages").?.array.items.len;
-        try std.testing.expect(delivered <= service_mod.max_unread_child_messages);
         total += delivered;
         const status = snapshot.value.object.get("status").?.string;
         if (!std.mem.eql(u8, status, "running") and !std.mem.eql(u8, status, "waiting_for_reply")) break;
     }
-    try std.testing.expectEqual(service_mod.max_unread_child_messages, total);
+    try std.testing.expectEqual(@as(usize, 9), total);
     try std.testing.expect(fake.saw_progress);
 }
-test "steering inbox capacity and invalid input fail explicitly" {
+test "steering inbox grows and invalid input fails explicitly" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
     fix.withModel(&fake);
     const id = try fix.start(.{ .task = "bounded messaging" });
     defer a.free(id);
     try waitFlag(io, &fake.entered, 1_000);
-    // The child Inbox is a bounded 16-slot window; overflow is an explicit
-    // failure, never a silent drop, and it does not cancel the parent.
+    // Queue more than the former 16-slot window without canceling the parent.
     var round: usize = 0;
     while (round < 16) : (round += 1) {
         var receipt = try fix.send(id, "bounded steering");
@@ -381,22 +370,21 @@ test "steering inbox capacity and invalid input fail explicitly" {
     }
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    // A full Inbox must fail without leaking the already-encoded steering
-    // receipt. The caller allocator here is the leak-checking test allocator,
-    // not an arena, so a missing error-path release would be reported.
-    try std.testing.expectError(error.InboxFull, fix.service.service().send(a, .{ .id = id, .message = "seventeenth" }, &fix.parent_cancel));
+    // The caller allocator for this receipt is leak-checking, not an arena.
+    const seventeenth = try fix.service.service().send(a, .{ .id = id, .message = "seventeenth" }, &fix.parent_cancel);
+    a.free(seventeenth.text);
     try std.testing.expectError(error.InvalidSubagentMessage, fix.service.service().send(arena.allocator(), .{ .id = id, .message = "" }, &fix.parent_cancel));
-    const too_long: [subagent.max_message_bytes + 1]u8 = @splat('m');
-    try std.testing.expectError(error.InvalidSubagentMessage, fix.service.service().send(arena.allocator(), .{ .id = id, .message = &too_long }, &fix.parent_cancel));
+    const long_message: [65537]u8 = @splat('m');
+    _ = try fix.service.service().send(arena.allocator(), .{ .id = id, .message = &long_message }, &fix.parent_cancel);
     const too_long_id: [subagent.max_id_bytes + 1]u8 = @splat('i');
     try std.testing.expectError(error.InvalidSubagentId, fix.service.service().send(arena.allocator(), .{ .id = &too_long_id, .message = "x" }, &fix.parent_cancel));
     try std.testing.expectError(error.UnknownSubagentId, fix.service.service().send(arena.allocator(), .{ .id = "subagent_999", .message = "x" }, &fix.parent_cancel));
     try fix.endTask();
 }
-test "parent message direction cap is 32 successful sends" {
+test "parent message direction accepts more than 32 sends" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     // Each child model round reports progress after the Runtime has consumed
     // every pending steering entry, so a progress snapshot is a real delivery
@@ -408,9 +396,7 @@ test "parent message direction cap is 32 successful sends" {
     var first = try fix.get(id, true);
     defer first.deinit();
     try std.testing.expectEqualStrings("running", first.value.object.get("status").?.string);
-    // Four batches of eight keep the peak Inbox usage bounded even if the
-    // child consumes a prefix of a batch concurrently: leftovers from one batch
-    // plus the next batch can never exceed the 16-slot Inbox.
+    // Four batches provide delivery barriers before the thirty-third send.
     var batch: usize = 0;
     while (batch < 4) : (batch += 1) {
         var index: usize = 0;
@@ -425,12 +411,12 @@ test "parent message direction cap is 32 successful sends" {
     }
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    try std.testing.expectError(error.SubagentMessageLimit, fix.service.service().send(arena.allocator(), .{ .id = id, .message = "too many" }, &fix.parent_cancel));
+    _ = try fix.service.service().send(arena.allocator(), .{ .id = id, .message = "thirty-third" }, &fix.parent_cancel);
     try fix.endTask();
 }
 test "old ids from another root fail closed while same-root collected ids stay readable" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io };
     fix.withModel(&fake);
@@ -465,7 +451,7 @@ test "old ids from another root fail closed while same-root collected ids stay r
 }
 test "beforeFinish returns bounded host hints whenever a job is uncollected" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io, .behavior = .wait_for_cancel, .parent_cancel = &fix.parent_cancel };
     fix.withModel(&fake);
@@ -487,7 +473,7 @@ test "beforeFinish returns bounded host hints whenever a job is uncollected" {
 }
 test "App child factory resolves independent target credentials protocols and proxy" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     const app = try selectionApp(fix);
     defer app.deinit();
@@ -568,7 +554,7 @@ test "App child freezes effective thinking and explicit target keeps its default
         }
     };
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     const app = try selectionApp(fix);
     defer app.deinit();
@@ -623,7 +609,7 @@ test "App child freezes effective thinking and explicit target keeps its default
 }
 test "App child factory fails closed and unknown price pauses actual child runtime" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     const app = try selectionApp(fix);
     defer app.deinit();
@@ -667,7 +653,7 @@ test "App child factory fails closed and unknown price pauses actual child runti
 }
 test "App staged settings snapshot and non-Codex to Codex child source" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 10000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     const app = try selectionApp(fix);
     defer app.deinit();
@@ -701,7 +687,7 @@ test "App staged settings snapshot and non-Codex to Codex child source" {
 }
 test "unsupported child protocol fails the start without a child run" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     fix.parent_runtime.selector = .{ .configured = .chat, .selected = .systemone, .initial_attempted = true };
     var fake: FakeModel = .{ .io = std.testing.io };
@@ -715,7 +701,7 @@ test "unsupported child protocol fails the start without a child run" {
 }
 test "explicit model without client factory fails before publication" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var fake: FakeModel = .{ .io = std.testing.io };
     fix.withModel(&fake);
@@ -730,7 +716,7 @@ test "explicit model without client factory fails before publication" {
 test "concurrent sibling starts are not refused and endTask is repeatable" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var first: FakeModel = .{ .io = io };
     var second: FakeModel = .{ .io = io };
@@ -763,7 +749,7 @@ test "concurrent sibling starts are not refused and endTask is repeatable" {
 }
 test "child approval maps into the parent permission domain before authorize" {
     const a = std.testing.allocator;
-    const fix = try Fixture.create(a, std.testing.io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
     var recorder: ApprovalRecorder = .{ .io = std.testing.io };
     fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
@@ -801,7 +787,7 @@ test "real child Decision ask brokers both allow and deny without replay or auxi
         const DecisionClient = @import("../app/decision_client.zig").Client;
         const parent = (try DecisionClient.create(a, io, parsed_config.value, &env)).?;
         defer parent.deinit();
-        const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+        const fix = try Fixture.create(a, io, .chat, .chat);
         defer fix.deinit();
         fix.decision = parent;
         try fix.root.write("sentinel.txt", "BASE", false);
@@ -838,13 +824,12 @@ test "real child Decision ask brokers both allow and deny without replay or auxi
         try std.testing.expectEqualStrings(if (approval == .allow_once) "BASEA" else "BASE", contents.data);
     }
 }
-test "child local timeout withdraws a pending approval without canceling the parent" {
+test "child local cancellation withdraws a pending approval without canceling the parent" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    // The child watchdog fires while the parent is still deciding; a cooperative
-    // host blocks well past the timeout so an early return can only come from
-    // the broker-local cancellation token.
-    const fix = try Fixture.create(a, io, .chat, .chat, 100);
+    // Cancel the child at the authorization boundary. The cooperative host
+    // observes broker-local cancellation rather than a removed task watchdog.
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var recorder: ApprovalRecorder = .{ .io = io, .delay_ms = 1000 };
     fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
@@ -853,18 +838,19 @@ test "child local timeout withdraws a pending approval without canceling the par
     fix.service.deps.model_factory = .{ .context = &model, .make_fn = ApprovalModel.make };
     const id = try fix.start(.{ .task = "approval outlives the child" });
     defer a.free(id);
+    recorder.cancel_child = &fix.service.current.?.cancel;
     var result = try fix.getResult(id, true);
     defer result.deinit(a);
     try std.testing.expect(result.is_error);
     try std.testing.expect(!result.canceled);
     try std.testing.expectEqual(@as(usize, 1), recorder.emitted);
     try std.testing.expectEqual(@as(usize, 1), recorder.authorized);
-    // The broker did not hang for the full host delay: the child's local
-    // timeout canceled the broker-local token and the parent mirror was cleared.
+    // Child-local cancellation canceled the broker-local token and cleared
+    // the parent mirror before the full host delay.
     try std.testing.expect(recorder.saw_canceled);
     try std.testing.expectEqual(@as(usize, 1), recorder.cleared);
     try std.testing.expectEqual(recorder.id, recorder.cleared_id);
-    // A child-local timeout must never cancel or poison the parent task.
+    // Child-local cancellation must never cancel or poison the parent task.
     try std.testing.expect(!fix.parent_cancel.isRequested());
     try std.testing.expect(!fix.parent_runtime.poisoned);
     try std.testing.expect(!fix.active());
@@ -872,13 +858,13 @@ test "child local timeout withdraws a pending approval without canceling the par
 test "parent grace expiry injects Io cancellation into a nested async child runtime" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    // 1.5s parent/child watchdog: far above the 20ms grace, far below a hang.
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_500);
+    // Explicit parent cancellation drives cleanup without a task watchdog.
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
 
     // Real Tools executor and real Service: the tool path itself must reach the
     // nested child Runtime, not a direct Service call.
-    var store = mem.Store.init(&fix.root, fix.config.limits);
+    var store = mem.Store.init(&fix.root);
     var tools: tools_mod.Tools = .{ .root = &fix.root, .memory = &store, .config = &fix.config, .environment = &fix.env };
     tools.subagent = fix.service.service();
     fix.parent_runtime.executor = tools.executor();
@@ -963,7 +949,7 @@ test "http clone keeps frozen key CA and route while owning a separate pool" {
 test "send refuses a finished or canceled job that is not collected yet" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     const service = fix.service.service();
 
@@ -1009,7 +995,7 @@ test "send refuses a finished or canceled job that is not collected yet" {
 test "per-agent status rows grouped progress four workers without get and ignored events" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var models = [_]GroupProgressModel{
         .{ .io = io, .kind = .ignored }, .{ .io = io, .kind = .message },
@@ -1109,7 +1095,7 @@ test "per-agent status rows grouped progress four workers without get and ignore
 test "six children run at once and every mutation lands through the shared gate" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     fix.service.beginTask(&fix.parent_cancel);
 
@@ -1170,7 +1156,7 @@ test "six children run at once and every mutation lands through the shared gate"
 test "sibling jobs keep their questions and replies independent by id" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var first: FakeModel = .{
         .io = io,
@@ -1231,7 +1217,7 @@ test "sibling jobs keep their questions and replies independent by id" {
 test "canceling one sibling keeps the others running and collectable" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     fix.service.beginTask(&fix.parent_cancel);
     var fakes: [3]FakeModel = undefined;
@@ -1281,7 +1267,7 @@ test "canceling one sibling keeps the others running and collectable" {
 test "collecting siblings in any order keeps the job list intact" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     fix.service.beginTask(&fix.parent_cancel);
     var fakes: [3]FakeModel = undefined;
@@ -1322,7 +1308,7 @@ test "collecting siblings in any order keeps the job list intact" {
 test "endTask cancels and joins every sibling and bounds the finish hint" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     // More siblings than the finish hint lists and more than the view cache.
     const children = 9;
@@ -1377,7 +1363,7 @@ test "endTask cancels and joins every sibling and bounds the finish hint" {
 test "pending sibling approvals are brokered per job id" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     var recorder: ApprovalRecorder = .{ .io = io };
     fix.parent_runtime.host = .{ .context = &recorder, .emit_fn = ApprovalRecorder.emit, .authorize_fn = ApprovalRecorder.authorize };
@@ -1425,7 +1411,7 @@ test "pending sibling approvals are brokered per job id" {
 test "multiple retained cleanup owners are all kept until deinit closes them" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const fix = try Fixture.create(a, io, .chat, .chat, 1_000_000);
+    const fix = try Fixture.create(a, io, .chat, .chat);
     defer fix.deinit();
     // Start both before either collect: a retained owner makes `run` refuse with
     // CleanupFailed, so the second start must already be running.

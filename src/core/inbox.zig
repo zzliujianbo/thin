@@ -1,4 +1,4 @@
-//! Bounded, single-session pending input. No callbacks are made under the lock.
+//! Single-session pending input. No callbacks are made under the lock.
 const std = @import("std");
 const Cancellation = @import("protocol.zig").Cancellation;
 const Allocator = std.mem.Allocator;
@@ -43,8 +43,8 @@ pub const Snapshot = struct {
 pub const Inbox = struct {
     const Slot = struct { entry: Entry, leased: bool = false, tombstone: bool = false };
     mutex: std.atomic.Value(bool) = .init(false),
-    slots: [16]?Slot = @splat(null),
-    bytes: usize = 0,
+    slots: std.ArrayList(?Slot) = .empty,
+    slots_allocator: ?Allocator = null,
     next_id: u64 = 0,
     revision: u64 = 0,
     epoch: u64 = 0,
@@ -68,9 +68,9 @@ pub const Inbox = struct {
     }
     fn pending(self: *Inbox, kind: Kind) ?usize {
         var index: ?usize = null;
-        for (self.slots, 0..) |slot, i| if (slot) |s| {
+        for (self.slots.items, 0..) |slot, i| if (slot) |s| {
             if (s.leased or s.tombstone or s.entry.kind != kind) continue;
-            if (index == null or s.entry.id < self.slots[index.?].?.entry.id) index = i;
+            if (index == null or s.entry.id < self.slots.items[index.?].?.entry.id) index = i;
         };
         return index;
     }
@@ -91,41 +91,52 @@ pub const Inbox = struct {
     fn enqueueInternal(self: *Inbox, a: Allocator, kind: Kind, text: []const u8, require_open_run: bool) !u64 {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] == '/' or trimmed[0] == '!' or std.mem.findScalar(u8, text, 0) != null or !std.unicode.utf8ValidateSlice(text)) return error.InvalidInput;
-        if (text.len > 65536) return error.InputTooLarge;
         var entry = Entry{ .id = 0, .kind = kind, .text = try a.dupe(u8, text), .allocator = a };
         errdefer entry.deinit();
         self.lock();
         defer self.unlock();
         if (require_open_run and self.epoch != 0 and (!self.active or self.sealed)) return error.RunSealed;
         if (self.next_id == std.math.maxInt(u64) or self.revision == std.math.maxInt(u64)) return error.IdentityExhausted;
-        if (self.bytes + text.len > 262144) return error.InboxFull;
-        for (&self.slots) |*slot| if (slot.* == null) {
-            self.next_id += 1;
-            entry.id = self.next_id;
-            slot.* = .{ .entry = entry };
-            self.bytes += text.len;
-            self.changed();
-            return entry.id;
+        var index: ?usize = null;
+        for (self.slots.items, 0..) |slot, i| if (slot == null) {
+            index = i;
+            break;
         };
-        return error.InboxFull;
+        if (index == null) {
+            const slots_allocator = self.slots_allocator orelse a;
+            try self.slots.append(slots_allocator, null);
+            self.slots_allocator = slots_allocator;
+            index = self.slots.items.len - 1;
+        }
+        self.next_id += 1;
+        entry.id = self.next_id;
+        self.slots.items[index.?] = .{ .entry = entry };
+        self.changed();
+        return entry.id;
     }
     pub fn snapshot(self: *Inbox) Snapshot {
         self.lock();
         defer self.unlock();
         var result = Snapshot{ .revision = self.revision, .paused = self.paused, .confirming = self.confirming, .active = self.active, .epoch = self.epoch };
+        // Counts cover the entire queue; previews remain display-only.
+        for (self.slots.items) |slot| if (slot) |s| {
+            if (s.leased or s.tombstone) continue;
+            if (s.entry.kind == .steering) result.steering += 1 else result.follow_up += 1;
+            if (result.newest_id == null or s.entry.id > result.newest_id.?) {
+                result.newest_id = s.entry.id;
+                result.newest_bytes = s.entry.text.len;
+            }
+        };
         // ID-order previews; value owned, UTF-8 scalar aligned.
         var after: u64 = 0;
         for (0..16) |_| {
             var best: ?usize = null;
-            for (self.slots, 0..) |slot, i| if (slot) |s| {
+            for (self.slots.items, 0..) |slot, i| if (slot) |s| {
                 if (s.leased or s.tombstone or s.entry.id <= after) continue;
-                if (best == null or s.entry.id < self.slots[best.?].?.entry.id) best = i;
+                if (best == null or s.entry.id < self.slots.items[best.?].?.entry.id) best = i;
             };
-            const s = self.slots[best orelse break].?;
+            const s = self.slots.items[best orelse break].?;
             after = s.entry.id;
-            if (s.entry.kind == .steering) result.steering += 1 else result.follow_up += 1;
-            result.newest_id = s.entry.id;
-            result.newest_bytes = s.entry.text.len;
             var preview = &result.previews[result.preview_count];
             preview.id = s.entry.id;
             preview.kind = s.entry.kind;
@@ -140,10 +151,9 @@ pub const Inbox = struct {
     pub fn withdraw(self: *Inbox, expected_id: u64) ?Entry {
         self.lock();
         defer self.unlock();
-        for (&self.slots) |*slot| if (slot.*) |s| {
+        for (self.slots.items) |*slot| if (slot.*) |s| {
             if (s.entry.id != expected_id or s.leased or s.tombstone) continue;
             slot.* = null;
-            self.bytes -= s.entry.text.len;
             self.changed();
             return s.entry;
         };
@@ -154,7 +164,7 @@ pub const Inbox = struct {
         defer self.unlock();
         if (!self.eligible() or (if (next) self.active else (!self.active or self.sealed))) return null;
         const i = self.pending(.steering) orelse (if (next) self.pending(.follow_up) else null) orelse return null;
-        const s = &self.slots[i].?;
+        const s = &self.slots.items[i].?;
         s.leased = true;
         self.changed();
         return .{ .id = s.entry.id, .kind = s.entry.kind, .text = s.entry.text };
@@ -168,12 +178,11 @@ pub const Inbox = struct {
     pub fn commit(self: *Inbox, lease: Lease) ?Entry {
         self.lock();
         defer self.unlock();
-        for (&self.slots) |*slot| if (slot.*) |*s| {
+        for (self.slots.items) |*slot| if (slot.*) |*s| {
             if (s.entry.id != lease.id or !s.leased) continue;
             var entry = s.entry;
             const dead = s.tombstone;
             slot.* = null;
-            self.bytes -= entry.text.len;
             self.changed();
             if (dead) {
                 entry.deinit();
@@ -186,10 +195,9 @@ pub const Inbox = struct {
     pub fn restore(self: *Inbox, lease: Lease) void {
         self.lock();
         defer self.unlock();
-        for (&self.slots) |*slot| if (slot.*) |*s| {
+        for (self.slots.items) |*slot| if (slot.*) |*s| {
             if (s.entry.id != lease.id or !s.leased) continue;
             if (s.tombstone) {
-                self.bytes -= s.entry.text.len;
                 s.entry.deinit();
                 slot.* = null;
             } else s.leased = false;
@@ -258,9 +266,8 @@ pub const Inbox = struct {
         defer self.unlock();
         if (!self.confirming or self.revision != expected_revision or self.revision == std.math.maxInt(u64)) return false;
         cancel.cancel();
-        for (&self.slots) |*slot| if (slot.*) |*s| {
+        for (self.slots.items) |*slot| if (slot.*) |*s| {
             if (s.leased) s.tombstone = true else {
-                self.bytes -= s.entry.text.len;
                 s.entry.deinit();
                 slot.* = null;
             }
@@ -273,11 +280,13 @@ pub const Inbox = struct {
     pub fn deinit(self: *Inbox) void {
         self.lock();
         defer self.unlock();
-        for (&self.slots) |*slot| if (slot.*) |*s| {
+        for (self.slots.items) |*slot| if (slot.*) |*s| {
             std.debug.assert(!s.leased);
             s.entry.deinit();
             slot.* = null;
         };
-        self.bytes = 0;
+        if (self.slots_allocator) |a| self.slots.deinit(a);
+        self.slots = .empty;
+        self.slots_allocator = null;
     }
 };

@@ -221,7 +221,36 @@ test "subagent tool progress owns decoded text after document release" {
     defer empty.deinit();
     try std.testing.expect(empty.event.tool_view.subagent_progress == null);
 }
-test "owned assistant blocks stay canonical while text is bounded" {
+test "user committed event owns complete large input" {
+    const a = std.testing.allocator;
+    const input = try a.alloc(u8, 65537);
+    defer a.free(input);
+    @memset(input, 'x');
+    var item = try ownEvent(a, 1, .{ .user_committed = .{ .id = 1, .text = input } });
+    defer item.deinit();
+    @memset(input, 'y');
+    try std.testing.expectEqual(@as(usize, 65537), item.event.user_committed.text.len);
+    try std.testing.expectEqual(@as(u8, 'x'), item.event.user_committed.text[65536]);
+    try std.testing.expect(!item.display_truncated);
+}
+test "owned events retain large text and every assistant block" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 65537);
+    defer a.free(text);
+    @memset(text, 'q');
+    const blocks = try a.alloc(p.Block, 257);
+    defer a.free(blocks);
+    @memset(blocks, .{ .text = "short" });
+    blocks[256] = .{ .text = text };
+    var item = try ownEvent(a, 1, .{ .assistant_committed = blocks });
+    defer item.deinit();
+    @memset(text, 'z');
+    try std.testing.expectEqual(@as(usize, 257), item.event.assistant_committed.len);
+    try std.testing.expectEqual(@as(usize, 65537), item.event.assistant_committed[256].text.len);
+    try std.testing.expectEqual(@as(u8, 'q'), item.event.assistant_committed[256].text[65536]);
+    try std.testing.expect(item.canonical_complete and !item.display_truncated);
+}
+test "owned assistant blocks retain canonical text" {
     const a = std.testing.allocator;
     var text = [_]u8{ 'a', 'b', 'c' };
     const blocks = [_]p.Block{ .{ .text = &text }, .{ .reasoning = "why" } };
