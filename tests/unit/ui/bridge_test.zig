@@ -350,6 +350,93 @@ test "terminal follows every split part and is never queued behind them" {
     try t.expectEqual(@as(usize, 4), drained.parts);
     try t.expectEqual(body.len, drained.bytes);
 }
+fn sendNumber(bridge: *Bridge, n: usize, cancel: *p.Cancellation) !void {
+    var buf: [4]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{d:0>4}", .{n});
+    const host_ = bridge.host();
+    try host_.emit_fn(host_.context, .{ .text = text }, cancel);
+    @memset(&buf, 'x');
+}
+
+fn popNumber(bridge: *Bridge, n: usize) !void {
+    var item = bridge.pop() orelse return error.MissingItem;
+    defer item.deinit();
+    var buf: [4]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&buf, "{d:0>4}", .{n});
+    try std.testing.expect(item.event == .text);
+    try std.testing.expectEqualStrings(expected, item.event.text);
+    try std.testing.expectEqual(@as(usize, 4), item.storage.len);
+    try std.testing.expect(item.owner == bridge);
+}
+
+test "large queue retains FIFO ownership across compaction and reuse" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, t.io, &cancel);
+    defer bridge.deinit();
+
+    for (0..1200) |i| try sendNumber(&bridge, i, &cancel);
+    try t.expectEqual(Progress{ .len = 1200, .bytes = 4800, .outstanding = 1200 }, progress(&bridge));
+    for (0..100) |i| try popNumber(&bridge, i);
+    try t.expectEqual(@as(usize, 100), bridge.head);
+    for (1200..1300) |i| try sendNumber(&bridge, i, &cancel);
+    for (100..700) |i| try popNumber(&bridge, i);
+    try t.expect(bridge.head < 100); // At least one compaction occurred.
+    for (1300..1400) |i| try sendNumber(&bridge, i, &cancel);
+    try t.expectEqual(Progress{ .len = 700, .bytes = 2800, .outstanding = 700 }, progress(&bridge));
+    for (700..1400) |i| try popNumber(&bridge, i);
+    try t.expect(bridge.pop() == null);
+    try t.expectEqual(Progress{ .len = 0, .bytes = 0, .outstanding = 0 }, progress(&bridge));
+    try bridge.reset();
+    try sendNumber(&bridge, 42, &cancel);
+    try popNumber(&bridge, 42);
+    try bridge.reset();
+}
+
+test "held popped item keeps reset busy and live queue is freed on deinit" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, t.io, &cancel);
+    defer bridge.deinit();
+    for (0..8) |i| try sendNumber(&bridge, i, &cancel);
+    var held = bridge.pop().?;
+    defer held.deinit();
+    for (1..6) |i| try popNumber(&bridge, i);
+    try t.expectEqual(Progress{ .len = 2, .bytes = 12, .outstanding = 3 }, progress(&bridge));
+    try t.expectError(error.Busy, bridge.reset());
+    try t.expectEqualStrings("0000", held.event.text);
+    for (6..8) |i| try popNumber(&bridge, i);
+    try t.expectEqual(Progress{ .len = 0, .bytes = 4, .outstanding = 1 }, progress(&bridge));
+    try t.expectError(error.Busy, bridge.reset());
+    try sendNumber(&bridge, 8, &cancel);
+    try sendNumber(&bridge, 9, &cancel);
+    // held is released first by defer; bridge.deinit drains the remaining live items.
+}
+
+test "small allocation failures leave queued ownership unchanged" {
+    const t = std.testing;
+    for (0..3) |fail_index| {
+        var cancel: p.Cancellation = .{};
+        var backing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        var bridge = Bridge.init(backing.allocator(), t.io, &cancel);
+        defer bridge.deinit();
+        const host_ = bridge.host();
+        if (fail_index == 2) {
+            try host_.emit_fn(host_.context, .{ .text = "one" }, &cancel);
+            try t.expectError(error.OutOfMemory, host_.emit_fn(host_.context, .{ .text = "two" }, &cancel));
+            try t.expectEqual(Progress{ .len = 1, .bytes = 3, .outstanding = 1 }, progress(&bridge));
+            var item = bridge.pop().?;
+            defer item.deinit();
+            try t.expectEqualStrings("one", item.event.text);
+            try t.expectError(error.Busy, bridge.reset());
+        } else {
+            try t.expectError(error.OutOfMemory, host_.emit_fn(host_.context, .{ .text = "one" }, &cancel));
+            try t.expectEqual(Progress{ .len = 0, .bytes = 0, .outstanding = 0 }, progress(&bridge));
+            try bridge.reset();
+        }
+    }
+}
+
 test "allocation failure mid-body keeps the emitted prefix and returns the reservation" {
     const t = std.testing;
     var cancel: p.Cancellation = .{};

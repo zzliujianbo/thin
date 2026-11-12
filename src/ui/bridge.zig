@@ -168,6 +168,8 @@ pub const Bridge = struct {
     disconnected: bool = false,
 
     queue: std.ArrayList(Item) = .empty,
+    /// Only queue.items[head..] owns live items; the prefix has been popped.
+    head: usize = 0,
     /// Current queued count, exposed to the existing frontend under the lock.
     len: usize = 0,
 
@@ -417,8 +419,18 @@ pub const Bridge = struct {
         self.lock();
         defer self.unlock();
         if (self.len == 0) return null;
+        const item = self.queue.items[self.head];
+        self.head += 1;
         self.len -= 1;
-        return self.queue.orderedRemove(0);
+        if (self.len == 0) {
+            self.queue.clearRetainingCapacity();
+            self.head = 0;
+        } else if (self.head >= self.len) {
+            std.mem.copyForwards(Item, self.queue.items[0..self.len], self.queue.items[self.head..]);
+            self.queue.items.len = self.len;
+            self.head = 0;
+        }
+        return item;
     }
 
     /// 断开 UI：触发取消、标记 disconnected 并清除权限请求。
@@ -445,7 +457,7 @@ pub const Bridge = struct {
     pub fn reset(self: *Bridge) !void {
         self.lock();
         defer self.unlock();
-        if (self.active != 0 or self.queue.items.len != 0 or self.outstanding != 0 or self.bytes != 0) return error.Busy;
+        if (self.active != 0 or self.len != 0 or self.outstanding != 0 or self.bytes != 0) return error.Busy;
 
         self.clearPermission();
         // Keep the ID high-water mark: stale prior-task decisions cannot approve
