@@ -122,7 +122,7 @@ pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     };
     const detail = call.detail orelse return .{ .kind = kind, .label = try a.dupe(u8, unavailable) };
     // Preserve bounded detail until frame-time width is known; no old 32/72
-    // cell path/command cutoff before applying the actual 95% row limit.
+    // cell path/command cutoff before applying the actual full-width row limit.
     return .{ .kind = kind, .label = try singleLineImpl(a, detail, 512, call.truncated) };
 }
 
@@ -272,8 +272,8 @@ pub fn commandSuffixLen(value: Caption, outcome: Outcome) usize {
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.
 /// Clip BEFORE SGR so no partial escapes; mixed outcomes keep independent colors.
 pub fn commandColumns(columns: usize) usize {
-    // Overflow-safe floor(95%), including very narrow frames.
-    return if (columns == 0) 0 else @max(1, columns / 20 * 19 + columns % 20 * 19 / 20);
+    // The row owns the full terminal width; only a zero-width frame has none.
+    return columns;
 }
 
 /// `duration_ms` is the measured wall-clock execution time of this row. It is
@@ -285,7 +285,7 @@ pub fn commandColumns(columns: usize) usize {
 pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64, keep_tail: usize) ![]const u8 {
     // Detail stays <=512 bytes; allow its prefix and bounded observed counts
     // without sanitizing/truncating the same path a second time at512 bytes.
-    // Reserve the suffix inside the existing 95% limit, not after clipping.
+    // Reserve the suffix inside the existing full-width limit, not after clipping.
     // On tiny terminals omit optional time rather than wrapping the command.
     var duration_buf: [32]u8 = undefined;
     var duration_writer = std.Io.Writer.fixed(&duration_buf);
@@ -368,7 +368,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
     }
     try out.writer.writeAll(safe[at..]);
     if (tail.len != 0 and !tail_written) try out.writer.print("{s}{s}{s}", .{ outcomeColor(if (spans.len != 0) spans[spans.len - 1].outcome else .pending), tail, theme.reset });
-    if (suffix.len != 0) try out.writer.print("{s}{s}{s}", .{ theme.muted, suffix, theme.reset });
+    if (suffix.len != 0) try out.writer.print("{s}{s}{s}", .{ theme.duration, suffix, theme.reset });
     return a.dupe(u8, out.written());
 }
 

@@ -490,7 +490,7 @@ test "all four tool icons breathe warm while glyph, column and width stay fixed"
     try std.testing.expectEqualStrings("w", activity.icon(.write));
     try std.testing.expectEqualStrings("m", activity.icon(.memory));
 }
-test "tool details survive old cutoffs and rows clip at95percent with complete clusters and dots" {
+test "tool details survive old cutoffs and rows clip at full width with complete clusters and dots" {
     try text.initLocale();
     const a = std.testing.allocator;
     const output = @import("markdown_writer.zig");
@@ -514,11 +514,11 @@ test "tool details survive old cutoffs and rows clip at95percent with complete c
     const body = "r 中文é repeated-path 中文é repeated-path 中文é repeated-path";
     const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, 80, null, 120, 0);
     defer a.free(line);
-    try std.testing.expect(output.displayWidth(line) <= 76);
+    try std.testing.expect(output.displayWidth(line) <= 80);
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
-    try std.testing.expectEqual(@as(usize, 95), commandColumns(100));
-    try std.testing.expectEqual(@as(usize, 75), commandColumns(79));
-    for (0..128) |columns| try std.testing.expectEqual(if (columns == 0) @as(usize, 0) else @max(@as(usize, 1), columns * 19 / 20), commandColumns(columns));
+    try std.testing.expectEqual(@as(usize, 100), commandColumns(100));
+    try std.testing.expectEqual(@as(usize, 79), commandColumns(79));
+    for (0..128) |columns| try std.testing.expectEqual(columns, commandColumns(columns));
     try std.testing.expect(commandColumns(std.math.maxInt(usize)) <= std.math.maxInt(usize));
     const memory = try caption(a, "memory", "{\"action\":\"write\",\"topic\":\"core\",\"content\":\"hidden-body\"}");
     defer memory.deinit(a);
@@ -564,7 +564,7 @@ test "only the executing tool icon breathes while completed spans stay static an
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(std.mem.find(u8, first, theme.tool_icon_pulse[0] ++ ">" ++ theme.muted ++ " sleep 1") != null);
     // A clip that eats the icon cannot fabricate one: no prefix, no breathing.
-    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 4, null, 1, 0);
+    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 3, null, 1, 0);
     defer a.free(narrow);
     try std.testing.expect(std.unicode.utf8ValidateSlice(narrow));
     try std.testing.expectEqualStrings(theme.muted ++ "..." ++ theme.reset, narrow);
@@ -670,12 +670,13 @@ test "all tool outcome prefixes are colored without recoloring summaries or dura
                 .canceled => theme.caution,
                 .pending => unreachable,
             };
-            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, activity.icon(kind), outcomeColor(outcome), body[activity.icon(kind).len..], theme.reset, theme.muted, theme.reset });
+            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, activity.icon(kind), outcomeColor(outcome), body[activity.icon(kind).len..], theme.reset, theme.duration, theme.reset });
             defer a.free(expected);
             try std.testing.expectEqualStrings(expected, line);
             try std.testing.expect(!std.mem.eql(u8, theme.thinking, color));
             try std.testing.expect(!std.mem.eql(u8, theme.thinking, outcomeColor(outcome)));
-            const clipped = try commandLine(a, body, spans, 4, 250, 0, 0);
+            // Three columns cannot keep the icon, so the row is dots only.
+            const clipped = try commandLine(a, body, spans, 3, 250, 0, 0);
             defer a.free(clipped);
             const clipped_expected = try std.fmt.allocPrint(a, "{s}...{s}", .{ outcomeColor(outcome), theme.reset });
             defer a.free(clipped_expected);

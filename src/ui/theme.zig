@@ -29,6 +29,9 @@ pub const user = "\x1b[38;5;255m\x1b[48;2;52;36;24m";
 pub const user_background = "\x1b[48;2;52;36;24m";
 
 pub const success = "\x1b[38;5;114m";
+/// Row timing stays readable next to muted labels without competing with the
+/// outcome colour: a dim teal, not a second highlight.
+pub const duration = "\x1b[38;5;66m";
 pub const warning = "\x1b[38;5;220m";
 pub const failure = "\x1b[38;5;203m";
 pub const caution = "\x1b[38;5;214m";
