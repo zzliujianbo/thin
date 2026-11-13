@@ -74,6 +74,14 @@ pub const Body = struct {
         self.pinned = false;
         if (self.dirty) self.valid = false;
     }
+    pub fn releaseDrainedRender(self: *Body) void {
+        if (self.pinned or !self.isDrained()) return;
+        self.rows = &.{};
+        self.metadata = null;
+        self.consumed = 0;
+        self.valid = false;
+        _ = self.arena.reset(.free_all);
+    }
     pub fn abort(self: *Body) void {
         self.pinned = false;
         self.valid = false;
@@ -117,10 +125,13 @@ pub const Body = struct {
     pub fn build(self: *Body) !void {
         if (self.pinned) return;
         if (!self.valid) {
-            self.arena.deinit();
-            self.arena = std.heap.ArenaAllocator.init(self.a);
             self.rows = &.{};
             self.metadata = null;
+            self.consumed = 0;
+            if (!self.arena.reset(.retain_capacity)) {
+                self.limit = .memory;
+                return error.OutOfMemory;
+            }
             const result = engine.render(self.arena.allocator(), self.source.items, self.base, self.state, self.finished, self.columns, true, .normal, self.max_window_bytes, self.max_rows) catch |err| {
                 self.limit = if (err == error.OutOfMemory) .memory else .window;
                 return err;

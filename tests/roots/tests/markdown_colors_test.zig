@@ -129,6 +129,12 @@ fn allocationCase(a: Allocator) !void {
         return err;
     };
     try body.finish();
+    try body.build();
+    body.abort();
+    try body.build();
+    body.abort();
+    try body.build();
+    body.releasePin();
     var rows: std.ArrayList([]const u8) = .empty;
     defer freeRows(a, &rows);
     try progress(a, body, &rows, true);

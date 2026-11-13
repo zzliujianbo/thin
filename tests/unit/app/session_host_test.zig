@@ -1,3 +1,138 @@
+test "live ring compacts large selective acknowledgements stably" {
+    const a = std.testing.allocator;
+    var ring = LiveRing{ .allocator = a };
+    defer ring.deinit();
+    var identities: [4096][*]u8 = undefined;
+    var payload: [17]u8 = @splat('x');
+    for (1..4097) |seq| {
+        payload[0] = @intCast(seq % 251);
+        const json = try a.dupe(u8, payload[0 .. 1 + seq % payload.len]);
+        identities[seq - 1] = json.ptr;
+        ring.push(seq, json) catch |err| {
+            a.free(json);
+            return err;
+        };
+    }
+    const capacity = ring.items.capacity;
+    // Retire a middle interval first, leaving an earlier hole, then a prefix
+    // and a suffix. Repeating a proof must not free or count entries twice.
+    try ring.acknowledgeRange(4, 4, 1200, 2400, 4096);
+    try std.testing.expectEqual(@as(u64, 0), ring.reclaimed_through);
+    try ring.acknowledgeRange(4, 4, 0, 300, 4096);
+    try ring.acknowledgeRange(4, 4, 3500, 4096, 4096);
+    try ring.acknowledgeRange(4, 4, 1200, 2400, 4096);
+    try std.testing.expectEqual(@as(u64, 300), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(u64, 4096), ring.highest_acknowledged);
+    try std.testing.expectEqual(capacity, ring.items.capacity);
+    var expected_bytes: usize = 0;
+    var index: usize = 0;
+    for (1..4097) |seq| {
+        if (seq <= 300 or (seq >= 1200 and seq <= 2400) or seq >= 3500) continue;
+        const entry = ring.items.items[index];
+        try std.testing.expectEqual(@as(u64, seq), entry.seq);
+        try std.testing.expect(entry.json.ptr == identities[seq - 1]);
+        try std.testing.expectEqual(@as(u8, @intCast(seq % 251)), entry.json[0]);
+        try std.testing.expectEqual(@as(usize, 1 + seq % payload.len), entry.json.len);
+        expected_bytes += entry.json.len;
+        index += 1;
+    }
+    try std.testing.expectEqual(index, ring.items.items.len);
+    try std.testing.expectEqual(expected_bytes, ring.bytes);
+    try std.testing.expect(ring.contains(301));
+    try std.testing.expect(!ring.contains(1200));
+    const appended = try a.dupe(u8, "new");
+    ring.push(4097, appended) catch |err| {
+        a.free(appended);
+        return err;
+    };
+    try std.testing.expectEqual(@as(u64, 4097), ring.newestSeq().?);
+    try std.testing.expectEqual(expected_bytes + 3, ring.bytes);
+    try ring.acknowledgeRange(4, 4, 301, 3499, 4097);
+    try std.testing.expectEqual(@as(u64, 4096), ring.reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 1), ring.items.items.len);
+    try std.testing.expect(ring.items.items[0].json.ptr == appended.ptr);
+    try std.testing.expectEqualStrings("new", ring.items.items[0].json);
+}
+
+test "draft mark pruning keeps the exact floor and both cuts" {
+    const a = std.testing.allocator;
+    var host: SessionHost = undefined;
+    host.allocator = a;
+    host.events = .{ .allocator = a };
+    host.draft_marks = .empty;
+    host.draft_marks_exact = true;
+    defer host.draft_marks.deinit(a);
+    host.pruneDraftMarks(); // empty
+    try host.draft_marks.append(a, .{ .seq = 10, .text = 2, .reasoning = 3 });
+    host.events.reclaimed_through = 100;
+    host.pruneDraftMarks(); // one
+    try std.testing.expectEqual(@as(usize, 1), host.draft_marks.items.len);
+    try host.draft_marks.appendSlice(a, &.{
+        .{ .seq = 20, .text = 5, .reasoning = 7 },
+        .{ .seq = 30, .text = 9, .reasoning = 11 },
+        .{ .seq = 40, .text = 13, .reasoning = 17 },
+    });
+    host.events.reclaimed_through = 5;
+    host.pruneDraftMarks(); // no floor
+    try std.testing.expectEqual(@as(usize, 4), host.draft_marks.items.len);
+    host.events.reclaimed_through = 15;
+    host.pruneDraftMarks(); // floor already first
+    try std.testing.expectEqual(@as(usize, 4), host.draft_marks.items.len);
+    host.events.reclaimed_through = 25;
+    host.pruneDraftMarks();
+    try std.testing.expectEqual(@as(usize, 3), host.draft_marks.items.len);
+    try std.testing.expectEqual(@as(u64, 20), host.draft_marks.items[0].seq);
+    try std.testing.expectEqual(@as(usize, 5), host.draftCut(25).?.text);
+    try std.testing.expectEqual(@as(usize, 7), host.draftCut(25).?.reasoning);
+    try std.testing.expectEqual(@as(usize, 13), host.draftCut(40).?.text);
+    try std.testing.expectEqual(@as(usize, 17), host.draftCut(40).?.reasoning);
+    host.events.reclaimed_through = 30;
+    host.pruneDraftMarks(); // exact floor
+    try std.testing.expectEqual(@as(u64, 30), host.draft_marks.items[0].seq);
+    try std.testing.expectEqual(@as(usize, 9), host.draftCut(30).?.text);
+    try std.testing.expectEqual(@as(usize, 11), host.draftCut(30).?.reasoning);
+    host.events.reclaimed_through = 100;
+    host.pruneDraftMarks(); // beyond all marks
+    try std.testing.expectEqual(@as(usize, 1), host.draft_marks.items.len);
+    try std.testing.expectEqual(@as(u64, 40), host.draft_marks.items[0].seq);
+    try std.testing.expectEqual(@as(usize, 13), host.draftCut(100).?.text);
+    try std.testing.expectEqual(@as(usize, 17), host.draftCut(100).?.reasoning);
+    host.draft_marks_exact = false;
+    host.pruneDraftMarks();
+    try std.testing.expect(host.draftCut(100) == null);
+}
+
+test "live acknowledgement and draft pruning allocate nothing" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const a = failing.allocator();
+    {
+        var host: SessionHost = undefined;
+        host.allocator = a;
+        host.events = .{ .allocator = a };
+        host.draft_marks = .empty;
+        host.draft_marks_exact = true;
+        defer host.events.deinit();
+        defer host.draft_marks.deinit(a);
+        for (1..5) |seq| {
+            const json = try a.dupe(u8, "x");
+            host.events.push(seq, json) catch |err| {
+                a.free(json);
+                return err;
+            };
+            try host.draft_marks.append(a, .{ .seq = seq, .text = seq, .reasoning = seq * 2 });
+        }
+        const allocations = failing.alloc_index;
+        failing.fail_index = allocations;
+        try host.events.acknowledgeRange(1, 1, 0, 3, 4);
+        host.pruneDraftMarks();
+        try std.testing.expectEqual(allocations, failing.alloc_index);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(u64, 3), host.draft_marks.items[0].seq);
+        try std.testing.expectEqual(@as(usize, 6), host.draftCut(3).?.reasoning);
+    }
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
 test "live ring retains events until explicitly reclaimed" {
     const a = std.testing.allocator;
     var ring = LiveRing{ .allocator = a };
@@ -60,9 +195,23 @@ test "live ring retires only proven ranges and keeps an earlier hole" {
     var ring = LiveRing{ .allocator = a };
     defer ring.deinit();
     for (1..6) |seq| try ring.push(seq, try a.dupe(u8, "e"));
-    try std.testing.expectError(error.StaleControl, ring.acknowledgeRange(2, 1, 2, 3, 5));
-    try std.testing.expectError(error.InvalidInput, ring.acknowledgeRange(2, 2, 4, 3, 5));
-    try std.testing.expectError(error.InvalidSequence, ring.acknowledgeRange(2, 2, 2, 6, 5));
+    const rejected = [_]struct { expected: anyerror, epoch: u64, first: u64, last: u64 }{
+        .{ .expected = error.StaleControl, .epoch = 1, .first = 2, .last = 3 },
+        .{ .expected = error.StaleControl, .epoch = 0, .first = 2, .last = 3 },
+        .{ .expected = error.InvalidInput, .epoch = 2, .first = 4, .last = 3 },
+        .{ .expected = error.InvalidSequence, .epoch = 2, .first = 2, .last = 6 },
+    };
+    for (rejected) |input| {
+        try std.testing.expectError(input.expected, ring.acknowledgeRange(2, input.epoch, input.first, input.last, 5));
+        try std.testing.expectEqual(@as(usize, 5), ring.items.items.len);
+        try std.testing.expectEqual(@as(usize, 5), ring.bytes);
+        try std.testing.expectEqual(@as(u64, 0), ring.highest_acknowledged);
+        try std.testing.expectEqual(@as(u64, 0), ring.reclaimed_through);
+        for (ring.items.items, 1..) |entry, seq| {
+            try std.testing.expectEqual(@as(u64, seq), entry.seq);
+            try std.testing.expectEqualStrings("e", entry.json);
+        }
+    }
     try ring.acknowledgeRange(2, 2, 2, 3, 5);
     try std.testing.expectEqual(@as(u64, 3), ring.highest_acknowledged);
     // Position 1 is still unproven, so the exact-recovery cursor may not move.

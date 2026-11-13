@@ -3435,6 +3435,7 @@ test "canonical stream commit drains long finalized paragraphs by complete prefi
             const old_base = body.base;
             const old_written = ui.records.items[index].stream_written;
             try ui.draw();
+            try std.testing.expect(body.arena.queryCapacity() > 0);
             const entry = ui.frame_records[0];
             const expected = body.releaseLimit(body.visibleRows().len);
             try std.testing.expectEqual(expected, entry.stream_rows);
@@ -3448,7 +3449,10 @@ test "canonical stream commit drains long finalized paragraphs by complete prefi
             try std.testing.expectEqual(old_written + expected, ui.records.items[index].stream_written);
             try std.testing.expect(body.base >= old_base);
             try std.testing.expect(!std.mem.eql(u8, ui.notice, "Display commit incomplete; output retained"));
-            if (!body.isDrained()) try std.testing.expect(!ui.records.items[index].output);
+            if (!body.isDrained()) {
+                try std.testing.expect(!ui.records.items[index].output);
+                try std.testing.expect(body.arena.queryCapacity() > 0);
+            }
         }
         try std.testing.expect(saw_preview);
         try std.testing.expect(frames > 1 and frames < 100);
@@ -3457,6 +3461,9 @@ test "canonical stream commit drains long finalized paragraphs by complete prefi
         try std.testing.expectEqual(rendered.lines.len, drawn);
         try std.testing.expect(ui.records.items[index].output);
         try std.testing.expect(ui.records.items[index].delivery_complete);
+        try std.testing.expectEqual(@as(usize, 0), body.arena.queryCapacity());
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].lines.len);
+        try std.testing.expect(ui.records.items[index].cache == null);
     };
 }
 test "stream rows publish only after ACK and matching canonical text is not duplicated" {
@@ -3467,7 +3474,14 @@ test "stream rows publish only after ACK and matching canonical text is not dupl
     defer ui.deinit();
     try seedShiftDraft(&ui);
     const index = ui.draft.?;
+    const stream = ui.records.items[index].stream.?;
     try ui.draw();
+    const capacity = stream.arena.queryCapacity();
+    const base = stream.base;
+    try std.testing.expect(capacity > 0 and stream.pinned and !stream.finished);
+    stream.releaseDrainedRender();
+    try std.testing.expectEqual(capacity, stream.arena.queryCapacity());
+    try std.testing.expectEqual(base, stream.base);
     // The active body keeps no full styled prefix copy; only unwritten rows.
     try std.testing.expect(ui.records.items[index].flow_prefix == null);
     try std.testing.expect(ui.records.items[index].pending_stream_rows != 0);
@@ -3478,6 +3492,14 @@ test "stream rows publish only after ACK and matching canonical text is not dupl
     try ui.appendDraft(.assistant, "```");
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[index].stream_written != 0);
+    try std.testing.expect(stream.arena.queryCapacity() > 0);
+    const unfinished_base = stream.base;
+    const unfinished_window = stream.windowBytes();
+    const unfinished_capacity = stream.arena.queryCapacity();
+    stream.releaseDrainedRender();
+    try std.testing.expectEqual(unfinished_capacity, stream.arena.queryCapacity());
+    try std.testing.expectEqual(unfinished_base, stream.base);
+    try std.testing.expectEqual(unfinished_window, stream.windowBytes());
     const body = try std.testing.allocator.dupe(u8, ui.records.items[index].body.items);
     defer std.testing.allocator.free(body);
     try ui.replaceCommitted(&.{.{ .text = body }}, false, true);
@@ -11705,6 +11727,10 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
         try std.testing.expectEqual(@as(usize, 0), ui.frame_records[0].stream_rows);
         try std.testing.expect(body.hasMetadataProgress());
         try std.testing.expect(!body.isDrained());
+        const capacity = body.arena.queryCapacity();
+        try std.testing.expect(capacity > 0 and body.pinned);
+        body.releaseDrainedRender();
+        try std.testing.expectEqual(capacity, body.arena.queryCapacity());
         try std.testing.expectEqual(@as(usize, 0), body.base);
         try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
         try std.testing.expectEqualStrings("# ", body.source.items);
@@ -11714,6 +11740,7 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
         if (scenario == 0) {
             ui.frame_offset = ui.frame.len - 1;
             ui.finishFrame();
+            try std.testing.expectEqual(capacity, body.arena.queryCapacity());
             try std.testing.expect(body.hasMetadataProgress());
             try std.testing.expect(!body.isDrained());
             try std.testing.expectEqual(@as(usize, 0), body.base);
@@ -11733,6 +11760,7 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
             ui.finishFrame();
         }
         if (scenario != 0) {
+            try std.testing.expectEqual(capacity, body.arena.queryCapacity());
             try std.testing.expect(!body.hasMetadataProgress());
             try std.testing.expectEqual(@as(usize, 0), body.base);
             try std.testing.expect(!body.isDrained());
@@ -11755,6 +11783,9 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
         try std.testing.expectEqual(@as(usize, 0), body.windowBytes());
         try std.testing.expectEqualStrings("", body.source.items);
         try std.testing.expectEqual(@as(usize, 2), ui.records.items[index].delivery_visible);
+        try std.testing.expectEqual(@as(usize, 0), body.arena.queryCapacity());
+        try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].lines.len);
+        try std.testing.expect(ui.records.items[index].cache == null);
         try std.testing.expectEqual(@as(usize, 1), fake.ack_count);
         try std.testing.expectEqual(@as(u64, 1), fake.ack_sequence);
     }

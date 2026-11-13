@@ -6602,6 +6602,7 @@ const Ui = struct {
                             self.requestDraw();
                         }
                         record.invalidate();
+                        stream.releaseDrainedRender();
                         if (progressed and (stream.pendingBytes() != 0 or stream.hasMetadataProgress())) self.requestProgressDraw();
                     } else |_| {
                         committed = false;

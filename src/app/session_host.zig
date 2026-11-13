@@ -159,18 +159,18 @@ const LiveRing = struct {
         if (first != 0 and first > last) return error.InvalidInput;
         if (last > high) return error.InvalidSequence;
         if (last == 0) return;
-        var index: usize = 0;
-        while (index < self.items.items.len) {
-            const seq = self.items.items[index].seq;
-            const inside = if (first == 0) seq <= last else seq >= first and seq <= last;
-            if (!inside) {
-                index += 1;
-                continue;
+        var retained: usize = 0;
+        for (self.items.items, 0..) |entry, index| {
+            const inside = if (first == 0) entry.seq <= last else entry.seq >= first and entry.seq <= last;
+            if (inside) {
+                self.bytes -= entry.json.len;
+                self.allocator.free(entry.json);
+            } else {
+                if (retained != index) self.items.items[retained] = entry;
+                retained += 1;
             }
-            const entry = self.items.orderedRemove(index);
-            self.bytes -= entry.json.len;
-            self.allocator.free(entry.json);
         }
+        self.items.items.len = retained;
         if (last > self.highest_acknowledged) self.highest_acknowledged = last;
         // Contiguous retirement may only advance up to the oldest retained
         // position; a remaining hole keeps the exact-recovery cursor below it.
@@ -616,8 +616,12 @@ pub const SessionHost = struct {
     /// Keep one floor mark at or below the contiguous watermark plus every mark
     /// above it; a baseline can only cut at or after that floor.
     fn pruneDraftMarks(self: *SessionHost) void {
-        while (self.draft_marks.items.len >= 2 and self.draft_marks.items[1].seq <= self.events.reclaimed_through) {
-            _ = self.draft_marks.orderedRemove(0);
+        const marks = self.draft_marks.items;
+        var drop: usize = 0;
+        while (drop + 1 < marks.len and marks[drop + 1].seq <= self.events.reclaimed_through) : (drop += 1) {}
+        if (drop != 0) {
+            std.mem.copyForwards(DraftMark, marks[0 .. marks.len - drop], marks[drop..]);
+            self.draft_marks.items.len = marks.len - drop;
         }
     }
 

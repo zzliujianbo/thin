@@ -329,6 +329,118 @@ test "pinned append partial commit abort resize and metadata-only closer" {
     try progress(a, pin, &rows, true);
     try std.testing.expect(pin.isDrained());
 }
+test "body warm invalid rebuilds reuse arena and preserve pinned rows" {
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    {
+        const body = try body_mod.Body.create(backing.allocator(), 8);
+        defer body.destroy();
+        try body.append("alpha beta gamma\n");
+        try body.build();
+        body.abort();
+        try body.build(); // Consolidate the initial arena nodes.
+        body.abort();
+        try body.build(); // Warm the consolidated layout.
+        body.releasePin();
+        const allocs = backing.allocations;
+        const renders = body.stats.renders;
+        try body.build(); // valid repin does not render
+        try std.testing.expectEqual(renders, body.stats.renders);
+        const old = body.visibleRows()[0].text;
+        const old_copy = try std.testing.allocator.dupe(u8, old);
+        defer std.testing.allocator.free(old_copy);
+        try body.append("delta\n");
+        try body.finish();
+        try std.testing.expectEqual(old.ptr, body.visibleRows()[0].text.ptr);
+        try std.testing.expectEqualStrings(old_copy, body.visibleRows()[0].text);
+        body.releasePin();
+        try body.build();
+        body.abort();
+        try body.build(); // consolidate after the larger source
+        body.abort();
+        try body.build();
+        body.abort();
+        const warm_allocs = backing.allocations;
+        try std.testing.expect(warm_allocs >= allocs);
+        for (0..3) |_| {
+            try body.build();
+            body.abort();
+        }
+        try std.testing.expectEqual(warm_allocs, backing.allocations);
+        body.resize(4);
+        try body.build();
+        try std.testing.expectEqualStrings("alpha beta gamma\ndelta\n", body.source.items);
+    }
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
+test "body retain reset preheat OOM clears render refs without semantic mutation" {
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    {
+        const body = try body_mod.Body.create(backing.allocator(), 8);
+        defer body.destroy();
+        try body.append("alpha\n\xf0\x9f");
+        try body.build();
+        body.abort();
+        // Force multiple used nodes so retain_capacity must preheat via alloc.
+        _ = try body.arena.allocator().alloc(u8, 16384);
+        _ = try body.arena.allocator().alloc(u8, 65536);
+        const before_base = body.base;
+        const before_state = body.state;
+        const before_decoder = body.decoder;
+        const before_stats = body.stats;
+        const before_finished = body.finished;
+        const before_dirty = body.dirty;
+        const before_end = body.acceptedSourceEnd();
+        backing.fail_index = backing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, body.build());
+        try std.testing.expect(backing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), body.rows.len);
+        try std.testing.expect(body.metadata == null);
+        try std.testing.expectEqual(@as(usize, 0), body.consumed);
+        try std.testing.expect(!body.valid and !body.pinned);
+        try std.testing.expectEqual(body_mod.Limit.memory, body.limit);
+        try std.testing.expectEqual(before_base, body.base);
+        try std.testing.expectEqualDeep(before_state, body.state);
+        try std.testing.expectEqualDeep(before_decoder, body.decoder);
+        try std.testing.expectEqualDeep(before_stats, body.stats);
+        try std.testing.expectEqual(before_finished, body.finished);
+        try std.testing.expectEqual(before_dirty, body.dirty);
+        try std.testing.expectEqual(before_end, body.acceptedSourceEnd());
+        try std.testing.expectEqualStrings("alpha\n", body.source.items);
+        backing.fail_index = std.math.maxInt(usize);
+        try body.build();
+        try std.testing.expectEqual(body_mod.Limit.memory, body.limit);
+    }
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
+test "body releases only unpinned drained render capacity" {
+    const body = try body_mod.Body.create(std.testing.allocator, 80);
+    defer body.destroy();
+    try body.append("hello\n");
+    try body.build();
+    const capacity = body.arena.queryCapacity();
+    try std.testing.expect(capacity > 0);
+    body.releaseDrainedRender();
+    try std.testing.expectEqual(capacity, body.arena.queryCapacity());
+    try body.finish();
+    body.releaseDrainedRender();
+    try std.testing.expectEqual(capacity, body.arena.queryCapacity());
+    body.releasePin();
+    body.releaseDrainedRender();
+    try std.testing.expectEqual(capacity, body.arena.queryCapacity());
+    try body.build();
+    _ = try body.commit(body.visibleRows().len);
+    try std.testing.expect(body.isDrained());
+    const stats = body.stats;
+    body.releaseDrainedRender();
+    try std.testing.expectEqual(@as(usize, 0), body.arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 0), body.rows.len);
+    try std.testing.expect(body.metadata == null and !body.valid);
+    try std.testing.expectEqual(@as(usize, 0), body.consumed);
+    try std.testing.expectEqualDeep(stats, body.stats);
+}
+
 test "plain mode does not invent a trailing empty row" {
     const a = std.testing.allocator;
     const result = try markdown.render(a, "line\n", .{ .columns = 80, .max_lines = 20, .ansi = false, .markdown = false });
