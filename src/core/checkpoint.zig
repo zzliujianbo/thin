@@ -42,7 +42,21 @@ pub const State = struct {
     /// Observer continuity only; the Runtime never treats these as authority.
     journal_seq: u64 = 0,
     journal_turn: u64 = 0,
+    /// Display-only line counts for resumed tool rows. Never model input, replay
+    /// data or send authority; absent in older checkpoints.
+    tool_stats: ?[]const ToolStat = null,
 };
+
+/// One saved row's file-change counters, keyed by the canonical tool call id.
+pub const ToolStat = struct {
+    call_id: []const u8,
+    modified: u64 = 0,
+    added: u64 = 0,
+    removed: u64 = 0,
+};
+
+pub const max_tool_stats = 256;
+pub const max_tool_stat_id = 128;
 
 // Count escaped output before allocating the exact encoded size.
 const Counter = struct {
@@ -178,6 +192,9 @@ pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
         if (tree.value.object.get("input_margin_tokens")) |v| try shape(u32, v);
         _ = tree.value.object.swapRemove("max_input_tokens");
         _ = tree.value.object.swapRemove("input_margin_tokens");
+        // Display-only metadata added later: an older checkpoint simply has no
+        // such rows, and must still resume.
+        if (!tree.value.object.contains("tool_stats")) try tree.value.object.put(tree.arena.allocator(), "tool_stats", .null);
     }
     try shape(State, tree.value);
     const parsed = try std.json.parseFromValue(State, a, tree.value, .{});
@@ -193,6 +210,13 @@ fn utf8(s: []const u8) !void {
 fn basic(state: State) !void {
     if (state.version != 2) return error.UnsupportedVersion;
     try utf8(state.system);
+    if (state.tool_stats) |stats| {
+        if (stats.len > max_tool_stats) return error.InputLimit;
+        for (stats) |stat| {
+            try utf8(stat.call_id);
+            if (stat.call_id.len == 0 or stat.call_id.len > max_tool_stat_id) return error.InvalidHistory;
+        }
+    }
     for (state.messages) |m| {
         if (m.replay) |r| {
             try utf8(r.scope.connection);

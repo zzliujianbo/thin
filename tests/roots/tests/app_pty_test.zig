@@ -3135,8 +3135,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(final.count(markers[0]) == 1 and final.count(markers[1]) == 1 and final.count(markers[2]) == 1);
         try Driver.checkComposerTail(final);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m>\x1b[38;5;203m false; #") != null); // Failure prefix; summary still clips at80% in its existing failure color.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "...\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m>\x1b[38;5;203m false; #") != null); // Failure prefix; the summary clips at 95% in its existing failure color.
+        // The clipped target ends in dots, then the reserved outcome marker.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "... [error]\x1b[0m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "·") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);

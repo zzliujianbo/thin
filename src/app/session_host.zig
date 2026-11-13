@@ -20,6 +20,7 @@
 const std = @import("std");
 const r = @import("../core/runtime.zig");
 const p = @import("../core/protocol.zig");
+const checkpoint = @import("../core/checkpoint.zig");
 const task = @import("../core/task.zig");
 const inbox_mod = @import("../core/inbox.zig");
 const settings_preferences = @import("../core/settings.zig");
@@ -378,7 +379,7 @@ pub const SessionHost = struct {
         // any producer exists. It is copied into the owned display ring so a
         // remote frontend sees restored checkpoints without ever reading live
         // Runtime slices, native replay or configuration.
-        if (host.connection.initial_history_fn) |history| host.seedHistory(history(host.connection.context));
+        if (host.connection.initial_history_fn) |history| host.seedHistory(history(host.connection.context), host.session.displayStats());
         return host;
     }
 
@@ -805,13 +806,14 @@ pub const SessionHost = struct {
     /// Convert startup canonical messages into owned display rows. Bounded by
     /// count and bytes; native replay, configuration and credentials never
     /// cross this conversion.
-    fn seedHistory(self: *SessionHost, messages: []const p.Message) void {
+    fn seedHistory(self: *SessionHost, messages: []const p.Message, stats: []const checkpoint.ToolStat) void {
         var seeded: usize = 0;
         var bytes: usize = 0;
         var user_id: u64 = 0;
+        var tool_id: u64 = 0;
         var text_buf = std.ArrayList(u8).empty;
         defer text_buf.deinit(self.allocator);
-        for (messages) |message| {
+        for (messages, 0..) |message, index| {
             switch (message.role) {
                 .context => continue,
                 .user => {
@@ -835,12 +837,70 @@ pub const SessionHost = struct {
                     if (user_id == 0) user_id = 1;
                     if (!self.seedEvent(.{ .user_committed = .{ .id = user_id, .text = text_buf.items } }, &seeded, &bytes)) return;
                 },
-                .assistant, .tool => {
+                .assistant => {
                     if (message.blocks.len == 0) continue;
-                    if (!self.seedEvent(.{ .assistant_committed = message.blocks }, &seeded, &bytes)) return;
+                    // An explicit `!command` is wrapped in program-generated prose.
+                    // Replay only its tool_call so the caption still pairs with the
+                    // saved result and no assistant row pretends to be model output.
+                    var call_blocks: [8]p.Block = undefined;
+                    var calls: usize = 0;
+                    var program_note = false;
+                    for (message.blocks) |block| switch (block) {
+                        .tool_call => if (calls < call_blocks.len) {
+                            call_blocks[calls] = block;
+                            calls += 1;
+                        },
+                        .text => |text| program_note = program_note or std.mem.eql(u8, text, r.local_command_note),
+                        else => {},
+                    };
+                    const blocks = if (program_note and calls != 0) call_blocks[0..calls] else message.blocks;
+                    if (!self.seedEvent(.{ .assistant_committed = blocks }, &seeded, &bytes)) return;
+                },
+                // One saved result becomes one tool_result row. Replaying it as
+                // assistant text would drop the tool line entirely, because only
+                // text blocks reach the transcript. Args are already seeded by
+                // the preceding assistant tool_call, so captions stay exact.
+                .tool => for (message.blocks) |block| switch (block) {
+                    .tool_result => |result| {
+                        tool_id +%= 1;
+                        if (tool_id == 0) tool_id = 1;
+                        if (!self.seedEvent(.{ .tool_result = .{
+                            .id = tool_id,
+                            .name = seededToolName(messages, index, result.call_id),
+                            .local = r.isLocalCommand(result.call_id),
+                            .result = .{
+                                .text = result.text,
+                                .is_error = result.is_error,
+                                .canceled = result.canceled,
+                                .truncated = result.truncated,
+                                .file_stats = seededFileStats(stats, result.call_id),
+                            },
+                        } }, &seeded, &bytes)) return;
+                    },
+                    else => {},
                 },
             }
         }
+    }
+
+    /// Name of the tool_call that produced `call_id`, or "" when the saved
+    /// history no longer carries it. Display only: never executable.
+    fn seededToolName(messages: []const p.Message, index: usize, call_id: []const u8) []const u8 {
+        for (messages[0..index]) |prior| for (prior.blocks) |candidate| {
+            if (candidate == .tool_call and std.mem.eql(u8, candidate.tool_call.id, call_id)) return candidate.tool_call.name;
+        };
+        return "";
+    }
+
+    /// Saved `~M +A -D` counters for one call, or null when the history carries
+    /// none. Display only: a stale id never becomes a row.
+    fn seededFileStats(stats: []const checkpoint.ToolStat, call_id: []const u8) ?@import("../util/line_stats.zig").File {
+        for (stats) |stat| {
+            if (!std.mem.eql(u8, stat.call_id, call_id)) continue;
+            if (stat.added == 0 and stat.removed == 0) return null;
+            return .{ .changes = .{ .modified = stat.modified, .added = stat.added, .removed = stat.removed } };
+        }
+        return null;
     }
 
     fn seedEvent(self: *SessionHost, event: r.Event, seeded: *usize, bytes: *usize) bool {

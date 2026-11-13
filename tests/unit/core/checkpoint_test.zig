@@ -26,6 +26,36 @@ test "checkpoint reads retired v2 budget fields without re-emitting them" {
     defer a.free(bad);
     try std.testing.expectError(error.InvalidType, decode(a, bad));
 }
+test "checkpoint keeps display-only tool counters and reads old files without them" {
+    const a = std.testing.allocator;
+    var state = fixture(.chat);
+    const stats = [_]ToolStat{.{ .call_id = "c1", .modified = 2, .added = 12, .removed = 3 }};
+    state.tool_stats = &stats;
+    const bytes = try encode(a, state);
+    defer a.free(bytes);
+    var decoded = try decode(a, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.tool_stats.?.len);
+    try std.testing.expectEqualStrings("c1", decoded.value.tool_stats.?[0].call_id);
+    try std.testing.expectEqual(@as(u64, 2), decoded.value.tool_stats.?[0].modified);
+    try std.testing.expectEqual(@as(u64, 12), decoded.value.tool_stats.?[0].added);
+    try std.testing.expectEqual(@as(u64, 3), decoded.value.tool_stats.?[0].removed);
+    // The counters are display metadata, never request history.
+    try validateRequestHistory(a, fixtureRequest(decoded.value, fixture_config));
+    // Older checkpoints never carried the key; they must still resume.
+    const base = try encode(a, fixture(.chat));
+    defer a.free(base);
+    const old = try std.mem.replaceOwned(u8, a, base, ",\"tool_stats\":null", "");
+    defer a.free(old);
+    try std.testing.expect(old.len < base.len);
+    var legacy = try decode(a, old);
+    defer legacy.deinit();
+    try std.testing.expect(legacy.value.tool_stats == null);
+    // A malformed counter row fails closed.
+    const bad = try std.mem.replaceOwned(u8, a, bytes, "\"call_id\":\"c1\"", "\"call_id\":\"\"");
+    defer a.free(bad);
+    try std.testing.expectError(error.InvalidHistory, decode(a, bad));
+}
 test "checkpoint preserves more than 1024 canonical messages" {
     const a = std.testing.allocator;
     const messages = try a.alloc(p.Message, 1026);

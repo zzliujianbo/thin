@@ -1369,6 +1369,88 @@ test "confirming barrier is controller-bound and released with its view" {
 
     try host.shutdown();
 }
+test "seeded tool results replay as tool_result rows, not assistant text" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const project_len = try tmp.dir.realPath(io, &path_buffer);
+    const project = path_buffer[0..project_len];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", project);
+
+    const id = try ids.generate(io);
+    const host = try SessionHost.init(a, io, &env, .{ .project = project, .id = id, .owner = .daemon });
+    defer host.deinit();
+
+    const messages = [_]p.Message{
+        .{ .role = .context, .blocks = &.{.{ .text = "prefix" }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "question" }} },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "orphan", .text = "unpaired" } }} },
+        .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "call-1", .name = "read_file", .arguments = "{\"path\":\"src/main.zig\"}" } }} },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "call-1", .text = "file body", .is_error = true } }} },
+        .{ .role = .user, .blocks = &.{.{ .text = "!printf hi" }} },
+        .{ .role = .assistant, .blocks = &.{
+            .{ .text = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response." },
+            .{ .tool_call = .{ .id = "local_command_7", .name = "bash", .arguments = "{\"command\":\"printf hi\"}" } },
+        } },
+        .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "local_command_7", .text = "{\"stdout\":\"hi\"}" } }} },
+    };
+    const stats = [_]checkpoint.ToolStat{.{ .call_id = "call-1", .modified = 2, .added = 12, .removed = 3 }};
+    host.seedHistory(&messages, &stats);
+
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":31,\"op\":\"history\",\"limit\":8}", 1);
+    defer a.free(frame);
+    var parsed = try parseJson(a, frame);
+    defer parsed.deinit();
+    const entries = parsed.value.object.get("entries").?.array.items;
+    var user_rows: usize = 0;
+    var assistant_rows: usize = 0;
+    var tool_rows: usize = 0;
+    var saw_paired = false;
+    var saw_orphan = false;
+    var saw_local = false;
+    for (entries) |entry| {
+        const kind = entry.object.get("t").?.string;
+        if (std.mem.eql(u8, kind, "user")) user_rows += 1;
+        if (std.mem.eql(u8, kind, "assistant")) assistant_rows += 1;
+        if (!std.mem.eql(u8, kind, "tool_result")) continue;
+        tool_rows += 1;
+        // A saved tool message must never become assistant text again.
+        try std.testing.expect(entry.object.get("blocks") == null);
+        const name = entry.object.get("name").?.string;
+        if (std.mem.eql(u8, entry.object.get("v").?.string, "file body")) {
+            try std.testing.expectEqualStrings("read_file", name);
+            try std.testing.expect(entry.object.get("is_error").?.bool);
+            // Resumed rows keep their saved +A -D counters.
+            const changes = entry.object.get("opts").?.object.get("changes").?.object;
+            try std.testing.expectEqual(@as(i64, 12), changes.get("added").?.integer);
+            try std.testing.expectEqual(@as(i64, 3), changes.get("removed").?.integer);
+            try std.testing.expect(entry.object.get("local") == null);
+            saw_paired = true;
+        }
+        if (std.mem.eql(u8, entry.object.get("v").?.string, "{\"stdout\":\"hi\"}")) {
+            // A saved !command keeps its own row plus the local-output marker.
+            try std.testing.expectEqualStrings("bash", name);
+            try std.testing.expect(entry.object.get("local").?.bool);
+            saw_local = true;
+        }
+        if (std.mem.eql(u8, entry.object.get("v").?.string, "unpaired")) {
+            // A result without its call still replays; only the caption is lost.
+            try std.testing.expectEqualStrings("", name);
+            saw_orphan = true;
+        }
+    }
+    // The !command wrapper is provenance, never a replayed assistant row.
+    try std.testing.expect(std.mem.indexOf(u8, frame, r.local_command_note) == null);
+    try std.testing.expectEqual(@as(usize, 2), user_rows);
+    try std.testing.expectEqual(@as(usize, 2), assistant_rows);
+    try std.testing.expectEqual(@as(usize, 3), tool_rows);
+    try std.testing.expect(saw_paired and saw_orphan and saw_local);
+}
+
 test "history reply is valid JSON with truncated outside the entries array" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -1391,7 +1473,7 @@ test "history reply is valid JSON with truncated outside the entries array" {
         .{ .role = .user, .blocks = &.{.{ .text = "first question" }} },
         .{ .role = .assistant, .blocks = &.{.{ .text = "first answer" }} },
     };
-    host.seedHistory(&messages);
+    host.seedHistory(&messages, &.{});
     try std.testing.expect(host.history.items.items.len == 2);
 
     const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":21,\"op\":\"history\",\"limit\":4}", 1);

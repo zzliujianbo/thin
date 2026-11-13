@@ -359,6 +359,21 @@ test "login key copy is wiped before the request arena is released" {
     request.wipeSecrets();
     for (secret) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
+test "tool result local marker round-trips and defaults off" {
+    const a = std.testing.allocator;
+    const encoded = try encodeEvent(a, .{ .tool_result = .{ .id = 4, .name = "bash", .local = true, .result = .{ .text = "out" } } });
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"local\":true") != null);
+    var decoded = try decodeEvent(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expect(decoded.event.tool_result.local);
+    // An older worker omits the field; the viewer must not fail.
+    const legacy = try std.mem.replaceOwned(u8, a, encoded, ",\"local\":true", "");
+    defer a.free(legacy);
+    var old = try decodeEvent(a, legacy);
+    defer old.deinit();
+    try std.testing.expect(!old.event.tool_result.local);
+}
 test "event encoding round-trips display text and drops inbox pointers" {
     const a = std.testing.allocator;
     const encoded = try encodeEvent(a, .{ .permission = .{ .id = 3, .tool_name = "bash", .description = "rm -rf x" } });

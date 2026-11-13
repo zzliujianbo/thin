@@ -7,7 +7,7 @@ const theme = @import("theme.zig");
 const Allocator = std.mem.Allocator;
 pub const Error = Allocator.Error || error{ MarkdownRenderLimit, MarkdownCellOverflow };
 
-pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, thinking, table_header, user, warning, failure };
+pub const Tone = enum { normal, heading, strong, code, inline_code, quote, link, link_url, rule, border, muted, thinking, table_header, user, success, warning, failure };
 pub const Style = struct { tone: Tone = .normal, bold: bool = false, italic: bool = false, strike: bool = false, underline: bool = false };
 
 /// Optional completion sink, default off. When set, a finished row is handed to
@@ -182,6 +182,7 @@ pub const Writer = struct {
             .thinking => theme.thinking,
             .table_header => theme.table_header,
             .user => theme.user,
+            .success => theme.success,
             .warning => theme.warning,
             .failure => theme.failure,
         });

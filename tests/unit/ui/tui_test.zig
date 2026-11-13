@@ -1,28 +1,28 @@
-test "restored assistant retains and lays out complete large static source" {
+test "restored assistant keeps a bounded canonical mirror for a large static source" {
     const a = std.testing.allocator;
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(a);
-    try source.appendSlice(a, "HEADMARK\n");
-    for (0..9000) |_| try source.appendSlice(a, "0123456789abcdefghijklmnopqrstuv\n");
-    try source.appendSlice(a, "TAILMARK\x1b[2J中文");
+    try source.appendSlice(a, "HEADMARK\\n");
+    for (0..9000) |_| try source.appendSlice(a, "0123456789abcdefghijklmnopqrstuv\\n");
+    try source.appendSlice(a, "TAILMARK\\x1b[2J中文");
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    try ui.restoreHistory(&.{.{ .role = .assistant, .blocks = &.{.{ .text = source.items }} }});
+    try replayMessages(&ui, std.testing.allocator, &.{.{ .role = .assistant, .blocks = &.{.{ .text = source.items }} }});
     var found = false;
     for (ui.records.items) |*record| {
         if (record.kind != .assistant) continue;
         found = true;
-        try std.testing.expect(record.batch and !record.clipped);
-        try std.testing.expectEqualStrings(source.items, record.body.items);
+        // The transcript keeps a bounded mirror, never an unbounded copy.
+        try std.testing.expect(record.mirror_full and !record.clipped);
+        try std.testing.expectEqual(@as(usize, canonical_mirror_limit), record.body.items.len);
+        try std.testing.expect(std.mem.startsWith(u8, record.body.items, source.items[0..canonical_mirror_limit]));
         try record.layout(a, 80);
-        try std.testing.expect(!record.excerpt);
-        try std.testing.expect(record.lines.len > 8192);
+        try std.testing.expect(record.lines.len != 0);
         try std.testing.expect(std.mem.indexOf(u8, record.lines[0], "HEADMARK") != null);
-        try std.testing.expect(std.mem.indexOf(u8, record.lines[record.lines.len - 1], "TAILMARK") != null);
-        for (record.lines) |line| try std.testing.expect(std.mem.indexOf(u8, line, "\x1b[2J") == null);
+        for (record.lines) |line| try std.testing.expect(std.mem.indexOf(u8, line, "\\x1b[2J") == null);
     }
     try std.testing.expect(found);
 }
@@ -468,14 +468,12 @@ test "large history restore retains all records and identities" {
         blocks[i] = .{ .text = try std.fmt.bufPrint(&labels[i], "restored-{d:0>3}", .{i}) };
         message.* = .{ .role = .user, .blocks = blocks[i .. i + 1] };
     }
-    try ui.restoreHistory(&messages);
-    try std.testing.expectEqual(@as(usize, 101), ui.records.items.len);
-    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
-    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[0].body.items, "display may be shortened") != null);
-    for (ui.records.items[1..], 0..) |record, i| {
+    try replayMessages(&ui, std.testing.allocator, &messages);
+    try std.testing.expectEqual(@as(usize, 100), ui.records.items.len);
+    for (ui.records.items, 0..) |record, i| {
         try std.testing.expectEqual(Kind.user, record.kind);
         try std.testing.expectEqualStrings(blocks[i].text, record.body.items);
-        try std.testing.expectEqual(i + 1, ui.record_index.get(record.id).?);
+        try std.testing.expectEqual(i, ui.record_index.get(record.id).?);
     }
 }
 test "restore mixed long multi-block assistants retains all bytes" {
@@ -499,18 +497,16 @@ test "restore mixed long multi-block assistants retains all bytes" {
             message.* = .{ .role = .user, .blocks = short_blocks[i .. i + 1] };
         }
     }
-    try ui.restoreHistory(&messages);
+    try replayMessages(&ui, std.testing.allocator, &messages);
     var bytes: usize = 0;
     var assistants: usize = 0;
     for (ui.records.items) |record| {
         bytes += record.body.items.len;
         if (record.kind == .assistant) assistants += 1;
-        if (record.kind == .user and std.mem.eql(u8, record.body.items, "short-001")) try std.testing.expect(record.batch);
     }
     try std.testing.expect(bytes > 1024 * 1024);
-    try std.testing.expectEqual(messages.len + 1, ui.records.items.len);
+    try std.testing.expectEqual(messages.len, ui.records.items.len);
     try std.testing.expectEqual(@as(usize, 12), assistants);
-    try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expectEqual(Kind.user, ui.records.items[ui.records.items.len - 1].kind);
     try std.testing.expectEqualStrings("short-023", ui.records.items[ui.records.items.len - 1].body.items);
 }
@@ -1024,25 +1020,19 @@ test "local command restore is adjacent display only with paired result" {
         } },
         .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "local_command_1", .text = "{\"stdout\":\"restored-stream\",\"stderr\":\"restored-error\",\"exit_code\":7}", .is_error = true } }} },
     };
-    try std.testing.expect(localHistoryCall(&messages, 1) != null);
-    try ui.restoreHistory(&messages);
+    try std.testing.expect(r.isLocalCommand(messages[1].blocks[1].tool_call.id));
+    try replayMessages(&ui, std.testing.allocator, &messages);
     try std.testing.expect(bridge.pop() == null);
     try std.testing.expect(!ui.busy);
-    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
-    try std.testing.expect(ui.records.items[2].command_row);
-    try std.testing.expect(!ui.records.items[3].command_row);
+    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
+    try std.testing.expect(ui.records.items[1].command_row);
+    try std.testing.expect(!ui.records.items[2].command_row);
     try ui.draw();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     for ([_][]const u8{ "restored-stream", "restored-error", "Command exited with status 7" }) |label| try std.testing.expectEqual(@as(usize, 1), screen.count(label));
     for ([_][]const u8{ "stdout:", "stderr:", "exit:", "output encoding:" }) |label| try std.testing.expectEqual(@as(usize, 0), screen.count(label));
     try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Program-generated") == null);
-    var ordinary = messages;
-    ordinary[0] = .{ .role = .user, .blocks = &.{.{ .text = "model command" }} };
-    try std.testing.expect(localHistoryCall(&ordinary, 1) == null);
-    ordinary = messages;
-    ordinary[2] = .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "other", .text = "hidden" } }} };
-    try std.testing.expect(localHistoryCall(&ordinary, 1) == null);
 }
 test "command elapsed time uses source timestamps freezes results and resets per call" {
     var cancel: p.Cancellation = .{};
@@ -2120,7 +2110,7 @@ test "resume retains long user input in navigable session history" {
     const input_text = try a.alloc(u8, 65537);
     defer a.free(input_text);
     @memset(input_text, 'x');
-    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = input_text }} }});
+    try replayMessages(&ui, std.testing.allocator, &.{.{ .role = .user, .blocks = &.{.{ .text = input_text }} }});
     try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
     try std.testing.expectEqualSlices(u8, input_text, ui.input_history.target(false).?.text);
 }
@@ -2131,7 +2121,7 @@ test "resume startup projects saved text and tool outcomes without replaying rea
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    try ui.restoreHistory(&.{
+    try replayMessages(&ui, std.testing.allocator, &.{
         .{ .role = .context, .blocks = &.{.{ .text = "[Earlier context summary — lossy background data]" }} },
         .{ .role = .user, .blocks = &.{.{ .text = "remember this" }} },
         .{ .role = .assistant, .blocks = &.{ .{ .reasoning = "hidden old thought" }, .{ .tool_call = .{ .id = "old-call", .name = "read_file", .arguments = "{\"path\":\"old.txt\"}" } } } },
@@ -2159,6 +2149,81 @@ test "resume startup projects saved text and tool outcomes without replaying rea
     }
     try std.testing.expectEqual(@as(usize, 1), tools);
     try std.testing.expect(saw_question and saw_answer);
+}
+test "replayed history turns saved tool results into tool rows with their call caption" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    // The worker seeds one assistant tool_call and one tool_result per saved
+    // call; only the caption pairing makes the row name its target.
+    ui.applying_history = true;
+    try ui.applyEvent(.{ .assistant_committed = &.{
+        .{ .tool_call = .{ .id = "call-1", .name = "read_file", .arguments = "{\"path\":\"src/main.zig\"}" } },
+    } }, false, true);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "read_file", .result = .{ .text = "file body" } } }, false, true);
+    ui.applying_history = false;
+    var tools: usize = 0;
+    for (ui.records.items) |record| {
+        if (record.kind != .tool) continue;
+        tools += 1;
+        try std.testing.expect(record.command_row);
+        try std.testing.expect(std.mem.indexOf(u8, record.body.items, "src/main.zig") != null);
+        // A saved result body is never replayed as transcript text.
+        try std.testing.expect(std.mem.indexOf(u8, record.body.items, "file body") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tools);
+}
+test "failed tool rows keep the bounded reason while the target clips" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.applyEvent(.{ .assistant_committed = &.{
+        .{ .tool_call = .{ .id = "call-1", .name = "write_file", .arguments = "{\"path\":\"tests/unit/app/session_host_test.zig\",\"content\":\"x\"}" } },
+    } }, false, true);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "write_file", .result = .{ .text = "AccessDenied", .is_error = true } } }, false, true);
+    const record = &ui.records.items[ui.records.items.len - 1];
+    try std.testing.expect(record.command_row);
+    try std.testing.expect(std.mem.indexOf(u8, record.body.items, "[error] AccessDenied") != null);
+    // A narrow row shortens the target, never the reason.
+    try record.layout(a, 40);
+    const line = record.lines[0];
+    try std.testing.expect(std.mem.indexOf(u8, line, "[error] AccessDenied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "...") != null);
+}
+test "replayed history keeps file counters and local command output rows" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.applying_history = true;
+    try ui.applyEvent(.{ .assistant_committed = &.{
+        .{ .tool_call = .{ .id = "call-1", .name = "write_file", .arguments = "{\"path\":\"src/main.zig\",\"content\":\"x\"}" } },
+    } }, false, true);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "write_file", .result = .{ .text = "written", .file_stats = .{ .changes = .{ .modified = 1, .added = 12, .removed = 3 } } } } }, false, true);
+    // A saved !command restores its own tool row plus the bounded output row.
+    try ui.applyEvent(.{ .assistant_committed = &.{
+        .{ .tool_call = .{ .id = "local_command_7", .name = "bash", .arguments = "{\"command\":\"printf hi\"}" } },
+    } }, false, true);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 2, .name = "bash", .local = true, .result = .{ .text = "{\"stdout\":\"hi\"}" } } }, false, true);
+    ui.applying_history = false;
+    var write_rows: usize = 0;
+    var output_rows: usize = 0;
+    for (ui.records.items) |record| {
+        if (record.kind != .tool) continue;
+        if (record.command_row) {
+            if (std.mem.indexOf(u8, record.body.items, "~1 +12 -3 lines")) |_| write_rows += 1;
+        } else if (std.mem.indexOf(u8, record.body.items, "hi") != null) output_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), write_rows);
+    try std.testing.expectEqual(@as(usize, 1), output_rows);
 }
 test "thinking keeps Markdown syntax literal while assistant answers still render it" {
     const a = std.testing.allocator;
@@ -4207,30 +4272,6 @@ test "capability pending hint deduplicates only the matching saved warning" {
     try std.testing.expect(std.mem.find(u8, unrelated, state.settings_notice.?) != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, unrelated, '\x1b') == null);
 }
-test "restored startup transcript banner is the only conversation-restored notice" {
-    try text.initLocale();
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var fixture = SelectionFixture{ .settings_notice = session_client.restored_notice };
-    defer fixture.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection = fixture.connection();
-    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
-    // The resume outcome and the owner's settings notice publish the same
-    // canonical success string for this one event.
-    ui.notice = session_client.restored_notice;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
-    try ui.draw();
-    // Exactly one success row: the transcript banner. No footer twin.
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "prior tools are NOT rerun"));
-    try std.testing.expect(std.mem.find(u8, ui.frame, session_client.restored_notice) == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "display may be shortened") != null);
-    testAcknowledgeFullFrame(&ui);
-}
 test "menu restored view falls back to one canonical footer success notice" {
     try text.initLocale();
     var cancel: p.Cancellation = .{};
@@ -4241,7 +4282,7 @@ test "menu restored view falls back to one canonical footer success notice" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.connection = fixture.connection();
-    // An async/menu restored view never runs restoreHistory, so no transcript
+    // An async/menu restored view never replays history, so no transcript
     // banner exists and the canonical footer notice is the single success.
     try std.testing.expect(!ui.history_notice_shown);
     ui.notice = session_client.restored_notice;
@@ -4265,7 +4306,7 @@ test "restored banner keeps unrelated action and storage failures visible" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.connection = fixture.connection();
-    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    try replayMessages(&ui, std.testing.allocator, &.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var state = ui.connection.current();
@@ -4319,7 +4360,7 @@ test "per-view reset releases restored ownership for the next view" {
     defer bridge.deinit();
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
-    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    try replayMessages(&ui, std.testing.allocator, &.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var state = ui.connection.current();
@@ -4349,7 +4390,7 @@ test "evicted restored banner never resurrects a stale footer success" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.connection = fixture.connection();
-    try ui.restoreHistory(&.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
+    try replayMessages(&ui, std.testing.allocator, &.{.{ .role = .user, .blocks = &.{.{ .text = "retained question" }} }});
     ui.notice = session_client.restored_notice;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4507,13 +4548,13 @@ test "pending restored history stays visible with an unmatched tool result and u
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.connection = fixture.connection();
-    try ui.restoreHistory(&.{
+    try replayMessages(&ui, std.testing.allocator, &.{
         .{ .role = .user, .blocks = &.{.{ .text = "retained question" }} },
         .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "absent-call", .text = "retained result" } }} },
         .{ .role = .assistant, .blocks = &.{.{ .text = "retained answer" }} },
     });
     const count = ui.records.items.len;
-    try std.testing.expect(count >= 4);
+    try std.testing.expect(count >= 3);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectEqualStrings(fixture.settings_notice.?, try ui.hint(arena.allocator(), ui.connection.current()));
@@ -6775,7 +6816,7 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     try ui.acceptMemoryCompletion(saved);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     const saved_row = ui.records.items[0];
-    try std.testing.expectEqual(NoticeLevel.plain, saved_row.notice_level);
+    try std.testing.expectEqual(NoticeLevel.success, saved_row.notice_level);
     try std.testing.expect(saved_row.single_row);
     const expected_saved = try std.fmt.allocPrint(arena.allocator(), "M: \u{2713} {s}", .{saved.summary.text()});
     try std.testing.expectEqualStrings(expected_saved, saved_row.body.items);
@@ -6793,9 +6834,9 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     }) |terminal| {
         try ui.acceptMemoryCompletion(terminal);
         const row = ui.records.items[ui.records.items.len - 1];
-        // Real outcomes stay real, keep their warning tone, and are never forced
-        // into the success shape or the one-row clipping.
-        try std.testing.expectEqual(NoticeLevel.warning, row.notice_level);
+        // Real outcomes stay real, keep the red failure tone, and are never
+        // forced into the success shape or the one-row clipping.
+        try std.testing.expectEqual(NoticeLevel.failure, row.notice_level);
         try std.testing.expect(!row.single_row);
         try std.testing.expect(std.mem.startsWith(u8, row.body.items, "M: "));
         try std.testing.expect(std.mem.count(u8, row.body.items, "\u{2713}") == 0);
@@ -6805,7 +6846,7 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     // A partial save followed by a failure is reported as a failure.
     try ui.acceptMemoryCompletion(.{ .id = 13, .result = .failed, .failure = .storage, .saved_count = 1 });
     const partial = ui.records.items[ui.records.items.len - 1];
-    try std.testing.expectEqual(NoticeLevel.warning, partial.notice_level);
+    try std.testing.expectEqual(NoticeLevel.failure, partial.notice_level);
     try std.testing.expect(!partial.single_row);
     try std.testing.expect(std.mem.count(u8, partial.body.items, "\u{2713}") == 0);
     try ui.acceptMemoryCompletion(.{ .id = 11, .result = .canceled, .failure = .canceled });
@@ -7176,8 +7217,8 @@ test "local memory OOM keeps one pending value then clears and takes the next" {
     try std.testing.expect(ui.memory_completion_pending == null);
     try std.testing.expect(probe.value == null);
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[0].notice_level);
-    try std.testing.expectEqual(NoticeLevel.plain, ui.records.items[1].notice_level);
+    try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
+    try std.testing.expectEqual(NoticeLevel.success, ui.records.items[1].notice_level);
 }
 test "remote memory notice binds a record receipt and skipped binds metadata" {
     var cancel: p.Cancellation = .{};
@@ -7484,7 +7525,7 @@ test "memory terminal is conversation-only and never replaces foreground errors"
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try ui.acceptMemoryCompletion(.{ .id = 2, .result = .uncertain, .failure = .unavailable });
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[0].notice_level);
+    try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
     try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
     try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
     try std.testing.expect(ui.inbox.snapshot().newest_id == null);
@@ -13923,4 +13964,68 @@ test "local stop keeps gating the UI inbox without a remote barrier request" {
     try Ui.key(&ui, .escape);
     try std.testing.expect(!ui.stop_open and !ui.inbox.snapshot().confirming);
     try std.testing.expect(!cancel.isRequested());
+}
+
+/// Replay one owned history-page item exactly as the client delivers it, so
+/// history coverage exercises the real resume path instead of a projection.
+fn replayItem(ui: *Ui, a: std.mem.Allocator, event: r.Event) !void {
+    var item = session_client.Item{ .event = event, .history_replay = true, .storage = &.{}, .allocator = a };
+    defer item.deinit();
+    ui.inject_epoch = item.epoch;
+    ui.adoptReplayHistory(&item);
+    ui.applying_history = true;
+    defer ui.applying_history = false;
+    try ui.applyEvent(item.event, item.display_truncated, item.canonical_complete);
+}
+
+fn replayToolName(messages: []const p.Message, index: usize, call_id: []const u8) []const u8 {
+    for (messages[0..index]) |prior| for (prior.blocks) |candidate| {
+        if (candidate == .tool_call and std.mem.eql(u8, candidate.tool_call.id, call_id)) return candidate.tool_call.name;
+    };
+    return "";
+}
+
+/// Replay saved canonical messages as the worker's seed pass does.
+fn replayMessages(ui: *Ui, a: std.mem.Allocator, messages: []const p.Message) !void {
+    var tool_id: u64 = 0;
+    for (messages, 0..) |message, index| switch (message.role) {
+        .context => {},
+        .user => for (message.blocks) |block| switch (block) {
+            .text => |value| try replayItem(ui, a, .{ .user_committed = .{ .id = 0, .text = value } }),
+            else => {},
+        },
+        .assistant => {
+            var calls: [8]p.Block = undefined;
+            var count: usize = 0;
+            var note = false;
+            for (message.blocks) |block| switch (block) {
+                .tool_call => if (count < calls.len) {
+                    calls[count] = block;
+                    count += 1;
+                },
+                .text => |value| note = note or std.mem.eql(u8, value, r.local_command_note),
+                else => {},
+            };
+            const blocks = if (note and count != 0) calls[0..count] else message.blocks;
+            if (blocks.len == 0) continue;
+            try replayItem(ui, a, .{ .assistant_committed = blocks });
+        },
+        .tool => for (message.blocks) |block| switch (block) {
+            .tool_result => |result| {
+                tool_id +%= 1;
+                try replayItem(ui, a, .{ .tool_result = .{
+                    .id = tool_id,
+                    .name = replayToolName(messages, index, result.call_id),
+                    .local = r.isLocalCommand(result.call_id),
+                    .result = .{
+                        .text = result.text,
+                        .is_error = result.is_error,
+                        .canceled = result.canceled,
+                        .truncated = result.truncated,
+                    },
+                } });
+            },
+            else => {},
+        },
+    };
 }

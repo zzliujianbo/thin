@@ -887,6 +887,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try encodeCaption(&out, "display", value.result.display);
             try out.field("mem_ev", value.result.memory_evidence);
             try encodeFileStats(&out, "opts", value.result.file_stats);
+            if (value.local) try out.field("local", true);
         },
         .usage => |value| {
             try out.field("t", "usage");
@@ -1576,7 +1577,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
             .display_key = try decodeDisplayKey(object, "key"),
         } };
     } else if (std.mem.eql(u8, kind, "tool_result")) {
-        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "canceled", "trunc", "cleanup", "display", "mem_ev", "opts", "ms", "epoch", "seq", "disp_trunc", "canon_complete" });
+        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "canceled", "trunc", "cleanup", "display", "mem_ev", "opts", "ms", "local", "epoch", "seq", "disp_trunc", "canon_complete" });
         event = .{ .tool_result = .{
             .id = try requireU64(object, "id"),
             .name = try requireText(object, "name"),
@@ -1592,6 +1593,7 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
                 .file_stats = try decodeFileStats(object, "opts"),
                 .duration_ms = try optionalU64(object, "ms"),
             },
+            .local = try optionalBool(object, "local") orelse false,
         } };
     } else if (std.mem.eql(u8, kind, "usage")) {
         event = .{ .usage = .{

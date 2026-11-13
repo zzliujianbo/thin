@@ -122,7 +122,7 @@ pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     };
     const detail = call.detail orelse return .{ .kind = kind, .label = try a.dupe(u8, unavailable) };
     // Preserve bounded detail until frame-time width is known; no old 32/72
-    // cell path/command cutoff before applying the actual 80% row limit.
+    // cell path/command cutoff before applying the actual 95% row limit.
     return .{ .kind = kind, .label = try singleLineImpl(a, detail, 512, call.truncated) };
 }
 
@@ -256,21 +256,36 @@ pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]co
     }, if (reason.len != 0) " " else "", reason });
 }
 
+/// Bytes at the end of `commandText` carrying the outcome marker and its bounded
+/// reason. The renderer keeps them out of the clipped label, so a failure reason
+/// never degrades into a lone `[error]` fragment.
+pub fn commandSuffixLen(value: Caption, outcome: Outcome) usize {
+    const marker: usize = switch (outcome) {
+        .failed => " [error]".len,
+        .canceled => " [canceled]".len,
+        else => return 0,
+    };
+    const reason = if (outcome == .failed) value.failure_reason orelse "" else "";
+    return marker + @intFromBool(reason.len != 0) + reason.len;
+}
+
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.
 /// Clip BEFORE SGR so no partial escapes; mixed outcomes keep independent colors.
 pub fn commandColumns(columns: usize) usize {
-    // Overflow-safe floor(80%), including very narrow frames.
-    return if (columns == 0) 0 else @max(1, columns / 5 * 4 + columns % 5 * 4 / 5);
+    // Overflow-safe floor(95%), including very narrow frames.
+    return if (columns == 0) 0 else @max(1, columns / 20 * 19 + columns % 20 * 19 / 20);
 }
 
 /// `duration_ms` is the measured wall-clock execution time of this row. It is
 /// rendered last, in muted color, so it survives label clipping and never
 /// competes with the outcome color or diff marks. `active_time_ms` is the icon
-/// breathing clock only; the two are deliberately independent.
-pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64) ![]const u8 {
+/// breathing clock only; the two are deliberately independent. `keep_tail` is
+/// the byte offset of the outcome suffix (` [error] reason`), which is reserved
+/// before the label is clipped; zero keeps the whole body clip-able.
+pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64, keep_tail: usize) ![]const u8 {
     // Detail stays <=512 bytes; allow its prefix and bounded observed counts
     // without sanitizing/truncating the same path a second time at512 bytes.
-    // Reserve the suffix inside the existing 80% limit, not after clipping.
+    // Reserve the suffix inside the existing 95% limit, not after clipping.
     // On tiny terminals omit optional time rather than wrapping the command.
     var duration_buf: [32]u8 = undefined;
     var duration_writer = std.Io.Writer.fixed(&duration_buf);
@@ -279,12 +294,25 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         try shared.activity.formatDuration(&duration_writer, ms);
     }
     const limit = commandColumns(columns);
-    const suffix = if (duration_ms != null and limit >= duration_writer.buffered().len + 4) duration_writer.buffered() else "";
-    const safe = try boundedLine(a, body, limit - suffix.len, false, 640);
+    // The outcome tail (` [error] reason`) is reserved before the label is
+    // clipped: a narrow row shortens the target, never the reason.
+    var tail: []const u8 = if (keep_tail != 0 and keep_tail < body.len) body[keep_tail..] else "";
+    if (tail.len != 0) {
+        // Keep a little room for the clipped target; when even that is gone, fall
+        // back to the bare marker and finally to nothing at all.
+        const marker: usize = if (std.mem.startsWith(u8, tail, " [canceled]")) " [canceled]".len else " [error]".len;
+        if (text.width(tail) + 4 > limit) tail = tail[0..@min(tail.len, marker)];
+        if (text.width(tail) + 4 > limit) tail = "";
+    }
+    const tail_width = text.width(tail);
+    const suffix = if (duration_ms != null and limit >= tail_width + duration_writer.buffered().len + 4) duration_writer.buffered() else "";
+    const head = if (tail.len == 0) body else body[0..keep_tail];
+    const safe = try boundedLine(a, head, limit -| tail_width -| suffix.len, false, 640);
     defer a.free(safe);
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     var at: usize = 0;
+    var tail_written = false;
     for (spans) |span| {
         const begin = @min(@max(at, span.start), safe.len);
         const end = @min(@max(begin, span.end), safe.len);
@@ -328,12 +356,18 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
                     cursor = range.end;
                 }
             }
-            try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
+            // The outcome tail shares the last span's color, so a failed row
+            // still reads as one `[error] reason` run in the same SGR context.
+            if (tail.len != 0 and end == safe.len) {
+                try out.writer.print("{s}{s}{s}", .{ safe[cursor..end], tail, theme.reset });
+                tail_written = true;
+            } else try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
         }
         at = end;
         if (at == safe.len) break;
     }
     try out.writer.writeAll(safe[at..]);
+    if (tail.len != 0 and !tail_written) try out.writer.print("{s}{s}{s}", .{ outcomeColor(if (spans.len != 0) spans[spans.len - 1].outcome else .pending), tail, theme.reset });
     if (suffix.len != 0) try out.writer.print("{s}{s}{s}", .{ theme.muted, suffix, theme.reset });
     return a.dupe(u8, out.written());
 }

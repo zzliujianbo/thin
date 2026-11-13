@@ -21,6 +21,8 @@ pub const MemoryHooks = struct {
     check_fn: ?*const fn (*anyopaque) bool = null,
 };
 const session_context = @import("session_context.zig");
+const checkpoint_mod = @import("checkpoint.zig");
+const line_stats = @import("../util/line_stats.zig");
 const Io = std.Io;
 const tool_stream = @import("tool_stream.zig");
 const write_preview = @import("write_preview.zig");
@@ -193,7 +195,7 @@ pub const Event = union(enum) {
     /// 工具开始执行。
     tool_started: struct { id: u64, name: []const u8, started_ms: ?u64 = null, display_key: ?p.ToolDisplayKey = null },
     /// 工具结束（包括被拒绝、失败、取消）。
-    tool_result: struct { id: u64, name: []const u8, result: Execution, display_key: ?p.ToolDisplayKey = null },
+    tool_result: struct { id: u64, name: []const u8, result: Execution, display_key: ?p.ToolDisplayKey = null, local: bool = false },
     /// 单次模型调用的权威用量（流内快照不累加）。
     usage: struct { purpose: p.Purpose, protocol: p.Protocol, value: p.Usage },
     /// 发生协议降级后的新协议。
@@ -376,6 +378,16 @@ const AppliedPolicy = struct {
     }
 };
 
+/// Local `!command` calls carry this prefix. The UI projects their bounded
+/// output as a separate row, live and after a resume.
+pub fn isLocalCommand(id: []const u8) bool {
+    return std.mem.startsWith(u8, id, "local_command_");
+}
+
+/// Provenance text of the program-generated assistant message that wraps an
+/// explicit `!command`. The UI never shows it as model output.
+pub const local_command_note = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response.";
+
 /// Agent loop; owner serializes selection and worker execution.
 pub const Runtime = struct {
     /// 长期分配器；压缩的临时数据与单轮结果都从它派生 arena。
@@ -436,6 +448,10 @@ pub const Runtime = struct {
     /// A byte-for-byte snapshot match is not enough after compaction: the live
     /// messages must still contain that preface.
     applied_policy: ?AppliedPolicy = null,
+    /// Display-only line counts of finished write/edit calls, so a resumed row
+    /// can still show its `~M +A -D`. Bounded, owned by `allocator` (not the
+    /// history arena), never model input or send authority.
+    tool_stats: std.ArrayListUnmanaged(checkpoint_mod.ToolStat) = .empty,
 
     /// 创建 Runtime：校验配置，并把启动时的 Memory 快照以 JSON 字符串嵌入系统提示词。
     pub fn init(a: std.mem.Allocator, io: Io, config: *const cfg.Config, model: p.Model, executor: Executor, host: Host, startup_memory: []const u8) !Runtime {
@@ -478,6 +494,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Runtime) void {
         std.debug.assert(!self.busy.load(.acquire));
         self.arena.deinit();
+        self.clearToolStats();
         self.allocator.free(self.system);
         if (self.applied_policy) |applied| applied.deinit(self.allocator);
     }
@@ -664,6 +681,7 @@ pub const Runtime = struct {
             .input_price_flat_limit = self.config.model.input_price_flat_limit,
             .low_price_input = self.config.limits.low_price_input,
             .permission_id = self.permission_id,
+            .tool_stats = if (self.tool_stats.items.len == 0) null else self.tool_stats.items,
         };
         try @import("checkpoint.zig").validateStructure(state);
         return state;
@@ -725,6 +743,16 @@ pub const Runtime = struct {
         self.protected_index = history.items.len;
         if (self.applied_policy) |applied| applied.deinit(self.allocator);
         self.applied_policy = null;
+        // Display counters survive a resave; they live outside both arenas.
+        self.clearToolStats();
+        if (state.tool_stats) |stats| {
+            const a = self.allocator;
+            for (stats[0..@min(stats.len, checkpoint_mod.max_tool_stats)]) |stat| {
+                const id = try a.dupe(u8, stat.call_id[0..@min(stat.call_id.len, checkpoint_mod.max_tool_stat_id)]);
+                errdefer a.free(id);
+                try self.tool_stats.append(a, .{ .call_id = id, .modified = stat.modified, .added = stat.added, .removed = stat.removed });
+            }
+        }
         old_arena.deinit();
         self.allocator.free(old_system);
     }
@@ -936,7 +964,7 @@ pub const Runtime = struct {
         const owned = self.arena.allocator();
         const user = try p.cloneMessage(owned, .{ .role = .user, .blocks = &.{.{ .text = text }} });
         const assistant = try p.cloneMessage(owned, .{ .role = .assistant, .blocks = &.{
-            .{ .text = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response." },
+            .{ .text = local_command_note },
             .{ .tool_call = .{ .id = call_id, .name = "bash", .arguments = arguments } },
         } });
         try self.history.ensureUnusedCapacity(owned, 2);
@@ -1954,7 +1982,7 @@ pub const Runtime = struct {
                 try self.appendResult(call.id, result);
                 next_block += 1;
                 display_ordinal += 1;
-                try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key } }, cancel);
+                try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key, .local = isLocalCommand(call.id) } }, cancel);
                 try self.emitContext(cancel);
                 if (result.cleanup_failed) return error.CleanupFailed;
                 continue;
@@ -2062,7 +2090,7 @@ pub const Runtime = struct {
             started_call = null;
             next_block += 1;
             display_ordinal += 1;
-            try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key } }, cancel);
+            try self.emit(.{ .tool_result = .{ .id = host_id, .name = call.name, .result = result, .display_key = display_key, .local = isLocalCommand(call.id) } }, cancel);
             try self.emitContext(cancel);
 
             // 先写入结果并通知宿主，再因清理失败终止批次。
@@ -2149,10 +2177,38 @@ pub const Runtime = struct {
         } };
 
         try self.history.append(a, .{ .role = .tool, .blocks = blocks });
+        // Display-only counters: a failed append must never fail the turn.
+        if (result.file_stats) |stats| if (stats.changes) |changes| self.recordToolStat(id, changes) catch {};
         if (!result.is_error and !result.canceled and !result.truncated and !result.cleanup_failed and result.memory_evidence) {
             if (self.memory_capture) |capture| capture.add(.tool, result.text);
         }
         self.observer.notify(.{ .tool_completed = .{ .call_id = id, .result = result } });
+    }
+
+    /// Bounded row counters from the long-lived allocator. Oldest entries are
+    /// dropped first, so a long session keeps fixed display memory and a stale
+    /// id never becomes a row.
+    fn recordToolStat(self: *Runtime, call_id: []const u8, changes: line_stats.Changes) !void {
+        if (changes.added == 0 and changes.removed == 0) return;
+        const a = self.allocator;
+        while (self.tool_stats.items.len >= checkpoint_mod.max_tool_stats) {
+            const oldest = self.tool_stats.orderedRemove(0);
+            a.free(oldest.call_id);
+        }
+        const id = try a.dupe(u8, call_id[0..@min(call_id.len, checkpoint_mod.max_tool_stat_id)]);
+        errdefer a.free(id);
+        try self.tool_stats.append(a, .{ .call_id = id, .modified = changes.modified, .added = changes.added, .removed = changes.removed });
+    }
+
+    fn clearToolStats(self: *Runtime) void {
+        for (self.tool_stats.items) |stat| self.allocator.free(stat.call_id);
+        self.tool_stats.deinit(self.allocator);
+        self.tool_stats = .empty;
+    }
+
+    /// Startup/idle readers only: the latest finished row counters.
+    pub fn displayStats(self: *const Runtime) []const checkpoint_mod.ToolStat {
+        return self.tool_stats.items;
     }
 };
 

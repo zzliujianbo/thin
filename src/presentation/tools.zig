@@ -179,6 +179,19 @@ pub fn readFailure(result: r.Execution) ?[]const u8 {
     return "Read failed: details unavailable";
 }
 
+/// Bounded, frontend-neutral reason for one failed call. The read mapping stays
+/// exact; other tools expose only short identifier-shaped result text, so no
+/// JSON, no output body and no arbitrary prose ever reaches a caption.
+pub fn failureReason(kind: Kind, result: r.Execution) ?[]const u8 {
+    if (!result.is_error or result.canceled) return null;
+    if (kind == .read) return readFailure(result);
+    if (result.cleanup_failed) return "cleanup failed";
+    const text = result.text;
+    if (text.len == 0 or text.len > 48) return null;
+    for (text) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return null;
+    return text;
+}
+
 /// 成员拥有各Call；take交出唯一所有权。调用方收到started/result后依次消费，
 /// 包括没有started的prepare失败或deny。只使用canonical块，不采信tool_preview。
 pub const Queue = struct {

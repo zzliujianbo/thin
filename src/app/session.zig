@@ -687,6 +687,14 @@ pub const Session = struct {
         return &.{};
     }
 
+    /// Display-only row counters that belong to the restored messages. Same
+    /// startup-only contract as `initialHistory`: no producer may exist yet.
+    pub fn displayStats(self: *const Session) []const checkpoint.ToolStat {
+        if (self.app) |app| return app.runtime.displayStats();
+        if (self.loaded_checkpoint) |loaded| return loaded.value.tool_stats orelse &.{};
+        return &.{};
+    }
+
     /// Joined, normal interactive exit. Checkpoints are also written during the
     /// run; this publishes the final clean generation. A failure never changes
     /// task success; the caller must withhold the command.

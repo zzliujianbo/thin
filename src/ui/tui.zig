@@ -69,7 +69,7 @@ const reasoning_tail_bytes = 64 * 1024;
 const Kind = enum { user, assistant, reasoning, tool, notice };
 
 /// Conversation-only notice severity. Red/yellow never reach the footer.
-const NoticeLevel = enum { plain, warning, failure };
+const NoticeLevel = enum { plain, success, warning, failure };
 
 /// 对话区中的一条显示记录。body 保存原始 UTF-8 文本；渲染结果缓存在 cache 的 arena 中。
 const AgentRow = struct {
@@ -91,6 +91,8 @@ const Record = struct {
     single_row: bool = false,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
+    /// Byte offset in `body` where the clipped-immune outcome tail starts.
+    command_tail_start: usize = 0,
     agent_row: bool = false,
     agent_open: bool = false,
     /// Measured wall-clock execution time of this row; null when unobserved.
@@ -138,8 +140,6 @@ const Record = struct {
     pending_stream_rows: usize = 0,
     /// A real canonical revision replaced already-released stream rows.
     stream_revised: bool = false,
-    /// Static records (restored history) deliberately use the batch renderer.
-    batch: bool = false,
     /// Heap-owned bounded incremental thinking tail. It survives invalidate()
     /// and Record moves unchanged (the Writer sink points at the heap Tail, not
     /// at this record) and is destroyed exactly once, in deinit().
@@ -236,6 +236,7 @@ const Record = struct {
         const start = self.body.items.len;
         try self.append(a, label);
         self.command_row = true;
+        self.command_tail_start = self.body.items.len - presentation.commandSuffixLen(caption, outcome);
         self.duration_ms = duration_ms;
         self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + activity.icon(caption.kind).len + 1) else null });
     }
@@ -262,7 +263,7 @@ const Record = struct {
     }
 
     fn append(self: *Record, a: std.mem.Allocator, bytes: []const u8) !void {
-        if (self.kind == .assistant and !self.batch) {
+        if (self.kind == .assistant) {
             // Active body display is never gated by the 128 KiB mirror. Input
             // ownership belongs to the incremental Body; `body` is a bounded
             // preview used only for the one exact canonical comparison.
@@ -375,7 +376,7 @@ const Record = struct {
         }
 
         if (self.command_row) {
-            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null);
+            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null, self.command_tail_start);
             self.lines = try temp.dupe([]const u8, &.{line});
             self.excerpt = false; // Commands indicate clipping with ... only.
             self.columns = columns;
@@ -389,6 +390,7 @@ const Record = struct {
             // native scrollback stay exactly as written.
             const tone = switch (self.notice_level) {
                 .plain => theme.muted,
+                .success => theme.success,
                 .warning => theme.caution,
                 .failure => theme.failure,
             };
@@ -404,6 +406,7 @@ const Record = struct {
         const data = if (self.clipped and self.kind != .reasoning) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
         const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = null, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) switch (self.notice_level) {
             .plain => .muted,
+            .success => .success,
             .warning => .warning,
             .failure => .failure,
         } else .normal });
@@ -415,24 +418,6 @@ const Record = struct {
         self.cache = arena;
     }
 };
-
-// Strict adjacent shape is a display classification only, never authorization.
-// No historical call is executed, and ordinary model bash results stay compact.
-fn localHistoryCall(messages: []const p.Message, index: usize) ?[]const u8 {
-    if (index == 0 or index + 1 >= messages.len) return null;
-    const user = messages[index - 1];
-    const assistant = messages[index];
-    const result = messages[index + 1];
-    if (user.role != .user or user.blocks.len != 1 or user.blocks[0] != .text) return null;
-    const prompt = std.mem.trimStart(u8, user.blocks[0].text, " \t\r\n");
-    if (prompt.len == 0 or prompt[0] != '!') return null;
-    if (assistant.role != .assistant or assistant.blocks.len != 2 or assistant.blocks[0] != .text or assistant.blocks[1] != .tool_call) return null;
-    if (!std.mem.eql(u8, assistant.blocks[0].text, "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response.")) return null;
-    const call = assistant.blocks[1].tool_call;
-    if (!std.mem.eql(u8, call.name, "bash") or !std.mem.startsWith(u8, call.id, "local_command_") or call.id.len == "local_command_".len) return null;
-    if (result.role != .tool or result.blocks.len != 1 or result.blocks[0] != .tool_result or !std.mem.eql(u8, result.blocks[0].tool_result.call_id, call.id)) return null;
-    return call.id;
-}
 
 /// 当前等待用户审批的工具调用。description 由 Ui 的 allocator 持有，由 clearPermission 释放。
 /// clipped 表示预览被截断；pasted 表示审批期间出现过粘贴。两者任一为真时只能拒绝。
@@ -667,7 +652,6 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
 
     // Enter in normal flow without replaying pre-existing terminal history;
     // the composer moves down with output until it reaches the bottom.
-    if (connection.initial_history_fn) |history| try ui.restoreHistory(history(connection.context));
     // Remote attach may already own a running task; adopt its epoch before the
     // first frame so a stale approval or queue send cannot cross sessions.
     if (connection.session_client) |client| ui.adoptRemoteSession(client);
@@ -901,8 +885,6 @@ const Ui = struct {
     permission_scroll: usize = 0,
     /// 审批期间是否出现过粘贴；出现后该审批只能拒绝。
     approval_paste_seen: bool = false,
-    /// Static restored history uses the batch renderer, not live streaming.
-    restoring: bool = false,
     /// 后台任务是否正在运行。
     busy: bool = false,
     // The UI owns the only inbox. Never reach through State.runtime to draw it:
@@ -2601,7 +2583,7 @@ const Ui = struct {
         // Prepare every fallible part before publishing an id.
         // A failed body allocation owns no display row.
         try self.reserveRecord();
-        var prepared = Record{ .kind = kind, .batch = self.restoring, .agent_row = is_agent_row };
+        var prepared = Record{ .kind = kind, .agent_row = is_agent_row };
         errdefer prepared.deinit(self.allocator);
         if (kind == .reasoning) try prepared.attachTail(self.allocator, @max(1, self.size.columns -| 1));
         try prepared.append(self.allocator, data);
@@ -2619,62 +2601,6 @@ const Ui = struct {
         }
         self.requestDraw();
         return index;
-    }
-
-    /// Display-only projection of locally loaded canonical history.
-    /// No Bridge/observer events, execution, approvals or live reasoning replay.
-    fn restoreHistory(self: *Ui, messages: []const p.Message) !void {
-        if (messages.len == 0) return;
-        const prior_restoring = self.restoring;
-        self.restoring = true;
-        defer self.restoring = prior_restoring;
-        const restore_notice = try self.add(.notice, "Restored model context (display may be shortened); prior tools are NOT rerun");
-        self.records.items[restore_notice].batch = false;
-        // Published: this transcript banner now owns the success notice for
-        // this view. Set only after the row really exists.
-        self.history_notice_shown = true;
-        for (messages, 0..) |message, index| switch (message.role) {
-            .user, .context => {
-                for (message.blocks) |block| switch (block) {
-                    .text => |value| {
-                        _ = try self.add(if (message.role == .user) .user else .notice, value);
-                    },
-                    else => {},
-                };
-                if (message.role == .user and message.blocks.len == 1 and message.blocks[0] == .text) {
-                    const value = message.blocks[0].text;
-                    if (value.len != 0 and value[0] != '/') {
-                        const owned = try self.input_history.prepare(self.allocator, value);
-                        self.input_history.commit(self.allocator, owned);
-                    }
-                }
-            },
-            .assistant => {
-                try self.captureToolCaptions(message.blocks);
-                if (localHistoryCall(messages, index) == null)
-                    try self.replaceCommitted(message.blocks, false, true);
-            },
-            .tool => for (message.blocks) |block| switch (block) {
-                .tool_result => |result| {
-                    const tool_name: ?[]const u8 = find_name: {
-                        for (messages[0..index]) |prior| for (prior.blocks) |candidate| {
-                            if (candidate == .tool_call and std.mem.eql(u8, candidate.tool_call.id, result.call_id)) break :find_name candidate.tool_call.name;
-                        };
-                        break :find_name null;
-                    };
-                    // Display is not outgoing-history validation. A saved result
-                    // without its call is still readable and never executable.
-                    const caption = if (tool_name) |name| try self.nextToolCaption(name) else presentation.Caption{ .kind = .other, .label = try self.allocator.dupe(u8, "Saved tool result") };
-                    defer caption.deinit(self.allocator);
-                    try self.toolCompleted(caption, .{ .text = result.text, .is_error = result.is_error, .canceled = result.canceled, .truncated = result.truncated });
-                    if (index > 0) if (localHistoryCall(messages, index - 1)) |id| {
-                        if (std.mem.eql(u8, id, result.call_id)) try self.localCommandOutput(result.text, result.truncated);
-                    };
-                },
-                else => {},
-            },
-        };
-        self.clearToolCaptions();
     }
 
     fn removeRecord(self: *Ui, index: usize) void {
@@ -2872,7 +2798,7 @@ const Ui = struct {
             .kind = effective.kind,
             .label = try self.allocator.dupe(u8, effective.label),
             .display = effective.display,
-            .failure_reason = if (effective.kind == .read) shared.tools.readFailure(result) else null,
+            .failure_reason = shared.tools.failureReason(effective.kind, result),
         };
         defer observed.deinit(self.allocator);
         const index = try self.add(.tool, "");
@@ -2895,7 +2821,7 @@ const Ui = struct {
         defer a.free(label);
         const start = self.active_tool.?.started_ms;
         const background_start = if (self.active_tool.?.caption.display) |display| display.action == .start else false;
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, if (background_start) null else self.clock_ms -| start, self.clock_ms);
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, if (background_start) null else self.clock_ms -| start, self.clock_ms, 0);
     }
 
     fn waitingCommand(self: *Ui, a: std.mem.Allocator, entry: tool_views_module.Entry, columns: usize) ![]const u8 {
@@ -2910,7 +2836,7 @@ const Ui = struct {
         const generating = !entry.ready and entry.write_progress != null and entry.caption.kind == .write;
         // Generating and approval rows remain muted and static, without an
         // execution time; tool_started owns warm icon timing.
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(activity.icon(caption.kind).len + 1) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null);
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(activity.icon(caption.kind).len + 1) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null, 0);
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,
@@ -3381,7 +3307,7 @@ const Ui = struct {
                     }
                     if (tool.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                 }
-                if (self.commandKind()) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
+                if (self.commandKind() or tool.local) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
             },
             .context_snapshot => {},
             .usage => {},
@@ -5779,11 +5705,10 @@ const Ui = struct {
         self.records.items[index].notice_level = level;
     }
 
-    /// Memory terminal wording. Skipped is deliberately silent; failed and
-    /// uncertain are warnings unless cleanup safety is at stake. The saved
-    /// confirmation is a compact one-row summary, never a count. A failed or
-    /// uncertain result that still saved some entries keeps that fact and its
-    /// original severity instead of pretending to be a success.
+    /// Memory terminal wording. Skipped is deliberately silent. A saved
+    /// confirmation is green and a compact one-row summary, never a count; failed
+    /// and uncertain are red. A failed or uncertain result that still saved some
+    /// entries keeps that fact instead of pretending to be a success.
     fn formatMemoryTerminal(terminal: memory_status.Terminal, buffer: []u8) ?struct { level: NoticeLevel, text: []const u8 } {
         if (terminal.result == .skipped) return null;
         const label: []const u8 = switch (terminal.result) {
@@ -5794,8 +5719,9 @@ const Ui = struct {
             .skipped => return null,
         };
         const level: NoticeLevel = switch (terminal.result) {
-            .saved, .canceled => .plain,
-            .failed, .uncertain => if (terminal.failure != null and terminal.failure.? == .cleanup) .failure else .warning,
+            .saved => .success,
+            .canceled => .plain,
+            .failed, .uncertain => .failure,
             .skipped => unreachable,
         };
         const summary = terminal.summary.text();
