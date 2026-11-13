@@ -4,6 +4,130 @@ const body_mod = @import("../ui/body_stream.zig");
 const engine = @import("../ui/whitelist_render.zig");
 const Allocator = std.mem.Allocator;
 
+// Scalar oracle copied from the latest pre-batching renderer. This deliberately
+// uses the current writer and scanner, but never calls the product renderer.
+const ReferenceRender = struct {
+    const scan = @import("../ui/whitelist.zig");
+    const output = @import("../ui/markdown_writer.zig");
+    const Sink = struct {
+        a: Allocator,
+        writer: *output.Writer,
+        rows: std.ArrayList(engine.Row) = .empty,
+        trace: std.ArrayList(engine.Checkpoint) = .empty,
+        base: usize,
+        seed: engine.Checkpoint,
+        preview: bool = false,
+        max_rows: ?usize,
+        overflow: bool = false,
+        fn onRow(ctx: *anyopaque, line: []const u8, _: usize, _: []const u8) output.Error!void {
+            const self: *Sink = @ptrCast(@alignCast(ctx));
+            if (self.max_rows) |max_rows| {
+                if (self.rows.items.len >= max_rows) {
+                    self.a.free(line);
+                    self.overflow = true;
+                    return;
+                }
+            }
+            const end = self.writer.origin_end;
+            var cp = self.seed;
+            var covered: usize = 0;
+            for (self.trace.items) |item| {
+                if (item.end > end) break;
+                cp = item;
+                covered += 1;
+            }
+            const start = if (self.rows.items.len == 0) self.base else self.rows.items[self.rows.items.len - 1].end;
+            try self.rows.append(self.a, .{ .text = line, .start = start, .end = cp.end, .checkpoint = cp.state, .complete = !self.preview });
+            self.seed = cp;
+            const remaining = self.trace.items.len - covered;
+            std.mem.copyForwards(engine.Checkpoint, self.trace.items[0..remaining], self.trace.items[covered..]);
+            self.trace.shrinkRetainingCapacity(remaining);
+        }
+    };
+
+    fn render(a: Allocator, source: []const u8, base: usize, state: scan.State, final: bool, columns: usize, ansi: bool, tone: output.Tone, quantum: usize, max_rows: ?usize) !engine.Result {
+        if (max_rows != null and max_rows.? == 0) return error.MarkdownRenderLimit;
+        var budget: output.Budget = .{};
+        var writer: output.Writer = .{ .a = a, .columns = std.math.clamp(columns, 1, 512), .ansi = ansi, .base = tone, .budget = if (max_rows != null) &budget else null };
+        defer writer.deinit();
+        var sink: Sink = .{ .a = a, .writer = &writer, .base = base, .seed = .{ .end = base, .state = state }, .max_rows = max_rows };
+        defer sink.trace.deinit(a);
+        errdefer {
+            for (sink.rows.items) |row| a.free(row.text);
+            sink.rows.deinit(a);
+        }
+        writer.sink = .{ .context = &sink, .onRow = Sink.onRow };
+        var offset: usize = 0;
+        var current = state;
+        var stopped = false;
+        while (offset < source.len) {
+            if ((if (max_rows) |n| sink.rows.items.len >= n else false) or (max_rows != null and offset >= @max(quantum, 1) and sink.rows.items.len != 0)) break;
+            if (max_rows != null and base + offset - sink.seed.end > engine.max_row_source_bytes) return error.MarkdownRenderLimit;
+            switch (scan.next(source, base, offset, current, final)) {
+                .need_more => {
+                    stopped = true;
+                    break;
+                },
+                .end => break,
+                .token => |token| {
+                    if (token.end <= base + offset or token.end > base + source.len) return error.MarkdownRenderLimit;
+                    try sink.trace.append(a, .{ .end = token.end, .state = token.after });
+                    current = token.after;
+                    offset = token.end - base;
+                    if (token.text.len != 0) {
+                        if (!std.meta.eql(writer.style, token.style)) try writer.setStyle(token.style);
+                        try writer.emitSourced(token.text, token.start, token.end, token.exact);
+                        if (max_rows != null and writer.cluster != null and !writer.pending_origin_synthetic and
+                            writer.pending_origin_end - writer.pending_origin_start > engine.max_cluster_source_bytes)
+                            return error.MarkdownRenderLimit;
+                    }
+                    if (max_rows != null and base + offset - sink.seed.end > engine.max_row_source_bytes) return error.MarkdownRenderLimit;
+                },
+            }
+        }
+        const work = offset;
+        const eof = final and !stopped and offset == source.len;
+        const full = if (max_rows) |n| sink.rows.items.len >= n else false;
+        if (writer.hasContent() and !full) {
+            sink.preview = !eof;
+            try writer.finish();
+        } else if (full and (sink.overflow or writer.hasContent() or !eof)) {
+            offset = sink.seed.end - base;
+        }
+        var metadata: ?engine.Checkpoint = null;
+        if (sink.rows.items.len == 0 and offset != 0 and eof) metadata = .{ .end = base + offset, .state = current };
+        return .{ .rows = try sink.rows.toOwnedSlice(a), .consumed = offset, .work = work, .metadata = metadata };
+    }
+};
+
+fn asciiAllocationCase(a: Allocator) !void {
+    const result = try engine.render(a, "alpha beta gamma delta 12345", 31, .{}, true, 80, true, .normal, 4096, 2);
+    defer {
+        for (result.rows) |row| a.free(row.text);
+        a.free(result.rows);
+    }
+}
+
+fn asciiSweepAllocationCase(bound: usize, fixed: bool) !bool {
+    var grew_before_oom = false;
+    for (0..bound) |fail_index| {
+        var storage: [256 * 1024]u8 = undefined;
+        var buffer = std.heap.FixedBufferAllocator.init(&storage);
+        const backing = if (fixed) buffer.allocator() else std.testing.allocator;
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        var observer: GrowthObserver = .{ .failing = &failing };
+        if (asciiAllocationCase(observer.allocator())) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            if (observer.grew) grew_before_oom = true;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    return grew_before_oom;
+}
+
 fn freeRows(a: Allocator, rows: *std.ArrayList([]const u8)) void {
     for (rows.items) |row| a.free(row);
     rows.deinit(a);

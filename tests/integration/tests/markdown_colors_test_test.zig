@@ -1,3 +1,108 @@
+const ascii_scan = @import("../ui/whitelist.zig");
+const ascii_output = @import("../ui/markdown_writer.zig");
+
+fn asciiCompare(reference: engine.Result, actual: engine.Result) !void {
+    try std.testing.expectEqual(reference.consumed, actual.consumed);
+    try std.testing.expectEqual(reference.work, actual.work);
+    try std.testing.expectEqualDeep(reference.metadata, actual.metadata);
+    try std.testing.expectEqual(reference.rows.len, actual.rows.len);
+    for (reference.rows, actual.rows) |x, y| {
+        try std.testing.expectEqualStrings(x.text, y.text);
+        try std.testing.expectEqual(x.start, y.start);
+        try std.testing.expectEqual(x.end, y.end);
+        try std.testing.expectEqualDeep(x.checkpoint, y.checkpoint);
+        try std.testing.expectEqual(x.complete, y.complete);
+    }
+}
+
+fn asciiPair(source: []const u8, base: usize, state: ascii_scan.State, final: bool, columns: usize, quantum: usize, max_rows: usize, tone: ascii_output.Tone) !void {
+    var reference_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reference_arena.deinit();
+    var actual_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer actual_arena.deinit();
+    const a = reference_arena.allocator();
+    const b = actual_arena.allocator();
+    const reference = try ReferenceRender.render(a, source, base, state, final, columns, true, tone, quantum, max_rows);
+    const actual = try engine.render(b, source, base, state, final, columns, true, tone, quantum, max_rows);
+    try asciiCompare(reference, actual);
+    for (reference.rows) |row| {
+        if (row.end > base and row.end <= base + source.len) {
+            const suffix = source[row.end - base ..];
+            const x = try ReferenceRender.render(a, suffix, row.end, row.checkpoint, final, columns, true, tone, quantum, max_rows);
+            const y = try engine.render(b, suffix, row.end, row.checkpoint, final, columns, true, tone, quantum, max_rows);
+            try asciiCompare(x, y);
+        }
+    }
+}
+
+fn asciiFixture() [2807]u8 {
+    var result: [2807]u8 = undefined;
+    for (&result, 0..) |*byte, i| {
+        const n = i / 6;
+        byte.* = switch (i % 6) {
+            0 => 'K',
+            1 => '0' + @as(u8, @intCast(n / 1000 % 10)),
+            2 => '0' + @as(u8, @intCast(n / 100 % 10)),
+            3 => '0' + @as(u8, @intCast(n / 10 % 10)),
+            4 => '0' + @as(u8, @intCast(n % 10)),
+            else => ' ',
+        };
+    }
+    return result;
+}
+
+test "ASCII batching matches independent scalar renderer and checkpoints" {
+    try @import("../ui/text.zig").initLocale();
+    const samples = [_][]const u8{
+        "",                                            "K0001 K0002 Plain 345",                 "# ", "abcd", "abcd\n",
+        "# Head\n> quote\n**bold** [link](u) \\* end", "```zig\ncode\n```\na_ * dangling [x](",
+        "abc 中文 é 👩‍💻\tend\nnext",
+        "**a**plain `x` trailing\\",
+    };
+    for (samples) |source| for ([_]usize{ 1, 2, 7, 109 }) |columns| for ([_]usize{ 0, 1, 2, 7, 4096 }) |quantum| for ([_]usize{ 1, 2, 65536 }) |max_rows| for ([_]bool{ false, true }) |final| {
+        try asciiPair(source, 31, .{}, final, columns, quantum, max_rows, .normal);
+        var seeded: ascii_scan.State = .{};
+        seeded.at_line_start = false;
+        try asciiPair(source, 31, seeded, final, columns, quantum, max_rows, .normal);
+    };
+    for (samples) |source| for (0..source.len + 1) |cut| {
+        if (!std.unicode.utf8ValidateSlice(source[0..cut]) or !std.unicode.utf8ValidateSlice(source[cut..])) continue;
+        try asciiPair(source[0..cut], 19, .{}, false, 7, 7, 2, .normal);
+        var seeded: ascii_scan.State = .{};
+        seeded.at_line_start = false;
+        try asciiPair(source[cut..], 19 + cut, seeded, true, 7, 7, 2, .normal);
+    };
+    const long = asciiFixture();
+    for ([_]bool{ false, true }) |final| try asciiPair(&long, 0, .{}, final, 109, 4096, 65536, .normal);
+    for ([_]ascii_output.Tone{ .normal, .thinking, .user, .success }) |tone| {
+        const source = "plain text **bold** 中文 end";
+        try asciiPair(source, 31, .{}, true, 7, 4096, 65536, tone);
+        var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer a.deinit();
+        var b = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer b.deinit();
+        const reference = try ReferenceRender.render(a.allocator(), source, 0, .{}, true, 109, true, tone, source.len, null);
+        const actual = try engine.renderAll(b.allocator(), source, 109, true, tone);
+        try asciiCompare(reference, actual);
+    }
+    try std.testing.expectError(error.MarkdownRenderLimit, engine.render(std.testing.allocator, "abc", 0, .{}, true, 7, true, .normal, 1, 0));
+}
+
+test "ordinary ASCII renderer propagates allocation failures" {
+    try @import("../ui/text.zig").initLocale();
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), asciiAllocationCase, .{});
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    var nofail = std.testing.FailingAllocator.init(backing.allocator(), .{});
+    try asciiAllocationCase(nofail.allocator());
+    const bound = nofail.alloc_index;
+    try std.testing.expect(bound > 0);
+    try std.testing.expectEqual(nofail.allocated_bytes, nofail.freed_bytes);
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    _ = try asciiSweepAllocationCase(bound, false);
+    try std.testing.expect(try asciiSweepAllocationCase(bound, true));
+}
+
 test "streaming chunks and ACK checkpoints match static glyph styles" {
     try @import("../ui/text.zig").initLocale();
     const a = std.testing.allocator;
