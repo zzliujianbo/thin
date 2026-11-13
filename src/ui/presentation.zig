@@ -386,6 +386,9 @@ pub const Prompt = struct {
 
 pub const PromptActivity = struct {
     busy: bool = false,
+    /// Tokens are arriving now. The flowing model label exists only for this
+    /// state; a busy turn without output keeps the static styling.
+    streaming: bool = false,
     now_ms: u64 = 0,
     phase: usize = 0,
     rate_band: shared.activity.RateBand = .unknown,
@@ -453,7 +456,7 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     const slot_flow = motion.busy and motion.effort_flash != null;
     const context_color = theme.contextColor(if (snapshot) |current| shared.state.contextRatio(current) else null);
     const slot_color = if (motion.effort_flash != null) idle_color else context_color;
-    const styled_model = label.len != 0 and (motion.busy or !std.mem.eql(u8, idle_color, theme.reset));
+    const styled_model = label.len != 0 and (motion.streaming or !std.mem.eql(u8, idle_color, theme.reset));
     const styled_slot = slot_flow or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
     if (!motion.busy and ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
@@ -463,7 +466,7 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     if (label.len != 0 or percent_only) {
         if (label.len != 0) {
             try out.writer.writeAll("(");
-            if (motion.busy) {
+            if (motion.streaming) {
                 try flowText(&out.writer, label, palette, motion.phase, &ordinal);
                 try out.writer.writeAll(theme.reset);
             } else try out.writer.print("{s}{s}{s}", .{ idle_color, label, theme.reset });

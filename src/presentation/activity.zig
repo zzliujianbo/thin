@@ -203,6 +203,13 @@ pub const Meter = struct {
         bucket.counts.add(counts);
     }
 
+    /// True from the first received delta until the call ends. Inter-chunk gaps
+    /// keep counting as output; waiting for the first token, running tools and a
+    /// finished call do not.
+    pub fn streaming(self: *const Meter) bool {
+        return self.call_active and self.first_received_ms != null;
+    }
+
     /// Rate in tenths of tokens/s. A short window is unknown, not a spike.
     pub fn liveRate(self: *const Meter, now_ms: u64) ?u64 {
         if (!self.call_active) return null;

@@ -174,7 +174,7 @@ test "percent prompt has default input colors and real spinner not loading text"
     defer idle.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash) ?%> ", idle.plain);
     try expectPromptStyle(idle.plain, idle.styled);
-    const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .now_ms = 80, .phase = 2 });
+    const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .streaming = true, .now_ms = 80, .phase = 2 });
     defer active.deinit(a);
     try std.testing.expectEqualStrings("(deepseek-flash) ?%⠙ ", active.plain);
     try expectPromptSuffix(active.styled, theme.reset ++ theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ");
@@ -274,7 +274,7 @@ test "context prompt is retained occupancy not cache billing and remains bounded
     try std.testing.expectEqualStrings("(fixture) 50.0%> ", value.plain);
     try expectPromptStyle("(" ++ theme.reset ++ "fixture" ++ theme.reset ++ ") " ++ theme.failure ++ "50.0%" ++ theme.reset ++ "> ", value.styled);
     for ([_]usize{ 1, 7, 24, 40, 79, 119 }) |width| {
-        const small = try prompt(a, "long-model-name", .{ .tokens = std.math.maxInt(u64), .limit = 1 }, width, .{ .busy = true, .now_ms = 80, .phase = 1 });
+        const small = try prompt(a, "long-model-name", .{ .tokens = std.math.maxInt(u64), .limit = 1 }, width, .{ .busy = true, .streaming = true, .now_ms = 80, .phase = 1 });
         defer small.deinit(a);
         try std.testing.expect(text.width(small.plain) <= @max(width, 2));
         try std.testing.expect(std.mem.find(u8, small.styled, "loading") == null);
@@ -337,7 +337,7 @@ test "low price marker shares the full static context color and optout removes i
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
     };
     for (0..80) |columns| {
-        const value = try prompt(a, "a very long model name", .{ .tokens = 10, .limit = 100 }, columns, .{ .low_price_input = true, .busy = true });
+        const value = try prompt(a, "a very long model name", .{ .tokens = 10, .limit = 100 }, columns, .{ .low_price_input = true, .busy = true, .streaming = true });
         defer value.deinit(a);
         try std.testing.expect(text.width(value.plain) <= @max(columns, 2));
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
@@ -380,7 +380,7 @@ test "effort confirmation replaces only the context slot and medium stays defaul
     const restored = try prompt(a, "fixture", context, 79, .{ .reasoning_effort = .medium });
     defer restored.deinit(a);
     try std.testing.expectEqualStrings("(fixture) 25.0%> ", restored.plain);
-    const busy = try prompt(a, "fixture", context, 79, .{ .busy = true, .reasoning_effort = .high, .effort_flash = .high });
+    const busy = try prompt(a, "fixture", context, 79, .{ .busy = true, .streaming = true, .reasoning_effort = .high, .effort_flash = .high });
     defer busy.deinit(a);
     try std.testing.expect(std.mem.startsWith(u8, busy.plain, "(fixture) high"));
     for (0..80) |columns| {
@@ -406,7 +406,7 @@ test "model keeps effort and TPS waves while context percent has static occupanc
                 }
                 try expected.writer.print("{s}) {s}2.3%{s}{s}{s}{s} ", .{ theme.reset, theme.success, theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
                 for (efforts) |effort| {
-                    const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .now_ms = now, .phase = phase, .rate_band = band, .reasoning_effort = effort });
+                    const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .streaming = true, .now_ms = now, .phase = phase, .rate_band = band, .reasoning_effort = effort });
                     defer value.deinit(a);
                     try expectPromptStyle(expected.written(), value.styled);
                     const plain = try std.fmt.allocPrint(a, "(model) 2.3%{s} ", .{activity.spinner(now)});
@@ -457,7 +457,7 @@ test "composer busy marker keeps its own braille pulse while tool rows breathe s
         defer a.free(tool);
         try std.testing.expect(std.mem.startsWith(u8, tool, tool_prefix));
         for ([_]usize{ 0, 7, 12, 15, 80 }) |columns| for ([_]shared.activity.RateBand{ .slow, .fast, .unknown }) |band| {
-            const rendered = try prompt(a, "model", .{ .tokens = 10, .limit = 100 }, columns, .{ .busy = true, .now_ms = now, .phase = 7, .rate_band = band, .reasoning_effort = .high });
+            const rendered = try prompt(a, "model", .{ .tokens = 10, .limit = 100 }, columns, .{ .busy = true, .streaming = true, .now_ms = now, .phase = 7, .rate_band = band, .reasoning_effort = .high });
             defer rendered.deinit(a);
             try expectPromptSuffix(rendered.styled, ending);
             try std.testing.expectEqual(text.width(rendered.plain), @import("markdown_writer.zig").displayWidth(rendered.styled));

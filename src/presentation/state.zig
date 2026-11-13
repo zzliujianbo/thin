@@ -21,6 +21,9 @@ pub const View = struct {
     live_tps_tenths: ?u64,
     rate_band: activity.RateBand,
     reasoning_effort: activity.ReasoningEffort,
+    /// Display deltas are arriving right now. Only this state animates the
+    /// model label; a busy turn that produces no tokens stays static.
+    streaming: bool = false,
 };
 
 pub const State = struct {
@@ -70,6 +73,7 @@ pub const State = struct {
             .live_tps_tenths = live_rate,
             .rate_band = activity.rateBand(live_rate),
             .reasoning_effort = self.reasoning_effort,
+            .streaming = self.meter.streaming(),
         };
     }
 };

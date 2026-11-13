@@ -89,6 +89,9 @@ const Record = struct {
     /// Memory saved result) opt in; every other notice keeps paragraph
     /// rendering so no real failure text is ever cut away.
     single_row: bool = false,
+    /// Leading status marker bytes that keep their own colour (e.g. `M: ✓`).
+    /// Zero colours the whole row with the notice severity.
+    notice_marker_len: usize = 0,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
     /// Byte offset in `body` where the clipped-immune outcome tail starts.
@@ -388,14 +391,8 @@ const Record = struct {
             // change re-derives the line from the retained body, so a still
             // drawable record obeys the new geometry. Rows already retired into
             // native scrollback stay exactly as written.
-            const tone = switch (self.notice_level) {
-                .plain => theme.muted,
-                .success => theme.success,
-                .warning => theme.caution,
-                .failure => theme.failure,
-            };
             const line = try presentation.singleLine(temp, self.body.items, @max(1, columns));
-            const styled = try std.fmt.allocPrint(temp, "{s}{s}{s}", .{ theme.reset, tone, line });
+            const styled = try self.styleMarker(temp, line);
             self.lines = try temp.dupe([]const u8, &.{styled});
             self.excerpt = false;
             self.columns = columns;
@@ -404,18 +401,61 @@ const Record = struct {
         }
         // 截断时追加提示，但提示只用于显示，模型历史保持不变。
         const data = if (self.clipped and self.kind != .reasoning) try std.fmt.allocPrint(temp, "{s}\n[display clipped; model history is unchanged]", .{self.body.items}) else self.body.items;
-        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = null, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) switch (self.notice_level) {
+        const rendered = try markdown.render(temp, data, .{ .columns = columns, .max_lines = null, .markdown = self.kind == .assistant, .tone = if (self.kind == .user) .user else if (self.kind == .reasoning) .thinking else if (self.kind == .notice) if (self.notice_marker_len != 0) .muted else switch (self.notice_level) {
             .plain => .muted,
             .success => .success,
             .warning => .warning,
             .failure => .failure,
         } else .normal });
-        self.lines = rendered.lines;
+        self.lines = try self.styleMarkerRow(temp, rendered.lines);
         self.excerpt = self.clipped or rendered.truncated or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
 
         // arena 所有权转移给 Record；之后由 invalidate 统一释放。
         self.cache = arena;
+    }
+
+    fn noticeMarkerTone(self: *const Record) []const u8 {
+        return switch (self.notice_level) {
+            .plain => theme.muted,
+            .success => theme.success,
+            .warning => theme.caution,
+            .failure => theme.failure,
+        };
+    }
+
+    /// One-row notice: only the leading marker takes the severity colour, the
+    /// remaining text stays muted. `notice_marker_len == 0` colours the row.
+    fn styleMarker(self: *const Record, temp: std.mem.Allocator, line: []const u8) ![]const u8 {
+        if (self.notice_marker_len == 0 or self.notice_marker_len >= line.len)
+            return std.fmt.allocPrint(temp, "{s}{s}{s}", .{ theme.reset, self.noticeMarkerTone(), line });
+        return std.fmt.allocPrint(temp, "{s}{s}{s}{s}{s}{s}", .{
+            theme.reset,
+            self.noticeMarkerTone(),
+            line[0..self.notice_marker_len],
+            theme.reset,
+            theme.muted,
+            line[self.notice_marker_len..],
+        });
+    }
+
+    /// Wrapped notice: the body already uses the muted tone, so only the marker
+    /// inside the first row needs an explicit colour.
+    fn styleMarkerRow(self: *const Record, temp: std.mem.Allocator, lines: []const []const u8) ![]const []const u8 {
+        if (self.notice_marker_len == 0 or lines.len == 0) return lines;
+        const marker = self.body.items[0..self.notice_marker_len];
+        const at = std.mem.find(u8, lines[0], marker) orelse return lines;
+        const styled = try temp.alloc([]const u8, lines.len);
+        styled[0] = try std.fmt.allocPrint(temp, "{s}{s}{s}{s}{s}{s}", .{
+            lines[0][0..at],
+            self.noticeMarkerTone(),
+            marker,
+            theme.reset,
+            theme.muted,
+            lines[0][at + marker.len ..],
+        });
+        @memcpy(styled[1..], lines[1..]);
+        return styled;
     }
 };
 
@@ -5705,16 +5745,16 @@ const Ui = struct {
         self.records.items[index].notice_level = level;
     }
 
-    /// Memory terminal wording. Skipped is deliberately silent. A saved
-    /// confirmation is green and a compact one-row summary, never a count; failed
-    /// and uncertain are red. A failed or uncertain result that still saved some
-    /// entries keeps that fact instead of pretending to be a success.
-    fn formatMemoryTerminal(terminal: memory_status.Terminal, buffer: []u8) ?struct { level: NoticeLevel, text: []const u8 } {
+    /// Memory terminal wording. Skipped is deliberately silent. The leading
+    /// marker carries the outcome (`✓` saved, `✗` failed or uncertain) and is the
+    /// only tinted part; the summary after it stays muted. A failed or uncertain
+    /// result that still saved some entries keeps that fact instead of pretending
+    /// to be a success.
+    fn formatMemoryTerminal(terminal: memory_status.Terminal, buffer: []u8) ?struct { level: NoticeLevel, text: []const u8, marker_len: usize } {
         if (terminal.result == .skipped) return null;
         const label: []const u8 = switch (terminal.result) {
             .saved => "M: \u{2713}",
-            .failed => "M: failed",
-            .uncertain => "M: uncertain",
+            .failed, .uncertain => "M: \u{2717}",
             .canceled => "M: canceled",
             .skipped => return null,
         };
@@ -5724,6 +5764,12 @@ const Ui = struct {
             .failed, .uncertain => .failure,
             .skipped => unreachable,
         };
+        // Only the marker is tinted; cancellation stays an uncoloured sentence.
+        const marker_len: usize = switch (terminal.result) {
+            .saved, .failed, .uncertain => label.len,
+            .canceled => 0,
+            .skipped => unreachable,
+        };
         const summary = terminal.summary.text();
         const value_text = if (terminal.result == .saved)
             if (summary.len == 0)
@@ -5731,12 +5777,12 @@ const Ui = struct {
             else
                 std.fmt.bufPrint(buffer, "{s} {s}", .{ label, summary }) catch return null
         else if (terminal.saved_count != 0 and summary.len != 0)
-            std.fmt.bufPrint(buffer, "{s}; saved ({d}) - {s}", .{ label, terminal.saved_count, summary }) catch return null
+            std.fmt.bufPrint(buffer, "{s} saved ({d}) - {s}", .{ label, terminal.saved_count, summary }) catch return null
         else if (terminal.saved_count != 0)
-            std.fmt.bufPrint(buffer, "{s}; saved ({d})", .{ label, terminal.saved_count }) catch return null
+            std.fmt.bufPrint(buffer, "{s} saved ({d})", .{ label, terminal.saved_count }) catch return null
         else
             label;
-        return .{ .level = level, .text = value_text };
+        return .{ .level = level, .text = value_text, .marker_len = marker_len };
     }
 
     fn appendMemoryCompletion(self: *Ui, terminal: memory_status.Terminal) !void {
@@ -5744,6 +5790,7 @@ const Ui = struct {
         const formatted = formatMemoryTerminal(terminal, &buffer) orelse return;
         const index = try self.addRecord(.notice, formatted.text, false);
         self.records.items[index].notice_level = formatted.level;
+        self.records.items[index].notice_marker_len = formatted.marker_len;
         // Only the saved confirmation is guaranteed one physical row. Failure,
         // uncertainty and cancellation keep the ordinary paragraph rendering so
         // nothing real becomes invisible on a narrow screen.
@@ -5870,7 +5917,7 @@ const Ui = struct {
         const writer = &formatted.writer;
         const label = switch (result.status) {
             .paused => "Paused",
-            .failed => "Failed",
+            .failed => "\u{2717}",
             .canceled => "Canceled; prior side effects remain",
             .success => unreachable,
         };
@@ -6766,9 +6813,12 @@ const Ui = struct {
         const display_bytes = try std.mem.concat(a, u8, &.{ prefix, suffix });
         const working = self.busy or self.presentationWaiting() or self.remoteSynchronizing() or self.mode != null or self.active_tool != null;
         const view = self.display.view(self.clock_ms);
-        self.model_flow.advance(self.clock_ms, working, view.live_tps_tenths);
+        // The flowing label belongs to live output only: waiting for the first
+        // token, tool execution or an idle view must not animate it.
+        const streaming = view.streaming and working;
+        self.model_flow.advance(self.clock_ms, streaming, view.live_tps_tenths);
         const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
+        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
         // Modal authorization/secret layouts stay fixed. Idle LF debt first
         // obtains a single-row composer ACK even if a newer long draft arrived.
         const limit: usize = if (self.permission != null or self.stop_open or self.idle_breaks != 0) 1 else @min(composer_layout.max_rows, @max(1, self.size.rows -| 5));

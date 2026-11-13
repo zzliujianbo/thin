@@ -760,7 +760,9 @@ async function runScenario(name, protocol, kind, isPty = false) {
     if (kind === 'auth-reject401' || kind === 'auth-reject403') {
       assert.equal(requests, 1, 'authentication failure must not retry');
       assert(result.output.includes(`[HTTP ${kind.slice(-3)}]`), 'HTTP status lost');
-      assert(result.output.includes('/ authentication'), 'failure category lost');
+      // The row names the next step instead of leaking the internal category tag.
+      assert(!result.output.includes('/ authentication'), 'internal failure category leaked');
+      assert(result.output.includes(kind === 'auth-reject401' ? 'check /login' : 'check workspace/model permissions'), 'actionable hint lost');
       assert(result.output.includes(kind === 'auth-reject401' ? 'credentials rejected' : 'workspace/model permissions'));
       assert(!result.output.includes('fixture-provider-secret-must-not-render'));
       assert(!result.output.includes(KEY));

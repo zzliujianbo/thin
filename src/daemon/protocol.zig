@@ -94,6 +94,9 @@ pub fn errorCode(err: anyerror) ErrorCode {
         error.ThinkingCapabilitiesLoading => .thinking_capabilities_loading,
         error.ThinkingCapabilitiesUnknown => .thinking_capabilities_unknown,
         error.ConnectionLost, error.ConnectionClosed, error.Transport, error.StreamPoisoned, error.Timeout => .transport,
+        // A model request that never produced a response is a transport-class
+        // failure, not an opaque internal fault for the viewing frontend.
+        error.ModelRequestFailed => .transport,
         error.ProtocolError, error.TruncatedFrame, error.FrameTooLarge, error.DuplicateField, error.UnknownField, error.SyntaxError, error.UnexpectedEndOfInput, error.BufferUnderrun, error.BadRequest => .protocol,
         else => .internal,
     };

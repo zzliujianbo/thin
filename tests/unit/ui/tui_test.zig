@@ -2176,6 +2176,32 @@ test "replayed history turns saved tool results into tool rows with their call c
     }
     try std.testing.expectEqual(@as(usize, 1), tools);
 }
+test "memory markers use a cross and only the marker is tinted" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var saved: memory_status.Terminal = .{ .id = 1, .result = .saved, .saved_count = 1 };
+    saved.summary.append("preference");
+    try ui.acceptMemoryCompletion(saved);
+    const ok_row = &ui.records.items[0];
+    try std.testing.expectEqual(NoticeLevel.success, ok_row.notice_level);
+    try std.testing.expectEqual(@as(usize, "M: \u{2713}".len), ok_row.notice_marker_len);
+    try ok_row.layout(a, 40);
+    try std.testing.expect(std.mem.find(u8, ok_row.lines[0], theme.success ++ "M: \u{2713}" ++ theme.reset ++ theme.muted) != null);
+    try std.testing.expect(std.mem.find(u8, ok_row.lines[0], " preference") != null);
+
+    try ui.acceptMemoryCompletion(.{ .id = 2, .result = .failed, .failure = .storage });
+    const bad_row = &ui.records.items[1];
+    try std.testing.expectEqual(NoticeLevel.failure, bad_row.notice_level);
+    try std.testing.expectEqual(@as(usize, "M: \u{2717}".len), bad_row.notice_marker_len);
+    try std.testing.expect(std.mem.startsWith(u8, bad_row.body.items, "M: \u{2717}"));
+    try bad_row.layout(a, 40);
+    try std.testing.expect(std.mem.find(u8, bad_row.lines[0], theme.failure ++ "M: \u{2717}" ++ theme.reset ++ theme.muted) != null);
+    try std.testing.expect(std.mem.find(u8, bad_row.lines[0], "failed") == null);
+}
 test "failed tool rows keep the bounded reason while the target clips" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};
@@ -4163,7 +4189,8 @@ test "terminal details publish once in conversation and never own the footer" {
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     const record = ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.failure, record.notice_level);
-    try std.testing.expect(std.mem.find(u8, record.body.items, "OutputLimitReached") != null);
+    try std.testing.expect(std.mem.find(u8, record.body.items, "provider output limit reached") != null);
+    try std.testing.expect(std.mem.find(u8, record.body.items, "OutputLimitReached") == null);
     try std.testing.expect(std.mem.find(u8, record.body.items, "limits.max_output_tokens") == null);
     const hint = try ui.hint(arena.allocator(), ui.connection.current());
     try std.testing.expect(std.mem.find(u8, hint, "OutputLimitReached") == null);
@@ -4502,10 +4529,41 @@ test "configured effort colors idle prefix before reasoning but never the busy m
         const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
         defer std.testing.allocator.free(marker);
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, theme.effortColor(.high)) == null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
+        // Waiting for the first token keeps the static effort colour: only the
+        // busy marker animates, never the model label.
+        const idle_label = try std.fmt.allocPrint(std.testing.allocator, "{s}fixture", .{theme.effortColor(.high)});
+        defer std.testing.allocator.free(idle_label);
+        try std.testing.expect(std.mem.find(u8, ui.frame, idle_label) != null);
+        for (theme.model_flow) |shade| {
+            const flowing = try std.fmt.allocPrint(std.testing.allocator, "{s}f", .{shade});
+            defer std.testing.allocator.free(flowing);
+            try std.testing.expect(std.mem.find(u8, ui.frame, flowing) == null);
+        }
         testAcknowledgeFullFrame(&ui);
     }
+    // A real delta starts the flow and inter-chunk gaps keep it: the call is
+    // still producing output even when one frame arrives with no new bytes.
+    ui.clock_ms = 9200;
+    ui.display.observe(.{ .text = "token" }, 9200);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.modelPalette(ui.display.view(ui.clock_ms).rate_band)[ui.model_flow.step()]) != null);
+    testAcknowledgeFullFrame(&ui);
+    ui.clock_ms = 12_000;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.modelPalette(ui.display.view(ui.clock_ms).rate_band)[ui.model_flow.step()]) != null);
+    testAcknowledgeFullFrame(&ui);
+    // The call ending silences the animation immediately, including for tools.
+    ui.display.finish(.{ .status = .success });
+    try ui.draw();
+    for (theme.model_flow) |shade| {
+        const flowing = try std.fmt.allocPrint(std.testing.allocator, "{s}f", .{shade});
+        defer std.testing.allocator.free(flowing);
+        try std.testing.expect(std.mem.find(u8, ui.frame, flowing) == null);
+    }
+    const idle_label = try std.fmt.allocPrint(std.testing.allocator, "{s}fixture", .{theme.effortColor(.high)});
+    defer std.testing.allocator.free(idle_label);
+    try std.testing.expect(std.mem.find(u8, ui.frame, idle_label) != null);
+    testAcknowledgeFullFrame(&ui);
     ui.display.observe(.{ .reasoning = "late thought" }, 9100);
     ui.display.finish(.{ .status = .success });
     ui.mode = null;
@@ -4635,7 +4693,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     try ui.draw();
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ "\x1b[1m" ++ theme.command_pulse[5] ++ "⠧" ++ theme.reset ++ " typed-default-color") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.model_flow[ui.model_flow.step()]) != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.modelPalette(ui.display.view(ui.clock_ms).rate_band)[ui.model_flow.step()]) != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
@@ -7252,7 +7310,9 @@ test "complete publishes a failed terminal once and keeps it out of the footer" 
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
     try std.testing.expectEqualStrings("Failed", ui.notice);
-    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "Failed") != null);
+    try std.testing.expect(std.mem.startsWith(u8, ui.records.items[0].body.items, "\u{2717}"));
+    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "cannot reach the model service") != null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "ModelRequestFailed") == null);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const hint = try ui.hint(arena.allocator(), ui.connection.current());
@@ -7547,8 +7607,9 @@ test "authentication terminal detail is red in conversation and absent from the 
         ui.queueTerminalNotice(result);
         const record = ui.records.items[ui.records.items.len - 1];
         try std.testing.expectEqual(NoticeLevel.failure, record.notice_level);
-        try std.testing.expect(std.mem.startsWith(u8, record.body.items, if (code == 401) "Failed [HTTP 401]" else "Failed [HTTP 403]"));
-        try std.testing.expect(std.mem.find(u8, record.body.items, "authentication") != null);
+        try std.testing.expect(std.mem.startsWith(u8, record.body.items, if (code == 401) "\u{2717} [HTTP 401]" else "\u{2717} [HTTP 403]"));
+        try std.testing.expect(std.mem.find(u8, record.body.items, if (code == 401) "check /login" else "workspace/model permissions") != null);
+        try std.testing.expect(std.mem.find(u8, record.body.items, "authentication") == null);
         const hint = try ui.hint(arena.allocator(), state);
         try std.testing.expect(std.mem.find(u8, hint, "HTTP") == null);
         try std.testing.expect(std.mem.find(u8, hint, "authentication") == null);
