@@ -135,6 +135,9 @@ pub fn build(b: *std.Build) void {
         guard.setCwd(b.path("."));
         break :guard guard;
     } else null;
+    // Independent group binaries are the fastest wall-clock entry: the build
+    // runner executes them concurrently instead of serializing one big process.
+    const parallel = b.step("test-unit-parallel", "Run the unit groups as separate concurrent processes");
     for ([_][]const u8{ "fast", "ui", "app", "core", "integration", "daemon" }) |group| {
         const variant = compose(b, group);
         const grouped = b.addTest(.{ .use_llvm = platform_llvm, .root_module = b.createModule(.{
@@ -151,8 +154,13 @@ pub fn build(b: *std.Build) void {
         run_group.step.name = b.fmt("run test [{s}]", .{group});
         const group_step = b.step(name, b.fmt("Run the {s} test selection", .{group}));
         if (std.mem.eql(u8, group, "daemon") and target.result.os.tag != .linux) {
+            // Daemon cases block on host services, so this host skips the whole
+            // group; the parallel entry must skip it too or it never returns.
             group_step.dependOn(&b.addFail("test-unit-daemon is Linux-only").step);
-        } else group_step.dependOn(&run_group.step);
+        } else {
+            group_step.dependOn(&run_group.step);
+            parallel.dependOn(group_step);
+        }
         if (shard_inventory) |guard| {
             guard.addArgs(&.{ "--shard", group });
             guard.addArtifactArg(grouped);
