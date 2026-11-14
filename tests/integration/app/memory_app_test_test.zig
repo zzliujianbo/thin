@@ -101,7 +101,6 @@ test "App automatic memory skips Decision even when configured and preserves pri
             try std.testing.expectEqual(@as(?u64, 333), app.memory_coordinator.extractor.?.last_usage.total());
             const saved = try app.memory.read(a, "preferences-review-style");
             defer a.free(saved.content);
-            defer a.free(saved.version);
             try std.testing.expect(std.mem.find(u8, saved.content, "concise") != null);
             var off = try cfg.clone(a, app.config.value);
             defer cfg.release(&off);

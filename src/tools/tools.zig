@@ -53,9 +53,9 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "memory",
-        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns one page of the core/index; use offset and limit to page. read returns content and version. Writes/deletes remain subject to host validation and limits. Create without expected_version; update/delete use read's version as expected_version. On conflict, reread; never overwrite blindly. topic core is startup core memory; other topics are ASCII slugs.",
+        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns one page of the core/index; use offset and limit to page. read returns content. write creates or replaces the topic; delete removes it. Writes/deletes remain subject to host validation and limits. topic core is startup core memory; other topics are ASCII slugs.",
         .parameters_json =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"expected_version":{"type":["string","null"]},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
         ,
     },
 };
@@ -251,8 +251,6 @@ pub const Memory = struct {
     topic: ?[]const u8 = null,
     /// 写入内容，仅 write 使用。
     content: ?[]const u8 = null,
-    /// 乐观并发版本（内容哈希）：write 更新与 delete 必须提供，create 必须为空。
-    expected_version: ?[]const u8 = null,
     /// list 分页起点与每页条数。索引没有总大小上限，但每次只返回一页。
     offset: u32 = 0,
     limit: ?u32 = null,
@@ -288,9 +286,8 @@ pub const Action = union(enum) {
                 try std.fmt.allocPrint(a, "Background {s} {s}", .{ q.action.name(), id })
             else
                 try std.fmt.allocPrint(a, "Background {s}", .{q.action.name()}),
-            // create 与 update 的区别仅在于 expected_version 是否为空。
             .memory => |m| if (m.action == .write)
-                try std.fmt.allocPrint(a, "Memory {s}: {s} ({d} bytes)\n{s}", .{ if (m.expected_version == null) "create" else "update", m.topic.?, m.content.?.len, m.content.? })
+                try std.fmt.allocPrint(a, "Memory write: {s} ({d} bytes)\n{s}", .{ m.topic.?, m.content.?.len, m.content.? })
             else
                 try std.fmt.allocPrint(a, "Memory {s}: {s}", .{ @tagName(m.action), m.topic orelse "index" }),
             // Display-only bounded task summary; never the context body.
@@ -419,7 +416,7 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         const args = try std.json.parseFromSliceLeaky(Memory, a, arguments, opts);
         // list 不接受 topic/content/版本号，保持调用形状严格。
         if (args.action == .list) {
-            if (args.topic != null or args.content != null or args.expected_version != null)
+            if (args.topic != null or args.content != null)
                 return error.InvalidMemoryArguments;
             if (args.limit) |limit| if (limit == 0 or limit > mem.max_list_limit) return error.InvalidMemoryArguments;
         } else {
@@ -433,9 +430,6 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
                 if (!std.unicode.utf8ValidateSlice(content) or std.mem.findScalar(u8, content, 0) != null)
                     return error.InvalidText;
             } else if (args.content != null) return error.InvalidMemoryArguments;
-            // read 不带版本号；delete 必须带读取时拿到的版本（CAS 条件），否则拒绝。
-            if (args.action == .read and args.expected_version != null) return error.InvalidMemoryArguments;
-            if (args.action == .delete and args.expected_version == null) return error.MissingMemoryVersion;
         }
         return .{ .memory = args };
     }
@@ -980,22 +974,18 @@ pub const Tools = struct {
                     const entry = try self.memory.read(a, m.topic.?);
                     try j.put(a, &value, "topic", j.str(m.topic.?));
                     try j.put(a, &value, "content", j.str(entry.content));
-                    try j.put(a, &value, "version", j.str(entry.version));
+                    const encoded = try j.encode(a, value);
+                    a.free(entry.content);
+                    return .{ .text = encoded };
                 },
 
                 .write => {
-                    // 版本仅取决于新内容；包括最终 JSON 在内的返回内存必须先于 CAS 提交。
-                    const next_version = try mem.version(a, m.content.?);
-                    defer a.free(next_version);
                     try j.put(a, &value, "topic", j.str(m.topic.?));
-                    try j.put(a, &value, "operation", j.str(if (m.expected_version == null) "created" else "updated"));
-                    try j.put(a, &value, "version", j.str(next_version));
+                    try j.put(a, &value, "operation", j.str("written"));
                     const encoded = try j.encode(a, value);
                     errdefer a.free(encoded);
-                    // expected_version 为空表示创建；非空则必须与当前版本一致。
-                    const entry = try self.memory.write(a, m.topic.?, m.content.?, m.expected_version);
+                    const entry = try self.memory.replace(a, m.topic.?, m.content.?);
                     a.free(entry.content);
-                    a.free(entry.version);
                     return .{ .text = encoded };
                 },
 
@@ -1005,7 +995,7 @@ pub const Tools = struct {
                     try j.put(a, &value, "operation", j.str("deleted"));
                     const encoded = try j.encode(a, value);
                     errdefer a.free(encoded);
-                    try self.memory.delete(m.topic.?, m.expected_version.?);
+                    try self.memory.remove(m.topic.?);
                     return .{ .text = encoded };
                 },
             },

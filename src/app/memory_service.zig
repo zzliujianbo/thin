@@ -370,9 +370,7 @@ pub const Coordinator = struct {
             error.CleanupFailed => .cleanup,
             error.MemoryUnavailable => .unavailable,
             error.Busy => .busy,
-            error.MemoryConflict, error.VersionConflict, error.GenerationConflict, error.PathAlreadyExists => .conflict,
             error.InvalidMemoryOutput,
-            error.InvalidMemoryVersion,
             error.InvalidMemoryEvidence,
             error.InvalidMemoryCandidate,
             error.DuplicateMemoryCandidate,
@@ -386,8 +384,6 @@ pub const Coordinator = struct {
             error.FileChanged,
             error.CoreTooLarge,
             error.ShardTooLarge,
-            error.InvalidGeneration,
-            error.GenerationOverflow,
             error.NotRegularFile,
             => .storage,
             else => .other,
@@ -612,16 +608,7 @@ pub const Coordinator = struct {
         var scratch = std.heap.ArenaAllocator.init(wiping.allocator());
         defer scratch.deinit();
         const a = scratch.allocator();
-        // Capture the generation at processing time, not at prompt retrieval:
-        // an earlier queued job may legitimately have written in the meantime.
-        const generation = self.store.generation() catch |err| {
-            out.set(.failed, err);
-            return;
-        };
         var digest = std.crypto.hash.sha2.Sha256.init(.{});
-        var generation_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &generation_bytes, generation, .little);
-        digest.update(&generation_bytes);
         for (capture.sources.items) |source| {
             digest.update(@tagName(source.kind));
             var size: [8]u8 = undefined;
@@ -630,7 +617,7 @@ pub const Coordinator = struct {
             digest.update(source.text);
         }
         const id = std.fmt.bytesToHex(digest.finalResult(), .lower);
-        const material: k.Material = .{ .id = &id, .generation = generation, .created_ms = now(self.io), .sources = capture.sources.items, .omitted_sources = capture.omitted_sources };
+        const material: k.Material = .{ .id = &id, .created_ms = now(self.io), .sources = capture.sources.items, .omitted_sources = capture.omitted_sources };
         self.process(a, out, material, cancel) catch |err| {
             if (err == error.Canceled) out.set(.canceled, err) else if (err == error.MemoryUnavailable) out.set(.uncertain, err) else out.set(.failed, err);
             return;
@@ -710,14 +697,13 @@ pub const Coordinator = struct {
                 span.fail(err);
                 return err;
             };
-            span.finish(if (result == .unchanged or result == .expired or result == .conflict) .skipped else .ok);
+            span.finish(if (result == .unchanged or result == .skipped) .skipped else .ok);
             switch (result) {
                 .created, .updated => {
                     out.saved_count +|= 1;
                     out.summary.append(std.mem.trim(u8, candidate.content, " \t\r\n"));
                 },
-                .conflict => return error.MemoryConflict,
-                .unchanged, .expired => {},
+                .unchanged, .skipped => {},
             }
         }
         out.set(if (out.saved_count == 0) .skipped else .saved, null);

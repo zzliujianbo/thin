@@ -32,7 +32,7 @@ test "service filters borrowed candidates without mutation" {
     defer arena.deinit();
     var dummy: u8 = 0;
     const service: Service = .{ .context = &dummy, .extract_fn = Fake.extract };
-    const material: Material = .{ .id = "test", .generation = 0, .created_ms = 1, .sources = &.{} };
+    const material: Material = .{ .id = "test", .created_ms = 1, .sources = &.{} };
     var cancel: p.Cancellation = .{};
     const items = try service.extract(arena.allocator(), material, &cancel);
     try std.testing.expectEqual(@as(usize, 4), items.len);

@@ -1,4 +1,4 @@
-test "memory empty snapshot has no side effects and CAS updates across Stores" {
+test "memory empty snapshot has no side effects and last-writer-wins across Stores" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -15,18 +15,18 @@ test "memory empty snapshot has no side effects and CAS updates across Stores" {
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
     try std.testing.expectError(error.FileNotFound, one.read(a, "missing"));
 
-    const first = try one.write(a, "topic", "first", null);
+    const first = try one.create(a, "topic", "first");
     defer freeEntry(a, first);
-    try std.testing.expectError(error.PathAlreadyExists, two.write(a, "topic", "lost", null));
-    const second = try two.write(a, "topic", "second", first.version);
+    try std.testing.expectError(error.PathAlreadyExists, two.create(a, "topic", "lost"));
+    const second = try two.replace(a, "topic", "second");
     defer freeEntry(a, second);
-    try std.testing.expectError(error.VersionConflict, one.write(a, "topic", "lost", first.version));
-    try std.testing.expectError(error.VersionConflict, one.delete("topic", first.version));
+    const third = try one.replace(a, "topic", "third");
+    defer freeEntry(a, third);
 
     const latest = try one.read(a, "topic");
     defer freeEntry(a, latest);
-    try std.testing.expectEqualStrings("second", latest.content);
-    try one.delete("topic", second.version);
+    try std.testing.expectEqualStrings("third", latest.content);
+    try one.remove("topic");
     try std.testing.expectError(error.FileNotFound, two.read(a, "topic"));
     try std.testing.expectError(error.InvalidTopic, one.read(a, "../x"));
 
@@ -44,16 +44,19 @@ test "memory real concurrent Stores and cross-process flock exclusion" {
     defer root.deinit();
     var one = Store.init(&root);
     var two = Store.init(&root);
-    const initial = try one.write(a, "topic", "initial", null);
+    const initial = try one.create(a, "topic", "initial");
     defer freeEntry(a, initial);
 
-    var first = try std.Io.concurrent(io, competingWrite, .{ &one, initial.version, "first" });
+    var first = try std.Io.concurrent(io, competingWrite, .{ &one, "first" });
     defer _ = first.cancel(io) catch {};
-    var second = try std.Io.concurrent(io, competingWrite, .{ &two, initial.version, "second" });
+    var second = try std.Io.concurrent(io, competingWrite, .{ &two, "second" });
     defer _ = second.cancel(io) catch {};
     const first_won = try first.await(io);
     const second_won = try second.await(io);
-    try std.testing.expect(first_won != second_won);
+    try std.testing.expect(first_won and second_won);
+    const latest = try one.read(a, "topic");
+    defer freeEntry(a, latest);
+    try std.testing.expect(std.mem.eql(u8, latest.content, "first") or std.mem.eql(u8, latest.content, "second"));
 
     const held = try one.lock();
     defer fs.closeFd(held);
@@ -94,10 +97,10 @@ test "memory refuses symlink directories and shards" {
     var store = Store.init(&root);
     try std.testing.expectEqual(@as(c_int, 0), std.c.symlinkat("/", root.dir.handle, ".thin"));
     try std.testing.expectError(error.NotDir, store.snapshot(a));
-    try std.testing.expectError(error.NotDir, store.write(a, "core", "text", null));
+    try std.testing.expectError(error.NotDir, store.create(a, "core", "text"));
     try std.testing.expectEqual(@as(c_int, 0), std.c.unlinkat(root.dir.handle, ".thin", 0));
 
-    const c = try store.write(a, "core", "core", null);
+    const c = try store.create(a, "core", "core");
     defer freeEntry(a, c);
 
     var mem = try store.directory(false);
@@ -114,7 +117,7 @@ test "index reads bounded titles, not full shard bodies" {
     var root = try testRoot(a, io, tmp.dir);
     defer root.deinit();
     var store = Store.init(&root);
-    const initial = try store.write(a, "topic", "Title\nbody", null);
+    const initial = try store.create(a, "topic", "Title\nbody");
     defer freeEntry(a, initial);
 
     // A separately edited body is checked by read, not secretly loaded into
@@ -149,11 +152,11 @@ test "memory sorted listing independent limits and project isolation" {
     var store = Store.init(&root);
     var isolated = Store.init(&root2);
 
-    const c = try store.write(a, "core", "CORE", null);
+    const c = try store.create(a, "core", "CORE");
     defer freeEntry(a, c);
-    const z = try store.write(a, "z", "zed\nrest", null);
+    const z = try store.create(a, "z", "zed\nrest");
     defer freeEntry(a, z);
-    const aa = try store.write(a, "a", "alpha", null);
+    const aa = try store.create(a, "a", "alpha");
     defer freeEntry(a, aa);
 
     const snap = try store.snapshot(a);
@@ -161,7 +164,7 @@ test "memory sorted listing independent limits and project isolation" {
     try std.testing.expectEqualStrings("CORE\n\na.md: alpha\nz.md: zed\n", snap);
     try std.testing.expectError(error.FileNotFound, isolated.read(a, "core"));
 
-    const extra = try store.write(a, "extra", "123456789", null);
+    const extra = try store.create(a, "extra", "123456789");
     defer freeEntry(a, extra);
     const extra_read = try store.read(a, "extra");
     defer freeEntry(a, extra_read);
@@ -190,9 +193,9 @@ test "memory sorted listing independent limits and project isolation" {
     const large = try a.alloc(u8, 40_000);
     defer a.free(large);
     @memset(large, 'x');
-    const updated = try store.write(a, "core", large, c.version);
+    const updated = try store.replace(a, "core", large);
     defer freeEntry(a, updated);
-    const shard = try store.write(a, "shard", large, null);
+    const shard = try store.create(a, "shard", large);
     defer freeEntry(a, shard);
     const roundtrip = try store.read(a, "shard");
     defer freeEntry(a, roundtrip);
@@ -212,7 +215,7 @@ test "memory listing caps oversized titles on a UTF-8 boundary" {
     const prefix: [max_title_bytes]u8 = @splat('a');
     const content = try std.fmt.allocPrint(a, "{s}中\nbody", .{prefix[0 .. max_title_bytes - 1]});
     defer a.free(content);
-    const entry = try store.write(a, "long-title", content, null);
+    const entry = try store.create(a, "long-title", content);
     defer freeEntry(a, entry);
 
     const page = try store.listPage(a, 0, 1);

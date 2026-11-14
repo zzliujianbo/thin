@@ -38,7 +38,7 @@ test "tool descriptions distinguish configured decision review from legacy appro
     for ([_]bool{ false, true }) |review| {
         const selected = schemasForDecision(review);
         try std.testing.expect(std.mem.indexOf(u8, selected[0].description, "next_offset as the next call's offset") != null);
-        try std.testing.expect(std.mem.indexOf(u8, selected[3].description, "read's version as expected_version") != null);
+        try std.testing.expect(std.mem.indexOf(u8, selected[3].description, "write creates or replaces the topic") != null);
     }
 }
 test "decision enabled prepares memory without review and preserves bash review" {
@@ -60,7 +60,7 @@ test "decision enabled prepares memory without review and preserves bash review"
     const calls = [_][]const u8{
         "{\"action\":\"write\",\"topic\":\"notes\",\"content\":\"durable fact\"}",
         "{\"action\":\"read\",\"topic\":\"notes\"}",
-        "{\"action\":\"delete\",\"topic\":\"notes\",\"expected_version\":\"v1\"}",
+        "{\"action\":\"delete\",\"topic\":\"notes\"}",
         "{\"action\":\"list\"}",
     };
     for (calls) |arguments| {
@@ -73,7 +73,6 @@ test "decision enabled prepares memory without review and preserves bash review"
             try std.testing.expectEqualStrings("durable fact", action.memory.content.?);
         }
     }
-    try std.testing.expectError(error.MissingMemoryVersion, Tools.prepare(&tools, a, .{ .id = "invalid", .name = "memory", .arguments = "{\"action\":\"delete\",\"topic\":\"notes\"}" }));
     const bash = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\"}" });
     try std.testing.expect(bash.decision_input != null);
     try std.testing.expect(bash.decision_input.? == .command);
@@ -92,7 +91,6 @@ test "tool arguments remain strict" {
     try std.testing.expectEqualStrings("../outside.txt", external.read_file.path);
     try std.testing.expectError(error.PathEscape, parse(a, "write_file", "{\"path\":\"../outside.txt\",\"content\":\"x\"}", .{}));
     try std.testing.expectEqual(@as(?usize, 99999999), (try parse(a, "read_file", "{\"path\":\"a\",\"limit\":99999999}", .{})).read_file.limit);
-    try std.testing.expectError(error.MissingMemoryVersion, parse(a, "memory", "{\"action\":\"delete\",\"topic\":\"core\"}", .{}));
     try std.testing.expectError(error.UnknownField, parse(a, "bash", "{\"command\":\"true\",\"trust\":true}", .{}));
 }
 test "command environment excludes fake credentials even under a normally allowed name" {

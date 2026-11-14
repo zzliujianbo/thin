@@ -242,29 +242,20 @@ test "automatic Memory tool-prefix rewrite retains actual usage observation" {
     try std.testing.expectEqual(@as(?u64, 1234), runtime.last_context_tokens);
     try std.testing.expectEqual(@as(usize, 1), fake.completes);
 }
-test "automatic Memory expected version requires same topic category Related and rejects sensitive candidates" {
+test "automatic Memory validates topic content and sensitive candidates" {
     const sources = [_]k.Evidence{.{ .id = 0, .kind = .user, .text = "Use focused offline tests" }};
-    const version = "1111111111111111111111111111111111111111111111111111111111111111";
-    var material = k.Material{ .id = "offline", .generation = 1, .created_ms = 1, .sources = &sources, .related = &.{.{ .category = .project, .topic = "testing", .content = "old fact", .version = version }} };
-    var candidate = k.Candidate{ .category = .project, .topic = "testing", .content = "Use focused offline tests", .expected_version = version };
+    const material = k.Material{ .id = "offline", .created_ms = 1, .sources = &sources };
+    var candidate = k.Candidate{ .category = .project, .topic = "testing", .content = "Use focused offline tests" };
     try k.validateCandidate(material, candidate);
     candidate.topic = "other-topic";
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
-    candidate.topic = "testing";
+    try k.validateCandidate(material, candidate);
     candidate.category = .preferences;
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
-    candidate.category = .project;
-    candidate.expected_version = "2222222222222222222222222222222222222222222222222222222222222222";
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
-    candidate.expected_version = "unknown";
-    try std.testing.expectError(error.InvalidMemoryVersion, k.validateCandidate(material, candidate));
-    candidate.expected_version = null;
+    try k.validateCandidate(material, candidate);
     candidate.content = "Authorization: Bearer credential";
     try k.validateCandidate(material, candidate);
     candidate.content = "-----BEGIN PRIVATE KEY-----";
     try std.testing.expectError(error.InvalidMemoryCandidate, k.validateCandidate(material, candidate));
     candidate.content = "safe fact";
-    material.related = &.{};
     try k.validateCandidate(material, candidate);
 }
 test "automatic Memory Capture keeps complete sources but omits invalid assistant and sensitive data with OOM safety" {

@@ -190,14 +190,11 @@ test "App ignores retired memory layout and preserves its artifacts" {
     defer app.deinit();
     const current = try app.memory.read(a, "core");
     defer a.free(current.content);
-    defer a.free(current.version);
     try std.testing.expectEqualStrings("current core", current.content);
-    const updated = try app.memory.write(a, "core", "updated core", current.version);
+    const updated = try app.memory.replace(a, "core", "updated core");
     defer a.free(updated.content);
-    defer a.free(updated.version);
     const reread = try app.memory.read(a, "core");
     defer a.free(reread.content);
-    defer a.free(reread.version);
     try std.testing.expectEqualStrings("updated core", reread.content);
     for (markers) |path| {
         const marker = try root.read(a, path, 0, 1024);

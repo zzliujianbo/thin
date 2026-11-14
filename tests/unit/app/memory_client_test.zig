@@ -113,8 +113,6 @@ test "memory client fake normal request preserves usage cancellation no tools no
     try std.testing.expectEqual(knowledge.Category.preferences, ignored_replay[0].category);
     try std.testing.expectEqualStrings("language", ignored_replay[0].topic);
     try std.testing.expectEqualStrings("Prefer Zig.", ignored_replay[0].content);
-    try std.testing.expectEqual(@as(?[]const u8, null), ignored_replay[0].expected_version);
-    try std.testing.expectEqual(@as(?u64, null), ignored_replay[0].expires_at_ms);
     fake.body_override = null;
     fake.mode = .oversized;
     const large = try Client.extract(client, a, fixture, &cancel);

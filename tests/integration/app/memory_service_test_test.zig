@@ -23,7 +23,7 @@ test "rotated journal credential filters related evidence and candidates" {
     };
     owner.secret_guard = .{ .context = &journal, .contains_fn = Guard.contains };
     var repository = knowledge.Repository.init(&owner.store);
-    const material: k.Material = .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .generation = try owner.store.generation(), .created_ms = 1, .sources = &.{} };
+    const material: k.Material = .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .created_ms = 1, .sources = &.{} };
     try std.testing.expectEqual(knowledge.Apply.created, try repository.apply(a, material, .{ .category = .preferences, .topic = "rotation", .content = "rotation old-credential-canary" }));
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -59,7 +59,6 @@ test "rotated journal credential filters related evidence and candidates" {
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-leak"));
     const saved = try owner.store.read(a, "preferences-safe");
     defer a.free(saved.content);
-    defer a.free(saved.version);
 }
 test "automatic Memory extracts once saves and creates no jobs" {
     const a = std.testing.allocator;
@@ -91,7 +90,6 @@ test "automatic Memory extracts once saves and creates no jobs" {
     try std.testing.expectEqualStrings("Prefers concise code-review explanations.", saved.summary.text());
     const entry = try owner.store.read(a, "preferences-response-style");
     defer a.free(entry.content);
-    defer a.free(entry.version);
     try std.testing.expect(std.mem.find(u8, entry.content, "concise") != null);
     try expectNoJobs(&root);
 
@@ -103,7 +101,7 @@ test "automatic Memory extracts once saves and creates no jobs" {
     try std.testing.expectEqual(@as(u32, 0), skipped.saved_count);
     try expectNoJobs(&root);
 }
-test "automatic Memory snapshots fresh generation after earlier mutation" {
+test "automatic Memory applies after an earlier manual mutation" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -120,11 +118,10 @@ test "automatic Memory snapshots fresh generation after earlier mutation" {
     defer owner.deinit();
     var fake: Fake = .{};
     owner.service_override = fake.service();
-    const entry = try owner.store.write(a, "old", "old fact", null);
+    const entry = try owner.store.create(a, "old", "old fact");
     defer a.free(entry.content);
-    defer a.free(entry.version);
     try begin(owner, a, input);
-    try owner.store.delete("old", entry.version);
+    try owner.store.remove("old");
     var cancel: p.Cancellation = .{};
     const terminal = try finalize(owner, a, input, &cancel);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
@@ -283,7 +280,7 @@ test "Auto Memory Off has no helper clients or storage side effects" {
     try std.testing.expectEqual(memory_status.Failure.unavailable, view.last_terminal.?.failure.?);
     try std.testing.expectError(error.FileNotFound, fs.openDirectory(root.dir.handle, ".thin"));
 }
-test "queued jobs run FIFO from owned capture copies with a fresh generation" {
+test "queued jobs run FIFO from owned capture copies" {
     const a = std.testing.allocator;
     var backend = std.Io.Threaded.init(a, .{});
     defer backend.deinit();
@@ -314,12 +311,10 @@ test "queued jobs run FIFO from owned capture copies with a fresh generation" {
     try std.testing.expectEqualStrings("fifo alpha fact", gated.texts[0][0..gated.text_lens[0]]);
     try std.testing.expectEqualStrings("fifo beta fact", gated.texts[1][0..gated.text_lens[1]]);
     try std.testing.expectEqualStrings("fifo gamma fact", gated.texts[2][0..gated.text_lens[2]]);
-    // Automatic guarded writes retain the epoch but later jobs see prior facts.
-    try std.testing.expectEqual(gated.generations[0], gated.generations[1]);
-    try std.testing.expectEqual(gated.generations[1], gated.generations[2]);
+    // Later jobs see prior facts through the normal related lookup.
     try std.testing.expectEqual(@as(usize, 0), gated.related_counts[0]);
-    try std.testing.expect(gated.related_counts[1] >= 1 and gated.fresh_versions[1]);
-    try std.testing.expect(gated.related_counts[2] >= 2 and gated.fresh_versions[2]);
+    try std.testing.expect(gated.related_counts[1] >= 1);
+    try std.testing.expect(gated.related_counts[2] >= 2);
     const expected = [_]struct { key: []const u8, text: []const u8 }{
         .{ .key = "preferences-job-1", .text = "fifo alpha fact" },
         .{ .key = "preferences-job-2", .text = "fifo beta fact" },
@@ -328,7 +323,6 @@ test "queued jobs run FIFO from owned capture copies with a fresh generation" {
     for (expected) |item| {
         const entry = try owner.store.read(a, item.key);
         defer a.free(entry.content);
-        defer a.free(entry.version);
         try std.testing.expect(std.mem.find(u8, entry.content, item.text) != null);
     }
     const view = owner.view();
@@ -520,9 +514,8 @@ test "mixed sources and candidates save only committed safe entries" {
     defer env.deinit();
     const owner = try Coordinator.create(a, io, &root, config.value, &env);
     defer owner.deinit();
-    const existing = try owner.store.write(a, "preferences-conflict", "existing independent fact", null);
+    const existing = try owner.store.create(a, "preferences-conflict", "existing independent fact");
     defer a.free(existing.content);
-    defer a.free(existing.version);
     const Mixed = struct {
         calls: usize = 0,
         fn extract(raw: *anyopaque, alloc: std.mem.Allocator, material: k.Material, _: *const p.Cancellation) ![]const k.Candidate {
@@ -561,15 +554,13 @@ test "mixed sources and candidates save only committed safe entries" {
     try std.testing.expectEqual(@as(usize, 1), mixed.calls);
     try std.testing.expectEqual(@as(u32, 2), terminal.saved_count);
     try std.testing.expectEqualStrings("Bearer abc.def · A useful fact.", terminal.summary.text());
-    try std.testing.expect(terminal.result == .failed);
+    try std.testing.expect(terminal.result == .saved);
     const saved = try owner.store.read(a, "preferences-good");
     defer a.free(saved.content);
-    defer a.free(saved.version);
     try std.testing.expect(std.mem.indexOf(u8, saved.content, "owned-memory-fixture-key") == null);
     try std.testing.expectError(error.FileNotFound, owner.store.read(a, "preferences-secret"));
     const ordinary = try owner.store.read(a, "preferences-bearer-secret");
     defer a.free(ordinary.content);
-    defer a.free(ordinary.version);
     var repository = knowledge.Repository.init(&owner.store);
     const now_ms: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
     const related = try repository.related(arena.allocator(), "Bearer", now_ms);
@@ -582,7 +573,6 @@ test "mixed sources and candidates save only committed safe entries" {
     try std.testing.expectEqual(@as(usize, 1), matches);
     const conflict = try owner.store.read(a, "preferences-conflict");
     defer a.free(conflict.content);
-    defer a.free(conflict.version);
     try std.testing.expectEqualStrings("existing independent fact", conflict.content);
 }
 test "automatic Memory saves every candidate without a total index budget" {
@@ -626,7 +616,6 @@ test "automatic Memory saves every candidate without a total index budget" {
         defer a.free(key);
         const entry = try owner.store.read(a, key);
         defer a.free(entry.content);
-        defer a.free(entry.version);
         try std.testing.expect(std.mem.find(u8, entry.content, "Durable fact") != null);
     }
 }

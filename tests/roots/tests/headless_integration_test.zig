@@ -229,7 +229,6 @@ fn scenario(allowed: bool) !void {
         try t.expectEqualStrings("ok\n", command.data);
         const entry = try memory.read(a, "facts");
         defer a.free(entry.content);
-        defer a.free(entry.version);
         try t.expectEqualStrings("New title\nfacts", entry.content);
     } else {
         // 拒绝时所有副作用都必须不存在。

@@ -1,4 +1,4 @@
-const fixture: knowledge.Material = .{ .id = "test", .generation = 1, .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Prefer Zig." }} };
+const fixture: knowledge.Material = .{ .id = "test", .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Prefer Zig." }} };
 
 const Fake = struct {
     calls: usize = 0,
@@ -118,9 +118,7 @@ const WireFake = struct {
     }
 };
 
-const cas_version = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-const cas_body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"editor\",\"content\":\"Prefer Zig.\"},{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\",\"expected_version\":\"" ++ cas_version ++ "\"}]}";
+const cas_body = "{\"items\":[{\"category\":\"preferences\",\"topic\":\"editor\",\"content\":\"Prefer Zig.\"},{\"category\":\"preferences\",\"topic\":\"language\",\"content\":\"Prefer Zig.\"}]}";
 
 fn casClientCase(out: std.mem.Allocator, protocol: p.Protocol) !void {
     const a = std.testing.allocator;
@@ -134,29 +132,19 @@ fn casClientCase(out: std.mem.Allocator, protocol: p.Protocol) !void {
     client.model_override = .{ .context = &fake, .call_fn = WireFake.invoke };
     var cancel: p.Cancellation = .{};
     var material = fixture;
-    const related: knowledge.Related = .{ .category = .preferences, .topic = "language", .content = "Old", .version = cas_version };
+    const related: knowledge.Related = .{ .category = .preferences, .topic = "language", .content = "Old" };
     material.related = &.{related};
     // The returned candidates are owned by the caller.
     const items = try Client.extract(client, out, material, &cancel);
     defer codec.freeCandidates(out, items);
     try std.testing.expectEqual(@as(usize, 2), items.len);
-    try std.testing.expectEqualStrings(cas_version, items[1].expected_version.?);
+    try std.testing.expectEqualStrings("editor", items[0].topic);
+    try std.testing.expectEqualStrings("language", items[1].topic);
     try std.testing.expectEqual(@as(?u64, 13), client.last_usage.input_tokens);
-    for (0..4) |case| {
-        var r = related;
-        switch (case) {
-            0 => {},
-            1 => r.category = .project,
-            2 => r.topic = "other",
-            3 => r.version = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            else => unreachable,
-        }
-        material.related = if (case == 0) &.{} else &.{r};
-        var task_arena = std.heap.ArenaAllocator.init(out);
-        defer task_arena.deinit();
-        const filtered = try client.service().extract(task_arena.allocator(), material, &cancel);
-        try std.testing.expectEqual(@as(usize, 1), filtered.len);
-        try std.testing.expectEqualStrings("editor", filtered[0].topic);
-    }
-    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    material.related = &.{related};
+    var task_arena = std.heap.ArenaAllocator.init(out);
+    defer task_arena.deinit();
+    const filtered = try client.service().extract(task_arena.allocator(), material, &cancel);
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }

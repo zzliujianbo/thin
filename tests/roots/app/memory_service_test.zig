@@ -71,9 +71,7 @@ const Gated = struct {
     started: std.atomic.Value(bool) = .init(false),
     calls: std.atomic.Value(u32) = .init(0),
     cancelled: std.atomic.Value(u32) = .init(0),
-    generations: [8]u64 = @splat(0),
     related_counts: [8]usize = @splat(0),
-    fresh_versions: [8]bool = @splat(false),
     texts: [8][32]u8 = @splat(@splat(0)),
     text_lens: [8]usize = @splat(0),
 
@@ -84,20 +82,8 @@ const Gated = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const index: usize = @intCast(self.calls.fetchAdd(1, .acq_rel));
         self.started.store(true, .release);
-        if (index < self.generations.len) {
-            self.generations[index] = material.generation;
+        if (index < self.related_counts.len) {
             self.related_counts[index] = material.related.len;
-            for (material.related) |related| {
-                if (std.mem.indexOf(u8, related.content, "fifo alpha fact") == null or related.version.len != 64) continue;
-                var valid = true;
-                for (related.version) |c| {
-                    if (!std.ascii.isHex(c)) {
-                        valid = false;
-                        break;
-                    }
-                }
-                if (valid) self.fresh_versions[index] = true;
-            }
             const text = material.sources[0].text;
             const count = @min(text.len, self.texts[index].len);
             @memcpy(self.texts[index][0..count], text[0..count]);

@@ -4,10 +4,9 @@ const p = @import("protocol.zig");
 pub const Category = enum { preferences, project, environment, solutions, pitfalls };
 pub const EvidenceKind = enum { user, tool, assistant };
 pub const Evidence = struct { id: usize, kind: EvidenceKind, text: []const u8 };
-pub const Related = struct { category: Category, topic: []const u8, content: []const u8, version: []const u8 };
+pub const Related = struct { category: Category, topic: []const u8, content: []const u8 };
 pub const Material = struct {
     id: []const u8,
-    generation: u64,
     created_ms: u64,
     sources: []const Evidence,
     related: []const Related = &.{},
@@ -17,8 +16,6 @@ pub const Candidate = struct {
     category: Category,
     topic: []const u8,
     content: []const u8,
-    expected_version: ?[]const u8 = null,
-    expires_at_ms: ?u64 = null,
 };
 /// All extractor results (including partially allocated results on errors) use
 /// the caller's allocator and belong to its task arena. The caller destroys that
@@ -46,24 +43,11 @@ pub const Service = struct {
         return filtered.toOwnedSlice(a);
     }
 };
-pub fn validateCandidate(material: Material, candidate: Candidate) !void {
+pub fn validateCandidate(_: Material, candidate: Candidate) !void {
     if (candidate.topic.len == 0 or candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.trim(u8, candidate.content, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(candidate.content) or std.mem.findScalar(u8, candidate.content, 0) != null or sensitiveMaterial(candidate.topic) or sensitiveMaterial(candidate.content)) return error.InvalidMemoryCandidate;
     for (candidate.topic, 0..) |c, i| {
         if (!(c >= 'a' and c <= 'z') and !(c >= '0' and c <= '9') and !(i != 0 and c == '-' and candidate.topic[i - 1] != '-')) return error.InvalidMemoryCandidate;
     }
-    if (candidate.expected_version) |expected| {
-        if (expected.len != 64) return error.InvalidMemoryVersion;
-        for (expected) |c| if (!std.ascii.isHex(c)) return error.InvalidMemoryVersion;
-        var authorized = false;
-        for (material.related) |related| {
-            if (related.category == candidate.category and std.mem.eql(u8, related.topic, candidate.topic) and std.mem.eql(u8, related.version, expected)) {
-                authorized = true;
-                break;
-            }
-        }
-        if (!authorized) return error.InvalidMemoryVersion;
-    }
-    if (candidate.expires_at_ms) |end| if (end <= material.created_ms) return error.InvalidMemoryCandidate;
 }
 
 /// Only explicit PEM private-key headers are recognized here. The coordinator

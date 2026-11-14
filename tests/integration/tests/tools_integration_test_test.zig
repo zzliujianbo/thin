@@ -269,9 +269,9 @@ test "session and log reads retain file safety and credential guards without per
             }
             // No file-delete tool exists. The only structured delete is Memory,
             // whose topic validation must not permit targeting session/log paths.
-            const delete_args = try std.fmt.allocPrint(temp, "{{\"action\":\"delete\",\"topic\":\"{s}\",\"expected_version\":\"fake\"}}", .{path});
+            const delete_args = try std.fmt.allocPrint(temp, "{{\"action\":\"delete\",\"topic\":\"{s}\"}}", .{path});
             try std.testing.expectError(error.InvalidMemoryTopic, executor.prepare_fn(executor.context, temp, .{ .id = "delete", .name = "memory", .arguments = delete_args }));
-            try std.testing.expectError(error.InvalidTopic, tools.execute(temp, .{ .memory = .{ .action = .delete, .topic = path, .expected_version = "fake" } }, &cancel));
+            try std.testing.expectError(error.InvalidTopic, tools.execute(temp, .{ .memory = .{ .action = .delete, .topic = path } }, &cancel));
             try std.testing.expectError(error.UnknownTool, executor.prepare_fn(executor.context, temp, .{ .id = "delete", .name = "delete_file", .arguments = args }));
         }
         const unchanged = try root.read(temp, canonical, 0, 128);
@@ -607,14 +607,15 @@ test "mutating file and Memory tool allocation failures precede commits" {
         var setup = std.heap.ArenaAllocator.init(a);
         defer setup.deinit();
         const original: ?mem.Entry = if (operation == .memory_update or operation == .memory_delete)
-            try store.write(setup.allocator(), "core", "old", null)
+            try store.create(setup.allocator(), "core", "old")
         else
             null;
+        _ = original;
         const action: t.Action = switch (operation) {
             .file_create => .{ .write_file = .{ .path = "created.txt", .content = "new" } },
             .memory_create => .{ .memory = .{ .action = .write, .topic = "core", .content = "new" } },
-            .memory_update => .{ .memory = .{ .action = .write, .topic = "core", .content = "new", .expected_version = original.?.version } },
-            .memory_delete => .{ .memory = .{ .action = .delete, .topic = "core", .expected_version = original.?.version } },
+            .memory_update => .{ .memory = .{ .action = .write, .topic = "core", .content = "new" } },
+            .memory_delete => .{ .memory = .{ .action = .delete, .topic = "core" } },
         };
         var reached_success = false;
         for (0..256) |fail_index| {
@@ -633,7 +634,6 @@ test "mutating file and Memory tool allocation failures precede commits" {
                     .memory_update, .memory_delete => {
                         const current = try store.read(check.allocator(), "core");
                         try std.testing.expectEqualStrings("old", current.content);
-                        try std.testing.expectEqualStrings(original.?.version, current.version);
                     },
                 }
                 continue;
@@ -650,7 +650,7 @@ test "mutating file and Memory tool allocation failures precede commits" {
             } else {
                 const current = try store.read(attempt.allocator(), "core");
                 try std.testing.expectEqualStrings("new", current.content);
-                try std.testing.expectEqualStrings(current.version, j.string(j.get(value, "version")).?);
+                try std.testing.expectEqualStrings("written", j.string(j.get(value, "operation")).?);
             }
             reached_success = true;
             break;

@@ -8,7 +8,6 @@
 // 依赖 Node 内置模块：http 提供伪造服务，child_process 启动 CLI 与 PTY 驱动，assert 做断言。
 
 import http from 'node:http';
-import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
@@ -491,17 +490,15 @@ async function runScenario(name, protocol, kind, isPty = false) {
         assert.equal(protocol,'chat');
         assert(rounds <= 2, 'memory summary request bound');
         const content = 'memory-summary-hidden-body';
-        const version = createHash('sha256').update(content).digest('hex');
         if (rounds === 1) send(res,protocol,'',[
           tool('mem_write','memory',{action:'write',topic:'caption-note',content}),
           tool('mem_read','memory',{action:'read',topic:'caption-note'}),
           tool('mem_list','memory',{action:'list'}),
-          tool('mem_delete','memory',{action:'delete',topic:'caption-note',expected_version:version})
+          tool('mem_delete','memory',{action:'delete',topic:'caption-note'})
         ]); else {
           for (const id of ['mem_write','mem_read','mem_list','mem_delete']) assert(outputs.has(id), 'memory paired result absent');
           assert.equal(JSON.parse(outputs.get('mem_read')).content,content);
-          assert.equal(JSON.parse(outputs.get('mem_read')).version,version);
-          assert.equal(await exists(join(project,'.thin','mem','caption-note.md')),false);
+          assert.equal(await exists(join(project,'.thin','memory','caption-note.md')),false);
           send(res,protocol,'memory-summary-final-answer');
         }
         return;

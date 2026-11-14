@@ -3,7 +3,7 @@ const display_text = @import("../util/display_text.zig");
 
 pub const Phase = enum { extracting, saving };
 pub const Result = enum { saved, skipped, failed, uncertain, canceled };
-pub const Failure = enum { canceled, unavailable, invalid_output, conflict, busy, storage, cleanup, other };
+pub const Failure = enum { canceled, unavailable, invalid_output, busy, storage, cleanup, other };
 pub const Active = struct { id: u64, phase: Phase };
 
 /// Fixed owned, single-line terminal-safe text. Appends separate saved entries.

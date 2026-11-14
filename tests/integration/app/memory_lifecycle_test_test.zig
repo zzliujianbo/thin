@@ -11,9 +11,8 @@ test "initial core failures reach Session queue exactly once" {
         try env.put("HOME", root.path);
         if (!busy) {
             var store = @import("../tools/memory.zig").Store.init(&root);
-            const entry = try store.write(a, "core", "known owned-memory-lifecycle-key", null);
+            const entry = try store.create(a, "core", "known owned-memory-lifecycle-key");
             a.free(entry.content);
-            a.free(entry.version);
         }
         const held = try fs.openDirectory(root.dir.handle, ".");
         defer fs.closeFd(held);

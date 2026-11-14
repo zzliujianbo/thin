@@ -1,4 +1,4 @@
-const test_material: k.Material = .{ .id = "synthetic", .generation = 1, .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Use Zig for this project." }} };
+const test_material: k.Material = .{ .id = "synthetic", .created_ms = 100, .sources = &.{.{ .id = 0, .kind = .user, .text = "Use Zig for this project." }} };
 
 const test_item = "{\"category\":\"project\",\"topic\":\"language\",\"content\":\"Zig is preferred.\"}";
 
