@@ -78,6 +78,23 @@ pub const Repository = struct {
         return std.fmt.allocPrint(a, "{s}: {s} {s}{s}{s}\n", .{ @tagName(candidate.category), candidate.topic, normalized[0..preview_len], marker, json });
     }
 
+    /// Public read semantic: V3 records return their content, manual raw
+    /// topics return their raw body, and legacy v1/v2 records are invisible.
+    /// Corrupt V3 records remain errors instead of leaking framing bytes.
+    pub fn readContent(self: *Repository, a: std.mem.Allocator, topic: []const u8) ![]u8 {
+        const entry = try self.store.read(a, topic);
+        defer a.free(entry.content);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const record = decode(scratch.allocator(), topic, entry.content) catch |err| switch (err) {
+            error.InvalidKnowledgeRecord => return error.InvalidKnowledgeRecord,
+            else => return err,
+        };
+        if (record) |r| return a.dupe(u8, r.content);
+        if (isLegacy(entry.content)) return error.FileNotFound;
+        return a.dupe(u8, entry.content);
+    }
+
     pub fn related(self: *Repository, a: std.mem.Allocator, query: []const u8, now_ms: u64) ![]const knowledge.Related {
         _ = now_ms;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -184,7 +201,11 @@ fn decode(a: std.mem.Allocator, key: []const u8, text: []const u8) !?Record {
     const pos = std.mem.find(u8, text, marker) orelse return null;
     // The prefix is a preview, not the authoritative record; accept complete
     // valid records regardless of the length of that untrusted preview.
-    const parsed = std.json.parseFromSlice(Record, a, text[pos + marker.len ..], .{ .allocate = .alloc_always }) catch |err| {
+    const parsed = std.json.parseFromSlice(Record, a, text[pos + marker.len ..], .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| {
         if (err == error.OutOfMemory) return err;
         return error.InvalidKnowledgeRecord;
     };

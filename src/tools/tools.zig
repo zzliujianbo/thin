@@ -12,6 +12,7 @@ const settings = struct {
     const relative_path = ".thin/settings.json";
 };
 const mem = @import("memory.zig");
+const knowledge_store = @import("knowledge_store.zig");
 const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");
 const runtime = @import("../core/runtime.zig");
@@ -971,11 +972,12 @@ pub const Tools = struct {
                 },
 
                 .read => {
-                    const entry = try self.memory.read(a, m.topic.?);
+                    var repository = knowledge_store.Repository.init(self.memory);
+                    const content = try repository.readContent(a, m.topic.?);
+                    defer a.free(content);
                     try j.put(a, &value, "topic", j.str(m.topic.?));
-                    try j.put(a, &value, "content", j.str(entry.content));
+                    try j.put(a, &value, "content", j.str(content));
                     const encoded = try j.encode(a, value);
-                    a.free(entry.content);
                     return .{ .text = encoded };
                 },
 

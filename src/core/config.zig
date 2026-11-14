@@ -357,11 +357,11 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, disk: bool, com
     // 语义校验失败时需要释放已解析的内存。
     parsed.arena.child_allocator = allocator;
     errdefer release(&parsed);
-    if (unresolved) try validatePendingSettings(parsed.value) else try validate(parsed.value);
     // Codex is a Responses variant; normalize only the effective in-memory
     // selection, never rewrite the user's config file.
     if (isCodexProvider(parsed.value.provider) and parsed.value.model.protocol == .auto)
         parsed.value.model.protocol = .responses;
+    if (unresolved) try validatePendingSettings(parsed.value) else try validate(parsed.value);
     return parsed;
 }
 
@@ -504,8 +504,8 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const memory = if (root.get("memory")) |v| try decode(MemoryConfig, a, v) else MemoryConfig{};
         break :blk .{ .proxy = proxy, .decision = decision, .image = image, .memory = memory, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
-    try validate(result);
     if (isCodexProvider(result.provider) and result.model.protocol == .auto) result.model.protocol = .responses;
+    try validate(result);
     tree.arena.child_allocator = allocator;
     return .{ .arena = tree.arena, .value = result };
 }

@@ -559,7 +559,10 @@ pub const Runtime = struct {
         var selector = if (connection_changed) initialSelector(candidate) else self.selector;
         if (protocol_changed and !connection_changed) {
             selector = llm.Selector.init(next.protocol);
-            if (next.protocol == .auto and self.history.items.len != 0) {
+            if (next.protocol == .auto and cfg.isCodexProvider(candidate.provider)) {
+                selector.selected = .responses;
+                selector.initial_attempted = true;
+            } else if (next.protocol == .auto and self.history.items.len != 0) {
                 selector.selected = self.selector.effective();
                 selector.initial_attempted = true;
             }
@@ -1678,7 +1681,7 @@ pub const Runtime = struct {
         messages_[0] = try p.textMessage(a, .user, view);
         const raw = context.rawTokens(instruction, &.{}, messages_);
         const effective = self.effectiveConfig();
-        const summary_request = withReasoning(effective, .{
+        var summary_request = withReasoning(effective, .{
             .scope = .{ .connection = effective.provider.base_url, .model = effective.model.name, .protocol = self.selector.effective() },
             .system = instruction,
             .tools = &.{},
@@ -1690,6 +1693,7 @@ pub const Runtime = struct {
         // Reject an unsendable complete summary request before counting an
         // inference attempt. Input/protocol rejection is not a paid summary
         // failure and must preserve its explicit error and recovery semantics.
+        summary_request.codec = try cfg.wireCodec(effective, summary_request.scope.protocol);
         try context.checkInputFor(effective, .summary, self.estimator.tokens(raw));
         try @import("checkpoint.zig").validateRequestHistory(a, summary_request);
 

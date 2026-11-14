@@ -126,6 +126,21 @@ test "codex refresh redaction material is absent from headers and body" {
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, canary) == null);
 }
+test "wire payload requires an explicit matching codec" {
+    const a = std.testing.allocator;
+    var config: cfg.Config = .{
+        .provider = .{ .base_url = "https://fixture.invalid/v1", .api_key = "fake-key" },
+        .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .responses },
+        .limits = .{ .request_timeout_ms = 60000 },
+    };
+    var client = try Client.init(a, std.testing.io, &config, "fake-key");
+    defer client.deinit();
+    var request = @import("../tests/adapter_test_support.zig").request(.responses);
+    request.wire = try a.dupe(u8, "{}");
+    defer a.free(request.wire.?);
+    var job: Client.Job = .{ .client = &client, .allocator = a, .request = request, .sink = .{}, .start = Io.Clock.awake.now(std.testing.io) };
+    try std.testing.expectError(error.IncompatibleModelProtocol, Client.perform(&job));
+}
 test "codex header values reject control characters" {
     for ([_][]const u8{ "", "bad\rvalue", "bad\nvalue", "bad\x00value", "bad\x7fvalue" }) |value| {
         try std.testing.expectError(error.InvalidCredential, validateHeaderValue(value));

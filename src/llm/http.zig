@@ -444,6 +444,7 @@ pub const Client = struct {
         const a = scratch.allocator();
         const protocol = job.request.scope.protocol;
         const expected_codec = try cfg.wireCodec(job.client.config.*, protocol);
+        if (job.request.wire != null and job.request.codec == null) return error.IncompatibleModelProtocol;
         const codec = job.request.codec orelse expected_codec;
         if (codec != expected_codec) return error.IncompatibleModelProtocol;
         const wire_proto: p.Protocol = switch (codec) {

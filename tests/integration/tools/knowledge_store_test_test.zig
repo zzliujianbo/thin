@@ -29,6 +29,9 @@ test "V3 create unchanged baseline update skip and legacy ignore" {
     try std.testing.expectEqualStrings("中文 rust", related[0].content);
     material.related = related;
     try std.testing.expectEqual(repo.Apply.updated, try repository.apply(a, material, candidate));
+    const read_back = try repository.readContent(a, "project-language");
+    defer a.free(read_back);
+    try std.testing.expectEqualStrings("rust updated", read_back);
 
     // Same content under a different category is a separate record.
     candidate.category = .preferences;
@@ -53,6 +56,18 @@ test "V3 create unchanged baseline update skip and legacy ignore" {
     const page = try store.listPage(a, 0, 100);
     try std.testing.expect(std.mem.find(u8, page.text, "legacy") == null);
     try std.testing.expectEqual(repo.Apply.skipped, try repository.apply(a, material, .{ .category = .project, .topic = "legacy", .content = "Zig new" }));
+    try std.testing.expectError(error.FileNotFound, repository.readContent(a, "project-legacy"));
+
+    // Corrupt/unknown V3 fields are rejected instead of leaking framing.
+    const malformed = "project: bad\n\n<!-- thin-knowledge-v3 -->\n{\"schema\":3,\"source\":\"" ++ id ++ "\",\"created_ms\":1,\"category\":\"project\",\"topic\":\"bad\",\"content\":\"bad\",\"extra\":true}\n";
+    _ = try store.replace(a, "project-bad", malformed);
+    try std.testing.expectError(error.InvalidKnowledgeRecord, repository.readContent(a, "project-bad"));
+
+    // Unmarked manual raw topics remain readable as their raw content.
+    _ = try store.replace(a, "manual-raw", "raw manual fact");
+    const manual = try repository.readContent(a, "manual-raw");
+    defer a.free(manual);
+    try std.testing.expectEqualStrings("raw manual fact", manual);
 }
 
 test "related records preserve complete conditions without versions" {

@@ -160,6 +160,9 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
         model = manual.apply(model);
         if (manual.context_tokens != null) official = false;
     }
+    // Codex is a Responses variant selected by provider; resolve it before
+    // capability/threshold lookup and before the auto authority check.
+    if (cfg.isCodexProvider(provider.connection) and model.protocol == .auto) model.protocol = .responses;
     // Only the current declaration authorizes auto. An archive is history, not
     // authority to probe a protocol or borrow stale request capabilities.
     if (model.protocol == .auto and (patch == null or patch.?.protocol == null)) return error.UnknownModelProtocol;
@@ -182,8 +185,7 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
 pub fn resolve(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8, historical: bool) !Selection {
     const registry = config.registry orelse return error.DefaultProviderUnavailable;
     const provider = registry.find(provider_name) orelse return error.DefaultProviderUnavailable;
-    var selected = try resolveOne(config, cache, provider, raw_id, historical);
-    if (cfg.isCodexProvider(selected.connection) and selected.model.protocol == .auto) selected.model.protocol = .responses;
+    const selected = try resolveOne(config, cache, provider, raw_id, historical);
     return .{
         .connection = try ownConnection(a, selected.connection),
         .model = try ownModel(a, selected.model),

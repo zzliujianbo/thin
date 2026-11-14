@@ -8,6 +8,9 @@ test "resume codec v3 roundtrip allocation cleanup no credentials or identity bi
     defer a.free(payload);
     const bytes = try encode(a, test_id, &s, payload);
     defer a.free(bytes);
+    const unchecked = try encodeUnchecked(a, test_id, &s, payload);
+    defer a.free(unchecked);
+    try std.testing.expectEqualStrings(bytes, unchecked);
     try std.testing.expectEqual(@as(u8, 3), bytes[8]);
     try std.testing.expectEqual(@as(u64, @intCast(payload.len)), std.mem.readInt(u64, bytes[13..21], .little));
     const selection_len = std.mem.readInt(u32, bytes[9..13], .little);

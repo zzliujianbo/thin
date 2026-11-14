@@ -80,8 +80,8 @@ fn firstSeqAfter(items: []const Entry, since: u64) usize {
     return lo;
 }
 
-/// Bounded FIFO of already-encoded events. Owns each json buffer; evicts the
-/// oldest entries when the count or byte budget would be exceeded.
+/// History storage for already-encoded events. Owns each json buffer; bytes is
+/// diagnostic and eviction is reserved for a future queue policy.
 const Ring = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(Entry) = .empty,
@@ -98,7 +98,9 @@ const Ring = struct {
     }
 
     fn push(self: *Ring, seq: u64, json: []u8) !void {
-        // The caller retains ownership unless append succeeds.
+        // firstSeqAfter relies on strict ordering; the caller retains ownership
+        // unless append succeeds.
+        if (self.items.items.len != 0 and seq <= self.items.items[self.items.items.len - 1].seq) return error.InvalidSequence;
         try self.items.append(self.allocator, .{ .seq = seq, .json = json });
         self.bytes +|= json.len;
     }
