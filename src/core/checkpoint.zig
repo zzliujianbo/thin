@@ -245,6 +245,13 @@ pub fn validateStructure(state: State) !void {
 /// Validate the ACTUAL request, independent of persisted selectors, budgets or
 /// poison flags. Used before every model boundary, including fake models.
 pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
+    const wire = try validateRequestHistoryWire(a, req);
+    a.free(wire);
+}
+
+/// Validate and return the exact outgoing wire payload for callers that can
+/// reuse it without re-encoding. The caller owns the returned slice.
+pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
     const proto = req.scope.protocol;
     if (proto == .auto) return error.InvalidSelector;
     if (proto == .systemone) return error.SystemOneNotChatModel;
@@ -286,13 +293,12 @@ pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
     _ = try context.boundaries(t, req.messages);
     // Exercise actual outgoing history validation and native-reasoning requirements.
     // No network calls.
-    const wire = switch (proto) {
-        .chat => try chat.encode(t, req),
-        .responses => try responses.encode(t, req),
-        .anthropic => try anthropic.encode(t, req),
+    return switch (proto) {
+        .chat => try chat.encode(a, req),
+        .responses => try responses.encode(a, req),
+        .anthropic => try anthropic.encode(a, req),
         .auto, .systemone => unreachable,
     };
-    _ = wire;
 }
 
 fn sameCall(a: p.ToolCall, b: p.ToolCall) bool {

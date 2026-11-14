@@ -1444,11 +1444,18 @@ pub const Runtime = struct {
         // Sticky process-safety failure wins over cancellation, validation and
         // every normal/summary/fallback invocation, including this same task.
         if (self.poisoned) return error.CleanupFailed;
-        try @import("checkpoint.zig").validateRequestHistory(a, req);
+        const wire = try @import("checkpoint.zig").validateRequestHistoryWire(a, req);
+        var send_req = req;
+        if (req.scope.protocol == .chat or req.scope.protocol == .anthropic) {
+            send_req.wire = wire;
+        } else {
+            a.free(wire);
+        }
+        defer if (send_req.wire != null) a.free(wire);
         const estimated = self.estimator.tokens(context.rawTokens(req.system, req.tools, req.messages));
         try context.checkInputFor(self.config.*, req.purpose, estimated);
         // Display-only work must not alter Selector observation/fallback/accounting.
-        if (req.purpose != .normal) return self.callModel(a, req, sink);
+        if (req.purpose != .normal) return self.callModel(a, send_req, sink);
         var uncanceled: p.Cancellation = .{};
         const cancel = req.cancellation orelse &uncanceled;
         self.beginToolViews(cancel);
@@ -1459,7 +1466,7 @@ pub const Runtime = struct {
         };
         if (controller) |value| value.* = .{ .allocator = self.allocator, .generation = self.display_generation, .schemas = req.tools };
         var forward = PreviewForward{ .runtime = self, .controller = controller, .original = sink, .cancel = cancel };
-        const outcome = self.callModel(a, req, .{ .context = &forward, .emit_fn = PreviewForward.emit }) catch |err| {
+        const outcome = self.callModel(a, send_req, .{ .context = &forward, .emit_fn = PreviewForward.emit }) catch |err| {
             self.discardToolViews(cancel);
             return err;
         };

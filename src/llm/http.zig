@@ -463,8 +463,10 @@ pub const Client = struct {
         } else if (isCodexConfig(self.config) or std.mem.eql(u8, self.config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
         const authorization = auth_owned orelse self.authorization;
 
-        // 按协议选择编码器：Chat Completions 或 Responses。
-        const payload = switch (protocol) {
+        // 按协议选择编码器：Chat Completions 或 Responses。Chat/Anthropic
+        // may reuse the validated wire payload; Responses can differ for Codex
+        // credentials, so it always re-encodes.
+        const payload = if (job.request.wire) |wire| wire else switch (protocol) {
             .chat => try chat.encode(a, job.request),
             .responses => if (credential != null) try responses.encodeCodex(a, job.request) else try responses.encode(a, job.request),
             .anthropic => try anthropic.encode(a, job.request),

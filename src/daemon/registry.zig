@@ -45,6 +45,8 @@ pub const Record = struct {
     generation: u64,
     /// Index publication time (0 for a caller-built record before registering).
     updated_ms: u64 = 0,
+    /// Probe captured by list/resolve; no owned strings.
+    probe: Probe = .{},
 };
 
 /// Release a record returned by `resolve`/`list`. Accepts a const pointer so a
@@ -256,12 +258,13 @@ pub const Registry = struct {
                         // One kernel+hello verified probe decides both visibility
                         // and the state the caller displays; it never starts a
                         // Runtime and never takes the controller role.
-                        const live_state = self.probeUnlocked(record, probe_timeout_ms).state;
-                        if (!probeVisible(live_state, running_only)) {
+                        const live_probe = self.probeUnlocked(record, probe_timeout_ms);
+                        record.probe = live_probe;
+                        if (!probeVisible(live_probe.state, running_only)) {
                             freeRecord(a, &record);
                             continue;
                         }
-                        const owned_state = a.dupe(u8, stateLabel(live_state)) catch |err| {
+                        const owned_state = a.dupe(u8, stateLabel(live_probe.state)) catch |err| {
                             freeRecord(a, &record);
                             return err;
                         };

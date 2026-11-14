@@ -213,6 +213,9 @@ pub const Request = struct {
     /// Local control only, never a provider request field.
     /// 中文：仅用于本地控制，不会作为字段发送给提供方。
     cancellation: ?*const Cancellation = null,
+    /// Optional already-validated wire payload. Only set for protocols whose
+    /// encoding does not depend on credentials; adapters may reuse it.
+    wire: ?[]u8 = null,
 };
 
 /// Display-only identity, separate from canonical call IDs and approval IDs.

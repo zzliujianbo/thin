@@ -432,8 +432,7 @@ const Supervisor = struct {
         try out.ok(request.id);
         try out.beginArray("sessions");
         for (records) |record| {
-            const probe = self.registry.probe(record, probe_timeout_ms);
-            const json = try self.sessionJson(record, probe);
+            const json = try self.sessionJson(record, record.probe);
             defer self.allocator.free(json);
             try out.element(json);
         }

@@ -69,6 +69,17 @@ const Entry = struct {
     json: []u8,
 };
 
+/// First index whose sequence is greater than `since`; entries are sorted by seq.
+fn firstSeqAfter(items: []const Entry, since: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (items[mid].seq <= since) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
 /// Bounded FIFO of already-encoded events. Owns each json buffer; evicts the
 /// oldest entries when the count or byte budget would be exceeded.
 const Ring = struct {
@@ -1470,11 +1481,9 @@ pub const SessionHost = struct {
         // viewer. A jump means content is gone (shortened context).
         var covered = since;
         const lives = self.events.items.items;
-        var live_index: usize = 0;
-        while (live_index < lives.len and lives[live_index].seq <= since) live_index += 1;
+        var live_index = firstSeqAfter(lives, since);
         const rows = self.history.items.items;
-        var row_index: usize = 0;
-        while (row_index < rows.len and rows[row_index].seq <= since) row_index += 1;
+        var row_index = firstSeqAfter(rows, since);
         const budget = if (protocol.max_response > response_reserve) protocol.max_response - response_reserve else 0;
         scan: while (true) {
             const live_seq: ?u64 = if (live_index < lives.len) lives[live_index].seq else null;
