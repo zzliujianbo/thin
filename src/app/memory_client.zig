@@ -133,8 +133,9 @@ pub const Client = struct {
         try context.checkInput(config, estimated);
         const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
         const wire = capabilities.wire(config.model.reasoning_effort);
-        const request: p.Request = .{
+        var request: p.Request = .{
             .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = config.model.protocol },
+            .codec = try cfg.wireCodec(config, config.model.protocol),
             .system = codec.instruction,
             .tools = &.{},
             .messages = &messages,
@@ -145,8 +146,10 @@ pub const Client = struct {
             .purpose = .normal,
             .cancellation = cancel,
         };
-        // Validate the actual frozen request before counting an inference attempt.
-        try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
+        // Validate and reuse the exact frozen wire before counting an inference attempt.
+        const wire_payload = try @import("../core/checkpoint.zig").validateRequestHistoryWire(a, request);
+        request.wire = wire_payload;
+        defer a.free(wire_payload);
         try self.check(cancel);
         var hash = std.hash.Wyhash.init(0);
         hash.update(config.model.name);

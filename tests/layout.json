@@ -1334,6 +1334,14 @@
       "unit": true
     },
     {
+      "virtual": "src/llm/codex.zig",
+      "production": "src/llm/codex.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
       "virtual": "src/llm/sse.zig",
       "production": "src/llm/sse.zig",
       "support": "tests/support/llm/sse.zig",

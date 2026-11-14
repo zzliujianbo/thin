@@ -11,6 +11,21 @@ test "checkpoint DTO excludes OAuth config and preserves frozen context" {
     try std.testing.expectEqual(state.context_tokens, decoded.value.context_tokens);
     try std.testing.expectEqual(state.selector.selected, decoded.value.selector.selected);
 }
+test "codex wire codec emits codex fields and rejects empty system" {
+    const a = std.testing.allocator;
+    var req = fixtureRequest(fixture(.responses), fixture_config);
+    req.codec = .codex_responses;
+    const wire = try validateRequestHistoryWire(a, req);
+    defer a.free(wire);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("low", object.get("text").?.object.get("verbosity").?.string);
+    try std.testing.expectEqualStrings("auto", object.get("tool_choice").?.string);
+    try std.testing.expect(object.get("parallel_tool_calls").?.bool);
+    req.system = "   ";
+    try std.testing.expectError(error.EmptyInstructions, validateRequestHistoryWire(a, req));
+}
 test "checkpoint reads retired v2 budget fields without re-emitting them" {
     const a = std.testing.allocator;
     const bytes = try encode(a, fixture(.chat));

@@ -412,8 +412,9 @@ pub const Client = struct {
         try context.checkInput(config, estimated);
         const capabilities = thinking.resolve(config.provider.base_url, config.model.name, config.model.reasoning);
         const wire = capabilities.wire(config.model.reasoning_effort);
-        const request: p.Request = .{
+        var request: p.Request = .{
             .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = config.model.protocol },
+            .codec = try cfg.wireCodec(config, config.model.protocol),
             .system = system,
             .tools = &.{},
             .messages = &messages,
@@ -424,7 +425,9 @@ pub const Client = struct {
             .cancellation = cancel,
         };
         // Local wire/capability failures are not attempted inference calls.
-        try @import("../core/checkpoint.zig").validateRequestHistory(a, request);
+        const wire_payload = try @import("../core/checkpoint.zig").validateRequestHistoryWire(a, request);
+        request.wire = wire_payload;
+        defer a.free(wire_payload);
         if (cancel.isRequested()) return error.Canceled;
         self.calls +|= 1;
         attempt(span);

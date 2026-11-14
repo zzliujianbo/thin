@@ -5,6 +5,20 @@ const std = @import("std");
 
 /// auto probes only Responses/Chat. Anthropic Messages is selected explicitly.
 pub const Protocol = enum { auto, chat, responses, anthropic, systemone };
+
+/// Internal wire encoding/driver. Codex is a Responses variant but is not a
+/// public config/UI protocol and never enters ReplayScope.
+pub const WireCodec = enum { chat, responses, codex_responses, anthropic, systemone };
+
+pub fn defaultCodec(proto: Protocol) ?WireCodec {
+    return switch (proto) {
+        .chat => .chat,
+        .responses => .responses,
+        .anthropic => .anthropic,
+        .systemone => .systemone,
+        .auto => null,
+    };
+}
 /// 请求用途：normal 为普通对话，summary 为上下文压缩时生成滚动摘要。
 pub const Purpose = enum { normal, summary };
 /// 消息角色；context 为滚动摘要等注入的上下文，不是用户真实输入。
@@ -213,9 +227,11 @@ pub const Request = struct {
     /// Local control only, never a provider request field.
     /// 中文：仅用于本地控制，不会作为字段发送给提供方。
     cancellation: ?*const Cancellation = null,
-    /// Optional already-validated wire payload. Only set for protocols whose
-    /// encoding does not depend on credentials; adapters may reuse it.
+    /// Optional already-validated wire payload. Adapters may reuse it.
     wire: ?[]u8 = null,
+    /// Resolved wire driver. Codex is selected by provider, never by UI/config
+    /// protocol; null falls back to the public protocol for compatibility.
+    codec: ?WireCodec = null,
 };
 
 /// Display-only identity, separate from canonical call IDs and approval IDs.

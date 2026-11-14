@@ -10,6 +10,7 @@ const llm = @import("../llm/llm.zig");
 const common = @import("../llm/common.zig");
 const chat = @import("../llm/chat.zig");
 const responses = @import("../llm/responses.zig");
+const codex = @import("../llm/codex.zig");
 const anthropic = @import("../llm/anthropic.zig");
 const j = @import("../util/json.zig");
 const json_bound = @import("../app/json_bound.zig");
@@ -255,8 +256,16 @@ pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
     const proto = req.scope.protocol;
     if (proto == .auto) return error.InvalidSelector;
     if (proto == .systemone) return error.SystemOneNotChatModel;
-    try basic(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
-    try common.validateRequest(req, proto);
+    const codec = req.codec orelse p.defaultCodec(proto) orelse return error.InvalidSelector;
+    const wire_proto: p.Protocol = switch (codec) {
+        .chat => .chat,
+        .responses, .codex_responses => .responses,
+        .anthropic => .anthropic,
+        .systemone => .systemone,
+    };
+    if (wire_proto != proto) return error.IncompatibleModelProtocol;
+    try basic(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(wire_proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
+    try common.validateRequest(req, wire_proto);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const t = arena.allocator();
@@ -277,7 +286,7 @@ pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
         };
         if (m.replay) |r| {
             const native = try strictJson(t, r.json);
-            switch (proto) {
+            switch (wire_proto) {
                 .chat => try validateChat(t, m, native.value),
                 .responses => try validateResponses(t, m),
                 .anthropic => {
@@ -293,11 +302,12 @@ pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
     _ = try context.boundaries(t, req.messages);
     // Exercise actual outgoing history validation and native-reasoning requirements.
     // No network calls.
-    return switch (proto) {
+    return switch (codec) {
         .chat => try chat.encode(a, req),
         .responses => try responses.encode(a, req),
+        .codex_responses => try codex.encode(a, req),
         .anthropic => try anthropic.encode(a, req),
-        .auto, .systemone => unreachable,
+        .systemone => unreachable,
     };
 }
 

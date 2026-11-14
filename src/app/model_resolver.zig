@@ -182,7 +182,8 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
 pub fn resolve(a: Allocator, config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8, historical: bool) !Selection {
     const registry = config.registry orelse return error.DefaultProviderUnavailable;
     const provider = registry.find(provider_name) orelse return error.DefaultProviderUnavailable;
-    const selected = try resolveOne(config, cache, provider, raw_id, historical);
+    var selected = try resolveOne(config, cache, provider, raw_id, historical);
+    if (cfg.isCodexProvider(selected.connection) and selected.model.protocol == .auto) selected.model.protocol = .responses;
     return .{
         .connection = try ownConnection(a, selected.connection),
         .model = try ownModel(a, selected.model),

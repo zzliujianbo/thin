@@ -258,6 +258,15 @@ test "Codex identity and credential sources are strict" {
     defer release(&parsed);
     try std.testing.expectError(error.ApiKeyNotFound, resolveApiKey(a, parsed.value, &env));
 }
+test "Codex provider normalizes auto to responses and resolves codec" {
+    const a = std.testing.allocator;
+    const proto = @import("protocol.zig");
+    var parsed = try parse(a, codex_fixture);
+    defer release(&parsed);
+    try std.testing.expectEqual(proto.Protocol.responses, parsed.value.model.protocol);
+    try std.testing.expectEqual(proto.WireCodec.codex_responses, try wireCodec(parsed.value, .responses));
+    try std.testing.expectError(error.IncompatibleModelProtocol, wireCodec(parsed.value, .chat));
+}
 test "Codex pending refresh survives disk and clone" {
     const a = std.testing.allocator;
     const raw = try std.mem.replaceOwned(u8, a, codex_fixture, "\"expires_at_ms\":123456789", "\"expires_at_ms\":123456789,\"refresh_pending\":true");

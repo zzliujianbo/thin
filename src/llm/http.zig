@@ -9,6 +9,7 @@ const sse = @import("sse.zig");
 const j = @import("../util/json.zig");
 const chat = @import("chat.zig");
 const responses = @import("responses.zig");
+const codex = @import("codex.zig");
 const anthropic = @import("anthropic.zig");
 const common = @import("common.zig");
 const pool = @import("http_pool.zig");
@@ -373,11 +374,11 @@ pub const Client = struct {
         }
     };
 
-    fn performProxy(job: *Job, transport: *curl.Client, a: std.mem.Allocator, address: []const u8, payload: []const u8, credential: ?*const codex_auth.RequestCredential, authorization: []const u8) !p.Outcome {
+    fn performProxy(job: *Job, transport: *curl.Client, a: std.mem.Allocator, codec: p.WireCodec, wire_proto: p.Protocol, address: []const u8, payload: []const u8, credential: ?*const codex_auth.RequestCredential, authorization: []const u8) !p.Outcome {
         try job.checkBudget();
         try job.client.checkProxyCleanup();
         var header_buffer: [8]std.http.Header = undefined;
-        const extra = try job.client.requestHeaders(job.request.scope.protocol, credential, &header_buffer);
+        const extra = try job.client.requestHeaders(wire_proto, credential, &header_buffer);
         var headers: [9]std.http.Header = undefined;
         @memcpy(headers[0..extra.len], extra);
         var count = extra.len;
@@ -385,12 +386,11 @@ pub const Client = struct {
             headers[count] = .{ .name = "authorization", .value = authorization };
             count += 1;
         }
-        var stream: Stream = switch (job.request.scope.protocol) {
+        var stream: Stream = switch (codec) {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
-            .responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
+            .responses, .codex_responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
             .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
             .systemone => return error.UnsupportedProtocol,
-            .auto => unreachable,
         };
         var decoder = sse.Decoder.init(job.client.allocator, null, .{ .context = &stream, .emit_fn = Stream.feed });
         defer decoder.deinit();
@@ -443,6 +443,16 @@ pub const Client = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
         const protocol = job.request.scope.protocol;
+        const expected_codec = try cfg.wireCodec(job.client.config.*, protocol);
+        const codec = job.request.codec orelse expected_codec;
+        if (codec != expected_codec) return error.IncompatibleModelProtocol;
+        const wire_proto: p.Protocol = switch (codec) {
+            .chat => .chat,
+            .responses, .codex_responses => .responses,
+            .anthropic => .anthropic,
+            .systemone => .systemone,
+        };
+        if (wire_proto != protocol) return error.IncompatibleModelProtocol;
         try job.checkBudget();
         var credential: ?codex_auth.RequestCredential = null;
         defer if (credential) |*auth| auth.deinit(self.allocator);
@@ -463,21 +473,20 @@ pub const Client = struct {
         } else if (isCodexConfig(self.config) or std.mem.eql(u8, self.config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
         const authorization = auth_owned orelse self.authorization;
 
-        // 按协议选择编码器：Chat Completions 或 Responses。Chat/Anthropic
-        // may reuse the validated wire payload; Responses can differ for Codex
-        // credentials, so it always re-encodes.
-        const payload = if (job.request.wire) |wire| wire else switch (protocol) {
+        // 按已解析的 wire codec 选择编码器。Codex 是 Responses 的内部变体，
+        // 不再根据 credential 是否存在猜测 body。
+        const payload = if (job.request.wire) |wire| wire else switch (codec) {
             .chat => try chat.encode(a, job.request),
-            .responses => if (credential != null) try responses.encodeCodex(a, job.request) else try responses.encode(a, job.request),
+            .responses => try responses.encode(a, job.request),
+            .codex_responses => try codex.encode(a, job.request),
             .anthropic => try anthropic.encode(a, job.request),
             .systemone => return error.UnsupportedProtocol,
-            .auto => unreachable,
         };
 
         // 去掉 base_url 结尾的斜杠，再拼接各协议固定的端点路径。
-        const address = try requestAddress(a, self.config.provider.base_url, protocol);
+        const address = try requestAddress(a, self.config.provider.base_url, wire_proto);
 
-        if (self.proxy_http) |*transport| return performProxy(job, transport, a, address, payload, if (credential) |*auth| auth else null, authorization);
+        if (self.proxy_http) |*transport| return performProxy(job, transport, a, codec, wire_proto, address, payload, if (credential) |*auth| auth else null, authorization);
 
         // Before acquiring a socket, drop expired/closed/unread idle connections.
         // This sends nothing and never retries a POST. boot includes suspend time.
@@ -538,12 +547,11 @@ pub const Client = struct {
 
         // 根据协议创建对应的流解析器，解析器的事件通过 sink 转发出去。
         const sink = p.ModelSink{ .context = job, .emit_fn = Job.emit };
-        var stream: Stream = switch (protocol) {
+        var stream: Stream = switch (codec) {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, sink) },
-            .responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, sink) },
+            .responses, .codex_responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, sink) },
             .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, sink) },
             .systemone => return error.UnsupportedProtocol,
-            .auto => unreachable,
         };
 
         var decoder = sse.Decoder.init(self.allocator, null, .{

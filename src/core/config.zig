@@ -358,6 +358,10 @@ fn parseBounded(allocator: std.mem.Allocator, bytes: []const u8, disk: bool, com
     parsed.arena.child_allocator = allocator;
     errdefer release(&parsed);
     if (unresolved) try validatePendingSettings(parsed.value) else try validate(parsed.value);
+    // Codex is a Responses variant; normalize only the effective in-memory
+    // selection, never rewrite the user's config file.
+    if (isCodexProvider(parsed.value.provider) and parsed.value.model.protocol == .auto)
+        parsed.value.model.protocol = .responses;
     return parsed;
 }
 
@@ -454,7 +458,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory")) return error.UnknownField;
     }
     const llm_value = root.get("llm") orelse return error.MissingField;
-    const result: Config = blk: {
+    var result: Config = blk: {
         const llm = try object(llm_value);
         var lk = llm.iterator();
         while (lk.next()) |entry| {
@@ -501,6 +505,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         break :blk .{ .proxy = proxy, .decision = decision, .image = image, .memory = memory, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
     try validate(result);
+    if (isCodexProvider(result.provider) and result.model.protocol == .auto) result.model.protocol = .responses;
     tree.arena.child_allocator = allocator;
     return .{ .arena = tree.arena, .value = result };
 }
@@ -657,6 +662,26 @@ pub fn release(parsed: *std.json.Parsed(Config)) void {
     parsed.arena.child_allocator = wiping.allocator();
     parsed.deinit();
     parsed.* = undefined;
+}
+
+/// Codex is selected by provider identity, not by model name or UI protocol.
+pub fn isCodexProvider(provider: Provider) bool {
+    return provider.kind == .openai_codex and std.mem.eql(u8, provider.base_url, providers.Id.openai_codex.baseUrl());
+}
+
+/// Resolve the internal wire driver from the public protocol and provider.
+pub fn wireCodec(config: Config, proto: protocol.Protocol) !protocol.WireCodec {
+    if (isCodexProvider(config.provider)) return switch (proto) {
+        .responses, .auto => .codex_responses,
+        else => error.IncompatibleModelProtocol,
+    };
+    return switch (proto) {
+        .chat => .chat,
+        .responses => .responses,
+        .anthropic => .anthropic,
+        .systemone => .systemone,
+        .auto => error.UnselectedProtocol,
+    };
 }
 
 pub fn validateKeySource(provider: Provider) !void {

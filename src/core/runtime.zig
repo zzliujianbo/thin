@@ -263,6 +263,10 @@ pub const Observer = struct {
 /// Shared by fresh runtimes and the explicit manual connectivity probe.
 pub fn initialSelector(config: cfg.Config) llm.Selector {
     var selector = llm.Selector.init(config.model.protocol);
+    if (config.model.protocol == .auto and cfg.isCodexProvider(config.provider)) {
+        selector.selected = .responses;
+        selector.initial_attempted = true;
+    }
     if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) {
         // Verified service protocol / declared Chat-only format is not a
         // reasoning-capability guess or an opportunity to probe Responses.
@@ -1444,14 +1448,11 @@ pub const Runtime = struct {
         // Sticky process-safety failure wins over cancellation, validation and
         // every normal/summary/fallback invocation, including this same task.
         if (self.poisoned) return error.CleanupFailed;
-        const wire = try @import("checkpoint.zig").validateRequestHistoryWire(a, req);
         var send_req = req;
-        if (req.scope.protocol == .chat or req.scope.protocol == .anthropic) {
-            send_req.wire = wire;
-        } else {
-            a.free(wire);
-        }
-        defer if (send_req.wire != null) a.free(wire);
+        send_req.codec = try cfg.wireCodec(self.config.*, req.scope.protocol);
+        const wire = try @import("checkpoint.zig").validateRequestHistoryWire(a, send_req);
+        send_req.wire = wire;
+        defer a.free(wire);
         const estimated = self.estimator.tokens(context.rawTokens(req.system, req.tools, req.messages));
         try context.checkInputFor(self.config.*, req.purpose, estimated);
         // Display-only work must not alter Selector observation/fallback/accounting.
