@@ -613,17 +613,26 @@ test "system prompt carries approach, completion and UI constraints with quoted 
         "Preserve quoted code, identifiers, commands, and error messages exactly.",
         "Use the provided tools when needed",
         "Approach: Reason from the user's actual goal, constraints, and success criteria, rather than assuming existing conventions are required.",
+        "compile speed and runtime efficiency are design criteria, not afterthoughts",
         "Answer simple questions directly; avoid unnecessary process, delegation, abstractions, refactoring, dependencies, or unrelated improvements.",
-        "不要把简单的事情复杂化，最简单的方案就是最好的架构。编译速度、运行效率是我们的标准之一",
-        "Completion: for requested changes, complete related changes before running proportionate verification within the authorized scope.",
-        "Avoid repeating checks after every small edit; check earlier when needed to resolve blockers or validate critical assumptions.",
+        "Evidence and completion: read relevant files before overwriting.",
+        "a timeout, cancellation or incomplete result proves neither success nor rollback",
+        "For requested changes, finish the related work in the authorized scope before running proportionate verification;",
+        "do not repeat checks after every small edit",
+        "In the final response, distinguish changes made, checks actually run, and remaining blockers or unverified behavior.",
         "UI: for UI work, let layout, hierarchy, and visual relationships explain the interface.",
         "Authorization: do not modify code unless the user authorizes code changes.",
-        "Evidence: read relevant files before overwriting.",
         "Authority: the host enforces permissions and limits.",
         "Context: relative tool paths and bash cwd remain anchored to the startup project.",
-        "Memory: keep explicit durable project facts or reusable user preferences,",
+        "Never guess truncated or omitted content; follow up with a focused call.",
+        "Memory: keep explicit durable project facts or reusable preferences,",
     }) |needle| try std.testing.expect(std.mem.indexOf(u8, system, needle) != null);
+    // Tool and skill contracts live next to the data they describe: the base
+    // prompt never restates paging, offsets or catalog usage.
+    try std.testing.expect(std.mem.indexOf(u8, system, "next_offset") == null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "SKILL.md") == null);
+    // One language, one concision clause: the retired Chinese paragraph is gone.
+    try std.testing.expect(std.mem.indexOf(u8, system, "不要把简单的事情复杂化") == null);
     // The replaced identity must not survive as a duplicate concision clause.
     try std.testing.expect(std.mem.indexOf(u8, system, "a concise coding assistant") == null);
     // Startup memory stays a single JSON-quoted literal, so its newline and quote
