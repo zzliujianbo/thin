@@ -74,6 +74,7 @@ const Entry = struct {
 const Ring = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(Entry) = .empty,
+    /// Diagnostic total of encoded bytes; no capacity cap.
     bytes: usize = 0,
     /// Only actual eviction establishes a gap: history-only sequence positions
     /// need not appear in this ring at all.
@@ -109,6 +110,7 @@ const Ring = struct {
 const LiveRing = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(Entry) = .empty,
+    /// Diagnostic total of unacknowledged bytes; no capacity cap.
     bytes: usize = 0,
     /// Contiguous retirement watermark: every position up to here is proven.
     reclaimed_through: u64 = 0,
@@ -279,6 +281,8 @@ pub const SessionHost = struct {
 
     events: LiveRing,
     history: Ring,
+    /// Tests only: lower the baseline byte budget; production uses the transport max.
+    test_history_budget: ?usize = null,
     pending_event: ?struct { item: bridge_mod.Item, json: []u8 } = null,
     pending_terminal: ?struct { terminal: r.Terminal, json: []u8 } = null,
     next_seq: u64 = 1,
@@ -296,10 +300,6 @@ pub const SessionHost = struct {
     /// is never replayed as if it were the original request.
     pending_name: ?[]u8 = null,
     pending_desc: ?[]u8 = null,
-    /// True when the stored detail is known to be a clipped prefix, either by
-    /// the Bridge display budget or by this host's own bound. A clipped detail
-    /// may be shown but never approved (`allow=true`); denying stays possible.
-    pending_detail_incomplete: bool = false,
 
     receipts: [16]Receipt = @splat(.{}),
     receipt_next: usize = 0,
@@ -654,7 +654,7 @@ pub const SessionHost = struct {
         switch (event) {
             .state => |phase| self.phase = phase,
             .context_snapshot => |snapshot| self.context = snapshot,
-            .permission => |permission| self.setPending(permission.id, permission.tool_name, permission.description, display_truncated),
+            .permission => |permission| self.setPending(permission.id, permission.tool_name, permission.description),
             .permission_cleared => |id| {
                 if (self.pending_permission == id) self.clearPending();
             },
@@ -711,11 +711,10 @@ pub const SessionHost = struct {
         }
     }
 
-    /// Owned, bounded copy of the approval detail plus id. The Bridge stays the
+    /// Owned copy of the approval detail plus id. The Bridge stays the
     /// authority for whether this id can still be answered.
-    fn setPending(self: *SessionHost, id: u64, tool_name: []const u8, description: []const u8, display_truncated: bool) void {
+    fn setPending(self: *SessionHost, id: u64, tool_name: []const u8, description: []const u8) void {
         self.clearPending();
-        self.pending_detail_incomplete = display_truncated;
         self.pending_permission = id;
         self.pending_name = self.allocator.dupe(u8, tool_name) catch null;
         self.pending_desc = self.allocator.dupe(u8, description) catch null;
@@ -732,7 +731,6 @@ pub const SessionHost = struct {
         self.pending_name = null;
         self.pending_desc = null;
         self.pending_permission = null;
-        self.pending_detail_incomplete = false;
     }
 
     fn takeSeq(self: *SessionHost) u64 {
@@ -1440,7 +1438,7 @@ pub const SessionHost = struct {
 
     pub fn watchBaseline(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {
         _ = try self.watchOwner(epoch);
-        return self.historyFrame(a, id, protocol.max_history, epoch);
+        return self.historyFrame(a, id, epoch);
     }
 
     pub const WatchPage = struct { frame: []u8, through: u64 };
@@ -1592,15 +1590,13 @@ pub const SessionHost = struct {
 
     /// `base` is the last sequence already represented by this snapshot: the
     /// client sets its cursor to it, then asks for events with seq > base.
-    /// Canonical rows are bounded by real encoded bytes so a large checkpoint
-    /// can never make a legal history reply exceed the transport limit.
+    /// Canonical rows are packed newest-first within the frame budget; older
+    /// rows are omitted and reported through `truncated`.
     fn replyHistory(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request) ![]u8 {
-        const requested = request.optionalU64("limit") catch null;
-        const limit: usize = @intCast(@min(requested orelse @as(u64, protocol.max_history), @as(u64, protocol.max_history)));
-        return self.historyFrame(a, request.id, limit, null);
+        return self.historyFrame(a, request.id, null);
     }
 
-    fn historyFrame(self: *SessionHost, a: std.mem.Allocator, id: u64, limit: usize, stream_epoch: ?u64) ![]u8 {
+    fn historyFrame(self: *SessionHost, a: std.mem.Allocator, id: u64, stream_epoch: ?u64) ![]u8 {
         const base: u64 = if (stream_epoch != null) self.events.reclaimed_through else self.next_seq -| 1;
 
         // Encode the current-state rows first: they must always fit, so their
@@ -1623,13 +1619,7 @@ pub const SessionHost = struct {
             if (self.context) |context| try scratch.add(.{ .context_snapshot = context }, true);
             // Replay the real owned approval detail, never an empty placeholder.
             if (self.pending_permission != null and self.pending_name != null and self.pending_desc != null) {
-                // The rebuilt row keeps the stored clipping flag, so a viewer
-                // that reconnects knows the detail is not the whole request.
-                try scratch.addWith(
-                    .{ .permission = .{ .id = self.pending_permission.?, .tool_name = self.pending_name.?, .description = self.pending_desc.? } },
-                    true,
-                    self.pending_detail_incomplete,
-                );
+                try scratch.add(.{ .permission = .{ .id = self.pending_permission.?, .tool_name = self.pending_name.?, .description = self.pending_desc.? } }, true);
             }
             if (self.task == null) if (self.last_terminal) |terminal| try scratch.add(.{ .finished = terminal }, true);
         }
@@ -1641,14 +1631,7 @@ pub const SessionHost = struct {
             // merged events pages in exact sequence order.
             while (end > 0 and entries[end - 1].seq > base) end -= 1;
         }
-        _ = limit; // No continuation exists for a shortened baseline.
-        var start: usize = end;
-        while (start > 0) {
-            start -= 1;
-        }
         const draft_shortened = stream_epoch != null and self.draftCut(base) == null;
-        const truncated = start != 0 or self.history.evicted_through != 0 or
-            self.partial_text.truncated or self.partial_reasoning.truncated or draft_shortened;
 
         var out = protocol.Out.init(a);
         defer out.deinit();
@@ -1659,6 +1642,26 @@ pub const SessionHost = struct {
             try out.field("through", base);
         }
         try out.field("base", base);
+
+        // Reserve the envelope, separators and synthetic rows before choosing
+        // the canonical window. Keep the newest rows: they are what a fresh
+        // terminal can draw, and `truncated` is an explicit incomplete notice.
+        var used: usize = out.buf.items.len + 32;
+        for (synthetic[0..synthetic_count]) |maybe| {
+            if (maybe) |json| used +|= json.len + 1;
+        }
+        const default_budget = if (protocol.max_response > response_reserve) protocol.max_response - response_reserve else 0;
+        const budget = self.test_history_budget orelse default_budget;
+        var start = end;
+        while (start > 0) {
+            const need = entries[start - 1].json.len + 1;
+            if (used +| need > budget) break;
+            used +|= need;
+            start -= 1;
+        }
+        const truncated = start != 0 or self.history.evicted_through != 0 or
+            self.partial_text.truncated or self.partial_reasoning.truncated or draft_shortened;
+
         try out.beginArray("entries");
         // Canonical blocks first, oldest to newest.
         for (entries[start..end]) |entry| {
@@ -1798,12 +1801,6 @@ pub const SessionHost = struct {
         const permission_id = request.u64Field("permission_id") catch return errorReply(a, request.id, error.BadRequest);
         const allow = request.boolField("allow", false) catch return errorReply(a, request.id, error.BadRequest);
         self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
-        // Authorizing a request whose visible detail is a clipped prefix would
-        // approve a command the viewer never saw. Refuse the allow explicitly
-        // instead of quietly running it; denying is always safe and stays open.
-        if (allow and self.pending_detail_incomplete and self.pending_permission == permission_id) {
-            return errorReply(a, request.id, error.InputTooLarge);
-        }
         const decision: r.Decision = if (allow) .allow_once else .deny;
         // Bridge.decide is the authority: a stale id, a cleared request or a
         // cancelled task answers false and the tool is not executed.

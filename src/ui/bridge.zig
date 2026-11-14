@@ -19,7 +19,7 @@ const Storage = []align(@alignOf(p.Block)) u8;
 pub const Item = struct {
     /// 已深拷贝到 storage 中的事件，字符串都指向 storage。
     event: r.Event,
-    /// 文本是否因预算被截断，UI 可据此提示。
+    /// 显示副本是否被裁剪，UI 可据此提示；不是容量预算。
     display_truncated: bool,
     /// Text clipping and a missing block tail are distinct semantic facts.
     /// Incomplete canonical arrays cannot prove absence of tool calls.
@@ -29,7 +29,7 @@ pub const Item = struct {
     /// 所属的桥，deinit 时用于回收 bytes 与 outstanding 计数。
     owner: *Bridge,
 
-    /// 释放内存并归还预算；每个 Item 只能调用一次。
+    /// 释放内存并归还有关统计；每个 Item 只能调用一次。
     pub fn deinit(self: *Item) void {
         const n = self.storage.len;
         // 先在锁外释放内存，只在更新计数时持锁。
@@ -65,6 +65,17 @@ const Copy = struct {
         return "";
     }
 
+    /// Copy at most `max` bytes, backing off to a UTF-8 boundary. This is a
+    /// display projection only; the Runtime keeps the complete result.
+    fn textBounded(self: *Copy, src: []const u8, max: usize) []const u8 {
+        var n = @min(src.len, max);
+        if (n < src.len) {
+            while (n > 0 and (src[n] & 0xc0) == 0x80) n -= 1;
+            self.clipped = true;
+        }
+        return self.text(src[0..n]);
+    }
+
     fn field(self: *Copy, src: ?@import("../core/tool_preview.zig").Field) ?@import("../core/tool_preview.zig").Field {
         const value = src orelse return null;
         const before = self.used;
@@ -81,7 +92,7 @@ const Copy = struct {
             .tool_result => |v| blk: {
                 var c = v;
                 c.call_id = self.text(v.call_id);
-                c.text = self.text(v.text);
+                c.text = self.textBounded(v.text, item_budget);
                 break :blk .{ .tool_result = c };
             },
         };
@@ -116,7 +127,10 @@ const Copy = struct {
             .tool_result => |v| blk: {
                 var c = v;
                 c.name = self.text(v.name);
-                c.result.text = self.text(v.result.text);
+                // Local command output is rendered verbatim and may carry the
+                // exit tail; clip only model tool results, which the UI shows
+                // as captions. The Runtime keeps the complete result either way.
+                c.result.text = if (v.local) self.text(v.result.text) else self.textBounded(v.result.text, item_budget);
                 break :blk .{ .tool_result = c };
             },
             .assistant_committed => |blocks| blk: {
@@ -173,7 +187,7 @@ pub const Bridge = struct {
     /// Current queued count, exposed to the existing frontend under the lock.
     len: usize = 0,
 
-    /// 已占用的预算字节数（含预留中的拷贝与已弹出但未 deinit 的 Item）。
+    /// 已拥有但尚未释放的存储字节数；所有权计数，不是容量上限。
     bytes: usize = 0, // includes reserved copies AND popped, still-owned items
     /// 已入队或已弹出但尚未 deinit 的 Item 数量。
     outstanding: usize = 0,
@@ -473,7 +487,7 @@ pub const Bridge = struct {
         self.close();
         std.debug.assert(self.active == 0);
 
-        // 中文：残留 Item 必须逐个释放，否则预算与分配内存都会泄漏。
+        // 中文：残留 Item 必须逐个释放，否则统计与分配内存都会泄漏。
         while (self.pop()) |item_| {
             var item = item_;
             item.deinit();

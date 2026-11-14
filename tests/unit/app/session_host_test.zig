@@ -434,7 +434,7 @@ test "memory completions remain ordered in one watch page without affecting prim
     host.controller = .{ .epoch = 1, .connection = 7 };
     host.phase = .calling_model;
     host.last_terminal = .{ .status = .paused, .detail = error.RoundLimit };
-    host.setPending(44, "bash", "approval detail", false);
+    host.setPending(44, "bash", "approval detail");
     host.observe(.{ .text = "partial body" }, false, true);
     host.observe(.{ .reasoning = "partial reasoning" }, false, true);
     const prior_seq = host.next_seq - 1;
@@ -504,7 +504,7 @@ test "memory completions remain ordered in one watch page without affecting prim
     // even if a caller supplies preexisting state at an idle boundary.
     try host.partial_text.append("retained body");
     try host.partial_reasoning.append("retained reasoning");
-    host.setPending(45, "bash", "retained permission", false);
+    host.setPending(45, "bash", "retained permission");
     var another: MemoryQueueFixture = .{ .values = values[0..1] };
     try std.testing.expectEqual(SessionHost.MemoryAdmission.admitted, host.admitMemoryCompletion(&another));
     try std.testing.expectEqualStrings("retained body", host.partial_text.buf.items);
@@ -1533,7 +1533,7 @@ test "bridge display metadata is stored and the approval detail survives reconne
     // Stored events are epoch-free: old history replays after takeover.
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"epoch\":0") != null);
 
-    host.setPending(9, "bash", "rm -rf /var/tmp/x", false);
+    host.setPending(9, "bash", "rm -rf /var/tmp/x");
     const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":22,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
@@ -1577,7 +1577,6 @@ test "long approval detail survives reconnect whole and stays approvable" {
     try runtime_host.emit_fn(runtime_host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = command } }, &host.cancel);
     host.pump(0);
     try std.testing.expectEqual(@as(?u64, 1), host.pending_permission);
-    try std.testing.expect(!host.pending_detail_incomplete);
     try std.testing.expectEqual(command.len, host.pending_desc.?.len);
 
     // A reconnected viewer sees the whole command and no clipping marker.
@@ -1602,62 +1601,6 @@ test "long approval detail survives reconnect whole and stays approvable" {
     const granted = try dispatchJson(host, a, "{\"v\":5,\"id\":82,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
     defer a.free(granted);
     try std.testing.expect(std.mem.indexOf(u8, granted, "\"ok\":true") != null);
-}
-test "a clipped approval detail is never silently allowed" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [4096]u8 = undefined;
-    const project_len = try tmp.dir.realPath(io, &path_buffer);
-    const project = path_buffer[0..project_len];
-    var environ = std.process.Environ.Map.init(a);
-    defer environ.deinit();
-    try environ.put("HOME", project);
-
-    const id = try ids.generate(io);
-    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
-    defer host.deinit();
-
-    // Explicit incomplete presentation metadata remains fail-closed even though
-    // the bridge no longer clips the source to a capacity quota.
-    const command = try a.alloc(u8, 64 * 1024 + 1024);
-    defer a.free(command);
-    @memset(command, 'y');
-
-    const runtime_host = host.bridge.host();
-    try runtime_host.emit_fn(runtime_host.context, .{ .permission = .{ .id = 1, .tool_name = "bash", .description = command } }, &host.cancel);
-    host.pump(0);
-    try std.testing.expectEqual(@as(?u64, 1), host.pending_permission);
-    try std.testing.expect(!host.pending_detail_incomplete);
-    try std.testing.expectEqualStrings(command, host.pending_desc.?);
-    host.setPending(1, "bash", command, true);
-    try std.testing.expect(host.pending_detail_incomplete);
-
-    // The rebuilt row carries the clipping flag instead of looking complete.
-    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":90,\"op\":\"history\"}", 1);
-    defer a.free(frame);
-    var parsed = try parseJson(a, frame);
-    defer parsed.deinit();
-    var seen = false;
-    for (parsed.value.object.get("entries").?.array.items) |entry| {
-        if (!std.mem.eql(u8, entry.object.get("t").?.string, "permission")) continue;
-        try std.testing.expectEqualStrings(command, entry.object.get("desc").?.string);
-        try std.testing.expectEqual(std.json.Value{ .bool = true }, entry.object.get("disp_trunc").?);
-        seen = true;
-    }
-    try std.testing.expect(seen);
-
-    const attach = try dispatchJson(host, a, "{\"v\":5,\"id\":91,\"op\":\"attach\",\"write\":true}", 1);
-    defer a.free(attach);
-    // Allowing what the viewer cannot fully see is refused, not applied.
-    const refused = try dispatchJson(host, a, "{\"v\":5,\"id\":92,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":true}", 1);
-    defer a.free(refused);
-    try std.testing.expect(std.mem.indexOf(u8, refused, "input_too_large") != null);
-    // Nothing was answered: a deny for the same id is still a live decision.
-    const denied = try dispatchJson(host, a, "{\"v\":5,\"id\":93,\"op\":\"approve\",\"epoch\":1,\"permission_id\":1,\"allow\":false}", 1);
-    defer a.free(denied);
-    try std.testing.expect(std.mem.indexOf(u8, denied, "\"ok\":true") != null);
 }
 test "submit receipt nonce is bound to kind and exact content" {
     const a = std.testing.allocator;
@@ -1820,6 +1763,39 @@ test "direct input is history-only while queued input is rendered exactly once" 
     }
     try std.testing.expectEqual(@as(usize, 1), direct_rows);
     try std.testing.expectEqual(@as(usize, 1), queued_rows);
+}
+test "history baseline keeps newest rows within a byte budget" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const project_len = try tmp.dir.realPath(io, &path_buffer);
+    const project = path_buffer[0..project_len];
+    var environ = std.process.Environ.Map.init(a);
+    defer environ.deinit();
+    try environ.put("HOME", project);
+
+    const id = try ids.generate(io);
+    const host = try SessionHost.init(a, io, &environ, .{ .project = project, .id = id, .owner = .daemon });
+    defer host.deinit();
+
+    for (0..10) |i| {
+        var text_buf: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&text_buf, "item-{d}", .{i});
+        const json = try protocol.encodeEventMeta(a, .{ .user_committed = .{ .id = @intCast(i + 1), .text = text } }, .{ .epoch = 0, .truncated = false, .canonical_complete = true });
+        try host.history.push(host.takeSeq(), json);
+    }
+
+    host.test_history_budget = 300;
+    const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":70,\"op\":\"history\"}", 1);
+    defer a.free(frame);
+    var parsed = try parseJson(a, frame);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("truncated").?.bool);
+    const entries = parsed.value.object.get("entries").?.array.items;
+    try std.testing.expect(entries.len > 0 and entries.len < 10);
+    try std.testing.expectEqualStrings("item-9", entries[entries.len - 1].object.get("v").?.string);
 }
 test "accepted queue entries are kept and paused when no runtime can start them" {
     const a = std.testing.allocator;

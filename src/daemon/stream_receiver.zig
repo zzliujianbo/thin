@@ -97,6 +97,7 @@ pub const Receiver = struct {
     frames: std.ArrayList([]u8) = .empty,
     head: usize = 0,
     count: usize = 0,
+    /// Queued frame bytes for diagnostics; no capacity cap.
     bytes: usize = 0,
     done: bool = false,
     failure: ?anyerror = null,

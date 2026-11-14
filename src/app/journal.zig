@@ -81,6 +81,7 @@ pub const Journal = struct {
     diagnostic_ready: std.atomic.Value(bool) = .init(false),
     count: usize = 0,
     outstanding: usize = 0,
+    /// Owned queued bytes for lifecycle assertions; no capacity cap.
     bytes: usize = 0,
     stopping: bool = false,
     done: bool = false,

@@ -126,8 +126,9 @@ test "file statistics and complete large result JSON survive owned copying" {
     try send(&bridge, .{ .tool_result = .{ .id = 9, .name = "read_file", .result = .{ .text = big, .file_stats = .{ .read = 20000, .partial = true } } } });
     try send(&bridge, .{ .context_snapshot = .{ .tokens = 700, .limit = 32768 } });
     var item = bridge.pop().?;
-    try t.expect(!item.display_truncated);
-    try t.expectEqualSlices(u8, big, item.event.tool_result.result.text);
+    try t.expect(item.display_truncated);
+    try t.expectEqual(@as(usize, b.item_budget), item.event.tool_result.result.text.len);
+    try t.expectEqualSlices(u8, big[0..b.item_budget], item.event.tool_result.result.text);
     try t.expectEqual(@as(?u64, 20000), item.event.tool_result.result.file_stats.?.read);
     try t.expect(item.event.tool_result.result.file_stats.?.partial);
     item.deinit();
@@ -263,8 +264,9 @@ test "complete large payloads preserve execution flags and every canonical block
 
     try send(&bridge, .{ .tool_result = .{ .id = 1, .name = "name", .result = .{ .text = huge, .is_error = true, .truncated = false } } });
     var item = bridge.pop().?;
-    try t.expect(!item.display_truncated);
-    try t.expectEqualSlices(u8, huge, item.event.tool_result.result.text);
+    try t.expect(item.display_truncated);
+    try t.expectEqual(@as(usize, b.item_budget), item.event.tool_result.result.text.len);
+    try t.expectEqualSlices(u8, huge[0..b.item_budget], item.event.tool_result.result.text);
     try t.expect(!item.event.tool_result.result.truncated);
     try t.expect(item.event.tool_result.result.is_error);
 

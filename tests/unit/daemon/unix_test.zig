@@ -52,7 +52,7 @@ test "step reader preserves partial header and body without waiting" {
     try std.testing.expect((try pair.a.readStep()) == .eof);
 }
 test "step reader rejects truncated frames without allocating declared length" {
-    for ([_][]const u8{ &.{0}, &.{ 0, 0, 0, 2, 'x' }, &.{ 0xff, 0xff, 0xff, 0xff } }) |raw| {
+    for ([_][]const u8{ &.{0}, &.{ 0, 0, 0, 2, 'x' } }) |raw| {
         var pair = try testPair(std.testing.allocator);
         defer pair.a.close();
         defer pair.b.close();
@@ -240,7 +240,7 @@ test "truncated frame and poisoned stream" {
     try std.testing.expectError(error.TruncatedFrame, a.readFrame(testWait()));
     try std.testing.expectError(error.StreamPoisoned, a.readFrame(testWait()));
 }
-test "maximum declared length does not allocate on header" {
+test "declared length above the cap is rejected before allocation" {
     const allocator = std.testing.allocator;
     const pair = try testPair(allocator);
     var a = pair.a;
@@ -249,12 +249,11 @@ test "maximum declared length does not allocate on header" {
     defer b.close();
 
     var header: [header_size]u8 = undefined;
-    std.mem.writeInt(u32, &header, std.math.maxInt(u32), .big);
+    std.mem.writeInt(u32, &header, @intCast(max_frame_len + 1), .big);
     try sendAll(b.descriptor(), &header);
-    try std.testing.expect((try a.readStep()) == .pending);
+    try std.testing.expectError(error.FrameTooLarge, a.readStep());
     try std.testing.expectEqual(@as(usize, 0), a.body.capacity);
-    b.close();
-    try std.testing.expectError(error.TruncatedFrame, a.readStep());
+    try std.testing.expectError(error.StreamPoisoned, a.readStep());
 }
 test "oversized write is refused before any byte is written" {
     const allocator = std.testing.allocator;
@@ -267,7 +266,7 @@ test "oversized write is refused before any byte is written" {
 
     if (@sizeOf(usize) <= @sizeOf(u32)) return error.SkipZigTest;
     const ptr: [*]const u8 = @ptrFromInt(1);
-    const payload = ptr[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+    const payload = ptr[0 .. max_frame_len + 1];
     try std.testing.expectError(error.FrameTooLarge, b.writeFrame(payload, wait));
 
     // The stream is untouched and still usable.

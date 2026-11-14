@@ -91,7 +91,6 @@ const poll_timeout_ms: u32 = 250;
 const finish_timeout_ms: u32 = 60_000;
 /// One page of display events per fetch; the UI drains one item per tick.
 const max_events: u16 = protocol.max_events;
-const max_history: u16 = protocol.max_history;
 /// Bounded local item queue: never buffer more than this between UI ticks.
 const max_listing_bytes: usize = 8 * 1024;
 const control_socket = "daemon.sock";
@@ -1603,7 +1602,6 @@ pub const Client = struct {
     fn readHistory(self: *Client) !void {
         var req = try self.request(.history);
         defer req.deinit();
-        try req.put("limit", max_history);
         var resp = try req.exchange(poll_timeout_ms);
         defer resp.deinit();
         try self.adoptHistory(&resp, false);

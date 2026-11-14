@@ -459,3 +459,27 @@ test "allocation failure mid-body keeps the emitted prefix and returns the reser
     try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
     try t.expectEqual(@as(usize, 0), progress(&bridge).outstanding);
 }
+test "large tool result display copy is clipped without touching canonical text" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, t.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+
+    const big = try t.allocator.alloc(u8, item_budget + 17);
+    defer t.allocator.free(big);
+    @memset(big, 'x');
+    try host_.emit_fn(host_.context, .{ .tool_result = .{
+        .id = 1,
+        .name = "bash",
+        .result = .{ .text = big },
+    } }, &cancel);
+    @memset(big, 'z');
+
+    var item = bridge.pop().?;
+    defer item.deinit();
+    try t.expect(item.display_truncated);
+    try t.expectEqual(@as(usize, item_budget), item.event.tool_result.result.text.len);
+    try t.expectEqual(@as(u8, 'x'), item.event.tool_result.result.text[0]);
+    try t.expect(std.unicode.utf8ValidateSlice(item.event.tool_result.result.text));
+}

@@ -910,7 +910,7 @@ test "complete bridge source preserves actual runtime truncation provenance" {
     const result = try std.fmt.allocPrint(a, "{{\"stdout\":\"{s}\",\"stderr\":\"UNAVAILABLE_BRIDGE_TAIL\",\"exit_code\":7}}", .{stdout});
     defer a.free(result);
     const host = bridge.host();
-    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = result, .is_error = true, .truncated = true } } }, &cancel);
+    try host.emit_fn(host.context, .{ .tool_result = .{ .id = 1, .name = "bash", .result = .{ .text = result, .is_error = true, .truncated = true }, .local = true } }, &cancel);
     var item = bridge.pop() orelse return error.MissingToolUiEvent;
     defer item.deinit();
     try std.testing.expect(!item.display_truncated);

@@ -30,8 +30,9 @@ const metadata = @import("../platform/metadata.zig");
 const native = @import("../platform/ipc_native.zig");
 const protocol = @import("../core/protocol.zig");
 
-/// Maximum representable payload of the four-byte wire length field.
-pub const max_frame_len: usize = std.math.maxInt(u32);
+/// Maximum accepted payload of the four-byte wire length field. This is a
+/// single-frame transport bound, not a queue capacity quota.
+pub const max_frame_len: usize = 64 * 1024 * 1024;
 /// Native sun_path capacity minus its terminating NUL (Linux 107, Darwin 103).
 pub const max_socket_path_len = native.max_socket_path_len;
 /// Owned NONBLOCK/CLOEXEC pair; Darwin also configures SO_NOSIGPIPE on both ends.
@@ -849,6 +850,10 @@ pub const Connection = struct {
                 self.header_read += n;
             }
             const declared = std.mem.readInt(u32, &self.header, .big);
+            if (@as(usize, declared) > max_frame_len) {
+                self.poisoned = true;
+                return error.FrameTooLarge;
+            }
             self.declared = declared;
             self.state = .body;
         }
@@ -893,7 +898,12 @@ pub const Connection = struct {
             }
             self.header_read += n;
             if (self.header_read < header_size) return .pending;
-            self.declared = std.mem.readInt(u32, &self.header, .big);
+            const declared = std.mem.readInt(u32, &self.header, .big);
+            if (@as(usize, declared) > max_frame_len) {
+                self.poisoned = true;
+                return error.FrameTooLarge;
+            }
+            self.declared = declared;
             self.state = .body;
         }
         if (self.body_read < self.declared) {

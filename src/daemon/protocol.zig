@@ -3,7 +3,7 @@
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
 //! Frames are JSON, framed by
-//! `daemon/unix.zig` (4-byte big-endian length, max 1 MiB, 0600 AF_UNIX with
+//! `daemon/unix.zig` (4-byte big-endian length, max 64 MiB, 0600 AF_UNIX with
 //! kernel SO_PEERCRED). This module owns only parsing, bounds, response
 //! assembly and the display-event projection of `core/runtime.Event`.
 //!
@@ -36,7 +36,6 @@ pub const version: u16 = 5;
 pub const max_response = unix.max_frame_len;
 pub const max_name: usize = 1024;
 pub const max_events: u16 = 32;
-pub const max_history: u16 = 32;
 pub const max_previews = 16;
 
 /// Wire error codes. The client maps these to the exact `anyerror` values that
