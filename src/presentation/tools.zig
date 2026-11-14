@@ -1,5 +1,6 @@
 //! 前端共享的工具展示数据和 canonical FIFO。只展示，不解析执行参数或授予权限。
-//! 不依赖终端宽度/ANSI/图标，也不把原始工具结果 JSON 作为展示正文。
+//! 不依赖终端宽度/ANSI/图标，也不把原始工具结果 JSON 作为展示正文；失败原因只从
+//! 本项目自有的信封字段或结果首行提取，且由调用方拥有并再次按行宽裁剪。
 const std = @import("std");
 const p = @import("../core/protocol.zig");
 const r = @import("../core/runtime.zig");
@@ -179,17 +180,91 @@ pub fn readFailure(result: r.Execution) ?[]const u8 {
     return "Read failed: details unavailable";
 }
 
-/// Bounded, frontend-neutral reason for one failed call. The read mapping stays
-/// exact; other tools expose only short identifier-shaped result text, so no
-/// JSON, no output body and no arbitrary prose ever reaches a caption.
-pub fn failureReason(kind: Kind, result: r.Execution) ?[]const u8 {
+/// Bounded excerpt kept from an arbitrary failure body. The row clips it again to
+/// the terminal width, so this is a memory bound, not a layout decision.
+const reason_bytes = 128;
+
+/// Owned, bounded, frontend-neutral reason for one failed call; the caller owns
+/// the returned slice. Every failure with a body gets a reason: the read mapping
+/// stays exact, bash results are our own JSON envelope so only its failure facts
+/// (timeout, signal, exit code, first stderr line) surface instead of the raw
+/// envelope, and other tools expose their JSON error message or the sanitized
+/// first line of their result. An empty body has nothing to show.
+pub fn failureReason(a: std.mem.Allocator, kind: Kind, result: r.Execution) !?[]const u8 {
     if (!result.is_error or result.canceled) return null;
-    if (kind == .read) return readFailure(result);
-    if (result.cleanup_failed) return "cleanup failed";
-    const text = result.text;
-    if (text.len == 0 or text.len > 48) return null;
-    for (text) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return null;
-    return text;
+    if (kind == .read) return try a.dupe(u8, readFailure(result) orelse return null);
+    if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
+    if (kind == .bash) return try bashReason(a, result.text) orelse try a.dupe(u8, "command failed");
+    if (try jsonError(a, result.text)) |message| return message;
+    return excerpt(a, result.text);
+}
+
+/// Other executors answer with our own `{"error": ...}` envelope. Return the
+/// message alone so a row never shows the envelope itself.
+fn jsonError(a: std.mem.Allocator, text: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] != '{') return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, trimmed, .{ .allocate = .alloc_if_needed, .max_value_len = 1024 * 1024 }) catch return null;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |map| map,
+        else => return null,
+    };
+    const message = if (object.get("error")) |value| switch (value) {
+        .string => |line| line,
+        else => "",
+    } else "";
+    return excerpt(a, message);
+}
+
+/// bash results are the executor's JSON envelope. Only its structured failure
+/// facts become a reason; a synthetic or malformed body never reaches a row.
+fn bashReason(a: std.mem.Allocator, text: []const u8) !?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{ .allocate = .alloc_if_needed, .max_value_len = 1024 * 1024 }) catch return null;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |map| map,
+        else => return null,
+    };
+    if (object.get("timed_out")) |value| switch (value) {
+        .bool => |flag| if (flag) return try a.dupe(u8, "timed out"),
+        else => {},
+    };
+    if (object.get("signal")) |value| switch (value) {
+        .integer => |number| return try std.fmt.allocPrint(a, "signal {d}", .{number}),
+        else => {},
+    };
+    const code: ?i64 = if (object.get("exit_code")) |value| switch (value) {
+        .integer => |number| number,
+        else => null,
+    } else null;
+    const stderr = if (object.get("stderr")) |value| switch (value) {
+        .string => |line| line,
+        else => "",
+    } else "";
+    const detail = try excerpt(a, stderr);
+    defer if (detail) |value| a.free(value);
+    if (code) |number| if (number != 0) {
+        return if (detail) |value| try std.fmt.allocPrint(a, "exit {d}: {s}", .{ number, value }) else try std.fmt.allocPrint(a, "exit {d}", .{number});
+    };
+    return if (detail) |value| try a.dupe(u8, value) else null;
+}
+
+/// Sanitized, single-line, bounded excerpt of a failure body. Null when nothing
+/// printable remains.
+fn excerpt(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    const text = std.mem.trimStart(u8, body, " \t\r\n");
+    if (text.len == 0) return null;
+    const prefix = try clean.sanitizePrefix(a, text, reason_bytes);
+    defer a.free(prefix.text);
+    const end = std.mem.indexOfAny(u8, prefix.text, "\r\n") orelse prefix.text.len;
+    const line = std.mem.trim(u8, prefix.text[0..end], " \t");
+    if (line.len == 0) return null;
+    const out = try a.dupe(u8, line);
+    for (out) |*byte| {
+        if (byte.* == '\t') byte.* = ' ';
+    }
+    return out;
 }
 
 /// 成员拥有各Call；take交出唯一所有权。调用方收到started/result后依次消费，

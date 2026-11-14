@@ -475,7 +475,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
           send(res,protocol,'',[
             tool('icon_shell','bash',{command:'sleep 1; cat r.json'}),
             tool('icon_second','bash',{command:'sleep 0.6; printf ok'}),
-            tool('icon_failure','bash',{command:'false; # failure-caption-long-enough-to-exercise-80-percent-clipping'})
+            tool('icon_failure','bash',{command:'false; # failure-caption-long-enough-to-exercise-80-percent-clipping-and-marker-reserved'})
           ]);
         } else {
           assert(outputs.get('icon_shell')?.includes('tool-json-hidden-marker'), 'tool result absent from protocol history');

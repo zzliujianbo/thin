@@ -2215,11 +2215,11 @@ test "failed tool rows keep the bounded reason while the target clips" {
     try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "write_file", .result = .{ .text = "AccessDenied", .is_error = true } } }, false, true);
     const record = &ui.records.items[ui.records.items.len - 1];
     try std.testing.expect(record.command_row);
-    try std.testing.expect(std.mem.indexOf(u8, record.body.items, "[error] AccessDenied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record.body.items, "✗ AccessDenied") != null);
     // A narrow row shortens the target, never the reason.
     try record.layout(a, 40);
     const line = record.lines[0];
-    try std.testing.expect(std.mem.indexOf(u8, line, "[error] AccessDenied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "✗ AccessDenied") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "...") != null);
 }
 test "replayed history keeps file counters and local command output rows" {
@@ -2799,7 +2799,7 @@ test "raw write deltas alone never display JSON or invent execution" {
             try std.testing.expect(std.mem.find(u8, ui.frame, "preview.txt") == null);
         } else if (index == 1) {
             try std.testing.expect(ui.active_tool != null);
-            try std.testing.expect(std.mem.find(u8, ui.frame, theme.tool_icon_pulse[0] ++ "w" ++ theme.muted ++ " preview.txt") != null);
+            try std.testing.expect(std.mem.find(u8, ui.frame, theme.flow_band[0] ++ "w" ++ theme.muted ++ " preview.txt") != null);
             try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
         } else {
             try std.testing.expect(ui.active_tool == null);
@@ -2845,7 +2845,7 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(0)) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, if (std.mem.eql(u8, name, "bash")) "date" else if (std.mem.eql(u8, name, "memory")) "read core" else "src/example.zig") != null);
         const icon = if (std.mem.eql(u8, name, "bash")) ">" else if (std.mem.eql(u8, name, "memory")) "m" else if (std.mem.eql(u8, name, "read_file")) "r" else "w";
-        const tool_prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}", .{ theme.toolIconColor(0), icon, theme.muted });
+        const tool_prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}", .{ theme.flow_band[0], icon, theme.muted });
         defer std.testing.allocator.free(tool_prefix);
         try std.testing.expect(std.mem.find(u8, ui.frame, tool_prefix) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "#7") == null);
@@ -2894,7 +2894,7 @@ test "first pending tool follows user gap then tools stay contiguous" {
         try expectTranscriptGap(&screen, "tool-user-end", "target-one");
         try std.testing.expectEqual(screen.rows - 1, screen.row);
         testAcknowledgeFullFrame(&ui);
-        try ui.toolCompleted(ui.active_tool.?.caption, .{ .text = "{}" });
+        try ui.toolCompleted(ui.active_tool.?.caption, .{ .text = "{}" }, false);
         ui.clearActiveTool();
         try ui.draw();
         try screen.replay(ui.frame);
@@ -2946,8 +2946,10 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try screen.replay(ui.frame);
     var failed_row: ?usize = null;
     var pending_row: ?usize = null;
+    // The screen fixture renders non-ASCII glyphs as `~`, so the failed row is
+    // located by its ASCII frame rather than by the `✗` marker itself.
     for (screen.grid, 0..) |line, row| {
-        if (std.mem.find(u8, &line, "date [error]") != null) failed_row = row;
+        if (std.mem.find(u8, &line, "date ~") != null) failed_row = row;
         if (std.mem.find(u8, &line, "pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
@@ -2959,7 +2961,7 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try ui.event(item);
     item.deinit();
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqualStrings("> date [error]", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("> date ✗ command failed", ui.records.items[0].body.items);
     try std.testing.expectEqualStrings("> pwd", ui.records.items[1].body.items);
     try ui.draw();
     try std.testing.expect(ui.records.items[0].output);
@@ -2967,14 +2969,14 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try std.testing.expect(ui.records.items[1].pending_output);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[1].lines.len);
-    try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null); // The previous result is not rewritten.
+    try std.testing.expect(std.mem.find(u8, ui.frame, " date ✗") == null); // The previous result is not rewritten.
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.success ++ ">" ++ theme.muted ++ " pwd") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-") == null);
     try screen.replay(ui.frame);
     failed_row = null;
     pending_row = null;
     for (screen.grid, 0..) |line, row| {
-        if (std.mem.find(u8, &line, "date [error]") != null) failed_row = row;
+        if (std.mem.find(u8, &line, "date ~") != null) failed_row = row;
         if (std.mem.find(u8, &line, "> pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
@@ -2985,7 +2987,7 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try std.testing.expectEqual(pending_row.? + 3, screen.row);
     testAcknowledgeFullFrame(&ui);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, " date [error]") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, " date ✗") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, " pwd") == null);
 }
 test "complete canonical tails beyond the old block cap prevent a false final heading" {
@@ -3048,7 +3050,7 @@ test "file captions are contiguous but separated from final prose and percent co
     defer call.deinit(std.testing.allocator);
     const cap = try presentation.fromCall(std.testing.allocator, call);
     defer cap.deinit(std.testing.allocator);
-    try ui.toolCompleted(cap, .{ .text = "raw-json-must-stay-hidden", .file_stats = .{ .changes = .{ .modified = 1, .added = 2, .removed = 3 } } });
+    try ui.toolCompleted(cap, .{ .text = "raw-json-must-stay-hidden", .file_stats = .{ .changes = .{ .modified = 1, .added = 2, .removed = 3 } } }, false);
     const host = bridge.host();
     try host.emit_fn(host.context, .{ .context_snapshot = .{ .tokens = 16384, .limit = 32768 } }, &cancel);
     var item = bridge.pop().?;
@@ -4447,16 +4449,16 @@ test "read command errors include a safe reason after error and never display ra
     defer call.deinit(std.testing.allocator);
     const caption = try presentation.fromCall(std.testing.allocator, call);
     defer caption.deinit(std.testing.allocator);
-    try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 });
-    try std.testing.expectEqualStrings("r README.md [error] FileNotFound: file not found", ui.records.items[0].body.items);
+    try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 }, false);
+    try std.testing.expectEqualStrings("r README.md ✗ FileNotFound: file not found", ui.records.items[0].body.items);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "[error] FileNotFound: file not found") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "✗ FileNotFound: file not found") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
     testAcknowledgeFullFrame(&ui);
-    try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true });
-    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "[error] Read failed: details unavailable") != null);
+    try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true }, false);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "✗ Read failed: details unavailable") != null);
     try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "secret") == null);
-    try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true });
+    try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true }, false);
     try std.testing.expectEqualStrings("r README.md [canceled]", ui.records.items[2].body.items);
 }
 test "sequential tool records from different frames have no gaps then final prose has one gap" {
@@ -4473,7 +4475,7 @@ test "sequential tool records from different frames have no gaps then final pros
         defer call.deinit(std.testing.allocator);
         const caption = try presentation.fromCall(std.testing.allocator, call);
         defer caption.deinit(std.testing.allocator);
-        try ui.toolCompleted(caption, .{ .text = "hidden-result", .file_stats = .{ .read = 1 } });
+        try ui.toolCompleted(caption, .{ .text = "hidden-result", .file_stats = .{ .read = 1 } }, false);
         try ui.draw();
         try screen.replay(ui.frame);
         try std.testing.expectEqual(@as(usize, 1), screen.count(path));
@@ -10815,7 +10817,7 @@ test "per-agent status rows" {
         defer a.free(id);
         try std.testing.expect(std.mem.find(u8, record.body.items, id) != null);
     }
-    try std.testing.expect(std.mem.find(u8, ui.records.items[2].body.items, "[error]") != null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[2].body.items, "✗") != null);
     try std.testing.expect(std.mem.find(u8, ui.records.items[4].body.items, "[canceled]") != null);
     // A settled group is never replayed by a later identical observation.
     try ui.observeSubagents();

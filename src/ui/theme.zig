@@ -89,17 +89,12 @@ pub const command_pulse = [_][]const u8{
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",
 };
 
-/// Executing tool rows keep their own icon and only breathe in brightness.
-/// The ramp rises and falls through the same warm 256-color levels (no truecolor,
-/// no background, no bold), so the glyph, its column and its cell width never
-/// move and no character is swapped frame to frame.
-pub const tool_icon_pulse = [_][]const u8{
-    "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;208m",
-    "\x1b[38;5;214m", "\x1b[38;5;208m", "\x1b[38;5;173m",
+/// An executing row is lit by one band that sweeps across the whole row: the
+/// column at the head is brightest and the band fades behind it. Foreground-only
+/// warm 256-color levels (no truecolor, no background, no bold), so a cluster,
+/// its column and its cell width never move and no glyph is swapped frame to
+/// frame; the row is simply dark where the band is not.
+pub const flow_band = [_][]const u8{
+    "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m",
+    "\x1b[38;5;208m", "\x1b[38;5;173m", "\x1b[38;5;137m",
 };
-
-/// One level per 180ms: slower than the retired 80ms tool spinner and owned by
-/// the tool row, not by composer TPS/effort/context styling.
-pub fn toolIconColor(now_ms: u64) []const u8 {
-    return tool_icon_pulse[@as(usize, @intCast((now_ms / 180) % tool_icon_pulse.len))];
-}

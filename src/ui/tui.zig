@@ -2825,7 +2825,7 @@ const Ui = struct {
         if (changed) self.requestDraw();
     }
 
-    fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution) !void {
+    fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution, local: bool) !void {
         const completion = shared.tools.Completion.fromExecution(result);
         const outcome = completion.outcome;
         const replacement: ?presentation.Caption = if (completion.display) |display|
@@ -2834,13 +2834,19 @@ const Ui = struct {
             null;
         defer if (replacement) |value| value.deinit(self.allocator);
         const effective = replacement orelse caption;
-        const observed = if (outcome == .success) try presentation.completed(self.allocator, effective, completion.file_stats) else presentation.Caption{
-            .kind = effective.kind,
-            .label = try self.allocator.dupe(u8, effective.label),
-            .display = effective.display,
-            .failure_reason = shared.tools.failureReason(effective.kind, result),
+        const observed = if (outcome == .success) try presentation.completed(self.allocator, effective, completion.file_stats) else blk: {
+            const label = try self.allocator.dupe(u8, effective.label);
+            errdefer self.allocator.free(label);
+            break :blk presentation.Caption{
+                .kind = effective.kind,
+                .label = label,
+                .display = effective.display,
+                .failure_reason = if (local) null else try shared.tools.failureReason(self.allocator, effective.kind, result),
+            };
         };
         defer observed.deinit(self.allocator);
+        // The reason is owned by this completion, not by the Caption contract.
+        defer if (observed.failure_reason) |reason| self.allocator.free(reason);
         const index = try self.add(.tool, "");
         const handoff = if (effective.display) |display| display.action == .start and outcome == .success else false;
         try self.records.items[index].setCommand(self.allocator, observed, outcome, if (handoff) null else completion.duration_ms);
@@ -2875,7 +2881,7 @@ const Ui = struct {
         defer a.free(label);
         const generating = !entry.ready and entry.write_progress != null and entry.caption.kind == .write;
         // Generating and approval rows remain muted and static, without an
-        // execution time; tool_started owns warm icon timing.
+        // execution time; tool_started owns the row flow clock and its timer.
         return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(activity.icon(caption.kind).len + 1) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null, 0);
     }
 
@@ -3323,12 +3329,15 @@ const Ui = struct {
                 // FIFO also covers prepare failures/denials without a start.
                 // Normal model tools keep captions; explicit local commands also
                 // project bounded literal streams without changing canonical data.
+                // A local command's own output block already carries stdout,
+                // stderr and the exit code, so its caption stays a bare marker.
+                const local = self.commandKind() or tool.local;
                 if (self.active_tool) |active| {
                     if (active.id == tool.id) {
                         // Both events may arrive in one UI tick; use the worker's
                         // measured result, never queue-drain time as execution time.
                         if (!active.grouped) {
-                            try self.toolCompleted(active.caption, tool.result);
+                            try self.toolCompleted(active.caption, tool.result, local);
                         } else if (self.subagent_starting and (tool.result.is_error or tool.result.canceled)) {
                             self.subagent_starting = false;
                             self.notice = "Subagent start failed";
@@ -3340,14 +3349,14 @@ const Ui = struct {
                     const caption = try self.executionCaption(tool.name, tool.display_key);
                     defer caption.deinit(self.allocator);
                     if (!(self.groupTools() and isSubagentTool(tool.name))) {
-                        try self.toolCompleted(caption, tool.result);
+                        try self.toolCompleted(caption, tool.result, local);
                     } else if (std.mem.eql(u8, tool.name, "subagent") and self.subagent_starting and (tool.result.is_error or tool.result.canceled)) {
                         self.subagent_starting = false;
                         self.notice = "Subagent start failed";
                     }
                     if (tool.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                 }
-                if (self.commandKind() or tool.local) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
+                if (local) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
             },
             .context_snapshot => {},
             .usage => {},

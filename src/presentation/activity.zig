@@ -102,6 +102,12 @@ pub fn commandStep(now_ms: u64) usize {
     return @intCast((now_ms / 120) % 8);
 }
 
+/// Whole-row execution flow: the lit band advances one column per 40ms, i.e.
+/// two columns per 80ms animation tick, so the sweep never stalls between frames.
+pub fn flowStep(now_ms: u64) usize {
+    return @intCast(now_ms / 40);
+}
+
 /// Observed wall-clock execution time for one command row. Always a measurement
 /// of the same monotonic clock passed by the caller; never an estimate. Values
 /// below one second retain milliseconds; longer times use seconds/minutes.

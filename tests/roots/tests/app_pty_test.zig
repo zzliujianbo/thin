@@ -262,7 +262,7 @@ const Driver = struct {
     }
 
     /// A generated/ready caption is visible before execution. Require both a
-    /// current complete row and an execution-only warm icon after the gate.
+    /// current complete row and the execution-only measured timer after the gate.
     fn waitRunningFrame(self: *Driver, start: usize, command: []const u8) !void {
         const view = try std.heap.page_allocator.create(regular.Screen);
         defer std.heap.page_allocator.destroy(view);
@@ -276,13 +276,9 @@ const Driver = struct {
             if (ack < start) continue;
             view.* = .{ .columns = self.columns };
             try view.replay(raw[0 .. ack + "\x1b[?25h".len]);
-            if (view.visible(needle)) {
-                for (spinner_theme.tool_icon_pulse) |tone| {
-                    var expected: [512]u8 = undefined;
-                    const running = try std.fmt.bufPrint(&expected, "{s}>{s} {s}", .{ tone, spinner_theme.muted, command });
-                    if (std.mem.indexOf(u8, raw[start .. ack + 1], running) != null) return;
-                }
-            }
+            // Only a started call carries an elapsed time; a generated caption
+            // and an approval preview have none.
+            if (view.visible(needle) and std.mem.indexOf(u8, raw[start .. ack + 1], spinner_theme.duration) != null) return;
             if (!self.owned) return error.EarlyExit;
         }
         return error.RunningToolFrameTimeout;
@@ -1767,25 +1763,19 @@ fn toolPreview(d: *Driver, init: std.process.Init, mode: []const u8, project: []
         std.debug.print("PREVIEW_GATE=finish\n", .{});
         const running = d.used;
         try d.waitFrame(running, "sleep 0.7");
-        // A running *tool row*, not the busy composer, must have its warm
-        // original bash icon and elapsed time before the owned sleep completes.
+        // A running *tool row*, not the busy composer, carries the execution-only
+        // elapsed time before the owned sleep completes. The band itself is
+        // covered by the row-flow unit tests and the tool-icons acceptance case.
         const until = now() + 1500;
         var witnessed = false;
         while (now() < until and !witnessed) {
             try d.drain(10);
             const bytes = d.output[running..d.used];
-            for (spinner_theme.tool_icon_pulse) |tone| {
-                var from: usize = 0;
-                while (std.mem.indexOfPos(u8, bytes, from, tone)) |at| {
-                    from = at + tone.len;
-                    const end = std.mem.indexOfPos(u8, bytes, from, "\x1b[K") orelse continue;
-                    const line = bytes[from..end];
-                    if (std.mem.startsWith(u8, line, ">" ++ spinner_theme.muted) and
-                        std.mem.indexOf(u8, line, "sleep 0.7") != null and
-                        std.mem.indexOf(u8, line, "s\x1b[0m") != null and
-                        std.mem.indexOf(u8, bytes[end..], "\x1b[?25h") != null) witnessed = true;
-                }
-            }
+            const timer = if (std.mem.indexOf(u8, bytes, spinner_theme.duration)) |at|
+                std.mem.indexOfPos(u8, bytes, at + spinner_theme.duration.len, "\x1b[0m") != null
+            else
+                false;
+            if (timer and std.mem.indexOf(u8, bytes, "\x1b[?25h") != null) witnessed = true;
         }
         try check(witnessed);
         try d.waitFrame(start, "preview-final-answer");
@@ -2611,7 +2601,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "read-error")) {
         const start = d.used;
         try d.send("read-missing\r");
-        try d.waitFrame(start, "[error] FileNotFound: file not found");
+        try d.waitFrame(start, "✗ FileNotFound: file not found");
         try d.waitText(start, "read-error-answer");
         try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "menu-navigation")) {
@@ -3091,14 +3081,13 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(first.visible("> sleep 1; cat r.json") and second.visible("> sleep 1; cat r.json"));
         try Driver.checkGap(first, "tool-icon-task", "> sleep 1; cat r.json");
         try Driver.checkGap(second, "tool-icon-task", "> sleep 1; cat r.json");
-        // The bash glyph stays fixed; only its warm foreground changes.
-        var pulses: usize = 0;
-        for ([_][]const u8{ "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m" }) |color| {
-            var pattern: [96]u8 = undefined;
-            const effect = try std.fmt.bufPrint(&pattern, "{s}>\x1b[38;5;245m sleep 1; cat r.json", .{color});
-            if (std.mem.indexOf(u8, d.output[animation_start..d.used], effect) != null) pulses += 1;
+        // One band sweeps the whole row: over the window several levels appear
+        // while the glyph, its column and the command text stay put.
+        var shades: usize = 0;
+        for (spinner_theme.flow_band) |color| {
+            if (std.mem.indexOf(u8, d.output[animation_start..d.used], color) != null) shades += 1;
         }
-        try check(pulses >= 2); // Distinct prefix shades, not repeated glyph/text.
+        try check(shades >= 2);
         try check(std.mem.indexOf(u8, d.output[start..d.used], ">_") == null);
         try Driver.checkComposerTail(first);
         try Driver.checkComposerTail(second);
@@ -3136,8 +3125,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try Driver.checkComposerTail(final);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m>\x1b[38;5;203m false; #") != null); // Failure prefix; the summary clips at the full row width in its failure color.
-        // The clipped target ends in dots, then the reserved outcome marker.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "... [error]\x1b[0m") != null);
+        // The clipped target ends in dots, then the reserved outcome marker and
+        // the bash failure reason taken from the result envelope.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "... ✗ exit 1\x1b[0m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "·") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);
@@ -3164,7 +3154,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitIdle(start);
         const final = try d.screen();
         var previous: ?usize = null;
-        for ([_][]const u8{ "w stats.txt  ~0 +5 -0 lines", "w stats.txt  ~1 +1 -1 lines", "r stats.txt  5 lines", "r stats.txt  2 lines [partial]", "w stats.txt  ~0 +0 -5 lines", "w stats.txt [error]" }) |caption| {
+        // The screen fixture renders non-ASCII glyphs as `~`; the failure marker
+        // itself is asserted on the raw output below.
+        for ([_][]const u8{ "w stats.txt  ~0 +5 -0 lines", "w stats.txt  ~1 +1 -1 lines", "r stats.txt  5 lines", "r stats.txt  2 lines [partial]", "w stats.txt  ~0 +0 -5 lines", "w stats.txt ~" }) |caption| {
             try check(final.count(caption) == 1);
             var found: ?usize = null;
             for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, caption) != null) {
@@ -3178,7 +3170,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try Driver.checkGap(final, "file-stats-task", "w stats.txt");
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mw\x1b[38;5;245m stats.txt") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mr\x1b[38;5;245m stats.txt") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203mw\x1b[38;5;203m stats.txt [error]") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203mw\x1b[38;5;203m stats.txt ✗") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;2m+1\x1b[38;5;245m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;1m-1\x1b[38;5;245m") != null);
         for ([_][]const u8{ "read_file ", "write_file ", "memory read " }) |old_label| try check(std.mem.indexOf(u8, d.output[start..d.used], old_label) == null);

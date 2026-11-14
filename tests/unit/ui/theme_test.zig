@@ -17,26 +17,18 @@ test "Markdown uses vivid yellow green and cool violet without changing font sty
     try testing.expectEqualStrings("\x1b[38;5;75m", effortColor(.high));
     try testing.expectEqualStrings("\x1b[38;5;171m", effortColor(.xhigh));
 }
-test "tool icon breathing uses only warm 256-color foreground levels in a smooth round trip" {
+test "executing row flow uses only warm foreground levels in a fading band" {
     const std = @import("std");
     const testing = std.testing;
-    const warm = [_][]const u8{ "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m" };
-    var levels: usize = 0;
-    for (tool_icon_pulse, 0..) |tone, i| {
+    const warm = [_][]const u8{ "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m", "\x1b[38;5;220m", "\x1b[38;5;223m" };
+    try testing.expect(flow_band.len >= 4);
+    for (flow_band, 0..) |tone, i| {
         // Foreground-only standard palette; never truecolor, background or bold.
         for ([_][]const u8{ "38;2;", "48;", "\x1b[1m", "\x1b[4m", "\x1b[7m" }) |rejected| try testing.expect(std.mem.indexOf(u8, tone, rejected) == null);
         var supported = false;
         for (warm) |allowed| supported = supported or std.mem.eql(u8, allowed, tone);
         try testing.expect(supported);
-        // Adjacent frames always move one visual level: no repeat, no glyph swap.
-        if (i != 0) try testing.expect(!std.mem.eql(u8, tone, tool_icon_pulse[i - 1]));
-        var known = false;
-        for (tool_icon_pulse[0..i]) |seen| known = known or std.mem.eql(u8, seen, tone);
-        if (!known) levels += 1;
+        // Adjacent columns always differ: the band never repeats one level.
+        if (i != 0) try testing.expect(!std.mem.eql(u8, tone, flow_band[i - 1]));
     }
-    try testing.expect(levels >= 4);
-    try testing.expectEqualStrings(tool_icon_pulse[0], toolIconColor(0));
-    try testing.expect(!std.mem.eql(u8, toolIconColor(0), toolIconColor(180)));
-    try testing.expectEqualStrings(toolIconColor(0), toolIconColor(180 * tool_icon_pulse.len));
-    try testing.expect(toolIconColor(std.math.maxInt(u64)).len != 0);
 }
