@@ -1706,8 +1706,8 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
             const row = if (i < view.history_len) &view.history[i] else &view.grid[i - view.history_len];
             if (std.mem.indexOf(u8, row, needle) == null) continue;
             const line = std.mem.trim(u8, row, " ");
-            // Normal tool rows occupy at most floor(80 * .8) cells.
-            try check(std.mem.trimEnd(u8, row, " ").len <= 64);
+            // Tool rows own the full terminal width; only line wrapping is forbidden.
+            try check(std.mem.trimEnd(u8, row, " ").len <= d.columns);
             if (pending and summary == null) try check(std.mem.startsWith(u8, line, "w "));
             matched = true;
         }

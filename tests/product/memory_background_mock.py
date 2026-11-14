@@ -54,7 +54,7 @@ DARWIN = sys.platform == 'darwin'
 INTERRUPTS = {signal.SIGTERM, signal.SIGINT}
 _controller_interrupted = False
 KEY = 'owned-memory-background-fixture-key'
-HELPER_PREFIX = 'Extract only durable, reusable knowledge'
+HELPER_PREFIX = 'Extract only durable project facts or reusable user preferences'
 # Prompt 2 shares the "review"/"concise" tokens of the committed fact so the
 # knowledge store's lexical retrieval actually returns it; that is what makes the
 # queued job's `related` evidence meaningful rather than incidental.
@@ -70,7 +70,6 @@ PROGRESS = re.compile(r'^M: ([' + SPINNERS + r'])(?: \+([1-9][0-9]*))?$')
 SAVED_PATH = '.thin/memory/preferences-review-style.md'
 RETIRED_PATHS = ('.thin/memory/jobs', '.thin/memory/jobs-owner', '.thin/mem-jobs', '.thin/mem-jobs-owner')
 CONTEXT_PREFIX = '[Context material'
-VERSION = re.compile(r'[0-9a-f]{64}')
 WARNING_MARKERS = ('Saved thinking level not applied', 'awaiting model capabilities')
 MEMORY_UI_LABELS = (
     'Memory: extracting', 'Memory: saving', 'Memory: queued', 'Memory: saved',
@@ -289,8 +288,7 @@ class MemoryService(http.server.BaseHTTPRequestHandler):
         if index == 0:
             control.helper1_arrived.set()
             assert control.release1.wait(30), 'Memory 1 gate timed out'
-            items = [{'category': 'preferences', 'topic': 'review-style', 'content': FACT,
-                      'expected_version': None, 'expires_at_ms': None}]
+            items = [{'category': 'preferences', 'topic': 'review-style', 'content': FACT}]
             self.sse(json.dumps({'items': items}))
             return
         if index == 1:
@@ -314,7 +312,7 @@ class MemoryService(http.server.BaseHTTPRequestHandler):
     def related_committed(material):
         for entry in material.get('related') or []:
             if (entry.get('category') == 'preferences' and entry.get('topic') == 'review-style'
-                    and entry.get('content') == FACT and VERSION.fullmatch(str(entry.get('version')))):
+                    and entry.get('content') == FACT):
                 return True
         return False
 
@@ -764,7 +762,6 @@ def run(app, columns, observe_saved=False):
                        if entry.get('category') == 'preferences' and entry.get('topic') == 'review-style']
             assert related and related[0].get('content') == FACT, \
                 f'queued Memory 2 related set lacks the committed fact: {materials[1].get("related")!r}'
-            assert VERSION.fullmatch(str(related[0].get('version'))), 'queued Memory 2 related version is not 64 hex'
             saved = project / SAVED_PATH
             assert saved.is_file(), 'committed Memory fact file is missing'
             saved_text = saved.read_text(encoding='utf-8')

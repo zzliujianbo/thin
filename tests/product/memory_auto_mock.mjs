@@ -59,7 +59,7 @@ const server = http.createServer(async (req, res) => {
       data += chunk;
     }
     const body = JSON.parse(data);
-    const helper = body.messages.some(m => m.role === 'system' && typeof m.content === 'string' && m.content.startsWith('Extract only durable, reusable knowledge'));
+    const helper = body.messages.some(m => m.role === 'system' && typeof m.content === 'string' && m.content.startsWith('Extract only durable project facts or reusable user preferences'));
     requests[helper ? 'helper' : 'primary']++;
     assert(requests.primary <= 7 && requests.helper <= 5, 'request count bound');
     if (!helper) {
@@ -101,8 +101,7 @@ const server = http.createServer(async (req, res) => {
       current.signalInterrupt();
       return;
     }
-    const items = current.prompt === FIRST ? [{category: 'preferences', topic: 'review-style', content: FACT,
-      expected_version: null, expires_at_ms: null}] : [];
+    const items = current.prompt === FIRST ? [{category: 'preferences', topic: 'review-style', content: FACT}] : [];
     current.helperResponded = true;
     // Whitespace is legal JSON and leaves the business payload unchanged.
     const json = JSON.stringify({items});

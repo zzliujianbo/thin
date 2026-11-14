@@ -47,23 +47,28 @@ pub const Decoder = struct {
 
     /// 喂入一段任意切分的字节。可能分发零个或多个完整事件。
     pub fn feed(self: *Decoder, bytes: []const u8) !void {
-        // 逐字节处理，因此网络读取可以在任意位置切开（包括 UTF-8 多字节字符与 CRLF 中间）。
-        for (bytes) |byte| {
-            // 上一个字节是 CR 时，跳过紧随其后的 LF，避免 CRLF 被当成两个行结束。
+        var i: usize = 0;
+        while (i < bytes.len) {
+            // A CR from the previous feed swallows exactly one following LF.
             if (self.skip_lf) {
                 self.skip_lf = false;
-                if (byte == '\n') continue;
+                if (bytes[i] == '\n') {
+                    i += 1;
+                    continue;
+                }
             }
-
-            if (byte == '\r' or byte == '\n') {
-                try self.endLine();
-                self.skip_lf = byte == '\r';
-            } else {
-                // 限制单个事件的总字节数，防止恶意服务器无限增长内存。
-                if (self.max_event_bytes) |limit| if (self.event_bytes >= limit) return error.EventTooLarge;
-                self.event_bytes = std.math.add(usize, self.event_bytes, 1) catch return error.OutOfMemory;
-                try self.line.append(self.allocator, byte);
+            var end = i;
+            while (end < bytes.len and bytes[end] != '\r' and bytes[end] != '\n') end += 1;
+            if (end > i) {
+                const chunk = bytes[i..end];
+                if (self.max_event_bytes) |limit| if (self.event_bytes + chunk.len > limit) return error.EventTooLarge;
+                self.event_bytes = std.math.add(usize, self.event_bytes, chunk.len) catch return error.OutOfMemory;
+                try self.line.appendSlice(self.allocator, chunk);
             }
+            if (end == bytes.len) break;
+            try self.endLine();
+            self.skip_lf = bytes[end] == '\r';
+            i = end + 1;
         }
     }
 
