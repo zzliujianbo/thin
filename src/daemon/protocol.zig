@@ -1508,7 +1508,28 @@ pub fn decodeEvent(a: std.mem.Allocator, json: []const u8) !DecodedEvent {
         .object => |value| value,
         else => return error.BadRequest,
     };
-    const arena = doc.arena.allocator();
+    return decodeEventObject(object, doc.arena.allocator(), doc);
+}
+
+/// Decode an already-parsed watch page entry without stringify/reparse. The
+/// returned event may borrow text from `value`; the client deep-copies it
+/// through `ui/session_client.ownEvent` before the page is released.
+pub fn decodeEventValue(a: std.mem.Allocator, value: std.json.Value) !DecodedEvent {
+    const object = switch (value) {
+        .object => |fields| fields,
+        else => return error.BadRequest,
+    };
+    var arena = try a.create(std.heap.ArenaAllocator);
+    arena.* = .init(a);
+    errdefer {
+        arena.deinit();
+        a.destroy(arena);
+    }
+    const doc = std.json.Parsed(std.json.Value){ .arena = arena, .value = value };
+    return decodeEventObject(object, arena.allocator(), doc);
+}
+
+fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: std.json.Parsed(std.json.Value)) !DecodedEvent {
     const display_truncated = try optionalBool(object, "disp_trunc") orelse false;
     const canonical_complete = try optionalBool(object, "canon_complete") orelse true;
     const epoch = try optionalU64(object, "epoch") orelse 0;

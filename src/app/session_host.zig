@@ -801,12 +801,9 @@ pub const SessionHost = struct {
         self.reset_failed = null;
     }
 
-    /// Convert startup canonical messages into owned display rows. Bounded by
-    /// count and bytes; native replay, configuration and credentials never
-    /// cross this conversion.
+    /// Convert startup canonical messages into owned display rows. Native
+    /// replay, configuration and credentials never cross this conversion.
     fn seedHistory(self: *SessionHost, messages: []const p.Message, stats: []const checkpoint.ToolStat) void {
-        var seeded: usize = 0;
-        var bytes: usize = 0;
         var user_id: u64 = 0;
         var tool_id: u64 = 0;
         var text_buf = std.ArrayList(u8).empty;
@@ -833,7 +830,7 @@ pub const SessionHost = struct {
                     if (text_buf.items.len == 0) continue;
                     user_id +%= 1;
                     if (user_id == 0) user_id = 1;
-                    if (!self.seedEvent(.{ .user_committed = .{ .id = user_id, .text = text_buf.items } }, &seeded, &bytes)) return;
+                    if (!self.seedEvent(.{ .user_committed = .{ .id = user_id, .text = text_buf.items } })) return;
                 },
                 .assistant => {
                     if (message.blocks.len == 0) continue;
@@ -852,7 +849,7 @@ pub const SessionHost = struct {
                         else => {},
                     };
                     const blocks = if (program_note and calls != 0) call_blocks[0..calls] else message.blocks;
-                    if (!self.seedEvent(.{ .assistant_committed = blocks }, &seeded, &bytes)) return;
+                    if (!self.seedEvent(.{ .assistant_committed = blocks })) return;
                 },
                 // One saved result becomes one tool_result row. Replaying it as
                 // assistant text would drop the tool line entirely, because only
@@ -873,7 +870,7 @@ pub const SessionHost = struct {
                                 .truncated = result.truncated,
                                 .file_stats = seededFileStats(stats, result.call_id),
                             },
-                        } }, &seeded, &bytes)) return;
+                        } })) return;
                     },
                     else => {},
                 },
@@ -901,20 +898,18 @@ pub const SessionHost = struct {
         return null;
     }
 
-    fn seedEvent(self: *SessionHost, event: r.Event, seeded: *usize, bytes: *usize) bool {
+    fn seedEvent(self: *SessionHost, event: r.Event) bool {
         const meta = protocol.EventMeta{ .epoch = 0, .truncated = false, .canonical_complete = true };
         const seq = self.takeSeq();
         const encoded = protocol.encodeEventMeta(self.allocator, event, meta) catch |err| {
             self.fatal = err;
             return false;
         };
-        bytes.* +|= encoded.len;
         self.history.push(seq, encoded) catch |err| {
             self.allocator.free(encoded);
             self.fatal = err;
             return false;
         };
-        seeded.* += 1;
         return true;
     }
 

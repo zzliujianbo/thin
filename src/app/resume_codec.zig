@@ -61,6 +61,12 @@ fn checkPayload(a: std.mem.Allocator, bytes: []const u8) !void {
 }
 
 pub fn encode(a: std.mem.Allocator, id: ids.Id, selection: *const selections.Snapshot, payload: []const u8) ![]u8 {
+    try checkPayload(a, payload);
+    return encodeUnchecked(a, id, selection, payload);
+}
+
+/// Save-path variant: the caller already validated/encoded the checkpoint payload.
+pub fn encodeUnchecked(a: std.mem.Allocator, id: ids.Id, selection: *const selections.Snapshot, payload: []const u8) ![]u8 {
     if (!ids.valid(id)) return error.InvalidSessionID;
     if (payload.len == 0) return error.InvalidResumeLength;
     if (selection.model_len == 0 or selection.model_len > selection.model_buffer.len or selection.provider_name_len > selection.provider_name_buffer.len) return error.InvalidResumeSelection;
@@ -69,7 +75,6 @@ pub fn encode(a: std.mem.Allocator, id: ids.Id, selection: *const selections.Sna
     selections.encode(&writer, selection) catch return error.InvalidResumeSelection;
     const selection_bytes = writer.buffered();
     _ = try parseSelection(a, selection_bytes);
-    try checkPayload(a, payload);
     const bytes = try a.alloc(u8, try totalSize(selection_bytes.len, payload.len));
     @memcpy(bytes[0..8], magic);
     bytes[8] = 3;

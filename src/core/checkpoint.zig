@@ -78,13 +78,11 @@ fn encodedSize(state: State) !usize {
 }
 
 pub fn encode(a: Allocator, state: State) ![]u8 {
-    const size = try encodedSize(state);
-    const bytes = try a.alloc(u8, size);
-    errdefer a.free(bytes);
-    var writer = std.Io.Writer.fixed(bytes);
-    try std.json.Stringify.value(state, .{ .emit_null_optional_fields = true }, &writer);
-    std.debug.assert(writer.end == size);
-    return bytes;
+    try basic(state);
+    var allocating = std.Io.Writer.Allocating.init(a);
+    defer allocating.deinit();
+    std.json.Stringify.value(state, .{ .emit_null_optional_fields = true }, &allocating.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    return allocating.toOwnedSlice();
 }
 
 // Check UTF-8 and basic bracket balance before strict JSON parsing.

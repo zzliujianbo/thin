@@ -21,6 +21,7 @@ const r = @import("../core/runtime.zig");
 const preferences = @import("../core/settings.zig");
 const shared = @import("../presentation.zig");
 const bridge_module = @import("../ui/bridge.zig");
+const util_json = @import("../util/json.zig");
 const decision_picker = @import("../ui/decision_picker.zig");
 const picker_module = @import("../ui/model_picker.zig");
 const session_client = @import("../ui/session_client.zig");
@@ -684,28 +685,6 @@ pub const Client = struct {
         return .{ .context = self, .vtable = &table };
     }
 
-    pub fn connection(self: *Client) tui.Connection {
-        return .{
-            .context = self,
-            .current_fn = currentFn,
-            .configure_fn = configureFn,
-            .configure_provider_fn = configureProviderFn,
-            .codex_login_fn = codexLoginFn,
-            .select_model_fn = selectModelFn,
-            .set_effort_fn = setEffortFn,
-            .cycle_effort_fn = cycleEffortFn,
-            .preference_fn = preferenceFn,
-            .setting_fn = settingFn,
-            .decision_fn = decisionFn,
-            .image_fn = imageFn,
-            .proxy_fn = proxyFn,
-            .proxy_address_fn = proxyAddressFn,
-            .refresh_models_fn = refreshModelsFn,
-            .poll_models_fn = pollModelsFn,
-            .session_client = self.vtable(),
-        };
-    }
-
     // -- transport ---------------------------------------------------------
 
     fn waitFor(self: *Client, timeout_ms: u32) unix.Wait {
@@ -1336,11 +1315,16 @@ pub const Client = struct {
     fn adoptSettings(self: *Client, object: std.json.ObjectMap) !void {
         var next: Pub = .{};
         next.doc = resp_doc: {
-            // The caller's document is released after this call; re-parse the
-            // public object into a document this projection keeps.
-            const bytes = try std.json.Stringify.valueAlloc(self.a, std.json.Value{ .object = object }, .{});
-            defer self.a.free(bytes);
-            break :resp_doc std.json.parseFromSlice(std.json.Value, self.a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" }) catch return error.ProtocolError;
+            // The caller's document is released after this call; keep a deep
+            // clone under an owned arena without stringify/parse.
+            const arena = try self.a.create(std.heap.ArenaAllocator);
+            arena.* = .init(self.a);
+            const value = util_json.clone(arena.allocator(), .{ .object = object }) catch |err| {
+                arena.deinit();
+                self.a.destroy(arena);
+                return err;
+            };
+            break :resp_doc .{ .arena = arena, .value = value };
         };
         // A later catalog can fail after an earlier one was already assigned to
         // `next`, so the error path releases the whole partial projection
@@ -1675,20 +1659,19 @@ pub const Client = struct {
     }
 
     fn pushEventMode(self: *Client, entry: std.json.Value, strict: bool) !void {
-        var owned_bytes: ?[]u8 = null;
-        defer if (owned_bytes) |bytes| self.a.free(bytes);
-        const json = switch (entry) {
-            .string => |text| text,
-            .object => blk: {
-                owned_bytes = try std.json.Stringify.valueAlloc(self.a, entry, .{});
-                break :blk owned_bytes.?;
+        var decoded = switch (entry) {
+            .string => |text| blk: {
+                if (text.len == 0 or text.len > protocol.max_response) return error.ProtocolError;
+                break :blk protocol.decodeEvent(self.a, text) catch |err| {
+                    if (strict) return err;
+                    return;
+                };
+            },
+            .object => protocol.decodeEventValue(self.a, entry) catch |err| {
+                if (strict) return err;
+                return;
             },
             else => return error.ProtocolError,
-        };
-        if (json.len == 0 or json.len > protocol.max_response) return error.ProtocolError;
-        var decoded = protocol.decodeEvent(self.a, json) catch |err| {
-            if (strict) return err;
-            return;
         };
         defer decoded.deinit();
         // A wire epoch is authority-bearing: it must match the controller epoch

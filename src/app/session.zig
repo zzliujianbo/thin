@@ -838,7 +838,7 @@ pub const Session = struct {
             std.crypto.secureZero(u8, payload);
             self.allocator.free(payload);
         }
-        return resume_codec.encode(self.allocator, self.session_id, &selection, payload);
+        return resume_codec.encodeUnchecked(self.allocator, self.session_id, &selection, payload);
     }
 
     fn current(raw: *anyopaque) tui.Connection.State {
