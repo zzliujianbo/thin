@@ -143,7 +143,7 @@ pub const Completion = struct {
 
 /// Bounded excerpt kept from an arbitrary failure body. The row clips it again to
 /// the terminal width, so this is a memory bound, not a layout decision.
-const reason_bytes = 128;
+const reason_bytes = 512;
 
 /// Owned, bounded, frontend-neutral reason for one failed call; the caller owns
 /// the returned slice. The failed call's own text is shown as-is (read errors are
@@ -192,23 +192,73 @@ fn bashReason(a: std.mem.Allocator, text: []const u8) !?[]const u8 {
         else => {},
     };
     if (object.get("signal")) |value| switch (value) {
-        .integer => |number| return try std.fmt.allocPrint(a, "signal {d}", .{number}),
+        .integer => |number| {
+            if (signalLabel(number)) |label| return try std.fmt.allocPrint(a, "signal {d} ({s})", .{ number, label });
+            return try std.fmt.allocPrint(a, "signal {d}", .{number});
+        },
         else => {},
     };
     const code: ?i64 = if (object.get("exit_code")) |value| switch (value) {
         .integer => |number| number,
         else => null,
     } else null;
+    if (code == null or code.? == 0) return null;
     const stderr = if (object.get("stderr")) |value| switch (value) {
-        .string => |line| line,
+        .string => |body| body,
         else => "",
     } else "";
-    const detail = try excerpt(a, stderr);
-    defer if (detail) |value| a.free(value);
-    if (code) |number| if (number != 0) {
-        return if (detail) |value| try std.fmt.allocPrint(a, "exit {d}: {s}", .{ number, value }) else try std.fmt.allocPrint(a, "exit {d}", .{number});
+    const stdout = if (object.get("stdout")) |value| switch (value) {
+        .string => |body| body,
+        else => "",
+    } else "";
+    const lines = nonEmptyLines(stderr);
+    if (lines.first) |first_raw| {
+        const first = try excerpt(a, first_raw);
+        defer if (first) |value| a.free(value);
+        if (first) |value| {
+            if (lines.last) |last_raw| if (!std.mem.eql(u8, first_raw, last_raw)) {
+                const last = try excerpt(a, last_raw);
+                defer if (last) |item| a.free(item);
+                if (last) |item| if (!std.mem.eql(u8, value, item))
+                    return try std.fmt.allocPrint(a, "exit {d}: {s} ... {s}", .{ code.?, value, item });
+            };
+            return try std.fmt.allocPrint(a, "exit {d}: {s}", .{ code.?, value });
+        }
+    }
+    // No printable stderr line: stdout is only a fallback diagnostic, clearly
+    // labelled so it can never pass for the error channel.
+    if (try excerpt(a, stdout)) |line| {
+        defer a.free(line);
+        return try std.fmt.allocPrint(a, "exit {d} (stderr empty); stdout: {s}", .{ code.?, line });
+    }
+    return try std.fmt.allocPrint(a, "exit {d} (stderr empty)", .{code.?});
+}
+
+/// Common signal names whose numbers are identical on Linux and macOS. Other
+/// signals stay numeric instead of being guessed.
+fn signalLabel(number: i64) ?[]const u8 {
+    return switch (number) {
+        2 => "SIGINT",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        else => null,
     };
-    return if (detail) |value| try a.dupe(u8, value) else null;
+}
+
+const LinePair = struct { first: ?[]const u8 = null, last: ?[]const u8 = null };
+
+fn nonEmptyLines(body: []const u8) LinePair {
+    var first: ?[]const u8 = null;
+    var last: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        if (first == null) first = line;
+        last = line;
+    }
+    return .{ .first = first, .last = last };
 }
 
 /// Sanitized, single-line, bounded excerpt of a failure body. Null when nothing

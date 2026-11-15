@@ -264,10 +264,9 @@ fn labelParts(name: []const u8, label: []const u8) LabelParts {
 /// while the call runs, a plain space once it settles. The slot always exists so
 /// removing the animation never shifts the tool name or command by a column.
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indicator: []const u8) ![]const u8 {
-    const reason = if (outcome == .failed) value.failure_reason orelse "" else "";
     const name = activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
-    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}{s}{s}{s}", .{
+    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}{s}", .{
         indicator,
         name,
         parts.sep,
@@ -278,9 +277,16 @@ pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indic
             .canceled => " [canceled]",
             else => "",
         },
-        if (reason.len != 0) " " else "",
-        reason,
     });
+}
+
+/// One-row failure detail rendered below a failed command row. `reason` stays
+/// raw on the record so a width change re-clips it instead of keeping stale cuts.
+pub fn failureReasonLine(a: std.mem.Allocator, reason: []const u8, columns: usize) ![]const u8 {
+    const width = @max(1, columns -| 2);
+    const line = try singleLine(a, reason, width);
+    defer a.free(line);
+    return std.fmt.allocPrint(a, "{s}  {s}{s}", .{ theme.failure, line, theme.reset });
 }
 
 /// Byte length of the fixed prefix `commandText` writes before its label; used
@@ -292,18 +298,15 @@ pub fn commandPrefixLen(value: Caption) usize {
     return 2 + name.len + parts.sep.len + @intFromBool(value.display != null) * "B: ".len;
 }
 
-/// Bytes at the end of `commandText` carrying the outcome marker and its bounded
-/// reason. The renderer keeps them out of the clipped label, so a narrow row
-/// shortens the target before the reason and clips the reason itself, never the
-/// marker.
-pub fn commandSuffixLen(value: Caption, outcome: Outcome) usize {
-    const marker: usize = switch (outcome) {
+/// Bytes at the end of `commandText` carrying only the outcome marker. The
+/// renderer reserves them before clipping, so a narrow row shortens the target
+/// first and drops the marker only when the row cannot hold it.
+pub fn commandSuffixLen(_: Caption, outcome: Outcome) usize {
+    return switch (outcome) {
         .failed => " \u{2717}".len,
         .canceled => " [canceled]".len,
-        else => return 0,
+        else => 0,
     };
-    const reason = if (outcome == .failed) value.failure_reason orelse "" else "";
-    return marker + @intFromBool(reason.len != 0) + reason.len;
 }
 
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.
@@ -350,8 +353,9 @@ fn flowTone(column: usize, head: shared.activity.FlowHead) []const u8 {
 /// rendered last, in muted color, so it survives label clipping and never
 /// competes with the outcome color or diff marks. `active_time_ms` is the icon
 /// flow clock only; the two are deliberately independent. `keep_tail` is
-/// the byte offset of the outcome suffix (` ✗ reason`), which is reserved
-/// before the label is clipped; zero keeps the whole body clip-able.
+/// the byte offset of the outcome marker (` ✗` / ` [canceled]`), which is
+/// reserved before the label is clipped; zero keeps the whole body clip-able.
+/// A failed call's reason lives on its own row below, never in this line.
 pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64, keep_tail: usize) ![]const u8 {
     // Detail stays <=512 bytes; allow its prefix and bounded observed counts
     // without sanitizing/truncating the same path a second time at512 bytes.
@@ -364,33 +368,18 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         try shared.activity.formatDuration(&duration_writer, ms);
     }
     const limit = commandColumns(columns);
-    // The outcome tail (` ✗ reason`) is reserved before the label is clipped, and
-    // the reason is clipped to the row itself: a long reason ends in dots instead
-    // of disappearing or eating the whole target, while a narrow row still
-    // shortens the target first and keeps at least the bare marker.
+    // The outcome tail is only the marker (` ✗` / ` [canceled]`); the reason is
+    // rendered on its own row below. Reserve the marker before clipping the
+    // label, and drop it only when the row is too narrow for it.
     var tail: []const u8 = if (keep_tail != 0 and keep_tail < body.len) body[keep_tail..] else "";
-    var tail_dots = false;
     var tail_width: usize = text.width(tail);
     const marker: usize = if (tail.len == 0) 0 else @min(tail.len, if (std.mem.startsWith(u8, tail, " [canceled]")) " [canceled]".len else " \u{2717}".len);
     const marker_width = text.width(tail[0..marker]);
     // The duration is optional: it never takes room from the bare marker.
     const suffix: []const u8 = if (duration_ms != null and limit >= marker_width + 4 + duration_writer.buffered().len) duration_writer.buffered() else "";
-    if (tail.len != 0) {
-        const room = limit -| suffix.len -| 4;
-        if (tail_width > room) {
-            const keep = if (room >= marker_width + 4) text.fitBytes(tail, room - 3) else 0;
-            if (keep > marker) {
-                tail = tail[0..keep];
-                tail_dots = true;
-                tail_width = text.width(tail) + 3;
-            } else if (room >= marker_width) {
-                tail = tail[0..marker];
-                tail_width = marker_width;
-            } else {
-                tail = "";
-                tail_width = 0;
-            }
-        }
+    if (tail.len != 0 and tail_width + suffix.len > limit) {
+        tail = if (limit -| suffix.len >= marker_width) tail[0..marker] else "";
+        tail_width = if (tail.len == 0) 0 else marker_width;
     }
     const head = if (tail.len == 0) body else body[0..keep_tail];
     const safe = try boundedLine(a, head, limit -| tail_width -| suffix.len, false, 640);
@@ -447,10 +436,10 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
                     cursor = range.end;
                 }
             }
-            // The outcome tail shares the last span's color, so a failed row
-            // still reads as one `✗ reason` run in the same SGR context.
+            // The outcome tail shares the last span's color, so the failed row
+            // keeps one `✗` run in the same SGR context.
             if (tail.len != 0 and end == safe.len) {
-                try out.writer.print("{s}{s}{s}{s}", .{ safe[cursor..end], tail, if (tail_dots) "..." else "", theme.reset });
+                try out.writer.print("{s}{s}{s}", .{ safe[cursor..end], tail, theme.reset });
                 tail_written = true;
             } else try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
         }
@@ -458,7 +447,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         if (at == safe.len) break;
     }
     try out.writer.writeAll(safe[at..]);
-    if (tail.len != 0 and !tail_written) try out.writer.print("{s}{s}{s}{s}", .{ outcomeColor(if (spans.len != 0) spans[spans.len - 1].outcome else .pending), tail, if (tail_dots) "..." else "", theme.reset });
+    if (tail.len != 0 and !tail_written) try out.writer.print("{s}{s}{s}", .{ outcomeColor(if (spans.len != 0) spans[spans.len - 1].outcome else .pending), tail, theme.reset });
     if (suffix.len != 0) try out.writer.print("{s}{s}{s}", .{ theme.duration, suffix, theme.reset });
     return a.dupe(u8, out.written());
 }

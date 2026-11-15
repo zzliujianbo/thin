@@ -150,6 +150,8 @@ pub const Terminal = struct {
     model_failure: ?p.FailureKind = null,
     /// 最后一次模型请求的 HTTP 状态码（若有）。
     http_status: ?u16 = null,
+    /// 主任务墙钟耗时：从接受到最终 Terminal（含模型、工具、压缩与审批等待）。
+    duration_ms: ?u64 = null,
     /// 原始失败原因（提供方原文或本地错误名），供前端直接展示。
     failure_message: [failure_message_max]u8 = @splat(0),
     failure_message_len: u16 = 0,
@@ -845,6 +847,7 @@ pub const Runtime = struct {
     const Operation = union(enum) { prompt: []const u8, compact, command: []const u8 };
 
     fn runTask(self: *Runtime, operation: Operation, cancel: *p.Cancellation) !Terminal {
+        const began = std.Io.Clock.awake.now(self.io);
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
@@ -923,6 +926,7 @@ pub const Runtime = struct {
         // Exactly one terminal result per accepted run, including failures. A
         // disconnected host need not receive it, but the caller still gets it.
         task.terminal.context_snapshot = self.contextSnapshot();
+        task.terminal.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
         inbox_success = task.terminal.status == .success;
         var finished_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .finished_emit });
         self.emit(.{ .finished = task.terminal }, cancel) catch |err| {

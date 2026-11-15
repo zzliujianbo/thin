@@ -912,6 +912,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("failure", if (terminal.detail) |detail| failureCode(detail) else "other");
             try out.field("model_failure", terminal.model_failure);
             try out.field("http", terminal.http_status);
+            try out.field("duration_ms", terminal.duration_ms);
             if (terminal.failureText().len != 0) try out.field("failure_message", terminal.failureText());
             try out.beginObject("usage");
             try out.field("normal_calls", terminal.usage.normal_calls);
@@ -1663,6 +1664,7 @@ fn decodeTerminalChecked(object: std.json.ObjectMap) !r.Terminal {
         .detail = detail,
         .model_failure = try optionalEnum(p.FailureKind, object, "model_failure"),
         .http_status = if (try optionalU64(object, "http")) |code| @intCast(@min(code, 999)) else null,
+        .duration_ms = try optionalU64(object, "duration_ms"),
         .usage = usage,
         .context_snapshot = context,
     };

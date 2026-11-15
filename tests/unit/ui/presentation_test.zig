@@ -86,7 +86,7 @@ test "normal preview captions show names until reliable typed fields arrive" {
     try std.testing.expect(std.mem.find(u8, line, "⠋") == null);
     try std.testing.expect(std.mem.find(u8, line, "0ms") == null);
 }
-test "failed rows keep the bounded reason while the label is clipped" {
+test "failed rows keep the reason on its own bounded row" {
     const a = std.testing.allocator;
     const output = @import("markdown_writer.zig");
     const captioned = try fromToolView(a, "read_file", .{ .path = .{ .text = "tests/unit/app/session_host_test.zig" } });
@@ -95,35 +95,26 @@ test "failed rows keep the bounded reason while the label is clipped" {
     failed.failure_reason = "FileNotFound: file not found";
     const body = try commandText(a, failed, .failed, " ");
     defer a.free(body);
-    const tail = commandSuffixLen(failed, .failed);
-    try std.testing.expect(tail != 0);
-    // A wide row keeps target and reason.
-    const wide = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 200, null, null, body.len - tail);
+    try std.testing.expect(std.mem.endsWith(u8, body, " ✗"));
+    try std.testing.expect(std.mem.indexOf(u8, body, "FileNotFound") == null);
+    try std.testing.expectEqual(@as(usize, 4), commandSuffixLen(failed, .failed));
+    // The reason row keeps the whole width and starts with the failure color.
+    const wide = try failureReasonLine(a, failed.failure_reason.?, 200);
     defer a.free(wide);
-    try std.testing.expect(std.mem.find(u8, wide, "✗ FileNotFound: file not found") != null);
-    // A narrow row clips the target with dots and still names the reason.
-    const narrow = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 60, null, null, body.len - tail);
+    try std.testing.expect(std.mem.startsWith(u8, wide, theme.failure ++ "  FileNotFound: file not found"));
+    try std.testing.expect(output.displayWidth(wide) <= 200);
+    // A narrow reason is clipped with dots, never dropped.
+    const long = "exit 2: sed: can't read a/very/long/path/that/does/not/fit/in/the/row";
+    const narrow = try failureReasonLine(a, long, 40);
     defer a.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "...") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "✗ FileNotFound: file not found") != null);
-    try std.testing.expect(output.displayWidth(narrow) <= commandColumns(60));
-    // A reason too long for the row is clipped with dots, never dropped.
-    var long = captioned;
-    long.failure_reason = "exit 2: sed: can't read a/very/long/path/that/does/not/fit/in/the/row";
-    const long_body = try commandText(a, long, .failed, " ");
-    defer a.free(long_body);
-    const long_tail = commandSuffixLen(long, .failed);
-    const clipped_reason = try commandLine(a, long_body, &.{.{ .start = 0, .end = long_body.len, .outcome = .failed }}, 40, null, null, long_body.len - long_tail);
-    defer a.free(clipped_reason);
-    try std.testing.expect(std.mem.find(u8, clipped_reason, "✗ exit 2") != null);
-    try std.testing.expect(std.mem.find(u8, clipped_reason, "not/fit") == null);
-    try std.testing.expect(std.mem.find(u8, clipped_reason, "...") != null);
-    try std.testing.expect(output.displayWidth(clipped_reason) <= commandColumns(40));
-    // No room at all: the marker itself survives, never a bare letter.
-    const tiny = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 12, null, null, body.len - tail);
-    defer a.free(tiny);
-    try std.testing.expect(std.mem.find(u8, tiny, "✗") != null);
-    try std.testing.expect(output.displayWidth(tiny) <= commandColumns(12));
+    try std.testing.expect(std.mem.startsWith(u8, narrow, theme.failure ++ "  exit 2: sed"));
+    try std.testing.expect(std.mem.endsWith(u8, narrow, "..." ++ theme.reset));
+    try std.testing.expect(output.displayWidth(narrow) <= commandColumns(40));
+    // No reason means no second row at all.
+    failed.failure_reason = null;
+    const silent = try commandText(a, failed, .failed, " ");
+    defer a.free(silent);
+    try std.testing.expect(std.mem.indexOf(u8, silent, "✗") != null);
 }
 fn expectFailureReason(a: std.mem.Allocator, kind: shared.tools.Kind, result: @import("../core/runtime.zig").Execution, expected: []const u8) !void {
     const reason = try shared.tools.failureReason(a, kind, result);
@@ -137,12 +128,14 @@ test "every failed tool owns a bounded reason and never a raw body" {
     try expectFailureReason(a, .read, .{ .text = "FileNotFound", .is_error = true }, "FileNotFound");
     // bash results are our own envelope: only structured failure facts surface.
     try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":7,\"stderr\":\"boom\"}", .is_error = true }, "exit 7: boom");
-    try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":2,\"stderr\":\"sed: can't read missing.zig\\nmore\"}", .is_error = true }, "exit 2: sed: can't read missing.zig");
+    try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":2,\"stderr\":\"sed: can't read missing.zig\\nmore\"}", .is_error = true }, "exit 2: sed: can't read missing.zig ... more");
     try expectFailureReason(a, .bash, .{ .text = "{\"timed_out\":true}", .is_error = true }, "timed out");
-    try expectFailureReason(a, .bash, .{ .text = "{\"signal\":9}", .is_error = true }, "signal 9");
+    try expectFailureReason(a, .bash, .{ .text = "{\"signal\":9}", .is_error = true }, "signal 9 (SIGKILL)");
     try expectFailureReason(a, .bash, .{ .text = "Command cleanup could not be confirmed. A child may remain alive.", .is_error = true }, "command failed");
-    // The envelope's stdout never becomes a reason, and a foreign body never a row.
-    try expectFailureReason(a, .bash, .{ .text = "{\"stdout\":\"secret\",\"stderr\":\"\",\"exit_code\":1}", .is_error = true }, "exit 1");
+    // stdout is only a labelled fallback when stderr has no printable line.
+    try expectFailureReason(a, .bash, .{ .text = "{\"stdout\":\"secret\",\"stderr\":\"\",\"exit_code\":1}", .is_error = true }, "exit 1 (stderr empty); stdout: secret");
+    try expectFailureReason(a, .bash, .{ .text = "{\"stderr\":\"has-error\",\"stdout\":\"normal-output\",\"exit_code\":1}", .is_error = true }, "exit 1: has-error");
+    try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":137,\"stderr\":\"\"}", .is_error = true }, "exit 137 (stderr empty)");
     // Other tools expose the sanitized first line only.
     try expectFailureReason(a, .other, .{ .text = "Boom: line one\nline two", .is_error = true }, "Boom: line one");
     try expectFailureReason(a, .other, .{ .text = "{\"error\":\"invalid log offset\",\"id\":\"job-1\"}", .is_error = true }, "invalid log offset");

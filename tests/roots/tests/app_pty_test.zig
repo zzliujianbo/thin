@@ -1312,7 +1312,9 @@ fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
     try check(view.col == tail.len + @as(usize, if (std.mem.endsWith(u8, tail, "%>")) 1 else 0));
     // Catch the original screenful of erased body, not just a surviving tail
     // marker. This compact fixture leaves many prior lines in the viewport.
-    try check(visible_prior >= 8);
+    // The denied call owns a failure-detail row and the task owns its total-time
+    // row, so two fewer prior markers fit than before.
+    try check(visible_prior >= 6);
     var occupied: usize = 0;
     var blanks: usize = 0;
     var longest_blank: usize = 0;
@@ -2485,7 +2487,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "read-error")) {
         const start = d.used;
         try d.send("read-missing\r");
-        try d.waitFrame(start, "✗ FileNotFound");
+        try d.waitFrame(start, "FileNotFound");
         try d.waitText(start, "read-error-answer");
         try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "menu-navigation")) {
@@ -3009,10 +3011,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try Driver.checkComposerTail(final);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m \x1b[38;5;245m bash sleep 0.6; printf ok") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m \x1b[38;5;203m bash false; #") != null); // Failure prefix; the summary clips at the full row width in its failure color.
-        // The clipped target ends in dots, then the reserved outcome marker and
-        // the bash failure reason taken from the result envelope.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "... ✗ exit 1\x1b[0m") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "·") == null);
+        // The clipped target ends in dots and the reserved marker; the bash
+        // failure reason owns the row below it.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "... ✗\x1b[0m") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "exit 1") != null);
+        // Every completed task now appends its total-time line.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "  · ") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Running bash") == null);
@@ -3061,7 +3065,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "file-stats-final-answer") != null) {
             answer = row;
         };
-        try check(answer != null and answer.? == previous.? + 2);
+        try check(answer != null and answer.? == previous.? + 3);
         for (final.grid[answer.? - 1]) |byte| try check(byte == ' ');
         try check(std.mem.indexOf(u8, &final.grid[final.row], "(fixture-model) ") != null and std.mem.indexOf(u8, &final.grid[final.row], "%>") != null);
         try Driver.checkComposerTail(final);

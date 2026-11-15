@@ -2215,12 +2215,16 @@ test "failed tool rows keep the bounded reason while the target clips" {
     try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "write_file", .result = .{ .text = "AccessDenied", .is_error = true } } }, false, true);
     const record = &ui.records.items[ui.records.items.len - 1];
     try std.testing.expect(record.command_row);
-    try std.testing.expect(std.mem.indexOf(u8, record.body.items, "✗ AccessDenied") != null);
-    // A narrow row shortens the target, never the reason.
+    try std.testing.expect(std.mem.endsWith(u8, record.body.items, " ✗"));
+    try std.testing.expect(std.mem.indexOf(u8, record.body.items, "AccessDenied") == null);
+    try std.testing.expectEqualStrings("AccessDenied", record.failure_reason.?);
+    // The reason owns its own row below the clipped target.
     try record.layout(a, 40);
-    const line = record.lines[0];
-    try std.testing.expect(std.mem.indexOf(u8, line, "✗ AccessDenied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "...") != null);
+    try std.testing.expectEqual(@as(usize, 2), record.lines.len);
+    try std.testing.expect(std.mem.endsWith(u8, record.lines[0], " ✗" ++ theme.reset));
+    try std.testing.expect(std.mem.indexOf(u8, record.lines[0], "...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record.lines[1], "AccessDenied") != null);
+    try std.testing.expect(@import("markdown_writer.zig").displayWidth(record.lines[1]) <= 40);
 }
 test "replayed history keeps file counters and local command output rows" {
     const a = std.testing.allocator;
@@ -2954,7 +2958,7 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
         if (std.mem.find(u8, &line, "pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
-    try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
+    try std.testing.expectEqual(failed_row.? + 2, pending_row.?);
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "hidden-output-json" } } }, &cancel);
@@ -2962,13 +2966,14 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try ui.event(item);
     item.deinit();
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqualStrings("  bash date ✗ command failed", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("  bash date ✗", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("command failed", ui.records.items[0].failure_reason.?);
     try std.testing.expectEqualStrings("  bash pwd", ui.records.items[1].body.items);
     try ui.draw();
     try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[0].pending_output);
     try std.testing.expect(ui.records.items[1].pending_output);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items[0].lines.len);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[1].lines.len);
     try std.testing.expect(std.mem.find(u8, ui.frame, " date ✗") == null); // The previous result is not rewritten.
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.success ++ " " ++ theme.muted ++ " bash pwd") != null);
@@ -2981,8 +2986,8 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
         if (std.mem.find(u8, &line, " bash pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
-    try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
-    // Both captions are contiguous at rows 0 and 1, so the second one is the
+    try std.testing.expectEqual(failed_row.? + 2, pending_row.?);
+    // Both captions are contiguous with the failure detail row between them, so the second one is the
     // last body row; the separator, hint and composer follow it unchanged and
     // the cursor lands exactly three rows below the pending caption.
     try std.testing.expectEqual(pending_row.? + 3, screen.row);
@@ -4200,6 +4205,42 @@ test "terminal details publish once in conversation and never own the footer" {
     try std.testing.expect(std.mem.find(u8, hint, "OutputLimitReached") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, hint, '\x1b') == null);
 }
+test "completed tasks append one muted total-time row" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.notice = "Ready";
+    const success: r.Terminal = .{ .status = .success, .duration_ms = 1234 };
+    ui.last_terminal = success;
+    ui.notice = Ui.terminalNotice(success);
+    ui.queueTerminalNotice(success);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    const record = ui.records.items[0];
+    try std.testing.expectEqual(NoticeLevel.plain, record.notice_level);
+    try std.testing.expect(std.mem.find(u8, record.body.items, theme.muted ++ "  \u{00b7} 1.23s") != null);
+    var failed: r.Terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .duration_ms = 42 };
+    failed.setFailureText("boom");
+    ui.last_terminal = failed;
+    ui.notice = Ui.terminalNotice(failed);
+    ui.queueTerminalNotice(failed);
+    const second = ui.records.items[ui.records.items.len - 1];
+    try std.testing.expectEqual(NoticeLevel.failure, second.notice_level);
+    try std.testing.expect(std.mem.find(u8, second.body.items, "boom") != null);
+    try std.testing.expect(std.mem.find(u8, second.body.items, "\n" ++ theme.muted ++ "  \u{00b7} 42ms") != null);
+    // A round-limit pause keeps its concise wording and still shows the time.
+    const paused: r.Terminal = .{ .status = .paused, .detail = error.RoundLimit, .duration_ms = 5 };
+    ui.queueTerminalNotice(paused);
+    const third = ui.records.items[ui.records.items.len - 1];
+    try std.testing.expect(std.mem.find(u8, third.body.items, "Paused at round limit; send a message to continue") != null);
+    try std.testing.expect(std.mem.find(u8, third.body.items, "  \u{00b7} 5ms") != null);
+    // A synthetic success without a measurement stays silent.
+    const legacy: r.Terminal = .{ .status = .success };
+    const before = ui.records.items.len;
+    ui.queueTerminalNotice(legacy);
+    try std.testing.expectEqual(before, ui.records.items.len);
+}
 test "input policy pauses stay red in conversation and out of the footer" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4452,15 +4493,16 @@ test "read command errors include a safe reason after error and never display ra
     const caption = try presentation.fromCall(std.testing.allocator, call);
     defer caption.deinit(std.testing.allocator);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 }, false);
-    try std.testing.expectEqualStrings("  read_file README.md ✗ FileNotFound", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("  read_file README.md ✗", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("FileNotFound", ui.records.items[0].failure_reason.?);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "✗ FileNotFound") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "FileNotFound") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
     testAcknowledgeFullFrame(&ui);
     try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true }, false);
     // 原始首行原样上行，只做单行化与控制字符清洗。
-    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "✗ {\"private-result\":\"secret\"}") != null);
-    try std.testing.expect(std.mem.findScalar(u8, ui.records.items[1].body.items, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[1].failure_reason.?, "{\"private-result\":\"secret\"}") != null);
+    try std.testing.expect(std.mem.findScalar(u8, ui.records.items[1].failure_reason.?, 0x1b) == null);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true }, false);
     try std.testing.expectEqualStrings("  read_file README.md [canceled]", ui.records.items[2].body.items);
 }

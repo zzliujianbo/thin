@@ -100,6 +100,8 @@ const Record = struct {
     agent_open: bool = false,
     /// Measured wall-clock execution time of this row; null when unobserved.
     duration_ms: ?u64 = null,
+    /// Raw failure detail rendered as one extra row below a failed command.
+    failure_reason: ?[]u8 = null,
     command_spans: std.ArrayList(presentation.CommandSpan) = .empty,
     /// Only a fully written frame commits transcript delivery. Pending survives index shifts.
     output: bool = false,
@@ -176,6 +178,8 @@ const Record = struct {
         self.discardPendingFlow();
         self.body.deinit(a);
         self.command_spans.deinit(a);
+        if (self.failure_reason) |reason| a.free(reason);
+        self.failure_reason = null;
     }
 
     fn discardPendingFlow(self: *Record) void {
@@ -241,6 +245,9 @@ const Record = struct {
         self.command_row = true;
         self.command_tail_start = self.body.items.len - presentation.commandSuffixLen(caption, outcome);
         self.duration_ms = duration_ms;
+        if (outcome == .failed) {
+            if (caption.failure_reason) |reason| self.failure_reason = try a.dupe(u8, reason);
+        }
         self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + presentation.commandPrefixLen(caption)) else null });
     }
 
@@ -380,7 +387,10 @@ const Record = struct {
 
         if (self.command_row) {
             const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null, self.command_tail_start);
-            self.lines = try temp.dupe([]const u8, &.{line});
+            if (self.failure_reason) |reason| {
+                const detail = try presentation.failureReasonLine(temp, reason, columns);
+                self.lines = try temp.dupe([]const u8, &.{ line, detail });
+            } else self.lines = try temp.dupe([]const u8, &.{line});
             self.excerpt = false; // Commands indicate clipping with ... only.
             self.columns = columns;
             self.cache = arena;
@@ -5904,26 +5914,48 @@ const Ui = struct {
     /// A failed task or an error pause stops the current main task, so it is
     /// red; an explicit user cancellation remains plain.
     fn publishTerminalNotice(self: *Ui, result: r.Terminal) bool {
-        if (result.status == .success) return true;
+        // A successful task has no failure text, but every completed task owns a
+        // muted total-time line. Synthetic terminals without a measurement stay
+        // silent so existing event fixtures keep their shape.
+        if (result.status == .success and result.duration_ms == null) return true;
         // Ordinary round-limit pauses already have user-facing wording; do not
         // expose their internal error name. Policy and output pauses keep detail.
-        if (result.status == .paused and result.model_failure != .output_limit and !r.policyPause(result.detail))
-            return self.tryAppendNotice(.failure, terminalNotice(result));
+        if (result.status == .paused and result.model_failure != .output_limit and !r.policyPause(result.detail)) {
+            var concise: std.Io.Writer.Allocating = .init(self.allocator);
+            defer concise.deinit();
+            concise.writer.writeAll(terminalNotice(result)) catch return false;
+            writeTaskDuration(&concise.writer, result.duration_ms, true) catch return false;
+            return self.tryAppendNotice(.failure, concise.written());
+        }
         var formatted: std.Io.Writer.Allocating = .init(self.allocator);
         defer formatted.deinit();
         const writer = &formatted.writer;
-        const label = switch (result.status) {
-            .paused => "Paused",
-            .failed => "\u{2717}",
-            .canceled => "Canceled; prior side effects remain",
-            .success => unreachable,
-        };
-        if (result.status == .canceled and result.detail != null and result.detail.? == error.Canceled)
-            writer.writeAll(label) catch return false
-        else
-            shared.failure.write(writer, label, result.detail, result.http_status, result.failureText()) catch return false;
-        const level: NoticeLevel = if (result.status == .canceled) .plain else .failure;
+        var level: NoticeLevel = .plain;
+        if (result.status != .success) {
+            const label = switch (result.status) {
+                .paused => "Paused",
+                .failed => "\u{2717}",
+                .canceled => "Canceled; prior side effects remain",
+                .success => unreachable,
+            };
+            if (result.status == .canceled and result.detail != null and result.detail.? == error.Canceled)
+                writer.writeAll(label) catch return false
+            else
+                shared.failure.write(writer, label, result.detail, result.http_status, result.failureText()) catch return false;
+            level = if (result.status == .canceled) .plain else .failure;
+        }
+        writeTaskDuration(writer, result.duration_ms, result.status != .success) catch return false;
         return self.tryAppendNotice(level, formatted.written());
+    }
+
+    /// Total wall-clock time of one completed task, muted under its outcome.
+    fn writeTaskDuration(writer: *std.Io.Writer, duration_ms: ?u64, leading_newline: bool) !void {
+        const ms = duration_ms orelse return;
+        if (leading_newline) try writer.writeByte('\n');
+        try writer.writeAll(theme.muted);
+        try writer.writeAll("  \u{00b7} ");
+        try shared.activity.formatDuration(writer, ms);
+        try writer.writeAll(theme.reset);
     }
 
     fn queueTerminalNotice(self: *Ui, result: r.Terminal) void {

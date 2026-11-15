@@ -124,9 +124,17 @@ test "finished frame carries the raw failure cause and rejects oversize text" {
         .detail = error.ModelRequestFailed,
         .model_failure = .authentication,
         .http_status = 401,
+        .duration_ms = 1234,
     };
     terminal.setFailureText("Incorrect API key provided: sk-test");
     try expectEventRoundTrip(a, .{ .finished = terminal });
+    {
+        const encoded_finished = try encodeEvent(a, .{ .finished = terminal });
+        defer a.free(encoded_finished);
+        var decoded_finished = try decodeEvent(a, encoded_finished);
+        defer decoded_finished.deinit();
+        try std.testing.expectEqual(@as(?u64, 1234), decoded_finished.event.finished.duration_ms);
+    }
 
     const encoded = try encodeEvent(a, .{ .finished = terminal });
     defer a.free(encoded);
