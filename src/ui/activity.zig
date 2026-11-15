@@ -5,17 +5,19 @@ pub const Meter = shared.activity.Meter;
 pub const Flow = shared.activity.Flow;
 pub const Tool = shared.tools.Kind;
 
-pub fn icon(kind: Tool) []const u8 {
+/// Tool name shown after the one-column status slot. It never changes between
+/// the running and settled row, so the command column stays put.
+pub fn toolName(kind: Tool) []const u8 {
     return switch (kind) {
-        .memory => "m",
-        .bash => ">",
-        .read => "r",
-        .write => "w",
-        .edit => "e",
-        .subagent => "a",
-        .subagent_id => "a",
-        .parent_message => "m",
-        .other => "⚙",
+        .memory => "memory",
+        .bash => "bash",
+        .read => "read_file",
+        .write => "write_file",
+        .edit => "edit_file",
+        .subagent => "subagent",
+        .subagent_id => "subagent",
+        .parent_message => "message_parent",
+        .other => "tool",
     };
 }
 

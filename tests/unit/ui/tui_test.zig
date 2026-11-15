@@ -2609,7 +2609,7 @@ test "typed tool row updates in place before execution and uses ready metadata a
     try emitToolUi(&ui, .{ .tool_views = .{ .generation = 9, .phase = .begin } });
     try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "write_file" } });
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ "w" ++ theme.muted ++ " write_file") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ " " ++ theme.muted ++ " write_file") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "transient-reasoning") == null);
     try std.testing.expect(ui.active_tool == null);
     const in_flight = try a.dupe(u8, ui.frame);
@@ -2622,7 +2622,7 @@ test "typed tool row updates in place before execution and uses ready metadata a
     for (0..3) |_| {
         try replayToolFrame(&ui, screen);
         try std.testing.expectEqual(@as(usize, 1), screen.count("src/preview.zig"));
-        try std.testing.expectEqual(@as(usize, 0), screen.count("write_file"));
+        try std.testing.expectEqual(@as(usize, 1), screen.count("write_file"));
         try std.testing.expect(ui.active_tool == null);
     }
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len); // reasoning only
@@ -2799,7 +2799,9 @@ test "raw write deltas alone never display JSON or invent execution" {
             try std.testing.expect(std.mem.find(u8, ui.frame, "preview.txt") == null);
         } else if (index == 1) {
             try std.testing.expect(ui.active_tool != null);
-            try std.testing.expect(std.mem.find(u8, ui.frame, theme.flow_band[0] ++ "w" ++ theme.muted ++ " preview.txt") != null);
+            const flow_prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s} write_file preview.txt", .{ theme.flow_band[0], activity.spinner(0), theme.muted });
+            defer std.testing.allocator.free(flow_prefix);
+            try std.testing.expect(std.mem.find(u8, ui.frame, flow_prefix) != null);
             try std.testing.expect(std.mem.find(u8, ui.frame, "+3") == null);
         } else {
             try std.testing.expect(ui.active_tool == null);
@@ -2844,8 +2846,7 @@ test "tool animation is transient and raw tool JSON never enters displayed recor
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, activity.spinner(0)) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, if (std.mem.eql(u8, name, "bash")) "date" else if (std.mem.eql(u8, name, "memory")) "read core" else "src/example.zig") != null);
-        const icon = if (std.mem.eql(u8, name, "bash")) ">" else if (std.mem.eql(u8, name, "memory")) "m" else if (std.mem.eql(u8, name, "read_file")) "r" else "w";
-        const tool_prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}", .{ theme.flow_band[0], icon, theme.muted });
+        const tool_prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}", .{ theme.flow_band[0], activity.spinner(0), theme.muted });
         defer std.testing.allocator.free(tool_prefix);
         try std.testing.expect(std.mem.find(u8, ui.frame, tool_prefix) != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "#7") == null);
@@ -2961,8 +2962,8 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try ui.event(item);
     item.deinit();
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqualStrings("> date ✗ command failed", ui.records.items[0].body.items);
-    try std.testing.expectEqualStrings("> pwd", ui.records.items[1].body.items);
+    try std.testing.expectEqualStrings("  bash date ✗ command failed", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("  bash pwd", ui.records.items[1].body.items);
     try ui.draw();
     try std.testing.expect(ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[0].pending_output);
@@ -2970,14 +2971,14 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[1].lines.len);
     try std.testing.expect(std.mem.find(u8, ui.frame, " date ✗") == null); // The previous result is not rewritten.
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.success ++ ">" ++ theme.muted ++ " pwd") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.success ++ " " ++ theme.muted ++ " bash pwd") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "hidden-") == null);
     try screen.replay(ui.frame);
     failed_row = null;
     pending_row = null;
     for (screen.grid, 0..) |line, row| {
         if (std.mem.find(u8, &line, "date ~") != null) failed_row = row;
-        if (std.mem.find(u8, &line, "> pwd") != null) pending_row = row;
+        if (std.mem.find(u8, &line, " bash pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
     try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
@@ -3058,7 +3059,7 @@ test "file captions are contiguous but separated from final prose and percent co
     item.deinit();
     try ui.replaceCommitted(&.{.{ .text = "final-body-marker" }}, false, true);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "w" ++ theme.muted ++ " src/main.zig  ~1 " ++ theme.diff_added ++ "+2" ++ theme.muted ++ " " ++ theme.diff_removed ++ "-3" ++ theme.muted ++ " lines") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, " " ++ theme.muted ++ " write_file src/main.zig  ~1 " ++ theme.diff_added ++ "+2" ++ theme.muted ++ " " ++ theme.diff_removed ++ "-3" ++ theme.muted ++ " lines") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "raw-json-must-stay-hidden") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "do-not-show-body") == null);
     // Keep exact palette assertions independent of the already-established
@@ -4451,7 +4452,7 @@ test "read command errors include a safe reason after error and never display ra
     const caption = try presentation.fromCall(std.testing.allocator, call);
     defer caption.deinit(std.testing.allocator);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 }, false);
-    try std.testing.expectEqualStrings("r README.md ✗ FileNotFound", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("  read_file README.md ✗ FileNotFound", ui.records.items[0].body.items);
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "✗ FileNotFound") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
@@ -4461,7 +4462,7 @@ test "read command errors include a safe reason after error and never display ra
     try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "✗ {\"private-result\":\"secret\"}") != null);
     try std.testing.expect(std.mem.findScalar(u8, ui.records.items[1].body.items, 0x1b) == null);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true }, false);
-    try std.testing.expectEqualStrings("r README.md [canceled]", ui.records.items[2].body.items);
+    try std.testing.expectEqualStrings("  read_file README.md [canceled]", ui.records.items[2].body.items);
 }
 test "sequential tool records from different frames have no gaps then final prose has one gap" {
     var cancel: p.Cancellation = .{};

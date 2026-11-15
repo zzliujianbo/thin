@@ -291,7 +291,7 @@ def run(app, wrap=False, local_command=False):
                         # live cursor row. Completion is not synonymous with
                         # retaining that row in the current grid.
                         transcript = tm('capture-pane', '-p', '-S', '-200', '-t', 'owned:0.0').splitlines()
-                        marker = '> true' if local_command else 'wrap-history-ready'
+                        marker = ' bash true' if local_command else 'wrap-history-ready'
                         return empty and any(marker in line for line in transcript)
 
                     wait(history_ready, 'owned history seed did not complete')

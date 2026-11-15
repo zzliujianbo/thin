@@ -248,13 +248,48 @@ fn activeIndicatorColor(now_ms: u64) []const u8 {
 
 pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null, generating: bool = false };
 
-pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome) ![]const u8 {
+/// Split a caption label into the separator after the tool name and the text
+/// that actually follows it. An unavailable detail is the tool name itself;
+/// provisional counts append two spaces to it, so neither repeats the name.
+const LabelParts = struct { sep: []const u8, text: []const u8 };
+fn labelParts(name: []const u8, label: []const u8) LabelParts {
+    if (label.len == 0) return .{ .sep = "", .text = "" };
+    if (std.mem.eql(u8, label, name)) return .{ .sep = "", .text = "" };
+    if (label.len >= name.len + 2 and std.mem.startsWith(u8, label, name) and label[name.len] == ' ' and label[name.len + 1] == ' ')
+        return .{ .sep = "", .text = label[name.len..] };
+    return .{ .sep = " ", .text = label };
+}
+
+/// `indicator` fills the fixed one-column status slot: the dot-matrix spinner
+/// while the call runs, a plain space once it settles. The slot always exists so
+/// removing the animation never shifts the tool name or command by a column.
+pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indicator: []const u8) ![]const u8 {
     const reason = if (outcome == .failed) value.failure_reason orelse "" else "";
-    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}", .{ if (value.display != null) "B:" else activity.icon(value.kind), value.label, switch (outcome) {
-        .failed => " \u{2717}",
-        .canceled => " [canceled]",
-        else => "",
-    }, if (reason.len != 0) " " else "", reason });
+    const name = activity.toolName(value.kind);
+    const parts = labelParts(name, value.label);
+    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}{s}{s}{s}", .{
+        indicator,
+        name,
+        parts.sep,
+        if (value.display != null) "B: " else "",
+        parts.text,
+        switch (outcome) {
+            .failed => " \u{2717}",
+            .canceled => " [canceled]",
+            else => "",
+        },
+        if (reason.len != 0) " " else "",
+        reason,
+    });
+}
+
+/// Byte length of the fixed prefix `commandText` writes before its label; used
+/// to shift label-relative diff marks onto the rendered row. Only settled and
+/// generating rows carry marks, so the indicator is always one space byte.
+pub fn commandPrefixLen(value: Caption) usize {
+    const name = activity.toolName(value.kind);
+    const parts = labelParts(name, value.label);
+    return 2 + name.len + parts.sep.len + @intFromBool(value.display != null) * "B: ".len;
 }
 
 /// Bytes at the end of `commandText` carrying the outcome marker and its bounded

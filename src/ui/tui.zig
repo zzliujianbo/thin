@@ -233,7 +233,7 @@ const Record = struct {
 
     fn setCommand(self: *Record, a: std.mem.Allocator, caption: presentation.Caption, outcome: presentation.Outcome, duration_ms: ?u64) !void {
         std.debug.assert(self.body.items.len == 0 and self.command_spans.items.len == 0);
-        const label = try presentation.commandText(a, caption, outcome);
+        const label = try presentation.commandText(a, caption, outcome, " ");
         defer a.free(label);
         try self.command_spans.ensureUnusedCapacity(a, 1);
         const start = self.body.items.len;
@@ -241,7 +241,7 @@ const Record = struct {
         self.command_row = true;
         self.command_tail_start = self.body.items.len - presentation.commandSuffixLen(caption, outcome);
         self.duration_ms = duration_ms;
-        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + activity.icon(caption.kind).len + 1) else null });
+        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + presentation.commandPrefixLen(caption)) else null });
     }
 
     /// Create the bounded thinking tail once, at the current terminal width.
@@ -2856,7 +2856,7 @@ const Ui = struct {
 
     /// Only the currently running call is replaceable; every result owns a row.
     fn pendingCommand(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
-        const label = try presentation.commandText(a, self.active_tool.?.caption, .pending);
+        const label = try presentation.commandText(a, self.active_tool.?.caption, .pending, activity.spinner(self.clock_ms));
         defer a.free(label);
         const start = self.active_tool.?.started_ms;
         const background_start = if (self.active_tool.?.caption.display) |display| display.action == .start else false;
@@ -2870,12 +2870,12 @@ const Ui = struct {
             observed = try presentation.provisionalWrite(a, entry.caption, entry.write_progress.?);
             break :blk observed.?;
         } else entry.caption;
-        const label = try presentation.commandText(a, caption, .pending);
+        const label = try presentation.commandText(a, caption, .pending, " ");
         defer a.free(label);
         const generating = !entry.ready and entry.write_progress != null and entry.caption.kind == .write;
         // Generating and approval rows remain muted and static, without an
         // execution time; tool_started owns the row flow clock and its timer.
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(activity.icon(caption.kind).len + 1) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null, 0);
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(presentation.commandPrefixLen(caption)) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null, 0);
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,

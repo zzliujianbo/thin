@@ -267,7 +267,7 @@ const Driver = struct {
         const view = try std.heap.page_allocator.create(regular.Screen);
         defer std.heap.page_allocator.destroy(view);
         var buffer: [512]u8 = undefined;
-        const needle = try std.fmt.bufPrint(&buffer, "> {s}", .{command});
+        const needle = try std.fmt.bufPrint(&buffer, " bash {s}", .{command});
         const until = now() + 10000;
         while (now() < until) {
             try self.drain(20);
@@ -1588,7 +1588,7 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
             const line = std.mem.trim(u8, row, " ");
             // The row is a fixed-width terminal row; wrapping is detected by
             // the unique needle count and the matched-row assertion below.
-            if (pending and summary == null) try check(std.mem.startsWith(u8, line, "w "));
+            if (pending and summary == null) try check(std.mem.startsWith(u8, line, "  write_file"));
             matched = true;
         }
         try check(matched);
@@ -1601,7 +1601,7 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
                 // The first complete generated row owns the full muted SGR;
                 // later sparse frames may update only its numeric suffix.
                 if (std.mem.eql(u8, needle, "write_file")) {
-                    try check(std.mem.indexOf(u8, complete[start..], spinner_theme.muted ++ "w" ++ spinner_theme.muted) != null);
+                    try check(std.mem.indexOf(u8, complete[start..], spinner_theme.muted ++ " " ++ spinner_theme.muted ++ " write_file") != null);
                 }
             }
         }
@@ -2962,9 +2962,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         const first = try d.screen();
         try d.quiet(240);
         const second = try d.screen();
-        try check(first.visible("> sleep 1; cat r.json") and second.visible("> sleep 1; cat r.json"));
-        try Driver.checkGap(first, "tool-icon-task", "> sleep 1; cat r.json");
-        try Driver.checkGap(second, "tool-icon-task", "> sleep 1; cat r.json");
+        try check(first.visible(" bash sleep 1; cat r.json") and second.visible(" bash sleep 1; cat r.json"));
+        try Driver.checkGap(first, "tool-icon-task", " bash sleep 1; cat r.json");
+        try Driver.checkGap(second, "tool-icon-task", " bash sleep 1; cat r.json");
         // One band sweeps the whole row: over the window several levels appear
         // while the glyph, its column and the command text stay put.
         var shades: usize = 0;
@@ -2982,8 +2982,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         var completed_row: ?usize = null;
         var next_row: ?usize = null;
         for (next_pending.grid, 0..) |line, row| {
-            if (std.mem.indexOf(u8, &line, "> sleep 1; cat r.json") != null) completed_row = row;
-            if (std.mem.indexOf(u8, &line, "> sleep 0.6; printf ok") != null) next_row = row;
+            if (std.mem.indexOf(u8, &line, " bash sleep 1; cat r.json") != null) completed_row = row;
+            if (std.mem.indexOf(u8, &line, " bash sleep 0.6; printf ok") != null) next_row = row;
         }
         try check(completed_row != null and next_row != null);
         try check(next_row.? == completed_row.? + 1);
@@ -2994,7 +2994,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         const final = try d.screen();
         try check(final.count("tool-icon-final-answer") == 1);
         var command_rows: [3]?usize = @splat(null);
-        const markers = [_][]const u8{ "> sleep 1; cat r.json", "> sleep 0.6; printf ok", "> false; #" };
+        const markers = [_][]const u8{ "  bash sleep 1; cat r.json", "  bash sleep 0.6; printf ok", "  bash false; #" };
         for (final.grid, 0..) |line, row| {
             var calls_on_row: usize = 0;
             for (markers, 0..) |marker, index| if (std.mem.indexOf(u8, &line, marker) != null) {
@@ -3007,8 +3007,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(command_rows[1].? == command_rows[0].? + 1 and command_rows[2].? == command_rows[1].? + 1);
         try check(final.count(markers[0]) == 1 and final.count(markers[1]) == 1 and final.count(markers[2]) == 1);
         try Driver.checkComposerTail(final);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m>\x1b[38;5;245m sleep 0.6; printf ok") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m>\x1b[38;5;203m false; #") != null); // Failure prefix; the summary clips at the full row width in its failure color.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m \x1b[38;5;245m bash sleep 0.6; printf ok") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m \x1b[38;5;203m bash false; #") != null); // Failure prefix; the summary clips at the full row width in its failure color.
         // The clipped target ends in dots, then the reserved outcome marker and
         // the bash failure reason taken from the result envelope.
         try check(std.mem.indexOf(u8, d.output[start..d.used], "... ✗ exit 1\x1b[0m") != null);
@@ -3023,12 +3023,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, "memory-summary-final-answer");
         try d.waitIdle(start);
         const final = try d.screen();
-        for ([_][]const u8{ "m write caption-note", "m read caption-note", "m list core/index", "m delete caption-note" }) |caption| {
+        for ([_][]const u8{ "  memory write caption-note", "  memory read caption-note", "  memory list core/index", "  memory delete caption-note" }) |caption| {
             try check(final.count(caption) == 1);
         }
         try check(std.mem.indexOf(u8, d.output[start..d.used], "memory-summary-hidden-body") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "expected_version") == null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mm\x1b[38;5;245m read caption-note") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m \x1b[38;5;245m memory read caption-note") != null);
         try check(final.count("memory-summary-final-answer") == 1);
         try Driver.checkComposerTail(final);
     } else if (std.mem.eql(u8, mode, "file-stats")) {
@@ -3040,7 +3040,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         var previous: ?usize = null;
         // The screen fixture renders non-ASCII glyphs as `~`; the failure marker
         // itself is asserted on the raw output below.
-        for ([_][]const u8{ "w stats.txt  ~0 +5 -0 lines", "w stats.txt  ~1 +1 -1 lines", "r stats.txt  5 lines", "r stats.txt  2 lines [partial]", "w stats.txt  ~0 +0 -5 lines", "w stats.txt ~" }) |caption| {
+        for ([_][]const u8{ "  write_file stats.txt  ~0 +5 -0 lines", "  write_file stats.txt  ~1 +1 -1 lines", "  read_file stats.txt  5 lines", "  read_file stats.txt  2 lines [partial]", "  write_file stats.txt  ~0 +0 -5 lines", "  write_file stats.txt ~" }) |caption| {
             try check(final.count(caption) == 1);
             var found: ?usize = null;
             for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, caption) != null) {
@@ -3051,13 +3051,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             previous = found;
         }
         try check(final.count("Final answer") == 0 and final.count("file-stats-final-answer") == 1);
-        try Driver.checkGap(final, "file-stats-task", "w stats.txt");
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mw\x1b[38;5;245m stats.txt") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114mr\x1b[38;5;245m stats.txt") != null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203mw\x1b[38;5;203m stats.txt ✗") != null);
+        try Driver.checkGap(final, "file-stats-task", "  write_file stats.txt");
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m \x1b[38;5;245m write_file stats.txt") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m \x1b[38;5;245m read_file stats.txt") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;203m \x1b[38;5;203m write_file stats.txt ✗") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;2m+1\x1b[38;5;245m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[38;5;1m-1\x1b[38;5;245m") != null);
-        for ([_][]const u8{ "read_file ", "write_file ", "memory read " }) |old_label| try check(std.mem.indexOf(u8, d.output[start..d.used], old_label) == null);
         var answer: ?usize = null;
         for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "file-stats-final-answer") != null) {
             answer = row;
