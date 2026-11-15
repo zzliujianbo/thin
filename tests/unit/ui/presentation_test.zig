@@ -557,7 +557,8 @@ test "all four tool rows flow without moving glyphs, columns or widths" {
         const tail_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.flow_band[0], "operation target"[15..], theme.reset });
         defer a.free(tail_prefix);
         try std.testing.expect(std.mem.endsWith(u8, tail, tail_prefix));
-        const again = try commandLine(a, active_body, &.{active_span}, 100, null, 40 * (2 * (width - 1)) * 4);
+        // LCM(flow 2*(width-1)*40ms, pulse 8*160ms) reproduces the first frame.
+        const again = try commandLine(a, active_body, &.{active_span}, 100, null, 40 * (2 * (width - 1)) * 16);
         defer a.free(again);
         try std.testing.expectEqualStrings(start, again);
         // A settled row never flows, whatever clock the caller holds.

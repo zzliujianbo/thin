@@ -323,7 +323,7 @@ pub fn failureReasonLine(a: std.mem.Allocator, reason: []const u8, columns: usiz
 pub fn taskSummaryLine(a: std.mem.Allocator, tool_calls: u32, files_edited: u32, duration_ms: u64, columns: usize) ![]const u8 {
     var buffer: [160]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try writer.writeAll("  \u{00b7} ");
+    try writer.writeAll("  ");
     try writer.print("{d} {s} changed \u{00b7} {d} {s} \u{00b7} ", .{
         files_edited,
         if (files_edited == 1) "file" else "files",

@@ -2,7 +2,7 @@
 
 const shared = @import("../presentation.zig");
 pub const Meter = shared.activity.Meter;
-pub const Flow = shared.activity.Flow;
+pub const labelInterval = shared.activity.labelInterval;
 pub const Tool = shared.tools.Kind;
 
 /// Tool name shown after the one-column status slot. It never changes between

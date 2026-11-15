@@ -3016,9 +3016,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(std.mem.indexOf(u8, d.output[start..d.used], "...\x1b[0m") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], " ✗\x1b[0m") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "exit 1") != null);
-        // Every completed task now appends its total-time line. It is rendered
-        // as styled display text, so no sanitizer replacement may leak in.
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "  · ") != null);
+        // Every completed task appends one styled task-summary row; no sanitizer
+        // replacement may leak into it.
+        try check(std.mem.indexOf(u8, d.output[start..d.used], " files changed ") != null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "\u{fffd}") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "bash #") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "tool-json-hidden-marker") == null);

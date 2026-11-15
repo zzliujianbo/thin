@@ -97,9 +97,14 @@ pub const EffortSet = struct {
     }
 };
 
-/// Renderer-independent execution pulse; only active tool presentation uses it.
+/// Composer busy-marker palette cadence, a multiple of the TUI's 80ms tick so
+/// every shade is painted for the same number of frames.
+const pulse_interval_ms: u64 = 160;
+
+/// Renderer-independent execution pulse shared by the composer busy marker
+/// and the running tool status slot.
 pub fn commandStep(now_ms: u64) usize {
-    return @intCast((now_ms / 120) % 8);
+    return @intCast((now_ms / pulse_interval_ms) % 8);
 }
 
 /// Ping-pong execution flow: the band head advances one column per 40ms step,
@@ -133,34 +138,16 @@ pub fn formatDuration(writer: *std.Io.Writer, ms: u64) !void {
     }
 }
 
-/// Continuous UI-owned phase, not absolute now/rate: speed changes must not
-/// jump the highlight backwards. Unknown TPS uses a quiet baseline, never a
-/// fabricated rate. A bounded catch-up prevents suspend/clock jumps flashing.
-pub const Flow = struct {
-    last_ms: ?u64 = null,
-    units: u64 = 0,
-
-    pub fn interval(tenths: ?u64) u64 {
-        const value = tenths orelse return 300;
-        const bounded: u64 = @min(value, 2000);
-        return @max(40, @as(u64, 300000) / (1000 + bounded * 3));
-    }
-
-    pub fn advance(self: *Flow, now_ms: u64, active: bool, tenths: ?u64) void {
-        const before = self.last_ms;
-        self.last_ms = now_ms;
-        if (!active) {
-            self.units = 0;
-            return;
-        }
-        const delta: u64 = @min(@as(u64, 1000), now_ms -| (before orelse now_ms));
-        self.units = (self.units + delta * 1000 / interval(tenths)) % 12000;
-    }
-
-    pub fn step(self: Flow) usize {
-        return @intCast(self.units / 1000);
-    }
-};
+/// Streaming model-label cadence: faster output moves the highlight faster,
+/// with a 40ms floor. Unknown TPS uses a quiet baseline, never a fabricated
+/// rate. The owner steps the phase once per due frame; only the interval is
+/// derived from velocity, so a late frame slows the highlight instead of
+/// jumping it backwards or skipping a shade.
+pub fn labelInterval(tenths: ?u64) u64 {
+    const value = tenths orelse return 300;
+    const bounded: u64 = @min(value, 2000);
+    return @max(40, @as(u64, 300000) / (1000 + bounded * 3));
+}
 
 const Counts = struct {
     ascii: u64 = 0,

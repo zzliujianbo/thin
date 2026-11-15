@@ -1058,12 +1058,12 @@ const Ui = struct {
     /// UI receipt clock and bounded statistics; never read worker-owned timing.
     clock_ms: u64 = 0,
     animation_tick: u64 = 0,
-    /// Frame-counted band step for the active tool row. A late frame advances
-    /// once, never by the elapsed number of columns, so the head cannot jump.
-    flow_step: u64 = 0,
-    flow_next_ms: u64 = 0,
+    /// Frame-counted phase for the one fast animation slot: the running tool
+    /// band (40ms) or the streaming model label (TPS-driven interval). A late
+    /// frame advances once, never by the elapsed number of steps.
+    fast_step: u64 = 0,
+    fast_next_ms: u64 = 0,
     display: shared.State = .{},
-    model_flow: activity.Flow = .{},
     active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64, display_key: ?p.ToolDisplayKey = null, grouped: bool = false } = null,
     /// Group id of the rows below; the owner's group scalars are never copied
     /// beyond what this display needs to order groups.
@@ -2266,7 +2266,8 @@ const Ui = struct {
         self.last_terminal = null;
         self.mode = null;
         self.display = .{};
-        self.model_flow = .{};
+        self.fast_step = 0;
+        self.fast_next_ms = 0;
         self.history_notice_shown = false;
         self.settings_error_seen = null;
         self.log_error_seen = null;
@@ -2899,8 +2900,8 @@ const Ui = struct {
         // one column per 40ms frame; the status slot keeps the shared global
         // pulse, and the duration stays wall-clock accurate.
         const elapsed = self.clock_ms -| start;
-        const flow_elapsed = self.flow_step *| flow_interval_ms;
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .label_start = label_start, .flow_elapsed_ms = flow_elapsed }}, columns, if (background_start) null else elapsed, self.clock_ms);
+        const fast_elapsed = self.fast_step *| flow_interval_ms;
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .label_start = label_start, .flow_elapsed_ms = fast_elapsed }}, columns, if (background_start) null else elapsed, self.clock_ms);
     }
 
     fn waitingCommand(self: *Ui, a: std.mem.Allocator, entry: tool_views_module.Entry, columns: usize) ![]const u8 {
@@ -3358,8 +3359,8 @@ const Ui = struct {
                 const grouped = self.groupTools() and isSubagentTool(tool.name);
                 if (grouped and std.mem.eql(u8, tool.name, "subagent")) self.subagent_starting = true;
                 self.active_tool = .{ .id = tool.id, .caption = try self.executionCaption(tool.name, tool.display_key), .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key, .grouped = grouped };
-                self.flow_step = 0;
-                self.flow_next_ms = self.clock_ms +| flow_interval_ms;
+                self.fast_step = 0;
+                self.fast_next_ms = self.clock_ms +| flow_interval_ms;
             },
             .tool_result => |tool| {
                 // FIFO also covers prepare failures/denials without a start.
@@ -4428,7 +4429,8 @@ const Ui = struct {
             .{ .level = state.reasoning_effort, .until_ms = self.clock_ms +| 5000 }
         else
             null;
-        self.model_flow = .{};
+        self.fast_step = 0;
+        self.fast_next_ms = 0;
         self.mode = null;
         self.last_terminal = null;
         self.closeModelPicker();
@@ -6313,26 +6315,53 @@ const Ui = struct {
         return self.connection.current().background.active_count != 0;
     }
 
+    /// The one fast (sub-80ms) animation slot. The running tool band owns it
+    /// first; otherwise the streaming model label does. Null means only the
+    /// 80ms tick is animating. Both owners step the same frame-counted phase
+    /// once per due frame, so a late loop slows the motion instead of skipping.
+    fn fastInterval(self: *const Ui) ?u64 {
+        if (self.active_tool) |tool| if (!tool.grouped) return flow_interval_ms;
+        if (!self.composerMounted() or !self.workingOnTask()) return null;
+        const view = self.display.view(self.clock_ms);
+        if (!view.streaming) return null;
+        return activity.labelInterval(view.live_tps_tenths);
+    }
+
+    /// Composer/work states shared by the prompt and the fast animation slot.
+    fn workingOnTask(self: *const Ui) bool {
+        return self.busy or self.presentationWaiting() or self.remoteSynchronizing() or self.mode != null or self.active_tool != null;
+    }
+
+    /// The streaming label lives in the composer. Modal owners hide it, so
+    /// animating behind them would only stage frames nobody can see.
+    fn composerMounted(self: *const Ui) bool {
+        return self.permission == null and !self.stop_open and !self.secret_mode and !self.secret_quarantine and
+            !self.settings_open and !self.provider_open and self.model_picker == null;
+    }
+
+    /// Any animation owner: working task, tool row or mode (the fast slot's
+    /// sources) plus memory/background progress. Memory rotates on the same
+    /// 80ms tick and dirty-draw path as a running task.
+    fn animationActive(self: *const Ui) bool {
+        return self.workingOnTask() or self.memoryAnimating() or self.backgroundAnimating();
+    }
+
     fn animate(self: *Ui) void {
         if (self.resize_waiting) return;
+        if (!self.animationActive()) return;
         const tick = self.clock_ms / 80;
         const tick_due = self.animation_tick != tick;
-        // The running tool row owns a 40ms step. Counting frames, not elapsed
-        // time, keeps the band at one column per draw even when the loop is
-        // late; time-based catch-up would make the head skip columns.
-        var flow_due = false;
-        if (self.active_tool) |tool| {
-            if (!tool.grouped) flow_due = self.clock_ms >= self.flow_next_ms;
-        }
-        if (!tick_due and !flow_due) return;
-        // Memory progress is a background owner: it rotates on the same 80 ms
-        // tick and dirty-draw path as a running task, but it needs neither a
-        // busy main task nor a second refresh source.
-        if (!self.busy and !self.presentationWaiting() and !self.remoteSynchronizing() and !self.memoryAnimating() and !self.backgroundAnimating()) return;
+        // The fast slot owns the sub-80ms phase: the tool band at 40ms or the
+        // streaming label at its TPS-driven interval. Counting frames, not
+        // elapsed time, keeps a late loop at one column or shade per draw;
+        // time-based catch-up would make the motion jump.
+        const fast_interval = self.fastInterval();
+        const fast_due = fast_interval != null and self.clock_ms >= self.fast_next_ms;
+        if (!tick_due and !fast_due) return;
         if (tick_due) self.animation_tick = tick;
-        if (flow_due) {
-            self.flow_step +|= 1;
-            self.flow_next_ms = self.clock_ms +| flow_interval_ms;
+        if (fast_due) {
+            self.fast_step +|= 1;
+            self.fast_next_ms = self.clock_ms +| fast_interval.?;
         }
         // An approval owns a full, non-sparse preview. Repainting that unchanged
         // preview for a composer pulse sends its title/body again every 80 ms.
@@ -6440,14 +6469,19 @@ const Ui = struct {
             if (!staged and !buffered and self.frame.len == 0 and self.resize_rescue.len == 0 and
                 self.drawReady() and !self.urgent_draw)
                 wait_ms = self.cadenceWaitMs();
-            // Align the last sleep with the next tool-flow frame instead of a
-            // fixed 16ms grid, which would sample a 40ms step late. The 16ms
-            // cap still bounds event/input latency.
-            if (!staged and !buffered and self.frame.len == 0 and self.resize_rescue.len == 0) {
-                if (self.active_tool) |tool| if (!tool.grouped) {
-                    const remaining = self.flow_next_ms -| self.clock_ms;
-                    wait_ms = @min(wait_ms, @as(u16, @intCast(@max(1, @min(remaining, flow_interval_ms)))));
-                };
+            // Align the last sleep with the next animation boundary instead of
+            // a fixed 16ms grid: the fast slot (tool band or streaming label)
+            // and the 80ms tick must both be sampled at their own deadline, not
+            // up to a grid step late. The 16ms cap still bounds input latency.
+            if (!staged and !buffered and !self.resize_waiting and self.frame.len == 0 and self.resize_rescue.len == 0) {
+                if (self.fastInterval()) |interval| {
+                    const remaining = self.fast_next_ms -| self.clock_ms;
+                    wait_ms = @min(wait_ms, @as(u16, @intCast(@max(1, @min(remaining, interval)))));
+                }
+                if (self.animationActive()) {
+                    const remaining = 80 - (self.clock_ms % 80);
+                    wait_ms = @min(wait_ms, @as(u16, @intCast(@max(1, remaining))));
+                }
             }
             try self.terminal.wait(self.frame.len != 0 or self.resize_rescue.len != 0, wait_ms);
         }
@@ -6893,14 +6927,14 @@ const Ui = struct {
         const prefix = try editorDisplay(a, visible[0..cursor]);
         const suffix = try editorDisplay(a, visible[cursor..]);
         const display_bytes = try std.mem.concat(a, u8, &.{ prefix, suffix });
-        const working = self.busy or self.presentationWaiting() or self.remoteSynchronizing() or self.mode != null or self.active_tool != null;
+        const working = self.workingOnTask();
         const view = self.display.view(self.clock_ms);
         // The flowing label belongs to live output only: waiting for the first
-        // token, tool execution or an idle view must not animate it.
+        // token, tool execution or an idle view must not animate it. Its phase
+        // is owned by the fast animation slot, one step per painted frame.
         const streaming = view.streaming and working;
-        self.model_flow.advance(self.clock_ms, streaming, view.live_tps_tenths);
         const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
+        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
         // Modal authorization/secret layouts stay fixed. Idle LF debt first
         // obtains a single-row composer ACK even if a newer long draft arrived.
         const limit: usize = if (self.permission != null or self.stop_open or self.idle_breaks != 0) 1 else @min(composer_layout.max_rows, @max(1, self.size.rows -| 5));
@@ -7131,7 +7165,7 @@ const Ui = struct {
             // Only the prompt, never that now-deleted draft, becomes history.
             const view = self.display.view(self.clock_ms);
             const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = self.model_flow.step(), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
+            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
             idle_prompt = try std.fmt.allocPrint(a, "{s}{s}\x1b[K", .{ decoration.styled, theme.reset });
             try writer.writeAll(idle_prompt);
             // Entry is the ACKed composer's bottom row, not the tail's top.

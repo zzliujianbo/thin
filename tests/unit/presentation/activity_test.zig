@@ -86,28 +86,16 @@ test "rate bands and configured effort have explicit unknown and stable mapping"
     inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
         try std.testing.expectEqual(@field(ReasoningEffort, name), ReasoningEffort.fromName(name));
     }
-    try std.testing.expect(commandStep(0) != commandStep(120));
-    try std.testing.expectEqual(commandStep(0), commandStep(960));
+    // Two 80ms ticks share one shade; the third advances exactly one step.
+    try std.testing.expectEqual(commandStep(0), commandStep(80));
+    try std.testing.expect(commandStep(0) != commandStep(160));
+    try std.testing.expectEqual(commandStep(0), commandStep(1280));
     try std.testing.expect(commandStep(std.math.maxInt(u64)) < 8);
 }
-test "model flow speeds up with TPS without backwards rate-change jumps" {
-    try std.testing.expect(Flow.interval(1000) < Flow.interval(100));
-    try std.testing.expectEqual(@as(u64, 300), Flow.interval(null));
-    try std.testing.expect(Flow.interval(std.math.maxInt(u64)) >= 40);
-    var slow: Flow = .{};
-    var fast: Flow = .{};
-    slow.advance(0, true, 100);
-    fast.advance(0, true, 1000);
-    slow.advance(600, true, 100);
-    fast.advance(600, true, 1000);
-    try std.testing.expect(fast.units > slow.units);
-    const old = slow.units;
-    slow.advance(600, true, 1000);
-    try std.testing.expectEqual(old, slow.units);
-    slow.advance(500, true, 0); // Clock regression never reverses a phase.
-    try std.testing.expectEqual(old, slow.units);
-    fast.advance(650, false, null);
-    try std.testing.expectEqual(@as(u64, 0), fast.units);
+test "label interval speeds up with TPS and stays bounded" {
+    try std.testing.expect(labelInterval(1000) < labelInterval(100));
+    try std.testing.expectEqual(@as(u64, 300), labelInterval(null));
+    try std.testing.expect(labelInterval(std.math.maxInt(u64)) >= 40);
 }
 test "live rate does not depend on delta or UTF8 boundaries" {
     var together: Meter = .{};

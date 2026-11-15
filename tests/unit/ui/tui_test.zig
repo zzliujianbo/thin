@@ -1058,7 +1058,7 @@ test "running tool flow advances one column per animation step" {
     // trails one shade and the next character owns the bright head.
     ui.clock_ms += 40;
     ui.animate();
-    try std.testing.expectEqual(@as(u64, 1), ui.flow_step);
+    try std.testing.expectEqual(@as(u64, 1), ui.fast_step);
     const second = try ui.pendingCommand(std.testing.allocator, 79);
     defer std.testing.allocator.free(second);
     const expected_second = try std.fmt.allocPrint(std.testing.allocator, "{s} bash {s}({s}c", .{
@@ -1073,7 +1073,7 @@ test "running tool flow advances one column per animation step" {
     // jumping the head several cells.
     ui.clock_ms += 200;
     ui.animate();
-    try std.testing.expectEqual(@as(u64, 2), ui.flow_step);
+    try std.testing.expectEqual(@as(u64, 2), ui.fast_step);
     const third = try ui.pendingCommand(std.testing.allocator, 79);
     defer std.testing.allocator.free(third);
     const expected_third = try std.fmt.allocPrint(std.testing.allocator, "{s} bash {s}({s}c{s}o", .{
@@ -1084,6 +1084,37 @@ test "running tool flow advances one column per animation step" {
     });
     defer std.testing.allocator.free(expected_third);
     try std.testing.expect(std.mem.find(u8, third, expected_third) != null);
+}
+test "streaming label advances one phase per animation frame" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.busy = true;
+    ui.mode = .calling_model;
+    ui.display.meter.reset();
+    ui.display.meter.beginCall();
+    ui.display.meter.observe(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    ui.clock_ms = 400; // The rate window is known and output is streaming.
+    ui.fast_step = 0;
+    ui.fast_next_ms = ui.clock_ms;
+    ui.animate();
+    try std.testing.expectEqual(@as(u64, 1), ui.fast_step);
+    const interval = activity.labelInterval(ui.display.view(ui.clock_ms).live_tps_tenths);
+    // A late loop advances exactly one shade, never a catch-up jump.
+    ui.clock_ms += @max(interval * 3, 200);
+    ui.animate();
+    try std.testing.expectEqual(@as(u64, 2), ui.fast_step);
+    // A frame before the new deadline leaves the phase alone.
+    ui.clock_ms += interval / 2 + 1;
+    ui.animate();
+    try std.testing.expectEqual(@as(u64, 2), ui.fast_step);
+    // Ending the call silences the slot even though the composer stays busy.
+    ui.display.finish(.{ .status = .success });
+    ui.clock_ms += 400;
+    ui.animate();
+    try std.testing.expectEqual(@as(u64, 2), ui.fast_step);
 }
 test "command elapsed time uses source timestamps freezes results and resets per call" {
     var cancel: p.Cancellation = .{};
@@ -4294,10 +4325,10 @@ test "completed tasks append one muted task summary row" {
     testAcknowledgeFullFrame(&ui);
     const drawn_success = ui.records.items[0];
     try std.testing.expectEqual(@as(usize, 1), drawn_success.lines.len);
-    try std.testing.expectEqualStrings(theme.muted ++ "  \u{00b7} 2 files changed \u{00b7} 5 tool calls \u{00b7} 1.23s" ++ theme.reset, drawn_success.lines[0]);
+    try std.testing.expectEqualStrings(theme.muted ++ "  2 files changed \u{00b7} 5 tool calls \u{00b7} 1.23s" ++ theme.reset, drawn_success.lines[0]);
     const drawn = ui.records.items[second_index];
     try std.testing.expect(drawn.lines.len >= 2);
-    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], theme.muted ++ "  \u{00b7} 1 file changed \u{00b7} 1 tool call \u{00b7} 42ms") != null);
+    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], theme.muted ++ "  1 file changed \u{00b7} 1 tool call \u{00b7} 42ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, drawn.lines[drawn.lines.len - 1], "\u{fffd}") == null);
     // A round-limit pause keeps its concise wording and still shows the time.
     const paused: r.Terminal = .{ .status = .paused, .detail = error.RoundLimit, .duration_ms = 5 };
@@ -4668,11 +4699,13 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     ui.clock_ms = 9200;
     ui.display.observe(.{ .text = "token" }, 9200);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.modelPalette(ui.display.view(ui.clock_ms).rate_band)[ui.model_flow.step()]) != null);
+    const palette = theme.modelPalette(ui.display.view(ui.clock_ms).rate_band);
+    try std.testing.expect(std.mem.find(u8, ui.frame, palette[@intCast(ui.fast_step % palette.len)]) != null);
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 12_000;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.modelPalette(ui.display.view(ui.clock_ms).rate_band)[ui.model_flow.step()]) != null);
+    const later_palette = theme.modelPalette(ui.display.view(ui.clock_ms).rate_band);
+    try std.testing.expect(std.mem.find(u8, ui.frame, later_palette[@intCast(ui.fast_step % later_palette.len)]) != null);
     testAcknowledgeFullFrame(&ui);
     // The call ending silences the animation immediately, including for tools.
     ui.display.finish(.{ .status = .success });
@@ -4808,14 +4841,17 @@ test "single composer hides statistics and completion and uses flow and exact br
     ui.display.meter.reset();
     ui.display.meter.beginCall();
     ui.display.meter.observe(100, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    ui.model_flow.advance(0, true, null);
     ui.clock_ms = 600;
     try ui.appendDraft(.assistant, "visible-body");
     _ = try ui.editor.insert("typed-default-color");
     try ui.draw();
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ "\x1b[1m" ++ theme.command_pulse[5] ++ "⠧" ++ theme.reset ++ " typed-default-color") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.modelPalette(ui.display.view(ui.clock_ms).rate_band)[ui.model_flow.step()]) != null);
+    const pulse = theme.command_pulse[shared.activity.commandStep(ui.clock_ms)];
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}⠧{s} typed-default-color", .{ theme.reset, pulse, theme.reset });
+    defer std.testing.allocator.free(marker);
+    try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
+    const palette = theme.modelPalette(ui.display.view(ui.clock_ms).rate_band);
+    try std.testing.expect(std.mem.find(u8, ui.frame, palette[@intCast(ui.fast_step % palette.len)]) != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("visible-body"));
@@ -4831,7 +4867,10 @@ test "single composer hides statistics and completion and uses flow and exact br
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 680;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.command_pulse[5] ++ "⠇" ++ theme.reset ++ " typed-default-color") != null);
+    const pulse_next = theme.command_pulse[shared.activity.commandStep(ui.clock_ms)];
+    const marker_next = try std.fmt.allocPrint(std.testing.allocator, "{s}⠇{s} typed-default-color", .{ pulse_next, theme.reset });
+    defer std.testing.allocator.free(marker_next);
+    try std.testing.expect(std.mem.find(u8, ui.frame, marker_next) != null);
     testAcknowledgeFullFrame(&ui);
     ui.mode = null;
     ui.draft = null;
