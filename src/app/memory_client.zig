@@ -52,7 +52,7 @@ pub const Client = struct {
         // initWithEnv snapshots only HTTP/proxy necessities and performs no I/O.
         // An auto route may own a transport now, but cannot call until bound to
         // the primary Runtime's actually confirmed protocol on the helper worker.
-        if (!frozen.selection_pending and frozen.model.protocol != .systemone) {
+        if (!frozen.selection_pending) {
             if (codex) {
                 if (source) |credential_source| self.transport = http.Client.initCodexWithEnv(owned, io, frozen, credential_source, env) catch |err| switch (err) {
                     error.OutOfMemory => return err,
@@ -87,7 +87,6 @@ pub const Client = struct {
     pub fn bindProtocol(self: *Client, protocol: p.Protocol) !void {
         if (protocol != .chat and protocol != .responses and protocol != .anthropic) return error.UnsupportedProtocol;
         if (self.source.value.selection_pending) return error.UnknownModelProtocol;
-        if (self.source.value.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(self.source.value.provider.base_url) != null) return error.UnsupportedProtocol;
         if (self.transport) |transport| if (transport.proxy_http) |proxy| if (proxy.poisoned or proxy.unreaped_pid != null) return error.CleanupFailed;
         const current = self.source.value.model.protocol;
         if (current == protocol) return;
@@ -118,7 +117,6 @@ pub const Client = struct {
         self.last_http_status = null;
         try self.check(cancel);
         const config = self.source.value;
-        if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null) return error.UnsupportedProtocol;
         // Never probe auto: a protocol fallback could duplicate a paid POST.
         if (config.selection_pending or config.model.protocol == .auto) return error.UnknownModelProtocol;
         const model = self.model_override orelse if (self.transport) |*transport| transport.model() else return error.MemoryUnavailable;

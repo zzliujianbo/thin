@@ -68,7 +68,6 @@ fn resolvedProtocol(cache: *const Cache, index: usize) Protocol {
     const row = cache.directory.rows[index];
     if (row.protocol != .auto) return row.protocol;
     if (row.dev_protocol != .auto) return row.dev_protocol;
-    if (catalog.documentedProtocol(row.provider, cache.directory.name(index))) |api| return api;
     if (preset(row.provider, cache.directory.name(index))) |entry| return entry.model.protocol;
     // This exact service exposes Chat Completions, not a model-name heuristic.
     if (row.provider == .deepseek) return .chat;
@@ -77,12 +76,6 @@ fn resolvedProtocol(cache: *const Cache, index: usize) Protocol {
 
 fn storedEntry(cache: *const Cache, index: usize) catalog.Entry {
     const row = cache.directory.rows[index];
-    const api = resolvedProtocol(cache, index);
-    if (api == .systemone) return .{
-        .provider = row.provider,
-        .selector = cache.directory.selector(index),
-        .model = .{ .name = cache.directory.name(index), .context_tokens = 0, .protocol = .systemone },
-    };
     const known = preset(row.provider, cache.directory.name(index));
     var entry: catalog.Entry = .{
         .provider = row.provider,
@@ -121,7 +114,6 @@ pub fn restoreEntry(cache: *const Cache, id: providers.Id, name: []const u8) ?ca
 }
 
 pub fn capacityFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
-    if (entry.model.protocol == .systemone) return null;
     if (cache.directory.find(entry.provider, entry.model.name)) |index| {
         const row = cache.directory.rows[index];
         if (row.available == true) return row.tokens;
@@ -141,7 +133,7 @@ fn validContext(n: ?u32) ?u32 {
 /// Selection-time only: callers own freezing active/resumed model windows.
 pub fn contextFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
     const protocol = entry.model.protocol;
-    if (protocol == .auto or protocol == .systemone) return null;
+    if (protocol == .auto) return null;
     if (cache.directory.find(entry.provider, entry.model.name)) |index| {
         const row = cache.directory.rows[index];
         if (row.protocol != .auto and row.protocol != protocol) return null;
@@ -160,7 +152,7 @@ fn validOutput(n: ?u32) ?u32 {
 }
 
 fn compatibleRoute(row: directory.Record, protocol: Protocol) bool {
-    return protocol != .auto and protocol != .systemone and (row.protocol == .auto or row.protocol == protocol);
+    return protocol != .auto and (row.protocol == .auto or row.protocol == protocol);
 }
 
 fn rowOutput(row: directory.Record, protocol: Protocol) ?u32 {
@@ -229,7 +221,7 @@ fn dynamicIndex(cache: *const Cache, config: cfg.Config) ?usize {
 fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinking.Declaration {
     const row = cache.directory.rows[index];
     const protocol = if (config.model.protocol == .auto and cfg.chatOnly(config.provider.base_url, config.model)) .chat else config.model.protocol;
-    if (protocol == .auto or protocol == .systemone) return null;
+    if (protocol == .auto) return null;
     const format: thinking.Format = if (protocol == .anthropic) .anthropic else if (row.provider == .deepseek) .deepseek else .standard;
     // Source authority belongs to the verified provider, not fetch success.
     const official = switch (row.provider) {
@@ -273,7 +265,6 @@ fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinki
 }
 
 pub fn entryDeclaration(cache: *const Cache, entry: catalog.Entry) ?thinking.Declaration {
-    if (entry.model.protocol == .systemone) return null;
     const config: cfg.Config = .{ .provider = catalog.connection(entry.provider), .model = entry.model };
     return declarationForConfig(cache, config);
 }
@@ -448,12 +439,6 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
         }
         const known = preset(id, name.string);
         const protocol: Protocol = if (row.protocol != .auto) row.protocol else if (known) |value| value.model.protocol else if (id == .deepseek) .chat else .auto;
-        if (protocol == .systemone) {
-            row.tokens = null;
-            // Non-generative records carry identity/availability, not windows
-            // or thinking borrowed from a same-name generative preset.
-            continue;
-        }
         if (record.object.get("effort")) |effort| {
             if (try parseEffort(effort, id, if (protocol == .auto) .chat else protocol)) |declaration| row.reasoning = try directory.Profile.from(declaration);
         }

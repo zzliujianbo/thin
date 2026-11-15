@@ -50,7 +50,7 @@ pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) vo
     config.model.input_price_flat_limit = null;
     const service = cfg.providers.Id.fromUrl(config.provider.base_url) orelse return;
     if (config.provider.kind) |hint| if (hint != service) return;
-    if (config.model.protocol == .auto or config.model.protocol == .systemone) return;
+    if (config.model.protocol == .auto) return;
     var entry = metadata.restoreEntry(cache, service, config.model.name) orelse return;
     entry.model.protocol = config.model.protocol;
     config.model.input_price_threshold = metadata.inputPriceThresholdFor(cache, entry);
@@ -61,34 +61,21 @@ pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) vo
 
 const Protocol = @import("../core/protocol.zig").Protocol;
 
-/// Cache-only protocol authority; no context/output capability is required.
-/// Native SystemOne endpoints never borrow the generative Zen/Go catalog.
-pub fn protocolFor(config: cfg.Config, cache: *const metadata.Cache, provider_name: []const u8, raw_id: []const u8) !Protocol {
-    const registry = config.registry orelse return error.DefaultProviderUnavailable;
-    const provider = registry.find(provider_name) orelse return error.DefaultProviderUnavailable;
-    return protocolForProvider(cache, provider, raw_id);
-}
-
-fn protocolForProvider(cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8) !Protocol {
+/// Reject an unknown or contradictory protocol before any candidate is built.
+fn validateProtocol(cache: *const metadata.Cache, provider: cfg.NamedProvider, raw_id: []const u8) !void {
     const patch = provider.patchFor(raw_id);
     const explicit = if (patch) |p| p.protocol else null;
-    if (cfg.providers.Id.fromSystemOneUrl(provider.connection.base_url)) |service| {
-        if (provider.connection.kind) |hint| if (hint != service) return error.ProviderEndpointMismatch;
-        if (explicit) |api| if (api != .systemone) return error.IncompatibleModelProtocol;
-        return .systemone;
-    }
     var discovered: ?Protocol = null;
     if (cfg.providers.Id.fromUrl(provider.connection.base_url)) |service| {
         if (provider.connection.kind) |hint| if (hint != service) return error.ProviderEndpointMismatch;
         if (metadata.restoreEntry(cache, service, raw_id)) |entry| discovered = entry.model.protocol;
     }
     if (explicit) |api| {
-        if (discovered) |known| if (known != .auto and known != api and (known == .systemone or api == .systemone)) return error.IncompatibleModelProtocol;
-        return api;
+        if (discovered) |known| if (known != .auto and known != api) return error.IncompatibleModelProtocol;
+        return;
     }
     const api = discovered orelse return error.UnknownModelProtocol;
     if (api == .auto) return error.UnknownModelProtocol;
-    return api;
 }
 
 const ResolvedModel = struct { connection: cfg.Provider, model: cfg.Model, official: bool };
@@ -101,22 +88,8 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
             if (cache.directory.rows[row].available != true) return error.DefaultModelUnavailable;
         }
         if (patch == null and metadata.restoreEntry(cache, service, raw_id) == null) return error.DefaultModelUnavailable;
-    } else if (patch == null and cfg.providers.Id.fromSystemOneUrl(provider.connection.base_url) == null) return error.DefaultModelUnavailable;
-    const api = try protocolForProvider(cache, provider, raw_id);
-    if (api == .systemone) {
-        // Neither name nor provider kind can manufacture generative capability.
-        var model: cfg.Model = .{ .name = raw_id, .context_tokens = 0, .protocol = .systemone };
-        if (patch) |manual| model = manual.apply(model);
-        var connection = provider.connection;
-        connection.base_url = cfg.providers.systemOneRoute(connection.base_url);
-        var candidate = config;
-        candidate.provider = connection;
-        candidate.model = model;
-        candidate.selection_pending = false;
-        candidate.selected_provider = provider.name;
-        try cfg.validate(candidate);
-        return .{ .connection = connection, .model = model, .official = false };
-    }
+    } else if (patch == null) return error.DefaultModelUnavailable;
+    try validateProtocol(cache, provider, raw_id);
     // A service alias and kind are not authority to borrow another endpoint's
     // catalog. Only actual recognized official URLs authorize those records.
     const id = cfg.providers.Id.fromUrl(provider.connection.base_url);

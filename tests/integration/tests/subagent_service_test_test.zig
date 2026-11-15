@@ -689,7 +689,7 @@ test "unsupported child protocol fails the start without a child run" {
     const a = std.testing.allocator;
     const fix = try Fixture.create(a, std.testing.io, .chat, .chat);
     defer fix.deinit();
-    fix.parent_runtime.selector = .{ .configured = .chat, .selected = .systemone, .initial_attempted = true };
+    fix.parent_runtime.selector = .{ .configured = .chat, .selected = .auto, .initial_attempted = true };
     var fake: FakeModel = .{ .io = std.testing.io };
     fix.withModel(&fake);
     fix.service.beginTask(&fix.parent_cancel);

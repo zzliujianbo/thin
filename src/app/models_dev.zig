@@ -1,6 +1,6 @@
 //! Bounded parser for the public models.dev catalog (no credentials).
 //! Exact provider/model IDs are retained. Protocol comes from the declared AI SDK
-//! adapter (`npm`) or exact native API URL, never from model names;
+//! adapter (`npm`), never from model names or API URLs;
 //! `reasoning: true` is not a profile.
 //! Structural JSON errors fail the whole document; malformed recognized options
 //! make only that model's profile unusable, while unknown option kinds are ignored.
@@ -89,7 +89,7 @@ fn formatFor(provider: []const u8, api: protocol.Protocol) ?thinking.Format {
         .anthropic => .anthropic,
         .chat => if (equal(provider, "deepseek")) .deepseek else .standard,
         .responses => .standard,
-        .auto, .systemone => null,
+        .auto => null,
     };
 }
 
@@ -243,17 +243,17 @@ fn overrideNpm(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !Adapte
     return .{ .npm = npm, .invalid = seen and npm == null };
 }
 
-/// Only an exact model-level api.url has native routing authority. SDK/id
-/// annotations do not invalidate a valid native description. Other URLs never
-/// replace the declared connection: ordinary protocols retain their SDK source.
-/// Null inherits that source; auto revokes it for a malformed/unknown descriptor.
+/// A model-level api.url must be a valid absolute http(s) URL, but never grants
+/// a protocol. SDK/id annotations do not invalidate a valid descriptor. Other
+/// URLs never replace the declared connection: ordinary protocols retain their
+/// SDK source. Null inherits that source; auto revokes it for a malformed or
+/// unknown descriptor.
 fn parseAPI(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?protocol.Protocol {
     if (!(try at(scanner, .object_begin))) {
         try scanner.skipValue();
         return .auto;
     }
     try expect(scanner, allocator, .object_begin);
-    var api_url: ?[]const u8 = null;
     var npm: ?[]const u8 = null;
     var seen: u8 = 0;
     var invalid = false;
@@ -277,7 +277,6 @@ fn parseAPI(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?protocol
         };
         switch (bit) {
             1 => {
-                api_url = value;
                 const uri = std.Uri.parse(value.?) catch {
                     invalid = true;
                     continue;
@@ -291,7 +290,6 @@ fn parseAPI(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?protocol
     }
     try expect(scanner, allocator, .object_end);
     if (invalid) return .auto;
-    if (api_url) |value| if (providers.Id.fromSystemOneUrl(value) != null) return .systemone;
     if (npm) |value| return protocolFor(value);
     return null;
 }
@@ -707,7 +705,6 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
         const row = try result.upsert(allocator, id, record.model);
         row.dev_present = true;
         row.dev_protocol = record.api;
-        if (record.api == .systemone) continue; // Identity only: no generative capabilities.
         row.dev_output_tokens = if (record.api != .auto) record.output_tokens else null;
         row.dev_context_tokens = if (record.api != .auto) record.context_tokens else null;
         row.dev_input_price_threshold = if (record.api != .auto) record.input_price_threshold else null;

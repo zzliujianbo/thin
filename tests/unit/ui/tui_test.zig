@@ -9023,8 +9023,8 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try text.initLocale();
     const models = [_]core_config.Model{
         .{ .name = "fixture/one", .context_tokens = 32768 },
-        // Native protocol and unknown capacity remain selectable.
-        .{ .name = "fixture/two", .protocol = .systemone, .context_tokens = 0 },
+        // Unknown capacity remains selectable.
+        .{ .name = "fixture/two", .protocol = .chat, .context_tokens = 0 },
         .{ .name = "unlogged/three", .context_tokens = 32768 },
     };
     var fixture: SelectionFixture = .{ .profiles_override = &models, .proxy_configured = true, .proxy_address = "10.0.0.1", .proxy_port = 8080 };

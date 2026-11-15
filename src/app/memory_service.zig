@@ -591,7 +591,7 @@ pub const Coordinator = struct {
             return;
         }
         if (self.service_override == null) {
-            if (protocol == .auto or protocol == .systemone) {
+            if (protocol == .auto) {
                 out.set(.failed, error.MemoryUnavailable);
                 return;
             }

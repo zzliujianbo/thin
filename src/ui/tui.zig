@@ -657,8 +657,6 @@ fn setupHint(state: Connection.State) ?[]const u8 {
     const notice = state.settings_notice orelse return null;
     if (std.mem.eql(u8, notice, "Not logged in; history available, use /login to activate"))
         return "Not configured: /login, then /model";
-    if (std.mem.eql(u8, notice, "SystemOne is not a chat model; history available, select a chat model"))
-        return "SystemOne is not a chat model; select /model";
     if (std.mem.eql(u8, notice, "Default model unavailable locally; select a configured model") or
         std.mem.eql(u8, notice, "Saved model unavailable locally; history available, use /model"))
         return "Model unavailable: select /model";

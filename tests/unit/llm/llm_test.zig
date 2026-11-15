@@ -1,19 +1,3 @@
-test "SystemOne is never sent to the generative model or fallback" {
-    var selector = Selector.init(.systemone);
-    var fake = Fake{};
-    const result = try selector.call(fake.model(), std.testing.allocator, testRequest(), .{});
-    try std.testing.expectEqual(@as(u8, 0), result.calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expect(!result.fallback);
-    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, result.outcome.failure.kind);
-    selector = Selector.init(.auto);
-    var request = testRequest();
-    request.scope.protocol = .systemone;
-    const automatic = try selector.call(fake.model(), std.testing.allocator, request, .{});
-    try std.testing.expectEqual(@as(u8, 0), automatic.calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expect(!selector.initial_attempted);
-}
 test "auto falls back once and remains pinned even when Chat fails" {
     var selector = Selector.init(.auto);
     var fake = Fake{ .fail_chat = true };

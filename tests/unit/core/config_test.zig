@@ -18,15 +18,9 @@ test "image rejects invalid owner model types duplicates and unknown fields" {
 test "removed decision section is rejected as an unknown root field" {
     try rejectedDecisionSection(std.testing.allocator);
 }
-test "SystemOne has no required generative window but retains field and budget safety" {
-    var model: Model = .{ .name = "reviewer", .protocol = .systemone, .context_tokens = 0 };
+test "model profiles keep field and budget safety at the upper bounds" {
+    var model: Model = .{ .name = "reviewer", .protocol = .chat, .context_tokens = 2 };
     try validateModel(model);
-    model.reasoning_effort = "off";
-    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model));
-    model.reasoning_effort = null;
-    model.reasoning = .{ .map = .{ .high = "high" } };
-    try std.testing.expectError(error.IncompatibleReasoningProtocol, validateModel(model));
-    model.reasoning = null;
     model.output_tokens = 0;
     try std.testing.expectError(error.InvalidBudget, validateModel(model));
     model.output_tokens = null;
@@ -35,8 +29,7 @@ test "SystemOne has no required generative window but retains field and budget s
     model.input_price_threshold = std.math.maxInt(u32);
     model.input_price_flat_limit = std.math.maxInt(u32);
     try validateModel(model);
-    model.context_tokens = 0;
-    model.protocol = .chat;
+    model.context_tokens = 1;
     try std.testing.expectError(error.InvalidBudget, validateModel(model));
 }
 test "runtime-only config clones retain derived maps but cannot write disk" {

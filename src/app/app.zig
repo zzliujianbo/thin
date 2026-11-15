@@ -217,7 +217,6 @@ pub const App = struct {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (owned.value.selection_pending) return error.DefaultModelUnavailable;
-        if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         try cfg.validate(owned.value);
         const self = try a.create(App);
         errdefer a.destroy(self);
@@ -476,7 +475,7 @@ pub const App = struct {
         const selection = try model_resolver.resolve(owned.arena.allocator(), owned.value, cache, selected.provider, selected.model, false);
         model_resolver.apply(&owned.value, selection);
         _ = reasoning_defaults.applyConfigured(&owned.value);
-        if (owned.value.model.protocol == .auto or owned.value.model.protocol == .systemone or owned.value.model.context_tokens == 0)
+        if (owned.value.model.protocol == .auto or owned.value.model.context_tokens == 0)
             return error.UnsupportedSubagentProtocol;
         try cfg.validate(owned.value);
         if (cancel.isRequested()) return error.Canceled;
@@ -657,7 +656,6 @@ pub const App = struct {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
-        if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const plan = try self.runtime.planSelection(owned.value, true);
         if (!std.meta.eql(owned.value.limits, self.runtime.effectiveConfig().limits)) return error.ConnectionLimitsChanged;
         const key = if (isCodex(owned.value)) blk: {

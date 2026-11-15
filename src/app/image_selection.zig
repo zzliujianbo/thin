@@ -10,10 +10,6 @@ pub const Choice = @import("settings_selection.zig").Choice;
 /// Custom endpoints are never rewritten to a different host or provider.
 pub fn baseUrl(provider: cfg.NamedProvider) ![]const u8 {
     const base = std.mem.trimEnd(u8, provider.connection.base_url, "/");
-    if (cfg.providers.Id.fromSystemOneUrl(base) != null) return error.UnsupportedImageEndpoint;
-    if (provider.patchFor(image.model_id)) |patch| {
-        if (patch.protocol == .systemone) return error.UnsupportedImageEndpoint;
-    }
     const normalized = if (std.mem.eql(u8, base, "https://api.deepseek.com/anthropic"))
         "https://api.deepseek.com"
     else

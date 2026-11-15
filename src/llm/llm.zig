@@ -39,11 +39,6 @@ pub const Selector = struct {
     /// unsupported_protocol、尚未输出任何内容、非摘要请求且无模型历史时，改用 Chat 重试一次。
     /// 回退后无论 Chat 成败，协议都固定为 Chat。
     pub fn call(self: *Selector, model: p.Model, allocator: std.mem.Allocator, original: p.Request, sink: p.ModelSink) !Result {
-        // SystemOne is a question/threshold protocol, never a chat probe.
-        if (self.configured == .systemone or self.effective() == .systemone or original.scope.protocol == .systemone) return .{
-            .outcome = .{ .failure = .{ .kind = .unsupported_protocol, .message = "unsupported_protocol: systemone" } },
-            .calls = 0,
-        };
         // 调用前已取消：直接返回，不访问模型（calls = 0）。
         if (original.cancellation) |cancel| {
             if (cancel.isRequested()) return .{

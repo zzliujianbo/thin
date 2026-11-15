@@ -1,43 +1,18 @@
-test "model API URLs identify SystemOne without SDK or name inference" {
+test "models.dev rejects duplicate API descriptors" {
     const a = std.testing.allocator;
-    var result = try parseDirectory(a,
-        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"shared":{"api":{"url":"https://opencode.ai/inference/systemone/v1"},"limit":{"context":100000,"output":32000},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"effort","values":["high"]}]},"no-window":{"api":{"url":"https://opencode.ai/inference/systemone/v1/"}},"jev-name-only":{},"bad-url":{"api":{"url":"https://opencode.ai.example/inference/systemone/v1"}},"bad-shape":{"api":"https://opencode.ai/inference/systemone/v1"},"bad-value":{"api":{"url":false}},"no-url":{"api":{}},"unrecognized":{"api":{"url":"https://opencode.ai/inference/systemone/v1","unknown":true}}}},"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"shared":{}}}}
-    );
-    defer result.deinit(a);
-    for ([_][]const u8{ "shared", "no-window" }) |name| {
-        const row = result.rows[result.find(.opencode_zen, name).?];
-        try std.testing.expectEqual(protocol.Protocol.systemone, row.dev_protocol);
-        try std.testing.expect(row.dev_reasoning == null);
-        try std.testing.expect(row.dev_output_tokens == null);
-        try std.testing.expect(row.dev_context_tokens == null);
-        try std.testing.expect(row.dev_input_price_threshold == null);
-        try std.testing.expect(row.dev_input_price_flat_limit == null);
-    }
-    try std.testing.expectEqual(protocol.Protocol.chat, result.rows[result.find(.opencode_go, "shared").?].dev_protocol);
-    try std.testing.expectEqual(protocol.Protocol.chat, result.rows[result.find(.opencode_zen, "jev-name-only").?].dev_protocol);
-    for ([_][]const u8{ "bad-shape", "bad-value", "unrecognized" }) |name| {
-        try std.testing.expectEqual(protocol.Protocol.auto, result.rows[result.find(.opencode_zen, name).?].dev_protocol);
-    }
-    // Neither an empty descriptor nor an untrusted URL may override a known
-    // SDK with SystemOne or redirect credentials to the metadata URL.
-    for ([_][]const u8{ "bad-url", "no-url" }) |name| {
-        try std.testing.expectEqual(protocol.Protocol.chat, result.rows[result.find(.opencode_zen, name).?].dev_protocol);
-    }
     try std.testing.expectError(error.InvalidModelsDev, parseDirectory(a,
-        \\{"opencode":{"models":{"x":{"api":{"url":"https://opencode.ai/inference/systemone/v1","url":"https://opencode.ai/inference/systemone/v1"}}}}}
+        \\{"opencode":{"models":{"x":{"api":{"url":"https://vendor.invalid/v1","url":"https://vendor.invalid/v1"}}}}}
     ));
     try std.testing.expectError(error.InvalidModelsDev, parseDirectory(a,
         \\{"opencode":{"models":{"x":{"api":{},"api":{}}}}}
     ));
 }
-test "API SDK and ID annotations preserve native and ordinary protocol sources" {
+
+test "API SDK and ID annotations preserve ordinary protocol sources" {
     var result = try parseDirectory(std.testing.allocator,
-        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"native":{"api":{"id":"native","npm":"@ai-sdk/openai-compatible","url":"https://opencode.ai/inference/systemone/v1"}},"ordinary":{"api":{"id":"ordinary","npm":"@ai-sdk/anthropic","url":"https://vendor.invalid/v1"},"limit":{"context":32768}},"inherited":{"api":{"id":"inherited","url":"https://vendor.invalid/v1"},"limit":{"context":32768}},"unknown":{"api":{"npm":"@ai-sdk/unknown"}},"malformed":{"api":{"url":"not-an-absolute-url"}}}}}
+        \\{"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"ordinary":{"api":{"id":"ordinary","npm":"@ai-sdk/anthropic","url":"https://vendor.invalid/v1"},"limit":{"context":32768}},"inherited":{"api":{"id":"inherited","url":"https://vendor.invalid/v1"},"limit":{"context":32768}},"unknown":{"api":{"npm":"@ai-sdk/unknown"}},"malformed":{"api":{"url":"not-an-absolute-url"}}}}}
     );
     defer result.deinit(std.testing.allocator);
-    const native = result.rows[result.find(.opencode_zen, "native").?];
-    try std.testing.expectEqual(protocol.Protocol.systemone, native.dev_protocol);
-    try std.testing.expect(native.dev_context_tokens == null);
     try std.testing.expectEqual(protocol.Protocol.anthropic, result.rows[result.find(.opencode_zen, "ordinary").?].dev_protocol);
     const inherited = result.rows[result.find(.opencode_zen, "inherited").?];
     try std.testing.expectEqual(protocol.Protocol.chat, inherited.dev_protocol);

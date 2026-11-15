@@ -62,9 +62,9 @@ test "settings search AND tokens fold ASCII preserve slash IDs and filter Off" {
     menu.move(false, 0);
     try std.testing.expectEqual(@as(usize, 0), menu.selected);
 }
-test "native protocol is an ordinary exact model and large windows stay bounded" {
+test "large exact model lists stay bounded" {
     const a = std.testing.allocator;
-    const models: [40]cfg.Model = @splat(.{ .name = "login/Native/Judge", .protocol = .systemone, .context_tokens = 16384 });
+    const models: [40]cfg.Model = @splat(.{ .name = "login/Native/Judge", .protocol = .chat, .context_tokens = 16384 });
     try std.testing.expectEqual(@as(usize, 41), count(&models, &logged, ""));
     try std.testing.expectEqualStrings("login/Native/Judge", choice(&models, &logged, "", 40).?.model);
     for ([_]usize{ 1, 2, 3, 10, 100 }) |height| {

@@ -641,7 +641,6 @@ pub fn wireCodec(config: Config, proto: protocol.Protocol) !protocol.WireCodec {
         .chat => .chat,
         .responses => .responses,
         .anthropic => .anthropic,
-        .systemone => .systemone,
         .auto => error.UnselectedProtocol,
     };
 }
@@ -737,7 +736,7 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
     if (!unresolved) {
         try validateUrl(config.provider.base_url);
         try validateKeySource(config.provider);
-        if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url) orelse providers.Id.fromSystemOneUrl(config.provider.base_url)) |actual| {
+        if (config.provider.kind) |declared| if (providers.Id.fromUrl(config.provider.base_url)) |actual| {
             if (declared != actual) return error.ProviderEndpointMismatch;
         };
     }
@@ -765,7 +764,7 @@ fn validateRegistry(registry: Registry) !void {
         for (registry.providers[0..i]) |previous| if (std.mem.eql(u8, previous.name, p.name)) return error.DuplicateProvider;
         try validateUrl(p.connection.base_url);
         try validateKeySource(p.connection);
-        if (p.connection.kind) |declared| if (providers.Id.fromUrl(p.connection.base_url) orelse providers.Id.fromSystemOneUrl(p.connection.base_url)) |actual| {
+        if (p.connection.kind) |declared| if (providers.Id.fromUrl(p.connection.base_url)) |actual| {
             if (declared != actual) return error.ProviderEndpointMismatch;
         };
         for (p.models, 0..) |m, j| {
@@ -794,14 +793,12 @@ pub fn chatOnly(base_url: []const u8, model: Model) bool {
 }
 
 fn validateReasoningProtocol(base_url: []const u8, model: Model) !void {
-    if (providers.Id.fromSystemOneUrl(base_url) != null and model.protocol != .systemone and model.protocol != .auto) return error.IncompatibleModelProtocol;
     if ((model.protocol == .responses or model.protocol == .anthropic) and chatOnly(base_url, model)) return error.IncompatibleReasoningProtocol;
 }
 
 /// Validate a model profile independently of request limits.
 pub fn validateModel(model: Model) !void {
     if (!validText(model.name, 1024)) return error.InvalidModel;
-    if (model.protocol == .systemone and (model.reasoning_effort != null or model.reasoning != null)) return error.IncompatibleReasoningProtocol;
     if (model.reasoning_effort) |effort| {
         if (!validText(effort, 128)) return error.InvalidReasoningEffort;
     }
@@ -816,7 +813,7 @@ pub fn validateModel(model: Model) !void {
     if (model.output_tokens) |tokens| {
         if (tokens == 0) return error.InvalidBudget;
     }
-    if (model.protocol != .systemone and model.context_tokens < 2) return error.InvalidBudget;
+    if (model.context_tokens < 2) return error.InvalidBudget;
     if (model.input_price_threshold) |tokens| if (tokens == 0) return error.InvalidBudget;
     if (model.input_price_flat_limit) |tokens| if (tokens == 0) return error.InvalidBudget;
 }

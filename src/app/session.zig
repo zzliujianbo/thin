@@ -437,10 +437,6 @@ pub const Session = struct {
             self.settings_notice = "Session is open elsewhere or not writable; read-only history";
             return self;
         }
-        if (config.model.protocol == .systemone) {
-            self.settings_notice = "SystemOne is not a chat model; history available, select a chat model";
-            return self;
-        }
         if (config.selection_pending) return self;
         if (isCodexProvider(config.provider)) {
             if (!self.hasLocalCredential(config.provider)) {
@@ -856,11 +852,10 @@ pub const Session = struct {
         }
         for (self.display_models, 0..) |model, index| {
             self.display_origins[index] = false;
-            self.display_disabled[index] = model.protocol == .systemone;
             if (config.registry) |registry| {
                 // Resolver leaves undeclared/unknown protocols at zero context;
                 // an explicitly declared auto remains valid for primary Chat/Responses probing.
-                self.display_disabled[index] = model.protocol == .systemone or model.context_tokens == 0;
+                self.display_disabled[index] = model.context_tokens == 0;
                 if (std.mem.findScalar(u8, model.name, '/')) |slash| {
                     if (registry.find(model.name[0..slash])) |provider| {
                         const raw_id = model.name[slash + 1 ..];
@@ -1716,8 +1711,8 @@ pub const Session = struct {
     }
 
     /// Owner-side revalidation: the exact declared/available row, its own alias
-    /// and a present local credential. SystemOne and unknown windows are real
-    /// declarations, so generic auxiliary eligibility must not filter them.
+    /// and a present local credential. Unknown windows are real declarations,
+    /// so generic auxiliary eligibility must not filter them.
     fn validateProxyMember(self: *Session, name: []const u8) !void {
         const global = self.global_config.?.value;
         const reference = try cfg.splitDefault(name);
@@ -1759,12 +1754,6 @@ pub const Session = struct {
 
     fn selectRegistryModel(self: *Session, selector: []const u8) !void {
         const previous = self.mutableConfig().*;
-        // Even a frozen historical SystemOne selection is display-only. Never
-        // let the retained-selection shortcut activate it as primary chat.
-        if (previous.model.protocol == .systemone and
-            (std.mem.eql(u8, selector, previous.model.name) or
-                (self.selected_alias != null and std.mem.eql(u8, selector, self.selected_alias.?))))
-            return error.SystemOneNotChatModel;
         const raw_current = std.mem.eql(u8, selector, previous.model.name);
         const alias_current = self.selected_alias != null and std.mem.eql(u8, selector, self.selected_alias.?);
         const revision_changed = if (ProviderId.fromUrl(previous.provider.base_url)) |id|
@@ -1816,7 +1805,6 @@ pub const Session = struct {
             };
         } else {
             const resolved = try model_resolver.resolve(owned.arena.allocator(), owned.value, &self.metadata_cache, provider_name, raw_id, false);
-            if (resolved.model.protocol == .systemone) return error.SystemOneNotChatModel;
             model_resolver.apply(&owned.value, resolved);
             context_official = resolved.context_official;
             wanted = reasoning_defaults.preference(owned.value);
@@ -1832,7 +1820,6 @@ pub const Session = struct {
         var owned = parsed;
         var consumed = false;
         defer if (!consumed) cfg.release(&owned);
-        if (owned.value.model.protocol == .systemone) return error.SystemOneNotChatModel;
         const alias = try self.aliasFor(owned.value);
         errdefer if (alias) |value| self.allocator.free(value);
         const pending_selection = if (self.loaded_checkpoint != null) try selections.capture(owned.value) else null;

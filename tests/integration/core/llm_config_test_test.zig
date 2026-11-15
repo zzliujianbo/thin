@@ -123,26 +123,6 @@ test "HTTP proxy empty list explicit persistence beyond 128 exact dynamic IDs" {
 test "HTTP proxy parse clone url disk allocation failures release ownership" {
     try t.checkAllAllocationFailures(t.allocator, proxyAllocationExercise, .{});
 }
-test "SystemOne exact model declaration owns protocol and roundtrips" {
-    const prefix = "{\"llm\":{\"default\":\"main/chat\",\"providers\":{\"main\":{\"base_url\":\"https://api.deepseek.com\",\"models\":{\"chat\":{\"protocol\":\"chat\",\"context_tokens\":65536}}},\"aux\":{\"base_url\":\"https://native-fixture.invalid/v1\",\"models\":{\"judge/raw\":{\"protocol\":\"systemone\"}}}}}";
-    var p = try cfg.parse(t.allocator, prefix ++ "}");
-    defer cfg.release(&p);
-    const declared = p.value.registry.?.find("aux").?.patchFor("judge/raw").?;
-    try t.expect(declared.protocol == .systemone);
-    try t.expect(declared.context_tokens == null);
-    var copy = try cfg.clone(t.allocator, p.value);
-    defer cfg.release(&copy);
-    try t.expectEqualDeep(p.value.registry, copy.value.registry);
-    var out: std.Io.Writer.Allocating = .init(t.allocator);
-    defer out.deinit();
-    try cfg.writeDisk(copy.value, &out.writer);
-    var roundtrip = try cfg.parse(t.allocator, out.written());
-    defer cfg.release(&roundtrip);
-    try t.expectEqualDeep(copy.value.registry, roundtrip.value.registry);
-    try t.expect(roundtrip.value.registry.?.find("aux").?.patchFor("judge/raw").?.protocol == .systemone);
-    try t.expect(roundtrip.value.registry.?.find("aux").?.patchFor("judge/raw").?.context_tokens == null);
-    try cfg.validate(roundtrip.value);
-}
 test "llm registry presence isolation roundtrip frozen clone and candidate changes" {
     var p = try cfg.parse(t.allocator, fixture);
     defer cfg.release(&p);

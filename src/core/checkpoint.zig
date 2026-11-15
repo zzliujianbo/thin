@@ -255,13 +255,11 @@ pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
 pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
     const proto = req.scope.protocol;
     if (proto == .auto) return error.InvalidSelector;
-    if (proto == .systemone) return error.SystemOneNotChatModel;
     const codec = req.codec orelse p.defaultCodec(proto) orelse return error.InvalidSelector;
     const wire_proto: p.Protocol = switch (codec) {
         .chat => .chat,
         .responses, .codex_responses => .responses,
         .anthropic => .anthropic,
-        .systemone => .systemone,
     };
     if (wire_proto != proto) return error.IncompatibleModelProtocol;
     try basic(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(wire_proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
@@ -294,7 +292,7 @@ pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
                     if (!r.retain_turn or blocks.len != m.blocks.len) return error.NativeMismatch;
                     for (blocks, m.blocks) |x, y| if (!sameBlock(x, y)) return error.NativeMismatch;
                 },
-                .auto, .systemone => unreachable,
+                .auto => unreachable,
             }
         }
     }
@@ -307,7 +305,6 @@ pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
         .responses => try responses.encode(a, req),
         .codex_responses => try codex.encode(a, req),
         .anthropic => try anthropic.encode(a, req),
-        .systemone => unreachable,
     };
 }
 

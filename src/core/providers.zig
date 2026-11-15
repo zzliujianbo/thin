@@ -2,16 +2,6 @@
 //! Credentials belong to declared registry connections, never service slots.
 const std = @import("std");
 
-/// Exact native question/threshold API; not a generative catalog endpoint.
-pub const systemone_base_url = "https://opencode.ai/inference/systemone/v1";
-
-/// A resolved SystemOne model may reuse only its own official Zen connection.
-/// All credentials, alias identity and proxy policy remain with the caller.
-/// Never rewrite Go, custom, lookalike or already-native connections.
-pub fn systemOneRoute(base_url: []const u8) []const u8 {
-    return if (Id.fromUrl(base_url) == .opencode_zen) systemone_base_url else base_url;
-}
-
 pub const Id = enum {
     deepseek,
     opencode_zen,
@@ -51,10 +41,6 @@ pub const Id = enum {
         if (std.mem.eql(u8, normalized, "https://opencode.ai/inference/go/v1")) return .opencode_go;
         if (std.mem.eql(u8, normalized, "https://opencode.ai/inference/v1")) return .opencode_zen;
         return null;
-    }
-    /// Native identity is NOT authority for the generative catalog.
-    pub fn fromSystemOneUrl(url: []const u8) ?Id {
-        return if (std.mem.eql(u8, std.mem.trimEnd(u8, url, "/"), systemone_base_url)) .opencode_zen else null;
     }
     pub fn fromSlug(value: []const u8) ?Id {
         for (all) |id| if (std.mem.eql(u8, value, id.slug())) return id;

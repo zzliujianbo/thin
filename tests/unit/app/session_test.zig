@@ -2560,7 +2560,7 @@ test "proxy allowlist revalidates exact rows credentials and preserves unrelated
     try std.testing.expectError(error.UnknownProxyModel, proxyToggle(&session, "aux/absent", true));
     try std.testing.expectError(error.InvalidDefault, proxyToggle(&session, "no-slash", true));
 
-    // Declared SystemOne and unknown-window rows are real declarations, not
+    // Declared unknown-window rows are real declarations, not
     // generic auxiliary candidates; logged-in literal keys are accepted.
     try proxyToggle(&session, "aux/native/raw", true);
     try proxyToggle(&session, "aux/unknown/raw", true);

@@ -474,6 +474,9 @@ test "journal bounded UTF8 payload and oversized encoded record continue" {
     defer root.deinit();
     var journal = try Journal.init(std.testing.allocator, &root, "x");
     defer journal.deinit();
+    // A multi-megabyte record and its fsync may legitimately outlast the
+    // default one-second drain budget on a loaded machine.
+    journal.test_flush_timeout_ms = 10_000;
     const large = try std.testing.allocator.alloc(u8, text_limit + 2);
     defer std.testing.allocator.free(large);
     for (0..large.len / 3) |i| @memcpy(large[i * 3 ..][0..3], "中");

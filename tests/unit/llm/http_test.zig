@@ -179,31 +179,6 @@ test "connection retry focused: transient allowlist rejects TLS DNS and configur
         error.Unexpected,              error.Timeout,
     }) |err| try std.testing.expect(!transientConnectError(err));
 }
-test "SystemOne cannot enter chat HTTP via protocol endpoint or stale client" {
-    const a = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedProtocol, requestAddress(a, "http://127.0.0.1:1", .systemone));
-    for ([_]p.Protocol{ .auto, .chat, .responses, .anthropic, .systemone }) |api| {
-        try std.testing.expectError(error.UnsupportedProtocol, requestAddress(a, "https://opencode.ai/inference/systemone/v1/", api));
-    }
-    var config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1:1" }, .model = .{ .name = "reviewer", .protocol = .systemone, .context_tokens = 0 } };
-    try std.testing.expectError(error.UnsupportedProtocol, Client.init(a, std.testing.io, &config, "fake"));
-    // Early rejection must precede worker/clock/proxy access, even if a caller
-    // bypassed init or mutated the config after constructing a chat client.
-    var client: Client = undefined;
-    client.config = &config;
-    const request: p.Request = .{
-        .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat },
-        .system = "",
-        .tools = &.{},
-        .messages = &.{},
-    };
-    const result = try client.model().call(a, request, .{});
-    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, result.failure.kind);
-    config.model.protocol = .chat;
-    config.provider.base_url = "https://opencode.ai/inference/systemone/v1";
-    const endpoint = try client.model().call(a, request, .{});
-    try std.testing.expectEqual(p.FailureKind.unsupported_protocol, endpoint.failure.kind);
-}
 test "completed worker cannot publish late tools or hide usage at the final deadline gate" {
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://example.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 32768 }, .limits = .{ .request_timeout_ms = 1 } };
     var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake");

@@ -101,7 +101,6 @@ fn encodeWire(a: std.mem.Allocator, runtime: *r.Runtime, protocol: p.Protocol) !
         .chat => chat.encode(a, req),
         .responses => responses.encode(a, req),
         .anthropic => anthropic.encode(a, req),
-        .systemone => error.SystemOneNotChatModel,
         .auto => unreachable,
     };
 }

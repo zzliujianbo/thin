@@ -292,19 +292,6 @@ test "checkpoint JSON preflight grows beyond retired depth and structural counts
     defer wide.deinit();
     try std.testing.expectEqual(@as(usize, 65537), wide.value.array.items.len);
 }
-test "SystemOne history remains structural data but cannot authorize chat requests" {
-    const a = std.testing.allocator;
-    var state = fixture(.chat);
-    state.selector = llm.Selector.init(.systemone);
-    const bytes = try encode(a, state);
-    defer a.free(bytes);
-    const parsed = try decode(a, bytes);
-    defer parsed.deinit();
-    try std.testing.expectEqualDeep(state, parsed.value);
-    var config = fixture_config;
-    config.model.protocol = .systemone;
-    try std.testing.expectError(error.SystemOneNotChatModel, validateRequestHistory(a, fixtureRequest(parsed.value, config)));
-}
 test "checkpoint loads poison estimator selector independently from pre-send scope checks" {
     const a = std.testing.allocator;
     var s = fixture(.chat);

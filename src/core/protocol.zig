@@ -4,18 +4,17 @@
 const std = @import("std");
 
 /// auto probes only Responses/Chat. Anthropic Messages is selected explicitly.
-pub const Protocol = enum { auto, chat, responses, anthropic, systemone };
+pub const Protocol = enum { auto, chat, responses, anthropic };
 
 /// Internal wire encoding/driver. Codex is a Responses variant but is not a
 /// public config/UI protocol and never enters ReplayScope.
-pub const WireCodec = enum { chat, responses, codex_responses, anthropic, systemone };
+pub const WireCodec = enum { chat, responses, codex_responses, anthropic };
 
 pub fn defaultCodec(proto: Protocol) ?WireCodec {
     return switch (proto) {
         .chat => .chat,
         .responses => .responses,
         .anthropic => .anthropic,
-        .systemone => .systemone,
         .auto => null,
     };
 }

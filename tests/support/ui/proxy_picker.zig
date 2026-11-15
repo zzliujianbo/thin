@@ -6,7 +6,7 @@ fn freeRows(a: std.mem.Allocator, rendered: Rows) void {
 const profiles = [_]cfg.Model{
     .{ .name = "login/Family/Proxy", .protocol = .chat, .context_tokens = 16384 },
     // Native protocol and unknown capacity stay selectable for proxy routing.
-    .{ .name = "login/native/Judge", .protocol = .systemone, .context_tokens = 0 },
+    .{ .name = "login/native/Judge", .protocol = .chat, .context_tokens = 0 },
     .{ .name = "second/family/proxy", .protocol = .responses, .context_tokens = 16384 },
     .{ .name = "unlogged/private-model", .context_tokens = 16384 },
     .{ .name = "raw-only", .context_tokens = 16384 },

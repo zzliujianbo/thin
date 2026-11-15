@@ -62,16 +62,6 @@ pub const entries = [_]Entry{
     go("cat-jam-free", .chat),
 };
 
-/// Exact model-to-wire bindings published by OpenCode's endpoint table:
-/// https://opencode.ai/docs/zen/ . This supplies ONLY a protocol when live
-/// metadata omits it, never discovery/availability or generative capabilities.
-/// Do not broaden to prefixes, case folding, Go or arbitrary endpoint aliases.
-pub fn documentedProtocol(id: Id, raw_id: []const u8) ?@import("../core/protocol.zig").Protocol {
-    if (id == .opencode_zen and
-        (std.mem.eql(u8, raw_id, "jev-1.13") or std.mem.eql(u8, raw_id, "jev-1.13-free"))) return .systemone;
-    return null;
-}
-
 /// Official pricing documents a flat context-length schedule within 1M for
 /// these two exact direct Chat routes (not reseller routes or name prefixes).
 /// Source: https://api-docs.deepseek.com/quick_start/pricing/

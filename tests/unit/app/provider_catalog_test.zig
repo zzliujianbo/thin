@@ -1,13 +1,3 @@
-test "documented native protocol is exact service identity not availability or a name heuristic" {
-    for ([_][]const u8{ "jev-1.13", "jev-1.13-free" }) |name| {
-        try std.testing.expectEqual(@as(?@import("../core/protocol.zig").Protocol, .systemone), documentedProtocol(.opencode_zen, name));
-        try std.testing.expect(documentedProtocol(.opencode_go, name) == null);
-        try std.testing.expect(documentedProtocol(.deepseek, name) == null);
-        try std.testing.expect(find(name) == null);
-    }
-    for ([_][]const u8{ "jev", "jevfree", "Jev-1.13-free", "jev-1.13-free-extra", "family/jev-1.13-free" }) |name|
-        try std.testing.expect(documentedProtocol(.opencode_zen, name) == null);
-}
 test "documented flat price ranges are limited to exact direct DeepSeek Chat routes" {
     for (entries) |entry| {
         if (entry.provider == .deepseek and entry.model.protocol == .chat) {

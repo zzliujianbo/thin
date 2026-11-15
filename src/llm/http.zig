@@ -54,7 +54,6 @@ pub const Client = struct {
     }
 
     pub fn initWithEnv(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8, env: *const std.process.Environ.Map) !Client {
-        if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null) return error.UnsupportedProtocol;
         if (isCodexConfig(config) or std.mem.eql(u8, config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
         // 控制字符会破坏 HTTP 头格式，因此在这里拒绝。
         if (key.len == 0 or key.len > 16384) return error.InvalidApiKey;
@@ -103,8 +102,6 @@ pub const Client = struct {
     /// authorization, CA/route transport and session identity are copied; the
     /// key is never re-resolved from a filtered command environment.
     pub fn cloneForConfig(self: *const Client, allocator: std.mem.Allocator, io: Io, config: *const cfg.Config) !Client {
-        if (config.model.protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(config.provider.base_url) != null)
-            return error.UnsupportedProtocol;
         if (self.codex_source != null) {
             if (!isCodexConfig(config) or !std.mem.eql(u8, config.provider.base_url, codex_base) or config.model.protocol != .responses) return error.UnsupportedProtocol;
         } else {
@@ -213,9 +210,6 @@ pub const Client = struct {
     /// 执行一次模型请求。在独立的 I/O worker 中完成网络操作，主协程负责轮询取消与超时。
     fn invoke(context: *anyopaque, allocator: std.mem.Allocator, request: p.Request, sink: p.ModelSink) !p.Outcome {
         const self: *Client = @ptrCast(@alignCast(context));
-        if (request.scope.protocol == .systemone or self.config.model.protocol == .systemone or
-            cfg.providers.Id.fromSystemOneUrl(self.config.provider.base_url) != null)
-            return failure(.unsupported_protocol, "unsupported_protocol: systemone", null, false);
         // auto 只能是配置层的占位值，进入 HTTP 层前必须已解析为具体协议。
         if (request.scope.protocol == .auto) return error.UnselectedProtocol;
         // 回放作用域必须与当前连接、模型一致，避免把历史 replay 发送到其他端点。
@@ -390,7 +384,6 @@ pub const Client = struct {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
             .responses, .codex_responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
             .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, .{ .context = job, .emit_fn = Job.emit }) },
-            .systemone => return error.UnsupportedProtocol,
         };
         var decoder = sse.Decoder.init(job.client.allocator, null, .{ .context = &stream, .emit_fn = Stream.feed });
         defer decoder.deinit();
@@ -451,7 +444,6 @@ pub const Client = struct {
             .chat => .chat,
             .responses, .codex_responses => .responses,
             .anthropic => .anthropic,
-            .systemone => .systemone,
         };
         if (wire_proto != protocol) return error.IncompatibleModelProtocol;
         try job.checkBudget();
@@ -481,7 +473,6 @@ pub const Client = struct {
             .responses => try responses.encode(a, job.request),
             .codex_responses => try codex.encode(a, job.request),
             .anthropic => try anthropic.encode(a, job.request),
-            .systemone => return error.UnsupportedProtocol,
         };
 
         // 去掉 base_url 结尾的斜杠，再拼接各协议固定的端点路径。
@@ -552,7 +543,6 @@ pub const Client = struct {
             .chat => .{ .chat = chat.Stream.init(job.allocator, job.request.scope, sink) },
             .responses, .codex_responses => .{ .responses = responses.Stream.init(job.allocator, job.request.scope, sink) },
             .anthropic => .{ .anthropic = anthropic.Stream.init(job.allocator, job.request.scope, sink) },
-            .systemone => return error.UnsupportedProtocol,
         };
 
         var decoder = sse.Decoder.init(self.allocator, null, .{
@@ -633,7 +623,6 @@ fn transientConnectError(err: anyerror) bool {
 /// Keep persisted connection identity stable. Go uses its documented inference
 /// routes; custom endpoints are never rewritten by provider hint or model ID.
 fn requestAddress(a: std.mem.Allocator, base_url: []const u8, protocol: p.Protocol) ![]u8 {
-    if (protocol == .systemone or cfg.providers.Id.fromSystemOneUrl(base_url) != null) return error.UnsupportedProtocol;
     const normalized = std.mem.trimEnd(u8, base_url, "/");
     const base = blk: {
         if (cfg.providers.Id.fromUrl(normalized)) |id| switch (id) {
@@ -649,7 +638,6 @@ fn requestAddress(a: std.mem.Allocator, base_url: []const u8, protocol: p.Protoc
         .chat => "/chat/completions",
         .responses => "/responses",
         .anthropic => "/messages",
-        .systemone => return error.UnsupportedProtocol,
         .auto => return error.UnselectedProtocol,
     };
     return std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix });

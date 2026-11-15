@@ -180,7 +180,7 @@ test "memory client rejects unknown or zero Anthropic capacity before counting c
         }
     }
 }
-test "memory client refuses unresolved native absent credentials and input policy before calls" {
+test "memory client refuses unresolved absent credentials and input policy before calls" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -190,8 +190,6 @@ test "memory client refuses unresolved native absent credentials and input polic
     try std.testing.expectError(error.MemoryUnavailable, Client.extract(client, a, fixture, &cancel));
     client.source.value.model.protocol = .auto;
     try std.testing.expectError(error.UnknownModelProtocol, Client.extract(client, a, fixture, &cancel));
-    client.source.value.model.protocol = .systemone;
-    try std.testing.expectError(error.UnsupportedProtocol, Client.extract(client, a, fixture, &cancel));
     client.source.value.model.protocol = .chat;
     var fake: Fake = .{ .client = client };
     client.model_override = .{ .context = &fake, .call_fn = Fake.invoke };
@@ -252,7 +250,6 @@ test "memory client binds only primary confirmed auto protocol without startup r
         var cancel: p.Cancellation = .{};
         try std.testing.expectError(error.UnknownModelProtocol, Client.extract(client, a, fixture, &cancel));
         try std.testing.expectError(error.UnsupportedProtocol, client.bindProtocol(.auto));
-        try std.testing.expectError(error.UnsupportedProtocol, client.bindProtocol(.systemone));
         try client.bindProtocol(protocol);
         try client.bindProtocol(protocol);
         try std.testing.expectEqual(@as(u64, 0), client.calls);

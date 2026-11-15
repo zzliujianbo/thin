@@ -511,7 +511,7 @@ pub const SubagentService = struct {
         if (self.deps.runtime.poisoned) return error.UnsafeToContinue;
         if (self.deps.image.*) |client| if (client.isPoisoned()) return error.CleanupFailed;
         const protocol = self.deps.runtime.selector.effective();
-        if (protocol == .auto or protocol == .systemone) return error.UnsupportedSubagentProtocol;
+        if (protocol == .auto) return error.UnsupportedSubagentProtocol;
     }
 
     fn check(raw: *anyopaque) !void {
@@ -1479,7 +1479,7 @@ const ChildSession = struct {
         } else {
             // Inherit the parent's already selected protocol. Never re-probe auto.
             self.config.?.value.model.protocol = deps.runtime.selector.effective();
-            if (self.config.?.value.model.protocol == .auto or self.config.?.value.model.protocol == .systemone)
+            if (self.config.?.value.model.protocol == .auto)
                 return error.UnsupportedSubagentProtocol;
             self.client = try deps.http_client.cloneForConfig(a, deps.root.io, &self.config.?.value);
         }

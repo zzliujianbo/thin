@@ -85,7 +85,7 @@ test "proxy rows confirm complete rows and surface a missing endpoint" {
 }
 test "proxy rows keep one bounded window for large catalogs" {
     const a = std.testing.allocator;
-    const models: [40]cfg.Model = @splat(.{ .name = "login/Native/Judge", .protocol = .systemone, .context_tokens = 0 });
+    const models: [40]cfg.Model = @splat(.{ .name = "login/Native/Judge", .protocol = .chat, .context_tokens = 0 });
     try std.testing.expectEqual(@as(usize, 40), count(&models, &logged, ""));
     for ([_]usize{ 1, 2, 3, 10, 100 }) |height| {
         const rendered = try rows(a, .{ .selected = 39 }, &models, &logged, &.{}, true, "10.0.0.1", 8080, "", 80, height);

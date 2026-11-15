@@ -138,8 +138,8 @@ async function proxyFixture(name, url, configured) {
       go:{base_url:'https://opencode.ai/zen/go/v1', api_key:'go-fixture-key', models:{
         'Repo/Model-X':{protocol:'responses', context_tokens:65536},
       }},
-      native:{base_url:'https://opencode.ai/inference/systemone/v1', api_key:'native-fixture-key', models:{
-        'family/native-review':{protocol:'systemone'},
+      native:{base_url:'https://native.invalid/v1', api_key:'native-fixture-key', models:{
+        'family/native-review':{protocol:'chat', context_tokens:32768},
       }},
       ghost:{base_url:'https://ghost.invalid/v1', api_key_env:'THIN_MISSING_KEY', models:{
         'Case-Model':{protocol:'chat', context_tokens:32768},
@@ -164,8 +164,8 @@ async function fixture(name, url) {
     }},
     zen:{base_url:'https://opencode.ai/zen/v1', api_key:'zen-fixture-key', models:{}},
     go:{base_url:'https://opencode.ai/zen/go/v1', api_key:'go-fixture-key', models:{}},
-    native:{base_url:'https://opencode.ai/inference/systemone/v1', api_key:'native-fixture-key', models:{
-      'family/native-review':{protocol:'systemone'},
+    native:{base_url:'https://native.invalid/v1', api_key:'native-fixture-key', models:{
+      'family/native-review':{protocol:'chat', context_tokens:32768},
     }},
     }},
     limits:{low_price_input:true, request_timeout_ms:3000},
@@ -282,7 +282,7 @@ try {
   await untouched(n.configPath, unconfigured);
   await unchanged(n);
 
-  // Proxy allowlist: preserved pre-existing entry, a literal-key SystemOne
+  // Proxy allowlist: preserved pre-existing entry, a literal-key auxiliary
   // model, and a second literal-key model whose raw ID keeps a slash and case.
   const proxy = await proxyFixture('proxy-configured', url, true);
   // A retired settings file is inert: never read for preferences, repaired or removed.

@@ -40,7 +40,7 @@ test "provider output matrix omits optional caps and only Anthropic uses model c
                                 .chat => try chat.encode(allocator, request),
                                 .responses => try responses.encode(allocator, request),
                                 .anthropic => try anthropic.encode(allocator, request),
-                                .auto, .systemone => unreachable,
+                                .auto => unreachable,
                             };
                             const parsed = try std.json.parseFromSlice(j.Value, allocator, encoded, .{});
                             for ([_][]const u8{ "max_tokens", "max_completion_tokens", "max_output_tokens" }) |key| {
