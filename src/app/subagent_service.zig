@@ -31,7 +31,6 @@ const http = @import("../llm/http.zig");
 const inbox_mod = @import("../core/inbox.zig");
 const session_context = @import("../core/session_context.zig");
 const subagent = @import("../core/subagent.zig");
-const DecisionClient = @import("decision_client.zig").Client;
 const ImageClient = @import("image_client.zig").Client;
 
 /// Contract bounds, single-sourced from core/subagent.zig.
@@ -84,7 +83,6 @@ pub const Deps = struct {
     allocator: std.mem.Allocator,
     config: *const cfg.Config,
     http_client: *const http.Client,
-    decision: *const ?*DecisionClient,
     image: *const ?*ImageClient,
     root: *const fs.Root,
     environment: *const std.process.Environ.Map,
@@ -511,10 +509,6 @@ pub const SubagentService = struct {
         // late get/send/cancel of an older sibling is never blocked.
         if (self.retained_child != null) return error.CleanupFailed;
         if (self.deps.runtime.poisoned) return error.UnsafeToContinue;
-        if (self.deps.decision.*) |client| {
-            const decision_service = client.service();
-            if (decision_service.check_fn) |check_fn| try check_fn(decision_service.context);
-        }
         if (self.deps.image.*) |client| if (client.isPoisoned()) return error.CleanupFailed;
         const protocol = self.deps.runtime.selector.effective();
         if (protocol == .auto or protocol == .systemone) return error.UnsupportedSubagentProtocol;
@@ -1453,7 +1447,6 @@ const ChildSession = struct {
     tools: tools.Tools = undefined,
     tools_ready: bool = false,
     client: ?http.Client = null,
-    decision: ?*DecisionClient = null,
     image: ?*ImageClient = null,
     runtime: ?r.Runtime = null,
     cancel: p.Cancellation = .{},
@@ -1496,7 +1489,6 @@ const ChildSession = struct {
         // Store is never read or migrated before the child is destroyed.
         self.store = mem.Store.init(&self.root.?);
 
-        if (deps.decision.*) |parent| self.decision = try parent.clone();
         if (deps.image.*) |parent| self.image = try parent.clone();
 
         self.tools = .{
@@ -1531,7 +1523,6 @@ const ChildSession = struct {
             .authorize_fn = ChildHost.authorize,
         }, "");
         const runtime = &self.runtime.?;
-        runtime.decision_service = if (self.decision) |client| client.service() else null;
         const old_system = runtime.system;
         runtime.system = try std.fmt.allocPrint(a, "{s}\n\n{s}", .{ old_system, child_mode });
         a.free(old_system);
@@ -1558,14 +1549,6 @@ const ChildSession = struct {
             self.tools.parent_channel = null;
         }
         var failed = self.test_cleanup_failed;
-        if (self.decision) |client| {
-            var converged = true;
-            client.cleanupForClose() catch {
-                converged = false;
-                failed = true;
-            };
-            if (converged) self.decision = null;
-        }
         if (self.image) |client| {
             var converged = true;
             client.deinit() catch {

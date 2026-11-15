@@ -1,13 +1,9 @@
-fn schemasForDecision(enabled: bool) []const p.ToolSchema {
-    return schemasFor(enabled, false, true, 0, false);
+fn schemasFor(image_on: bool, memory_on: bool, channel: usize, background_on: bool) []const p.ToolSchema {
+    return schemasWithTitle(image_on, memory_on, channel, background_on, false);
 }
 
-fn schemasFor(review: bool, image_on: bool, memory_on: bool, channel: usize, background_on: bool) []const p.ToolSchema {
-    return schemasWithTitle(review, image_on, memory_on, channel, background_on, false);
-}
-
-fn schemasForServices(review: bool, enabled: bool) []const p.ToolSchema {
-    return schemasFor(review, enabled, true, 0, false);
+fn schemasForServices(enabled: bool) []const p.ToolSchema {
+    return schemasFor(enabled, true, 0, false);
 }
 
 const FakeBackground = struct {

@@ -232,20 +232,6 @@ pub fn build(b: *std.Build) void {
     const run_proxy = fixture(b, "node", "tests/product/proxy_mock.mjs", &.{proxy_tests}, &.{});
     b.step("test-proxy", "Run owned allowlisted HTTP CONNECT and destination TLS fixtures").dependOn(&run_proxy.step);
 
-    const systemone_tests = b.addTest(.{
-        .use_llvm = platform_llvm,
-        .root_module = b.createModule(.{
-            .root_source_file = all.path(b, "src/systemone_http_test_root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    systemone_tests.step.dependOn(&all.run.step);
-    addNative(b, systemone_tests.root_module);
-    const run_systemone = fixture(b, "node", "tests/product/systemone_mock.mjs", &.{systemone_tests}, &.{});
-    b.step("test-systemone", "Run owned SystemOne/curl HTTP, proxy and TLS fixtures").dependOn(&run_systemone.step);
-
     const anthropic_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
@@ -410,7 +396,6 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .linux) {
         full_prerequisites.dependOn(&run_http.step);
         full_prerequisites.dependOn(&run_anthropic.step);
-        full_prerequisites.dependOn(&run_systemone.step);
         full_prerequisites.dependOn(&run_proxy.step);
     }
     full_prerequisites.dependOn(&run_app.step);
@@ -424,7 +409,7 @@ pub fn build(b: *std.Build) void {
     full_prerequisites.dependOn(&run_approval_cancel.step);
     full_prerequisites.dependOn(&run_tool_preview.step);
     full_prerequisites.dependOn(&run_queued.step);
-    for ([_]*std.Build.Step.Compile{ exe, unit, rendering, memory_tests, http_tests, proxy_tests, systemone_tests, anthropic_tests, probes, pty_driver }) |artifact| configureStack(artifact);
+    for ([_]*std.Build.Step.Compile{ exe, unit, rendering, memory_tests, http_tests, proxy_tests, anthropic_tests, probes, pty_driver }) |artifact| configureStack(artifact);
 }
 
 const Composed = struct {

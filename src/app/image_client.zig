@@ -4,7 +4,7 @@ const cfg = @import("../core/config.zig");
 const image = @import("../core/image.zig");
 const p = @import("../core/protocol.zig");
 const codec = @import("../llm/image_codec.zig");
-const http = @import("../llm/decision_http.zig");
+const http = @import("../llm/curl_http.zig");
 
 pub const Options = struct {
     base_url: []const u8,

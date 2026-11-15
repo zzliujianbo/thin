@@ -968,10 +968,6 @@ pub const SessionHost = struct {
         return self.closing;
     }
 
-    pub fn sessionId(self: *SessionHost) ids.Id {
-        return self.session.session_id;
-    }
-
     // -----------------------------------------------------------------------
     // Task lifecycle used by dispatch
     // -----------------------------------------------------------------------
@@ -1126,7 +1122,6 @@ pub const SessionHost = struct {
             .login => self.handleLogin(a, request, connection_id),
             .preference => self.handlePreference(a, request, connection_id),
             .setting => self.handleSetting(a, request, connection_id),
-            .decision_model => self.handleDecisionModel(a, request, connection_id),
             .image_model => self.handleImageModel(a, request, connection_id),
             .proxy_model => self.handleProxyModel(a, request, connection_id),
             .proxy_address => self.handleProxyAddress(a, request, connection_id),
@@ -1938,8 +1933,6 @@ pub const SessionHost = struct {
         try out.field("memory_auto", state.memory_auto);
         try protocol.encodeMemoryView(&out, state.memory);
         // Dynamic child rows belong to snapshots, not the settings reply.
-        try out.field("decision_enabled", state.decision_enabled);
-        try out.field("decision_model", state.decision_model);
         try out.field("global_settings_available", state.global_settings_available);
         try out.field("settings_notice", state.settings_notice);
         try out.field("settings_error", if (state.settings_error) |err| @as(?[]const u8, @errorName(err)) else @as(?[]const u8, null));
@@ -1968,7 +1961,6 @@ pub const SessionHost = struct {
         try out.field("effort_levels_known", state.effort_levels.mask != 0);
 
         try encodeModels(&out, "models", state.models, state.model_context_official, state.model_disabled);
-        try encodeModels(&out, "decision_models", state.decision_models, null, null);
         try encodeModels(&out, "image_models", state.image_models, null, null);
 
         try out.beginArray("providers");
@@ -2097,28 +2089,16 @@ pub const SessionHost = struct {
         return replyFrame(&out);
     }
 
-    fn helperChoice(request: *const protocol.Request) !?tui.Connection.DecisionChoice {
+    fn imageChoice(request: *const protocol.Request) !?tui.Connection.ModelChoice {
         if (request.boolField("off", false) catch return error.BadRequest) return .off;
         const name = request.optionalString("name") orelse return null;
         if (name.len == 0 or name.len > protocol.max_name) return error.InvalidInput;
         return .{ .model = name };
     }
 
-    fn handleDecisionModel(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
-        self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
-        const choice = helperChoice(request) catch |err| return errorReply(a, request.id, err);
-        const callback = self.connection.decision_fn orelse return errorReply(a, request.id, error.Unsupported);
-        if (choice) |value| callback(self.connection.context, value) catch |err| return errorReply(a, request.id, err);
-        self.refreshConnection();
-        var out = protocol.Out.init(a);
-        defer out.deinit();
-        try out.ok(request.id);
-        return replyFrame(&out);
-    }
-
     fn handleImageModel(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
         self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
-        const choice = helperChoice(request) catch |err| return errorReply(a, request.id, err);
+        const choice = imageChoice(request) catch |err| return errorReply(a, request.id, err);
         const callback = self.connection.image_fn orelse return errorReply(a, request.id, error.Unsupported);
         if (choice) |value| callback(self.connection.context, value) catch |err| return errorReply(a, request.id, err);
         self.refreshConnection();
@@ -2252,15 +2232,6 @@ fn submitDigest(kind: protocol.TaskKind, text: []const u8) [32]u8 {
     hash.update(&[_]u8{0});
     hash.update(text);
     return hash.finalResult();
-}
-
-/// Length of the longest prefix that fits `maximum`, never inside a codepoint.
-fn boundedLen(bytes: []const u8, maximum: usize) usize {
-    var n = @min(bytes.len, maximum);
-    if (n < bytes.len) {
-        while (n > 0 and (bytes[n] & 0xc0) == 0x80) n -= 1;
-    }
-    return n;
 }
 
 fn providerFromSlug(slug: []const u8) ?providers.Id {

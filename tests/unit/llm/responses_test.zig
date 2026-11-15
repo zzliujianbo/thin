@@ -316,7 +316,8 @@ test "responses rejects incomplete truncation contradictions malformed args and 
         var s = Stream.init(a, test_support.response_scope, .{});
         try s.feed("", try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"message\":\"secret-key\"}}", .{kind}));
         const f = (try s.finish()).failure;
-        try std.testing.expect(std.mem.indexOf(u8, f.message, "secret-key") == null);
+        // 原始错误文本按原样保留，供直接展示与排错。
+        try std.testing.expectEqualStrings("secret-key", f.message);
     }
 
     var truncated = Stream.init(a, test_support.response_scope, .{});

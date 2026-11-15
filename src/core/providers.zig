@@ -52,7 +52,7 @@ pub const Id = enum {
         if (std.mem.eql(u8, normalized, "https://opencode.ai/inference/v1")) return .opencode_zen;
         return null;
     }
-    /// Native decision identity is NOT authority for the generative catalog.
+    /// Native identity is NOT authority for the generative catalog.
     pub fn fromSystemOneUrl(url: []const u8) ?Id {
         return if (std.mem.eql(u8, std.mem.trimEnd(u8, url, "/"), systemone_base_url)) .opencode_zen else null;
     }

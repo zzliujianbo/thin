@@ -375,8 +375,6 @@ pub const Coordinator = struct {
             error.InvalidMemoryCandidate,
             error.DuplicateMemoryCandidate,
             error.InvalidMaterial,
-            error.InvalidDecision,
-            error.InvalidDecisionOutput,
             error.InvalidKnowledgeRecord,
             error.SensitiveMemoryMaterial,
             error.TooManySessionCredentials,

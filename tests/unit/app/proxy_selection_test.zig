@@ -3,7 +3,7 @@ test "proxy allowlist appends exact IDs removes only matches and preserves order
     var parsed = try cfg.parse(a, fixture);
     defer cfg.release(&parsed);
     const arena = parsed.arena.allocator();
-    const decision_before = parsed.value.decision.?.model;
+    const key_before = parsed.value.registry.?.find("p").?.connection.api_key.?;
     // Duplicate add and absent removal never rewrite the declaration.
     try std.testing.expect(!try apply(arena, &parsed.value, "p/raw/id", true));
     try std.testing.expectEqual(@as(usize, 1), parsed.value.proxy.?.models.len);
@@ -16,7 +16,7 @@ test "proxy allowlist appends exact IDs removes only matches and preserves order
     try std.testing.expectEqualStrings("p/main", parsed.value.proxy.?.models[0]);
     try std.testing.expectEqualStrings("::1", parsed.value.proxy.?.address);
     try std.testing.expectEqual(@as(u16, 8080), parsed.value.proxy.?.port);
-    try std.testing.expectEqualStrings(decision_before, parsed.value.decision.?.model);
+    try std.testing.expectEqualStrings(key_before, parsed.value.registry.?.find("p").?.connection.api_key.?);
     try std.testing.expectError(error.InvalidDefault, apply(arena, &parsed.value, "p", true));
     try cfg.validate(parsed.value);
 }
@@ -56,7 +56,7 @@ test "proxy endpoint edit keeps members and unrelated settings" {
     try std.testing.expectEqual(@as(u16, 9090), parsed.value.proxy.?.port);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.proxy.?.models.len);
     try std.testing.expectEqualStrings("p/raw/id", parsed.value.proxy.?.models[0]);
-    try std.testing.expectEqualStrings("p/raw/id", parsed.value.decision.?.model);
+    try std.testing.expectEqualStrings("fake-main", parsed.value.registry.?.find("p").?.connection.api_key.?);
     try std.testing.expect(!parsed.value.limits.low_price_input);
     try cfg.validate(parsed.value);
     // Clearing removes the declaration and its members; repeating it is a no-op.

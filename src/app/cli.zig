@@ -275,8 +275,7 @@ const common_help =
     \\Commands run with your account permissions; bash is NOT a sandbox.
     \\Bash risk checks include sensitive-target deletion or writes, device destruction,
     \\sensitive chmod/chown, remote script execution, and fork bombs.
-    \\Without Decision, static risk matches require approval each time; with Decision,
-    \\approval follows its ask result, and a failed decision does not allow execution.
+    \\Static risk matches require explicit approval for that call.
     \\The confirmation popup uses arrows, Enter and Esc; on denial nothing runs.
     \\--print cannot approve a command, so calls requiring approval are denied.
     \\--print returns the final committed visible answer with the same tool policy.

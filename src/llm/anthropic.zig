@@ -182,6 +182,8 @@ pub const Stream = struct {
     ending: bool = false,
     failed: bool = false,
     failure_kind: p.FailureKind = .model,
+    /// 上游错误事件的原文，供失败结果直接展示（不翻译、不遮盖）。
+    error_text: ?[]const u8 = null,
     observed: bool = false,
     reason: ?[]const u8 = null,
     open: ?Item = null,
@@ -235,6 +237,7 @@ pub const Stream = struct {
             const detail = j.get(v, "error") orelse .null;
             const code = j.string(j.get(detail, "type")) orelse "";
             self.failure_kind = if (c.eq(code, "api_error") or c.eq(code, "overloaded_error")) .server else if (c.eq(code, "authentication_error") or c.eq(code, "permission_error")) .authentication else if (c.eq(code, "rate_limit_error")) .rate_limit else if (c.eq(code, "invalid_request_error")) .invalid_argument else .model;
+            self.error_text = c.rawValue(self.a, v, c.raw_max);
             self.failed = true;
             return;
         }
@@ -356,15 +359,15 @@ pub const Stream = struct {
         self.committed = true;
         const raw = if (self.raw_usage) |u| try j.encode(self.a, u) else null;
         if (self.failed) {
-            var failure = c.failure(self.observed, self.token_usage, raw);
+            var failure = c.failure(self.observed, self.token_usage, raw, self.error_text orelse "error event");
             failure.failure.kind = self.failure_kind;
             return failure;
         }
         if (!self.stopped or self.open != null or self.reason == null) return error.TruncatedStream;
         const reason = self.reason.?;
-        if (c.eq(reason, "max_tokens")) return c.outputLimit(self.observed, self.token_usage, raw);
+        if (c.eq(reason, "max_tokens")) return c.outputLimit(self.observed, self.token_usage, raw, "stop_reason: max_tokens");
         if (c.eq(reason, "pause_turn") or c.eq(reason, "model_context_window_exceeded")) {
-            var failure = c.failure(self.observed, self.token_usage, raw);
+            var failure = c.failure(self.observed, self.token_usage, raw, reason);
             if (c.eq(reason, "model_context_window_exceeded")) failure.failure.kind = .context_limit;
             return failure;
         }

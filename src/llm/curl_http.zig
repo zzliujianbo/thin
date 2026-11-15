@@ -120,7 +120,7 @@ pub const Client = struct {
             try checkCancel(self.io, cancel);
             return switch (err) {
                 error.OutOfMemory, error.CleanupFailed, error.Canceled, error.Timeout => err,
-                else => error.DecisionTransport,
+                else => error.TransportFailure,
             };
         };
         defer a.free(result.stdout);
@@ -448,18 +448,18 @@ fn parseResponse(a: std.mem.Allocator, result: process.Result) !Response {
     if (result.cleanup_failed or result.unreaped_pid != null) return error.CleanupFailed;
     if (result.canceled) return error.Canceled;
     if (result.timed_out) return error.Timeout;
-    if (result.truncated) return error.DecisionTransport;
-    const term = result.term orelse return error.DecisionTransport;
+    if (result.truncated) return error.TransportFailure;
+    const term = result.term orelse return error.TransportFailure;
     switch (term) {
-        .exited => |code| if (code != 0) return error.DecisionTransport,
-        else => return error.DecisionTransport,
+        .exited => |code| if (code != 0) return error.TransportFailure,
+        else => return error.TransportFailure,
     }
     const bytes = result.stdout;
-    if (bytes.len < 4 or result.stdout_bytes != bytes.len) return error.DecisionTransport;
+    if (bytes.len < 4 or result.stdout_bytes != bytes.len) return error.TransportFailure;
     const suffix = bytes[bytes.len - 4 ..];
-    if (suffix[0] != '\n') return error.DecisionTransport;
-    for (suffix[1..]) |digit| if (!std.ascii.isDigit(digit)) return error.DecisionTransport;
-    const status = std.fmt.parseInt(u16, suffix[1..], 10) catch return error.DecisionTransport;
-    if (status < 100) return error.DecisionTransport;
+    if (suffix[0] != '\n') return error.TransportFailure;
+    for (suffix[1..]) |digit| if (!std.ascii.isDigit(digit)) return error.TransportFailure;
+    const status = std.fmt.parseInt(u16, suffix[1..], 10) catch return error.TransportFailure;
+    if (status < 100) return error.TransportFailure;
     return .{ .status = status, .body = try a.dupe(u8, bytes[0 .. bytes.len - 4]) };
 }

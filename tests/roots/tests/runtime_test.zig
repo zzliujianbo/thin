@@ -6,7 +6,6 @@ const cfg = @import("../core/config.zig");
 const r = @import("../core/runtime.zig");
 const diagnostics = @import("../core/diagnostics.zig");
 const context = @import("../core/context.zig");
-const auxiliary = @import("../core/decision.zig");
 
 /// 1100 字节的长工具输出，用于撑大上下文，从而触发摘要压缩。
 const long_output: [1100]u8 = @splat('x');
@@ -104,33 +103,6 @@ const Fake = struct {
     execution_error: ?anyerror = null,
     /// When set, permission-id exhaustion asks the host to start a new epoch.
     rebase_permissions: bool = false,
-    decision_input: ?auxiliary.Input = null,
-    decision_output: auxiliary.Output = .{ .command = .{ .ask = false } },
-    decision_failure: ?anyerror = null,
-    decision_cancel: ?*p.Cancellation = null,
-    decision_calls: usize = 0,
-
-    fn auxiliaryDecide(raw: *anyopaque, _: std.mem.Allocator, _: auxiliary.Input, _: *const p.Cancellation) !auxiliary.Output {
-        const self: *Fake = @ptrCast(@alignCast(raw));
-        self.decision_calls += 1;
-        // Must happen before permission and all side effects.
-        try std.testing.expectEqual(@as(u32, 0), self.permissions + self.executions);
-        if (self.decision_cancel) |cancel| cancel.cancel();
-        if (self.decision_failure) |err| return err;
-        return self.decision_output;
-    }
-
-    fn repeatedAsk(raw: *anyopaque, _: std.mem.Allocator, _: auxiliary.Input, _: *const p.Cancellation) !auxiliary.Output {
-        const self: *Fake = @ptrCast(@alignCast(raw));
-        try std.testing.expectEqual(self.decision_calls, self.permissions);
-        try std.testing.expectEqual(self.decision_calls, self.executions);
-        self.decision_calls += 1;
-        return .{ .command = .{ .ask = true } };
-    }
-
-    fn service(self: *Fake) auxiliary.Service {
-        return .{ .context = self, .decide_fn = auxiliaryDecide };
-    }
 
     /// 返回模型接口，调用分发到 call。
     fn model(self: *Fake) p.Model {
@@ -237,7 +209,7 @@ const Fake = struct {
         if (!std.mem.eql(u8, call_.name, "write_file")) return error.UnexpectedTool;
         if (self.preparation_error) |err| return err;
         if (self.fail_prepare) return error.InvalidFixtureArguments;
-        return .{ .payload = ctx, .description = "write fixture", .explicit_denial = self.explicit_denial, .decision_input = self.decision_input };
+        return .{ .payload = ctx, .description = "write fixture", .explicit_denial = self.explicit_denial };
     }
 
     /// 执行工具：执行前先检查取消（已取消则不产生副作用），成功后计数，并按配置返回成功或清理失败。

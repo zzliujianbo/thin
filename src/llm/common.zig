@@ -4,6 +4,7 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const j = @import("../util/json.zig");
 const json_bound = @import("../app/json_bound.zig");
+const display_text = @import("../util/display_text.zig");
 
 /// JSON 值类型别名，来自 util/json.zig。
 pub const V = j.Value;
@@ -138,14 +139,55 @@ pub const Chunks = struct {
     }
 };
 
+/// Display bound for a raw failure cause. The row clips again; this is a memory
+/// bound, not a layout decision.
+pub const raw_max: usize = 400;
+
 /// 构造通用模型失败结果。observed 表示失败前是否已输出内容，用于阻止协议回退。
-pub fn failure(observed: bool, token_usage: p.Usage, raw_usage: ?[]const u8) p.Outcome {
-    return .{ .failure = .{ .kind = .model, .message = "Model did not complete successfully.", .observed_content = observed, .usage = token_usage, .raw_usage_json = raw_usage } };
+pub fn failure(observed: bool, token_usage: p.Usage, raw_usage: ?[]const u8, message: []const u8) p.Outcome {
+    return .{ .failure = .{ .kind = .model, .message = message, .observed_content = observed, .usage = token_usage, .raw_usage_json = raw_usage } };
 }
 
 /// Explicit provider output-cap termination; never inferred from usage counters.
-pub fn outputLimit(observed: bool, token_usage: p.Usage, raw_usage: ?[]const u8) p.Outcome {
-    return .{ .failure = .{ .kind = .output_limit, .message = "Model reached the output token limit.", .observed_content = observed, .usage = token_usage, .raw_usage_json = raw_usage } };
+pub fn outputLimit(observed: bool, token_usage: p.Usage, raw_usage: ?[]const u8, message: []const u8) p.Outcome {
+    return .{ .failure = .{ .kind = .output_limit, .message = message, .observed_content = observed, .usage = token_usage, .raw_usage_json = raw_usage } };
+}
+
+/// Raw failure text from a provider body: its own `error.message`/`message`
+/// when the body is JSON, otherwise the untouched first line. Sanitized for
+/// display and bounded, never reworded, classified or masked.
+pub fn rawText(a: std.mem.Allocator, body: []const u8, max: usize) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (j.parse(a, trimmed)) |value| {
+        if (rawValue(a, value, max)) |cause| return cause;
+    } else |_| {}
+    return cleanText(a, trimmed, max);
+}
+
+/// Same extraction for an already-parsed event; falls back to the event's own
+/// serialized text so an unknown error shape is still shown verbatim.
+pub fn rawValue(a: std.mem.Allocator, value: V, max: usize) ?[]const u8 {
+    const detail = j.get(value, "error");
+    // The provider's own sentence first; every other shape keeps the event text
+    // so codes, params and reason fields stay visible to whoever debugs it.
+    if (j.string(j.get(value, "message"))) |cause| if (cleanText(a, cause, max)) |out| return out;
+    if (detail) |d| {
+        if (j.string(d)) |cause| if (cleanText(a, cause, max)) |out| return out;
+        if (j.string(j.get(d, "message"))) |cause| if (cleanText(a, cause, max)) |out| return out;
+    }
+    const encoded = j.encode(a, value) catch return null;
+    return cleanText(a, encoded, max);
+}
+
+/// First non-empty line, display-sanitized and bounded. Never a classification.
+fn cleanText(a: std.mem.Allocator, cause: []const u8, max: usize) ?[]const u8 {
+    const end = std.mem.indexOfAny(u8, cause, "\r\n") orelse cause.len;
+    const line = std.mem.trim(u8, cause[0..end], " \t");
+    if (line.len == 0) return null;
+    const prefix = display_text.sanitizePrefix(a, line, max) catch return null;
+    if (prefix.text.len == 0) return null;
+    return prefix.text;
 }
 
 /// 复制回放作用域的 connection 与 model 字符串到分配器 a 中，使其独立于原始请求。

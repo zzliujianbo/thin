@@ -75,9 +75,6 @@ const Worker = struct {
     startup_rejected: bool = false,
     outcome: Outcome = .{},
     future: ?std.Io.Future(Outcome) = null,
-    /// Bounded tail of the child's captured stderr, for diagnostics only.
-    tail: [1024]u8 = undefined,
-    tail_len: usize = 0,
 
     fn publish(self: *Worker, out: Outcome) void {
         self.outcome = out;
@@ -104,13 +101,6 @@ pub const Workers = struct {
     /// Minimum per-worker grace for `close`, same reported-budget rule.
     close_grace_ms: u64 = 2_000,
     poisoned: std.atomic.Value(bool) = .init(false),
-    last_failure: [1024]u8 = undefined,
-    last_failure_len: usize = 0,
-    /// Last unconfirmed-cleanup record: worker id plus the real Term it ended
-    /// with. Never a credential; kept as the evidence a failed stop refuses to
-    /// discard.
-    unclean: [256]u8 = undefined,
-    unclean_len: usize = 0,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !Workers {
         const uid: u32 = @intCast(c.getuid());
@@ -337,13 +327,6 @@ pub const Workers = struct {
         }
     }
 
-    /// Bounded diagnostic tail of the last failed worker (never a credential:
-    /// the child's stdio carries no configuration values).
-    pub fn failureDetail(self: *const Workers) ?[]const u8 {
-        if (self.last_failure_len == 0) return null;
-        return self.last_failure[0..self.last_failure_len];
-    }
-
     pub fn deinit(self: *Workers) void {
         var unclean = false;
         for (self.list.items) |worker| {
@@ -365,7 +348,6 @@ pub const Workers = struct {
             return;
         }
         self.list.deinit(self.allocator);
-        wipe(self.last_failure[0..]);
         var env_it = self.environ.iterator();
         while (env_it.next()) |entry| {
             wipe(@constCast(entry.key_ptr.*));
@@ -413,7 +395,6 @@ pub const Workers = struct {
     fn abort(self: *Workers, worker: *Worker) void {
         worker.cancel.cancel();
         const out = self.joinWorker(worker);
-        self.captureFailure(worker);
         if (out.cleanup_failed or out.unreaped_pid != null) {
             // Keep the owned worker (and its recorded pid) for a later shutdown;
             // never pretend the failure was clean.
@@ -423,13 +404,6 @@ pub const Workers = struct {
         self.removeEndpoint(worker);
         self.remove(worker);
         self.destroyWorker(worker);
-    }
-
-    fn captureFailure(self: *Workers, worker: *Worker) void {
-        if (worker.tail_len == 0) return;
-        const n = @min(worker.tail.len, self.last_failure.len);
-        @memcpy(self.last_failure[0..n], worker.tail[0..n]);
-        self.last_failure_len = n;
     }
 
     fn awaitReady(self: *Workers, worker: *Worker) !registry.Hello {
@@ -459,32 +433,14 @@ pub const Workers = struct {
 
     /// A joined worker is only clean when the process itself confirms it: no
     /// unconfirmed process/group cleanup and a Term it produced on purpose.
-    /// Anything else keeps a bounded record and fails the stop.
-    fn cleanupUnconfirmed(self: *Workers, worker: *Worker, out: Outcome) bool {
+    fn cleanupUnconfirmed(_: *Workers, worker: *Worker, out: Outcome) bool {
         // A startup rejection is confirmed by the process itself: the worker
         // refused to start and exited with its private mapping code. Only that
         // flag, set on the pre-`hello` path, can use this exception; an
         // unexpected 70..90 exit of a running worker still fails the stop.
         if (worker.startup_rejected and classifyStartupOutcome(out) != null) return false;
-        if (out.cleanup_failed or out.unreaped_pid != null or !termConfirmed(out.term)) {
-            self.recordUnclean(worker, out);
-            return true;
-        }
+        if (out.cleanup_failed or out.unreaped_pid != null or !termConfirmed(out.term)) return true;
         return false;
-    }
-
-    fn recordUnclean(self: *Workers, worker: *Worker, out: Outcome) void {
-        var term_buf: [48]u8 = undefined;
-        var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{s} term={s} cleanup_failed={s} unreaped_pid={d}", .{
-            worker.id[0..],
-            describeTerm(&term_buf, out.term),
-            if (out.cleanup_failed) "true" else "false",
-            out.unreaped_pid orelse 0,
-        }) catch return;
-        const count = @min(text.len, self.unclean.len);
-        @memcpy(self.unclean[0..count], text[0..count]);
-        self.unclean_len = count;
     }
 
     /// One shared bounded wait: all notified workers converge in parallel, so
@@ -541,14 +497,6 @@ pub const Workers = struct {
         return cleanupGraceMs(limits, floor_ms);
     }
 
-    fn queryCleanupLimits(self: *Workers, conn: *unix.Connection) ?CleanupLimits {
-        const payload = self.exchange(conn, settings_request_id, "settings", settings_reply_ms) orelse return null;
-        defer self.allocator.free(payload);
-        var doc = parseReply(self.allocator, payload, settings_request_id) catch return null;
-        defer doc.deinit();
-        return replyCleanupLimits(doc.value);
-    }
-
     /// One correlated request/reply on an already-authorized owner connection.
     /// The returned payload is owned by the caller; any failure yields null.
     fn exchange(self: *Workers, conn: *unix.Connection, id: u64, op: []const u8, reply_ms: u32) ?[]u8 {
@@ -558,12 +506,6 @@ pub const Workers = struct {
         }) catch return null;
         conn.writeFrame(request, .{ .io = self.io, .timeout_ms = settings_probe_ms }) catch return null;
         return (conn.readFrame(.{ .io = self.io, .timeout_ms = reply_ms }) catch return null) orelse null;
-    }
-
-    /// Bounded diagnostic record of the last stop that could not be confirmed.
-    pub fn uncleanDetail(self: *const Workers) ?[]const u8 {
-        if (self.unclean_len == 0) return null;
-        return self.unclean[0..self.unclean_len];
     }
 
     fn removeEndpoint(self: *Workers, worker: *Worker) void {
@@ -599,7 +541,6 @@ const shutdown_request_id: u64 = 2;
 const settings_probe_ms: u32 = 500;
 /// A public `settings` reply also carries the model catalog, so one reply may
 /// be much larger than a probe frame; this is still a bounded wait.
-const settings_reply_ms: u32 = 1_500;
 /// Fixed IPC/teardown margin added to the worker's own cleanup budget: the
 /// reply, the worker's exit, the endpoint removal and the reap are all local.
 const cleanup_ipc_margin_ms: u64 = 2_000;
@@ -738,10 +679,6 @@ fn workerMain(worker: *Worker) Outcome {
         worker.allocator.free(result.stdout);
         worker.allocator.free(result.stderr);
     }
-    const tail_len = @min(result.stderr.len, worker.tail.len);
-    @memcpy(worker.tail[0..tail_len], result.stderr[0..tail_len]);
-    worker.tail_len = tail_len;
-
     const out: Outcome = .{
         .term = result.term,
         .cleanup_failed = result.cleanup_failed,
@@ -754,11 +691,6 @@ fn workerMain(worker: *Worker) Outcome {
     };
     worker.publish(out);
     return out;
-}
-
-fn describeTerm(buf: []u8, term: ?std.process.Child.Term) []const u8 {
-    const value = term orelse return std.fmt.bufPrint(buf, "none", .{}) catch "none";
-    return std.fmt.bufPrint(buf, "{f}", .{value}) catch "unknown";
 }
 
 fn launchNotify(context: *anyopaque, notice: platform_process.LaunchNotice) void {

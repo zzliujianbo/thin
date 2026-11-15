@@ -24,7 +24,7 @@ pub const Input = struct {
             // Keep the existing Linux syscall path: do not introduce a newer
             // glibc memfd_create symbol requirement into Linux products.
             const linux = std.os.linux;
-            const rc = linux.memfd_create("thin-decision", linux.MFD.CLOEXEC);
+            const rc = linux.memfd_create("thin-request", linux.MFD.CLOEXEC);
             if (linux.errno(rc) != .SUCCESS) return error.AnonymousInputFailed;
             const fd: c.fd_t = @intCast(rc);
             errdefer {

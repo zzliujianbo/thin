@@ -37,46 +37,18 @@ function handler(req, res) {
   req.on('end', () => {
     let scenario = 'invalid';
     try {
-      const m = /^\/([a-z-]+)\/(chat\/completions|responses|messages|systemone)$/.exec(req.url);
+      const m = /^\/([a-z-]+)\/(chat\/completions|responses|messages)$/.exec(req.url);
       assert(m); scenario = m[1];
       counts.set(scenario, (counts.get(scenario) ?? 0) + 1);
       assert.equal(req.method, 'POST');
       const body = JSON.parse(Buffer.concat(chunks));
-      const native = m[2] === 'systemone', anthropic = m[2] === 'messages', judge = scenario.startsWith('judge-');
+      const anthropic = m[2] === 'messages';
       assert.equal(req.headers['content-type'], 'application/json');
       if (anthropic) { assert.equal(req.headers['x-api-key'] === 'fake-proxy-key', true); assert.equal(req.headers['anthropic-version'], '2023-06-01'); }
       else assert.equal(req.headers.authorization === 'Bearer fake-proxy-key', true);
-      assert.equal(body.model, native || judge ? 'jev' : 'raw/id');
-      assert.equal(Boolean(req.socket.encrypted), !['alias-direct', 'decision-direct', 'judge-direct'].includes(scenario));
-      if (native) {
-        assert.deepEqual(Object.keys(body).sort(), ['model', 'questions', 'state']);
-        assert.equal(body.state, 'Command candidate (data only, not permission): printf fixture');
-        assert.deepEqual(Object.keys(body.questions).sort(), ['ask']);
-        assert(!/timeout|timing|deadline|milliseconds/i.test(JSON.stringify(body)));
-        assert.deepEqual(Object.keys(body.questions.ask).sort(), ['instructions', 'type']);
-        assert.equal(body.questions.ask.type, 'noul');
-        assert.equal(typeof body.questions.ask.instructions, 'string');
-        assert(body.questions.ask.instructions.length > 0);
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ answers: { ask: { type: 'noul', noul: 0.95 } }, usage: { input_tokens: 3, output_tokens: 1 } })); return;
-      }
+      assert.equal(body.model, 'raw/id');
+      assert.equal(Boolean(req.socket.encrypted), scenario !== 'alias-direct');
       assert.equal(body.stream, true);
-      if (judge) {
-        assert(!body.tools || body.tools.length === 0);
-        assert(!/timeout|timing|deadline|milliseconds/i.test(JSON.stringify(body)));
-        const system = body.messages.find(m => m.role === 'system');
-        const user = body.messages.find(m => m.role === 'user');
-        assert(system && user);
-        assert(system.content.includes('{"ask":true}'));
-        const input = JSON.parse(user.content);
-        assert.deepEqual(Object.keys(input).sort(), ['data', 'operation']);
-        assert.equal(input.operation, 'command');
-        assert.equal(input.data.command, 'printf fixture');
-        assert(Object.keys(input.data).every(key => key === 'command' || key === 'risk'));
-        if ('risk' in input.data) assert.equal(input.data.risk, null);
-        res.writeHead(200, { 'content-type': 'text/event-stream' });
-        res.end(chat({ content: '{"ask":true}' }) + chatTail()); return;
-      }
       assert(Array.isArray(body.tools) && body.tools.length === 1);
       assert.equal(req.headers.accept, 'text/event-stream');
       const protocol = anthropic ? 'anthropic' : m[2] === 'responses' ? 'responses' : 'chat';
@@ -150,10 +122,10 @@ try {
   const code = await new Promise((ok, no) => { child.once('error', no); child.once('close', (code, signal) => ok(signal ? 1 : code)); });
   child = undefined; // Already reaped: never signal its cached PID/PGID.
   console.log('proxy fixture counts:', JSON.stringify(Object.fromEntries([...counts].sort())), JSON.stringify({ connects, rejectedProxyRequests, tlsTunnels, handshakes, failures: failures.length }));
-  const expected = { 'alias-direct': 1, anthropic: 2, chat: 2, 'decision-direct': 1, 'decision-listed': 1, 'judge-direct': 1, 'judge-listed': 1, disconnect: 1, responses: 2, timeout: 1, cancel: 1 };
+  const expected = { 'alias-direct': 1, anthropic: 2, chat: 2, disconnect: 1, responses: 2, timeout: 1, cancel: 1 };
   assert.deepEqual(Object.fromEntries([...counts].sort()), Object.fromEntries(Object.entries(expected).sort()), 'origin requests exactly once, negative TLS/down zero HTTP');
-  assert.equal(connects, 13); // 6 normal + 2 TLS negatives + 3 partial + 2 decision backends; HTTP alias uses forward form.
-  assert.equal(rejectedProxyRequests, 1); assert.equal(tlsTunnels, 13); assert.equal(handshakes, 1);
+  assert.equal(connects, 11); // 6 normal + 2 TLS negatives + 3 partial; HTTP alias uses forward form.
+  assert.equal(rejectedProxyRequests, 1); assert.equal(tlsTunnels, 11); assert.equal(handshakes, 1);
   assert.deepEqual(failures, []); assert.equal(interrupted, false); assert.equal(code, 0);
 } finally {
   clearTimeout(watchdog); kill();

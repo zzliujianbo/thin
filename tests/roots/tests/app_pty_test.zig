@@ -674,17 +674,14 @@ fn settingsKey(d: *Driver, bytes: []const u8) !void {
     try d.waitFrame(start, "\x1b[?25l");
 }
 
-fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: usize) !void {
+fn settingsValues(d: *Driver, low: []const u8) !void {
     var low_buffer: [100]u8 = undefined;
-    var decision_buffer: [100]u8 = undefined;
     const low_text = try std.fmt.bufPrint(&low_buffer, "Low-price input  {s}", .{low});
-    const decision_text = try std.fmt.bufPrint(&decision_buffer, "Decision model   {s}", .{decision});
-    const selected_text = if (selected == 0) "> Low-price input" else "> Decision model";
     const until = now() + 10000;
     while (now() < until) {
         try d.drain(20);
         if (try d.acknowledgedScreen(d.settings_key_start)) |view| {
-            if (view.visible(low_text) and view.visible(decision_text) and view.visible(selected_text)) return;
+            if (view.visible(low_text) and view.visible("> Low-price input")) return;
         }
         if (!d.owned) return error.EarlyExit;
     }
@@ -692,20 +689,8 @@ fn settingsValues(d: *Driver, low: []const u8, decision: []const u8, selected: u
     return error.SettingsValueFrameTimeout;
 }
 
-fn settingsDecisionChoose(d: *Driver, name: []const u8, backwards: bool) !void {
-    var buffer: [1200]u8 = undefined;
-    const selected = try std.fmt.bufPrint(&buffer, "> {s}", .{name});
-    for (0..64) |_| {
-        const view = try d.screen();
-        if (view.visible(selected)) return;
-        try settingsKey(d, if (backwards) "\x1b[A" else "\x1b[B");
-    }
-    return error.DecisionChoiceUnavailable;
-}
-
-// The Node owner checks config.json CAS persistence and ignored legacy files;
-// choices are exact model references, never a dedicated Jev preset.
-// Omitted decision.enabled defaults on only when decision is configured.
+// The Node owner checks config.json CAS persistence and ignored legacy files.
+// Root rows are owner-published settings; no model submenu exists here.
 fn globalSettings(d: *Driver, mode: []const u8) !void {
     const off = std.mem.eql(u8, mode, "settings-global-off");
     const on = std.mem.eql(u8, mode, "settings-global-on");
@@ -717,40 +702,16 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try settingsKey(d, "/settings\r");
     const before = if (on) "off" else "on";
     const after = if (off) "off" else "on";
-    const decision_before = if (absent or native or on) "Off" else "native/family/native-review";
-    const decision_after = if (absent or off) "Off" else "native/family/native-review";
-    try settingsValues(d, before, decision_before, 0);
+    try settingsValues(d, before);
     if (off or on) {
         try settingsKey(d, "\r");
-        try settingsValues(d, after, decision_before, 0);
+        try settingsValues(d, after);
     }
     try settingsKey(d, "\x1b[B");
-    try settingsValues(d, after, decision_before, 1);
-    try settingsKey(d, "\r");
-    try d.waitVisibleFrame(d.settings_key_start, "Search> ");
-    const choice = try d.screen();
-    try check(!choice.visible("OpenCode Jev Free") and !choice.visible("Logged-in model") and !choice.visible("Request timeout"));
-    // The selected native row may be beyond the first bounded window. Verify
-    // both exact choices are navigable, not that every candidate fits at once.
-    try settingsDecisionChoose(d, "Off", false);
-    try check((try d.screen()).visible("> Off"));
-    try settingsDecisionChoose(d, "native/family/native-review", false);
-    try check((try d.screen()).visible("> native/family/native-review"));
-    try settingsKey(d, "\x1b[D");
-    try settingsValues(d, after, decision_before, 1);
-    try settingsKey(d, "\r");
-    try d.waitVisibleFrame(d.settings_key_start, "Search> ");
-    try settingsKey(d, "\x1b");
-    try settingsValues(d, after, decision_before, 1);
-    if (!verify) {
-        try settingsKey(d, "\r");
-        try d.waitVisibleFrame(d.settings_key_start, "Search> ");
-        try settingsDecisionChoose(d, if (on or native) "native/family/native-review" else "Off", false);
-        try settingsKey(d, "\r");
-        try settingsValues(d, after, decision_after, 1);
-    }
+    const next = try d.screen();
+    try check(next.visible("> Auto compaction"));
     try settingsKey(d, "\x1b[A");
-    try settingsValues(d, after, decision_after, 0);
+    try settingsValues(d, after);
     // Left returns to the root command list with settings selected. Tab
     // completes it, and a separately acknowledged Enter opens it again.
     try settingsKey(d, "\x1b[D");
@@ -760,39 +721,23 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     const completed = try d.screen();
     try check(completed.visible("/settings"));
     try settingsKey(d, "\r");
-    try settingsValues(d, after, decision_after, 0);
+    try settingsValues(d, after);
     const start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
     const closed = try d.screen();
-    try check(!closed.visible("Low-price input") and !closed.visible("Decision model"));
+    try check(!closed.visible("Low-price input") and !closed.visible("Auto compaction"));
     // No fabricated L assertion: unknown pricing has no authoritative tier.
     // Reopening checks the owner's published values after Esc, not UI intent.
     try settingsKey(d, "/settings\r");
-    try settingsValues(d, after, decision_after, 0);
+    try settingsValues(d, after);
     const close_start = d.used;
     try d.send("\x1b");
     try d.waitIdle(close_start);
 }
 
-// Node validates the saved whole JSON and request counts before releasing
-// each owned gate. Marker emission follows a complete replayed UI frame.
-fn decisionModelGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
-    const path = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "{s}/decision-model-release-{s}", .{ project, name }), 0);
-    try check(access(path, 0) == -1 and c._errno().* == @backingInt(c.E.NOENT));
-    std.debug.print("DECISION_MODEL_GATE={s}\n", .{name});
-    const until = now() + 10000;
-    while (now() < until) {
-        if (access(path, 0) == 0) return;
-        try check(c._errno().* == @backingInt(c.E.NOENT));
-        try d.drain(20);
-        if (!d.owned) return error.EarlyExit;
-    }
-    return error.DecisionModelGateTimeout;
-}
-
 // Screens are large: keep these extra acceptance helpers off the main stack.
-fn decisionModelScreen(d: *Driver, a: std.mem.Allocator, required_text: []const []const u8, hidden: []const []const u8) !void {
+fn settingsScreen(d: *Driver, a: std.mem.Allocator, required_text: []const []const u8, hidden: []const []const u8) !void {
     const view = try a.create(regular.Screen);
     defer a.destroy(view);
     // A bare Escape has an ambiguity deadline. An animation/metadata frame
@@ -811,63 +756,7 @@ fn decisionModelScreen(d: *Driver, a: std.mem.Allocator, required_text: []const 
         if (matches) return;
         if (!d.owned) return error.EarlyExit;
     }
-    return error.DecisionModelScreenDeadline;
-}
-
-fn decisionModel(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
-    const a = init.arena.allocator();
-    const backwards = std.mem.eql(u8, mode, "settings-decision-model-wrap");
-    try check(backwards or std.mem.eql(u8, mode, "settings-decision-model-down") or std.mem.eql(u8, mode, "settings-decision-model-native"));
-    try d.waitIdle(0);
-    var start = d.used;
-    try d.send("decision-warmup-history-private-marker\r");
-    try d.waitText(start, "decision-warmup-answer");
-    try d.waitIdle(start);
-    try settingsKey(d, "/settings\r");
-    try settingsKey(d, "\x1b[B");
-    try decisionModelScreen(d, a, &.{"> Decision model"}, &.{});
-    try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Off", "aux/family/judge", "primary/fixture-main", "Search> " }, &.{ "locked/secret-model", "OpenCode Jev Free", "Logged-in model", "Request timeout" });
-    try decisionModelGate(d, a, project, "opened");
-    try settingsDecisionChoose(d, "aux/family/judge", backwards);
-    // A pasted identity plus Enter cannot save or fabricate a candidate.
-    try d.send("\x1b[200~locked/secret-model\x1b[201~\r");
-    try d.quiet(150);
-    try decisionModelScreen(d, a, &.{"aux/family/judge"}, &.{ "locked/secret-model", "Decision model selected" });
-    try settingsKey(d, "\x1b");
-    try decisionModelScreen(d, a, &.{"> Decision model"}, &.{"Search> "});
-    try decisionModelGate(d, a, project, "canceled");
-
-    try settingsKey(d, "\r");
-    try settingsDecisionChoose(d, "aux/family/judge", backwards);
-    try decisionModelScreen(d, a, &.{ "> aux/family/judge", "Search> " }, &.{"locked/secret-model"});
-    // Search intersects provider and raw-ID tokens, case-insensitively. A query
-    // with no candidates cannot invent a choice or save on Enter.
-    try settingsKey(d, "missing-decision-query");
-    try decisionModelScreen(d, a, &.{ "Search> missing-decision-query", "No matching models" }, &.{ "> Off", "aux/family/judge", "primary/fixture-main" });
-    try d.send("\r");
-    try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"No matching models"}, &.{"Decision model   aux/family/judge"});
-    try settingsKey(d, "\x15AUX /JUDGE");
-    try decisionModelScreen(d, a, &.{ "Search> AUX /JUDGE", "> aux/family/judge" }, &.{ "> Off", "primary/fixture-main", "locked/secret-model", "No matching models" });
-    // Settings now returns a generic Ready notice. Authorize success from the
-    // completed owner-published frame and the following whole-JSON gate, not a
-    // removed selection-specific caption.
-    try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Decision model", "Decision model   aux/family/judge" }, &.{ "Search> ", "Logged-in model", "AUX /JUDGE", "missing-decision-query" });
-    try decisionModelGate(d, a, project, "selected");
-    start = d.used;
-    try d.send("\x1b");
-    try d.waitIdle(start);
-    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{ "family/judge", "AUX /JUDGE", "missing-decision-query" });
-    start = d.used;
-    try d.send("decision-normal-task-private-marker\r");
-    // The server only emits this AFTER inspecting the canonical bash result,
-    // not when a command preview or ready caption happens to become visible.
-    try d.waitFrame(start, "decision-tool-result-verified");
-    try d.waitIdle(start);
-    try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
-    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
+    return error.SettingsScreenDeadline;
 }
 
 // Image selection owns separate ACKed gates; no timer stands in for a save.
@@ -892,48 +781,48 @@ fn imageModel(d: *Driver, init: std.process.Init, project: []const u8) !void {
     try d.send("image-warmup-history-private-marker\r");
     try d.waitText(start, "image-warmup-answer");
     try d.waitIdle(start);
-    try decisionModelScreen(d, a, &.{"3.1%"}, &.{"?%"});
+    try settingsScreen(d, a, &.{"3.1%"}, &.{"?%"});
     try settingsKey(d, "/settings\r");
-    // Resolve the eight-row root by label and wait for every navigation ACK.
+    // Resolve the seven-row root by label and wait for every navigation ACK.
     try settingsValueSelect(d, a, "Image model");
-    try decisionModelScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{});
+    try settingsScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{});
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Off", "aux/deepseek-flash", "Search> " }, &.{ "primary/fixture-main", "locked/deepseek-flash", "aux/not-image" });
+    try settingsScreen(d, a, &.{ "> Off", "aux/deepseek-flash", "Search> " }, &.{ "primary/fixture-main", "locked/deepseek-flash", "aux/not-image" });
     try imageModelGate(d, a, project, "opened");
     try settingsKey(d, "aux/deepseek-flash");
-    try decisionModelScreen(d, a, &.{"> aux/deepseek-flash"}, &.{});
+    try settingsScreen(d, a, &.{"> aux/deepseek-flash"}, &.{});
     try settingsKey(d, "\x1b");
-    try decisionModelScreen(d, a, &.{"> Image model"}, &.{"Search> "});
+    try settingsScreen(d, a, &.{"> Image model"}, &.{"Search> "});
     try imageModelGate(d, a, project, "canceled");
     try settingsKey(d, "\r");
     try settingsKey(d, "aux/deepseek-flash");
-    try decisionModelScreen(d, a, &.{"> aux/deepseek-flash"}, &.{});
+    try settingsScreen(d, a, &.{"> aux/deepseek-flash"}, &.{});
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Image model", "aux/deepseek-flash" }, &.{"Search> "});
+    try settingsScreen(d, a, &.{ "> Image model", "aux/deepseek-flash" }, &.{"Search> "});
     try imageModelGate(d, a, project, "selected");
     start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
     // Settings> replaces the decorated composer. Inspect actual context only
     // after its completed close frame, before another request can repair it.
-    try decisionModelScreen(d, a, &.{"3.1%"}, &.{"?%"});
+    try settingsScreen(d, a, &.{"3.1%"}, &.{"?%"});
     start = d.used;
     try d.send("image-normal-task-private-marker\r");
     try d.waitFrame(start, "image-tool-result-verified");
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
     try settingsValueSelect(d, a, "Image model");
-    try decisionModelScreen(d, a, &.{"> Image model"}, &.{});
+    try settingsScreen(d, a, &.{"> Image model"}, &.{});
     try settingsKey(d, "\r");
     try settingsKey(d, "\x15Off");
-    try decisionModelScreen(d, a, &.{"> Off"}, &.{"aux/deepseek-flash"});
+    try settingsScreen(d, a, &.{"> Off"}, &.{"aux/deepseek-flash"});
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{"Search> "});
+    try settingsScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{"Search> "});
     try imageModelGate(d, a, project, "off");
     start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
-    try decisionModelScreen(d, a, &.{"3.1%"}, &.{"?%"});
+    try settingsScreen(d, a, &.{"3.1%"}, &.{"?%"});
     // A subsequent explicit request proves Off actually removes the tool.
     start = d.used;
     try d.send("image-off-proof\r");
@@ -941,7 +830,7 @@ fn imageModel(d: *Driver, init: std.process.Init, project: []const u8) !void {
     try d.waitIdle(start);
 }
 
-// Shared request-timeout and main-preference journey, with direct Decision choices.
+// Shared request-timeout and main-preference journey through owner-published rows.
 fn settingsValueGate(d: *Driver, a: std.mem.Allocator, project: []const u8, name: []const u8) !void {
     const raw = try std.fmt.allocPrint(a, "{s}/settings-values-release-{s}", .{ project, name });
     defer a.free(raw);
@@ -979,7 +868,7 @@ fn settingsValueMenuOrder(d: *Driver, a: std.mem.Allocator, labels: []const []co
     for (labels) |label| {
         const selected = try std.fmt.allocPrint(a, "> {s}", .{label});
         defer a.free(selected);
-        try decisionModelScreen(d, a, &.{selected}, &.{});
+        try settingsScreen(d, a, &.{selected}, &.{});
         try settingsKey(d, "\x1b[B");
     }
 }
@@ -993,7 +882,7 @@ fn settingsValueChoose(d: *Driver, a: std.mem.Allocator, label: []const u8, pare
     try settingsValueOpen(d, a, label);
     const selected = try std.fmt.allocPrint(a, "> {s}", .{parent});
     defer a.free(selected);
-    try decisionModelScreen(d, a, &.{selected}, &.{"Custom ("});
+    try settingsScreen(d, a, &.{selected}, &.{"Custom ("});
 }
 
 // Node validates the saved whole JSON and request counts before releasing
@@ -1067,7 +956,7 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     for ([_][]const u8{ "/attach ", "/cd /tmp/owned path" }) |draft| {
         const visible = std.mem.trimEnd(u8, draft, " \t\r\n");
         try settingsKey(d, draft);
-        try decisionModelScreen(d, a, &.{visible}, &.{"command arguments hidden"});
+        try settingsScreen(d, a, &.{visible}, &.{"command arguments hidden"});
         const view = try d.screen();
         const composer = &view.grid[view.row];
         try check(std.mem.indexOf(u8, composer, visible) != null);
@@ -1077,33 +966,33 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     try settingsKey(d, "/settings\r");
     // A batched command plus Enter may be processed in one read; require the
     // replayed Settings root before sending navigation keys.
-    try decisionModelScreen(d, a, &.{ "Low-price input", "Decision model" }, &.{});
+    try settingsScreen(d, a, &.{ "Low-price input", "Auto compaction" }, &.{});
     try settingsValueSelect(d, a, "Proxy");
-    try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{});
+    try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{});
     try settingsKey(d, "\r");
     if (configured) {
-        // Root 8 opens the second level on Address. Its editor is prefilled
+        // Root 7 opens the second level on Address. Its editor is prefilled
         // with the saved endpoint; an abandoned draft writes nothing.
-        try decisionModelScreen(d, a, &.{ "> Address", "Models" }, &.{ "Search> ", "Address> " });
+        try settingsScreen(d, a, &.{ "> Address", "Models" }, &.{ "Search> ", "Address> " });
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
         try settingsKey(d, "\x1510.9.9.9:1");
-        try decisionModelScreen(d, a, &.{ "Address> ", "10.9.9.9:1" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "10.9.9.9:1" }, &.{});
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{ "> Address", "127.0.0.1:8888" }, &.{ "Address> ", "10.9.9.9:1" });
+        try settingsScreen(d, a, &.{ "> Address", "127.0.0.1:8888" }, &.{ "Address> ", "10.9.9.9:1" });
         try settingsProxyGate(d, a, project, "address-canceled");
         // One complete frame for the edited endpoint authorizes exactly one
         // save; the preserved member list keeps its single entry.
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
         try settingsKey(d, "\x15127.0.0.2:9999");
-        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.2:9999" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "127.0.0.2:9999" }, &.{});
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "> Address", "127.0.0.2:9999", "1 selected" }, &.{"Address> "});
+        try settingsScreen(d, a, &.{ "> Address", "127.0.0.2:9999", "1 selected" }, &.{"Address> "});
         try settingsProxyGate(d, a, project, "address-changed");
         // Models opens the existing multi-select list from the second level.
         try settingsValueSelect(d, a, "Models");
-        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Address> "});
+        try settingsScreen(d, a, &.{"> Models"}, &.{"Address> "});
         try settingsKey(d, "\r");
         // The pre-existing allowlist entry stays checked on open.
         try settingsProxyState(d, a, "zen/fixture-zen/model-x", true);
@@ -1111,10 +1000,10 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         // A declared alias without a resolvable local credential is not a
         // candidate: filtering to it offers no saveable row and Enter is inert.
         try settingsProxySearch(d, a, "ghost/Case-Model");
-        try decisionModelScreen(d, a, &.{"No matching models"}, &.{});
+        try settingsScreen(d, a, &.{"No matching models"}, &.{});
         try d.send("\r");
         try d.quiet(40);
-        try decisionModelScreen(d, a, &.{"No matching models"}, &.{"[x]"});
+        try settingsScreen(d, a, &.{"No matching models"}, &.{"[x]"});
         try settingsProxyGate(d, a, project, "unlogged");
         // One batch with two Enters toggles exactly once and stays in the menu.
         try settingsProxySearch(d, a, "native/family/native-review");
@@ -1131,13 +1020,13 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         // Left leaves the list for the second level, Esc leaves Models for the
         // root row that owns it; each step keeps its owning selection.
         try settingsKey(d, "\x1b[D");
-        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsScreen(d, a, &.{"> Models"}, &.{"Search> "});
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
+        try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
         try settingsProxyGate(d, a, project, "root-return");
         // Reopen lands on Address; Models then opens the list again.
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{"> Address"}, &.{"Address> "});
+        try settingsScreen(d, a, &.{"> Address"}, &.{"Address> "});
         try settingsValueSelect(d, a, "Models");
         try settingsKey(d, "\r");
         // A full reopen does not keep all three targets inside the bounded
@@ -1161,7 +1050,7 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsProxyGate(d, a, project, "removed");
         // Escape from the list lands on Models; Enter reopens the same list.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsScreen(d, a, &.{"> Models"}, &.{"Search> "});
         try settingsKey(d, "\r");
         // Same bounded window after reopen: search each target before proving
         // its checked state from a complete frame.
@@ -1174,45 +1063,45 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsProxyGate(d, a, project, "persisted");
         // The list itself returns to Models before the shared root Escape.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsScreen(d, a, &.{"> Models"}, &.{"Search> "});
         // Models is a second level; one more Escape reaches the root row that
         // owns it, so both branches leave from the same screen.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
+        try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
     } else {
         // Models is the blocked child: opening without root.proxy shows the
         // fixed notice and Enter reports the missing endpoint instead of
         // guessing or writing one.
         try settingsValueSelect(d, a, "Models");
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "Proxy host/port not configured", "[ ]" }, &.{"[x]"});
+        try settingsScreen(d, a, &.{ "Proxy host/port not configured", "[ ]" }, &.{"[x]"});
         try settingsProxyGate(d, a, project, "opened");
         try d.send("\r");
         try d.quiet(50);
-        try decisionModelScreen(d, a, &.{"Configure a proxy"}, &.{"[x]"});
+        try settingsScreen(d, a, &.{"Configure a proxy"}, &.{"[x]"});
         try settingsProxyGate(d, a, project, "unconfigured");
         // An invalid port never lands: the editor keeps its draft and the
         // submenu keeps the unconfigured row underneath.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsScreen(d, a, &.{"> Models"}, &.{"Search> "});
         try settingsValueSelect(d, a, "Address");
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "Address> ", "Not configured" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "Not configured" }, &.{});
         try settingsKey(d, "127.0.0.1:0");
-        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:0" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "127.0.0.1:0" }, &.{});
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "Invalid proxy address", "Address> " }, &.{});
+        try settingsScreen(d, a, &.{ "Invalid proxy address", "Address> " }, &.{});
         try settingsProxyGate(d, a, project, "invalid");
         // A visible, fully acknowledged address is the first savable state.
         try settingsKey(d, "\x15127.0.0.1:8888");
-        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "> Address", "127.0.0.1:8888" }, &.{"Address> "});
+        try settingsScreen(d, a, &.{ "> Address", "127.0.0.1:8888" }, &.{"Address> "});
         try settingsProxyGate(d, a, project, "address-saved");
         // The saved endpoint makes the very first toggle savable.
         try settingsValueSelect(d, a, "Models");
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{"Search> "}, &.{"Proxy host/port not configured"});
+        try settingsScreen(d, a, &.{"Search> "}, &.{"Proxy host/port not configured"});
         try settingsProxySearch(d, a, "zen/fixture-zen/model-x");
         try settingsProxyState(d, a, "zen/fixture-zen/model-x", false);
         try settingsKey(d, "\r");
@@ -1220,10 +1109,10 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsProxyGate(d, a, project, "member-added");
         // Empty input disables the proxy through the same acknowledged save.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{"> Models"}, &.{"Search> "});
+        try settingsScreen(d, a, &.{"> Models"}, &.{"Search> "});
         try settingsValueSelect(d, a, "Address");
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
+        try settingsScreen(d, a, &.{ "Address> ", "127.0.0.1:8888" }, &.{});
         // The submenu row behind still prints the saved endpoint, so only the
         // cleared composer's own completed frame may authorize the save. The
         // offset must predate the Ctrl-U send: settingsKey already pumps that
@@ -1235,17 +1124,17 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try check(std.mem.startsWith(u8, &empty.grid[empty.row], "Address> "));
         try check(std.mem.indexOf(u8, &empty.grid[empty.row], "127.0.0.1:8888") == null);
         try settingsKey(d, "\r");
-        try decisionModelScreen(d, a, &.{ "> Address", "Not configured" }, &.{"Address> "});
+        try settingsScreen(d, a, &.{ "> Address", "Not configured" }, &.{"Address> "});
         try settingsProxyGate(d, a, project, "cleared");
         // Esc leaves the second level for the root row, which now reports the
         // removed endpoint instead of a stale host:port.
         try settingsKey(d, "\x1b");
-        try decisionModelScreen(d, a, &.{ "> Proxy", "Not configured", "Low-price input" }, &.{"Address> "});
+        try settingsScreen(d, a, &.{ "> Proxy", "Not configured", "Low-price input" }, &.{"Address> "});
         try settingsProxyGate(d, a, project, "reopened");
     }
     // Both branches end on the Settings root with Proxy selected: one Escape
     // closes Settings and needs its own acknowledged screen.
-    try decisionModelScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
+    try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
     const start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
@@ -1261,81 +1150,76 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.waitText(start, "values-warmup-answer");
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
-    try decisionModelScreen(d, a, &.{ "> Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Image model" }, &.{ "Output limit", "Task timeout" });
-    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Decision model", "Auto compaction", "Command timeout", "Request timeout", "Image model", "Auto memory", "Proxy" });
+    try settingsScreen(d, a, &.{ "> Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model" }, &.{ "Output limit", "Task timeout" });
+    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model", "Auto memory", "Proxy" });
     try settingsValueGate(d, a, project, "opened");
     try settingsValueOpen(d, a, "Auto compaction"); // Boolean toggle, no numeric picker.
-    try decisionModelScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
+    try settingsScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
     try settingsValueGate(d, a, project, "compaction");
 
     try settingsValueOpen(d, a, "Command timeout");
-    try decisionModelScreen(d, a, &.{ "> 123.456 s (current)", "Custom (s)..." }, &.{});
+    try settingsScreen(d, a, &.{ "> 123.456 s (current)", "Custom (s)..." }, &.{});
     try settingsValueGate(d, a, project, "current");
     try settingsValueOpen(d, a, "Custom (s)...");
-    try decisionModelScreen(d, a, &.{ "Custom: _ s", "up to 3 decimals", "Enter stages" }, &.{});
+    try settingsScreen(d, a, &.{ "Custom: _ s", "up to 3 decimals", "Enter stages" }, &.{});
     // Invalid candidates may intentionally have no confirmable ACK and emit
     // no new frame on Enter. Observe the existing screen, not waitFrame.
     try d.send("\r");
     try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"Custom: _ s"}, &.{"(staged)"});
+    try settingsScreen(d, a, &.{"Custom: _ s"}, &.{"(staged)"});
     try settingsValueGate(d, a, project, "invalid-empty");
     try settingsKey(d, "0");
     try d.send("\r");
     try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"Custom: 0_ s"}, &.{"(staged)"});
+    try settingsScreen(d, a, &.{"Custom: 0_ s"}, &.{"(staged)"});
     try settingsValueGate(d, a, project, "invalid-zero");
     try settingsKey(d, "\x15"); // Ctrl-U must clear all digits, not edit the composer.
-    try decisionModelScreen(d, a, &.{"Custom: _ s"}, &.{});
+    try settingsScreen(d, a, &.{"Custom: _ s"}, &.{});
     try settingsKey(d, "4294967.296"); // Same u32-ms overflow, expressed in seconds.
     try d.send("\r");
     try d.quiet(30);
-    try decisionModelScreen(d, a, &.{"Custom: 4294967.296_ s"}, &.{"(staged)"});
+    try settingsScreen(d, a, &.{"Custom: 4294967.296_ s"}, &.{"(staged)"});
     try settingsValueGate(d, a, project, "invalid-overflow");
     try settingsKey(d, "\x1b[D"); // edit -> candidate list, not parent Settings.
-    try decisionModelScreen(d, a, &.{"> Custom (s)..."}, &.{"Custom:"});
+    try settingsScreen(d, a, &.{"> Custom (s)..."}, &.{"Custom:"});
     try settingsValueGate(d, a, project, "edit-cancel");
     try settingsKey(d, "\r");
-    try decisionModelScreen(d, a, &.{"Custom: _ s"}, &.{});
+    try settingsScreen(d, a, &.{"Custom: _ s"}, &.{});
     try settingsKey(d, "120.001");
     // Two Enters in ONE input batch must only stage. The owner drops remaining
     // batch input, publishes a fresh generation, and waits for its frame ACK.
     try settingsKey(d, "\r\r");
-    try decisionModelScreen(d, a, &.{"> 120.001 s (staged)"}, &.{"Custom:"});
+    try settingsScreen(d, a, &.{"> 120.001 s (staged)"}, &.{"Custom:"});
     try settingsValueGate(d, a, project, "staged-cancel");
     try settingsKey(d, "\x1b"); // staged candidate -> parent, no save.
-    try decisionModelScreen(d, a, &.{"> Command timeout"}, &.{"Custom ("});
+    try settingsScreen(d, a, &.{"> Command timeout"}, &.{"Custom ("});
     try settingsValueGate(d, a, project, "canceled");
 
     try settingsValueOpen(d, a, "Command timeout");
-    try decisionModelScreen(d, a, &.{"> 123.456 s (current)"}, &.{"120.001 s"});
+    try settingsScreen(d, a, &.{"> 123.456 s (current)"}, &.{"120.001 s"});
     try settingsValueOpen(d, a, "Custom (s)...");
     try settingsKey(d, "120");
     try settingsKey(d, "\r\r");
-    try decisionModelScreen(d, a, &.{"> 120 s (staged)"}, &.{"Custom:"});
+    try settingsScreen(d, a, &.{"> 120 s (staged)"}, &.{"Custom:"});
     try settingsValueGate(d, a, project, "command-staged");
     try settingsKey(d, "\r"); // Separate Enter only after fresh ACK and disk gate.
-    try decisionModelScreen(d, a, &.{ "> Command timeout", "120 s" }, &.{"Custom ("});
+    try settingsScreen(d, a, &.{ "> Command timeout", "120 s" }, &.{"Custom ("});
     try settingsValueGate(d, a, project, "command");
 
     try settingsValueOpen(d, a, "Request timeout");
-    try decisionModelScreen(d, a, &.{"> 10 s (current)"}, &.{});
+    try settingsScreen(d, a, &.{"> 10 s (current)"}, &.{});
     try settingsValueChoose(d, a, "60 s", "Request timeout");
     try settingsValueGate(d, a, project, "request");
     // The retired task timeout is not a setting; no save occurs at this gate.
-    try decisionModelScreen(d, a, &.{"> Request timeout"}, &.{"Task timeout"});
+    try settingsScreen(d, a, &.{"> Request timeout"}, &.{"Task timeout"});
     try settingsValueGate(d, a, project, "task");
 
-    try settingsValueOpen(d, a, "Decision model");
-    try decisionModelScreen(d, a, &.{ "> aux/family/judge", "Off", "primary/fixture-main" }, &.{ "OpenCode Jev Free", "Logged-in model", "Request timeout" });
-    try settingsValueGate(d, a, project, "decision-menu");
-    try settingsKey(d, "\x1b[D"); // decision -> root Settings.
-    try decisionModelScreen(d, a, &.{"> Decision model"}, &.{"Logged-in model"});
     try settingsKey(d, "\x1b[D"); // Settings -> root commands.
-    try decisionModelScreen(d, a, &.{"> /settings"}, &.{"Low-price input"});
+    try settingsScreen(d, a, &.{"> /settings"}, &.{"Low-price input"});
     start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
-    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{"family/judge"});
+    try settingsScreen(d, a, &.{"fixture-main"}, &.{});
     // Back-to-commands deliberately restores "/". Esc dismisses that menu
     // without discarding the user's input; clear it before a normal prompt.
     try settingsKey(d, "\x15");
@@ -1345,7 +1229,7 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.waitFrame(start, "values-tool-result-verified");
     try d.waitIdle(start);
     try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
-    try decisionModelScreen(d, a, &.{"fixture-main"}, &.{});
+    try settingsScreen(d, a, &.{"fixture-main"}, &.{});
 }
 
 // Whole-capture replay through the last ACK, not a suffix that loses native
@@ -2601,7 +2485,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "read-error")) {
         const start = d.used;
         try d.send("read-missing\r");
-        try d.waitFrame(start, "✗ FileNotFound: file not found");
+        try d.waitFrame(start, "✗ FileNotFound");
         try d.waitText(start, "read-error-answer");
         try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "menu-navigation")) {
@@ -3192,8 +3076,6 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try settingsValuesJourney(&d, init, project);
     } else if (std.mem.eql(u8, mode, "settings-image-model")) {
         try imageModel(&d, init, project);
-    } else if (std.mem.startsWith(u8, mode, "settings-decision-model-")) {
-        try decisionModel(&d, init, mode, project);
     } else if (std.mem.eql(u8, mode, "settings-approval-cancel")) {
         try approvalCancel(&d);
     } else if (std.mem.startsWith(u8, mode, "settings-command-")) {

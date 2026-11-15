@@ -152,6 +152,8 @@ pub const Stream = struct {
     // 上游报错或结束原因不被接受，最终转为失败结果。
     failed: bool = false,
     output_limited: bool = false,
+    /// 上游错误事件的原文，供失败结果直接展示（不翻译、不遮盖）。
+    error_text: ?[]const u8 = null,
     refused: bool = false,
     unsupported_output: bool = false,
     // 任一 feed 出错后置位，流不可再用。
@@ -220,8 +222,9 @@ pub const Stream = struct {
             try self.sink.emit(.{ .usage = self.token_usage });
         };
 
-        // 上游错误事件：记为失败，不回显 error 内容（可能包含敏感信息）。
+        // 上游错误事件：保留原始错误文本，供失败结果原样展示。
         if (c.eq(event, "error") or j.get(v, "error") != null) {
+            self.error_text = c.rawValue(self.a, v, c.raw_max);
             self.failed = true;
             return;
         }
@@ -294,7 +297,17 @@ pub const Stream = struct {
             if (j.get(choice, "finish_reason")) |reason| if (reason != .null) {
                 const s = j.string(reason) orelse return error.InvalidEvent;
                 self.ended = true;
-                if (c.eq(s, "stop")) self.finish_reason = .stop else if (c.eq(s, "tool_calls")) self.finish_reason = .tool_calls else if (c.eq(s, "length")) self.output_limited = true else self.failed = true;
+                if (c.eq(s, "stop")) {
+                    self.finish_reason = .stop;
+                } else if (c.eq(s, "tool_calls")) {
+                    self.finish_reason = .tool_calls;
+                } else if (c.eq(s, "length")) {
+                    self.output_limited = true;
+                } else {
+                    // 未接受的结束原因本身就是原始失败原因，直接保留。
+                    self.error_text = try self.a.dupe(u8, s);
+                    self.failed = true;
+                }
             };
         }
     }
@@ -385,13 +398,13 @@ pub const Stream = struct {
         if (self.poisoned or self.committed) return error.InvalidStreamState;
         self.committed = true;
 
-        // 上游已报错：返回失败，但携带已观察到的 usage。
-        if (self.failed) return c.failure(self.observed, self.token_usage, self.raw_usage);
+        // 上游已报错：返回失败，但携带已观察到的 usage 与原始错误文本。
+        if (self.failed) return c.failure(self.observed, self.token_usage, self.raw_usage, self.error_text orelse "error event");
 
         // 缺少 [DONE] 或 finish_reason 说明流被截断，不能当作完整响应。
         if (!self.done or !self.ended) return error.TruncatedStream;
         // Do not construct a Response/replay or validate partial tool arguments as a success.
-        if (self.output_limited) return c.outputLimit(self.observed, self.token_usage, self.raw_usage);
+        if (self.output_limited) return c.outputLimit(self.observed, self.token_usage, self.raw_usage, "finish_reason: length");
         if (self.finish_reason == null) return error.TruncatedStream;
 
         // finish_reason 与是否存在工具调用必须一致。

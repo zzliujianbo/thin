@@ -23,7 +23,6 @@ const checkpoint = @import("../core/checkpoint.zig");
 const metadata = @import("model_metadata.zig");
 const model_resolver = @import("model_resolver.zig");
 const fs = @import("../platform/filesystem.zig");
-const decision_selection = @import("decision_selection.zig");
 const image_selection = @import("image_selection.zig");
 const proxy_selection = @import("proxy_selection.zig");
 const image = @import("../core/image.zig");
@@ -272,8 +271,6 @@ pub const Session = struct {
     /// baseline; selections with history never leak into credential saves.
     global_config: ?std.json.Parsed(cfg.Config) = null,
     display_models: []cfg.Model = &.{},
-    /// Independently resolved reviewer candidates; never use primary limits.
-    display_decision_models: []cfg.Model = &.{},
     display_image_models: []cfg.Model = &.{},
     // cfg registry parsing/validation rejects more than 16 providers. Names
     // borrow the global registry arena; current() rebuilds after each save.
@@ -434,7 +431,6 @@ pub const Session = struct {
         }
         const config = &self.pending.?.value;
         self.display_models = try self.buildModels(self.global_config.?.value);
-        self.display_decision_models = try self.buildDecisionModels(self.global_config.?.value);
         self.display_image_models = try self.buildImageModels(self.global_config.?.value);
         if (self.selected_alias == null) self.selected_alias = try self.aliasFor(config.*);
         if (self.read_only) {
@@ -442,7 +438,7 @@ pub const Session = struct {
             return self;
         }
         if (config.model.protocol == .systemone) {
-            self.settings_notice = "SystemOne is decision-only; history available, select a chat model";
+            self.settings_notice = "SystemOne is not a chat model; history available, select a chat model";
             return self;
         }
         if (config.selection_pending) return self;
@@ -532,7 +528,7 @@ pub const Session = struct {
         // Normalize display data before restore, even for a poisoned archive;
         // loading history itself must not require permission to run a task.
         if (state.tool_schema_hash == null and
-            (self.global_config.?.value.decision != null or self.global_config.?.value.imageActive() or candidate.executor.session_title != null))
+            (self.global_config.?.value.imageActive() or candidate.executor.session_title != null))
         {
             const messages = try scratch.allocator().alloc(@import("../core/protocol.zig").Message, state.messages.len);
             for (state.messages, 0..) |message, i|
@@ -588,7 +584,6 @@ pub const Session = struct {
         self.allocator.free(self.display_origins);
         self.allocator.free(self.display_disabled);
         self.freeDisplayModels(self.display_models);
-        self.freeDisplayModels(self.display_decision_models);
         self.freeDisplayModels(self.display_image_models);
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
@@ -676,7 +671,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .decision_fn = setDecision, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .take_memory_completion_fn = takeMemoryCompletionCallback, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
+        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .take_memory_completion_fn = takeMemoryCompletionCallback, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -916,9 +911,6 @@ pub const Session = struct {
             .low_price_input = self.app != null and !unselected and !config.selection_pending and config.limits.low_price_input and config.model.input_price_threshold != null,
             .limits = config.limits,
             .low_price_input_enabled = config.limits.low_price_input,
-            .decision_enabled = config.decisionActive(),
-            .decision_models = self.display_decision_models,
-            .decision_model = if (config.decision) |value| (if (value.enabled) value.model else null) else null,
             .image_enabled = config.imageActive(),
             .image_models = self.display_image_models,
             .image_model = if (config.imageActive()) config.image.model else null,
@@ -1042,8 +1034,6 @@ pub const Session = struct {
         }
         const models = try self.buildModels(latest.value);
         errdefer self.freeDisplayModels(models);
-        const decisions = try self.buildDecisionModels(latest.value);
-        errdefer self.freeDisplayModels(decisions);
         const images = try self.buildImageModels(latest.value);
         errdefer self.freeDisplayModels(images);
         if (self.global_config) |*old| cfg.release(old);
@@ -1061,10 +1051,8 @@ pub const Session = struct {
             }
         }
         self.freeDisplayModels(self.display_models);
-        self.freeDisplayModels(self.display_decision_models);
         self.freeDisplayModels(self.display_image_models);
         self.display_models = models;
-        self.display_decision_models = decisions;
         self.display_image_models = images;
         self.credential_revisions[@intCast(@backingInt(ProviderId.openai_codex))] +%= 1;
         // The saved login refreshes exactly this provider's authenticated list
@@ -1354,16 +1342,8 @@ pub const Session = struct {
                 self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
                 return true;
             };
-            const decision_models = self.buildDecisionModels(self.global_config.?.value) catch {
-                self.freeDisplayModels(models);
-                self.metadata_cache.deinit(self.allocator);
-                self.metadata_cache = previous;
-                self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
-                return true;
-            };
             const image_models = self.buildImageModels(self.global_config.?.value) catch {
                 self.freeDisplayModels(models);
-                self.freeDisplayModels(decision_models);
                 self.metadata_cache.deinit(self.allocator);
                 self.metadata_cache = previous;
                 self.metadata_notice = job.publicationFailed("Metadata display could not be updated; previous values kept");
@@ -1371,10 +1351,8 @@ pub const Session = struct {
             };
             previous.deinit(self.allocator);
             self.freeDisplayModels(self.display_models);
-            self.freeDisplayModels(self.display_decision_models);
             self.freeDisplayModels(self.display_image_models);
             self.display_models = models;
-            self.display_decision_models = decision_models;
             self.display_image_models = image_models;
             _ = self.completeInitialDefault(idle) catch false;
             const official_requested = job.requested & metadata.provider_mask;
@@ -1516,28 +1494,6 @@ pub const Session = struct {
         if (models.items.len > self.display_origins.len) self.display_origins = try self.allocator.realloc(self.display_origins, models.items.len);
         if (models.items.len > self.display_disabled.len) self.display_disabled = try self.allocator.realloc(self.display_disabled, models.items.len);
         return models.toOwnedSlice(self.allocator);
-    }
-
-    /// Resolve the same catalog with auxiliary caps before filtering. A small
-    /// reviewer window must not become unusable due to the main safety margin.
-    fn buildDecisionModels(self: *Session, global: cfg.Config) ![]cfg.Model {
-        var independent = global;
-        independent.limits = (global.decision orelse cfg.DecisionConfig{ .model = "" }).modelLimits(global.limits.request_timeout_ms);
-        const models = try self.buildModels(independent);
-        var count: usize = 0;
-        for (models) |model| {
-            const ref = cfg.splitDefault(model.name) catch unreachable;
-            const provider = independent.registry.?.find(ref.provider).?;
-            if (decision_selection.genericCandidate(independent, model) and self.hasLocalCredential(provider.connection)) {
-                models[count] = model;
-                count += 1;
-            } else self.freeDisplayModel(model);
-        }
-        errdefer {
-            for (models[0..count]) |model| self.freeDisplayModel(model);
-            self.allocator.free(models);
-        }
-        return self.allocator.realloc(models, count);
     }
 
     /// Image has a fixed documented Chat request; it does not borrow the main
@@ -1693,9 +1649,6 @@ pub const Session = struct {
         defer cfg.release(&declaration);
         switch (setting) {
             .low_price_input => declaration.value.limits.low_price_input = enabled,
-            .decision_enabled => {
-                if (declaration.value.decision) |*value| value.enabled = enabled else return error.DecisionNotConfigured;
-            },
         }
         try self.persistSettings(&declaration, .none);
     }
@@ -1709,42 +1662,7 @@ pub const Session = struct {
         try self.persistSettings(&declaration, .none);
     }
 
-    fn setDecision(raw: *anyopaque, choice: tui.Connection.DecisionChoice) !void {
-        const self: *Session = @ptrCast(@alignCast(raw));
-        try self.guardSelection();
-        // Revalidate at the owner, not merely in a previously drawn picker.
-        // No unknown raw IDs, other aliases or now-missing credentials may save.
-        switch (choice) {
-            .model => |name| {
-                const ref = try cfg.splitDefault(name);
-                const registry = self.global_config.?.value.registry orelse return error.MissingRegistry;
-                const provider = registry.find(ref.provider) orelse return error.UnknownProvider;
-                if (!self.hasLocalCredential(provider.connection)) return error.ApiKeyNotFound;
-                var found = false;
-                // Rebuild membership from current metadata/declaration and
-                // credentials rather than trusting a stale published row.
-                const candidates = try self.buildDecisionModels(self.global_config.?.value);
-                defer self.freeDisplayModels(candidates);
-                for (candidates) |model| {
-                    if (std.mem.eql(u8, name, model.name) and decision_selection.genericCandidate(self.global_config.?.value, model)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return error.UnknownDecisionModel;
-            },
-            else => {},
-        }
-        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
-        defer cfg.release(&declaration);
-        if (!try decision_selection.apply(declaration.arena.allocator(), &declaration.value, switch (choice) {
-            .off => .off,
-            .model => |name| .{ .model = name },
-        })) return;
-        try self.persistSettings(&declaration, .decision);
-    }
-
-    fn setImage(raw: *anyopaque, choice: tui.Connection.DecisionChoice) !void {
+    fn setImage(raw: *anyopaque, choice: tui.Connection.ModelChoice) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         try self.guardSelection();
         switch (choice) {
@@ -1922,8 +1840,6 @@ pub const Session = struct {
         defer if (defaults) |*value| cfg.release(value);
         const models = try self.buildModels(if (defaults) |value| value.value else self.global_config.?.value);
         errdefer self.freeDisplayModels(models);
-        const decision_models = try self.buildDecisionModels(if (defaults) |value| value.value else self.global_config.?.value);
-        errdefer self.freeDisplayModels(decision_models);
         const image_models = try self.buildImageModels(if (defaults) |value| value.value else self.global_config.?.value);
         errdefer self.freeDisplayModels(image_models);
         var replacement: ?*App.ConnectionReplacement = null;
@@ -1972,8 +1888,6 @@ pub const Session = struct {
         self.selected_alias = alias;
         self.freeDisplayModels(self.display_models);
         self.display_models = models;
-        self.freeDisplayModels(self.display_decision_models);
-        self.display_decision_models = decision_models;
         self.freeDisplayModels(self.display_image_models);
         self.display_image_models = image_models;
         self.active_context_official = context_official;
@@ -2049,8 +1963,6 @@ pub const Session = struct {
         }
         const models = try self.buildModels(baseline.value);
         errdefer self.freeDisplayModels(models);
-        const decision_models = try self.buildDecisionModels(baseline.value);
-        errdefer self.freeDisplayModels(decision_models);
         const image_models = try self.buildImageModels(baseline.value);
         errdefer self.freeDisplayModels(image_models);
         if (self.app) |app| try app.journal.rememberKey(key);
@@ -2071,8 +1983,6 @@ pub const Session = struct {
         }
         self.freeDisplayModels(self.display_models);
         self.display_models = models;
-        self.freeDisplayModels(self.display_decision_models);
-        self.display_decision_models = decision_models;
         self.freeDisplayModels(self.display_image_models);
         self.display_image_models = image_models;
         if (self.metadata_login_auto) if (id) |service| {

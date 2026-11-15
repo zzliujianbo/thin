@@ -2,13 +2,11 @@ test "tool schemas have stable order and valid JSON" {
     try std.testing.expectEqualStrings("read_file", schemas[0].name);
     try std.testing.expectEqualStrings("memory", schemas[3].name);
 
-    for ([_]bool{ false, true }) |review| for (schemasForDecision(review)[0..schemas.len], schemas) |schema, original| {
-        try std.testing.expectEqualStrings(original.name, schema.name);
-        try std.testing.expectEqualStrings(original.parameters_json, schema.parameters_json);
+    for (schemas) |schema| {
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema.parameters_json, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
-    };
+    }
 }
 test "edit parsing accepts more than 128 edits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -23,25 +21,7 @@ test "edit parsing accepts more than 128 edits" {
     const valid = try parse(a, "edit_file", at_limit, .{});
     try std.testing.expectEqual(@as(usize, count), valid.edit_file.edits.len);
 }
-test "tool descriptions distinguish configured decision review from legacy approval" {
-    const plain = schemasForDecision(false);
-    const reviewed = schemasForDecision(true);
-    try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "decision review disabled") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "high-risk commands require explicit approval") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=true requires approval for this call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes the extra command-approval prompt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Unavailable or invalid review pauses without executing") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "Review decides only whether to ask") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "timeout_ms uses the host default when omitted; built-in default is 5 minutes") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "reviewer deadline") == null);
-    for ([_]usize{ 0, 1, 3 }) |i| try std.testing.expectEqualStrings(plain[i].description, reviewed[i].description);
-    for ([_]bool{ false, true }) |review| {
-        const selected = schemasForDecision(review);
-        try std.testing.expect(std.mem.indexOf(u8, selected[0].description, "next_offset as the next call's offset") != null);
-        try std.testing.expect(std.mem.indexOf(u8, selected[3].description, "write creates or replaces the topic") != null);
-    }
-}
-test "decision enabled prepares memory without review and preserves bash review" {
+test "memory prepare carries its parsed payload and no review input" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -49,10 +29,10 @@ test "decision enabled prepares memory without review and preserves bash review"
     const n = try tmp.dir.realPath(io, &buffer);
     var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
     defer root.deinit();
-    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 }, .decision = .{ .model = "local/fixture" } };
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
     var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
     const selected = tools.executor().schemas;
-    try std.testing.expect(std.mem.indexOf(u8, selected[2].description, "ask=true requires approval") != null);
+    try std.testing.expectEqualStrings(schemas[2].description, selected[2].description);
     try std.testing.expectEqualStrings(schemas[3].description, selected[3].description);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -65,7 +45,6 @@ test "decision enabled prepares memory without review and preserves bash review"
     };
     for (calls) |arguments| {
         const prepared = try Tools.prepare(&tools, a, .{ .id = "m", .name = "memory", .arguments = arguments });
-        try std.testing.expect(prepared.decision_input == null);
         const action: *const Action = @ptrCast(@alignCast(prepared.payload));
         try std.testing.expect(action.* == .memory);
         if (action.memory.action == .write) {
@@ -73,10 +52,6 @@ test "decision enabled prepares memory without review and preserves bash review"
             try std.testing.expectEqualStrings("durable fact", action.memory.content.?);
         }
     }
-    const bash = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\"}" });
-    try std.testing.expect(bash.decision_input != null);
-    try std.testing.expect(bash.decision_input.? == .command);
-    try std.testing.expectEqualStrings("true", bash.decision_input.?.command.command);
 }
 test "tool arguments remain strict" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -209,9 +184,9 @@ test "image tool strict arguments schemas guards and bounded text output" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for ([_]bool{ false, true }) |review| {
-        const off = schemasForServices(review, false);
-        const on = schemasForServices(review, true);
+    {
+        const off = schemasForServices(false);
+        const on = schemasForServices(true);
         try std.testing.expectEqual(@as(usize, 5), off.len);
         try std.testing.expectEqual(@as(usize, 6), on.len);
         for (off[0..4], on[0..4]) |old, new| {
@@ -292,16 +267,16 @@ test "image tool strict arguments schemas guards and bounded text output" {
     try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_image = .{ .path = ".thin/settings.json" } }, &cancel));
 }
 test "session title schema is appended across the static matrix" {
-    for ([_]bool{ false, true }) |review| for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| for (0..channel_choices) |channel| {
-        const old = schemasFor(review, image_on, memory_on, channel, background_on);
+    for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| for (0..channel_choices) |channel| {
+        const old = schemasFor(image_on, memory_on, channel, background_on);
         try std.testing.expectEqualStrings("edit_file", old[old.len - 1].name);
-        const with_title = schemasWithTitle(review, image_on, memory_on, channel, background_on, true);
+        const with_title = schemasWithTitle(image_on, memory_on, channel, background_on, true);
         try std.testing.expectEqual(old.len + 1, with_title.len);
         for (old[0 .. old.len - 1], with_title[0 .. old.len - 1]) |before, after| try std.testing.expectEqualStrings(before.name, after.name);
         try std.testing.expectEqualStrings("set_session_title", with_title[old.len - 1].name);
         try std.testing.expectEqualStrings("edit_file", with_title[old.len].name);
     };
-    try std.testing.expectEqual(@as(usize, 12), schemasWithTitle(true, true, true, 1, true, true).len);
+    try std.testing.expectEqual(@as(usize, 12), schemasWithTitle(true, true, 1, true, true).len);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, title_schema.parameters_json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
@@ -326,7 +301,7 @@ test "session title prepare execution and capability boundaries" {
     try std.testing.expectEqualStrings("set_session_title", tools.executor().schemas[tools.executor().schemas.len - 2].name);
     try std.testing.expectError(error.InvalidSessionTitle, Tools.prepare(&tools, a, .{ .id = "t", .name = "set_session_title", .arguments = "{\"title\":\"\"}" }));
     const prepared = try Tools.prepare(&tools, a, call);
-    try std.testing.expect(prepared.explicit_denial == null and prepared.decision_input == null);
+    try std.testing.expect(prepared.explicit_denial == null);
     try std.testing.expectEqualStrings("原题", tools.session_title.?.text());
     cancel.cancel();
     const canceled = try Tools.executePrepared(&tools, a, prepared, &cancel);
@@ -339,9 +314,9 @@ test "session title prepare execution and capability boundaries" {
     try std.testing.expectEqualStrings("中文标题", json.value.object.get("title").?.string);
 }
 test "background schema is appended last and old schemas keep indexes" {
-    for ([_]bool{ false, true }) |review| {
-        const off = schemasFor(review, true, true, 1, false);
-        const on = schemasFor(review, true, true, 1, true);
+    {
+        const off = schemasFor(true, true, 1, false);
+        const on = schemasFor(true, true, 1, true);
         try std.testing.expectEqual(@as(usize, 10), off.len);
         try std.testing.expectEqual(@as(usize, 11), on.len);
         try std.testing.expectEqualStrings("read_image", off[4].name);
@@ -362,14 +337,14 @@ test "background schema is appended last and old schemas keep indexes" {
         }
     }
     // Child Tools never advertise background capability or the management tool.
-    const child = schemasFor(true, false, false, 2, false);
+    const child = schemasFor(false, false, 2, false);
     try std.testing.expectEqual(@as(usize, 5), child.len);
     try std.testing.expectEqualStrings("message_parent", child[3].name);
     try std.testing.expectEqualStrings("edit_file", child[4].name);
     try std.testing.expect(std.mem.indexOf(u8, child[2].parameters_json, "background") == null);
     for (child) |schema| try std.testing.expect(!std.mem.eql(u8, schema.name, "background"));
     // Root without subagent still appends the management tool last.
-    const root_only = schemasFor(false, true, true, 0, true);
+    const root_only = schemasFor(true, true, 0, true);
     try std.testing.expectEqual(@as(usize, 7), root_only.len);
     try std.testing.expectEqualStrings("background", root_only[5].name);
 }
@@ -440,7 +415,6 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expect(prepared.explicit_denial != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.description, "background service") != null);
-    try std.testing.expect(prepared.decision_input != null);
     try std.testing.expectEqual(@as(usize, 0), fake.checks);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     const managed = try Tools.prepare(&tools, a, .{ .id = "m", .name = "background", .arguments = "{\"action\":\"status\",\"id\":\"0123456789ab-1\"}" });

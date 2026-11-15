@@ -15,51 +15,8 @@ test "image retired enabled is rejected regardless of value" {
 test "image rejects invalid owner model types duplicates and unknown fields" {
     try rejectedImageAllocationCase(std.testing.allocator);
 }
-test "explicit decision protocol round trips with shared timeout" {
-    try decisionAllocationCase(std.testing.allocator);
-    var parsed = try parse(std.testing.allocator, decision_fixture);
-    defer release(&parsed);
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeDisk(parsed.value, &out.writer);
-    var tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
-    defer tree.deinit();
-    const decision = tree.value.object.get("decision").?.object;
-    try std.testing.expect(decision.get("backend") == null);
-    try std.testing.expect(decision.get("request_timeout_ms") == null);
-    try std.testing.expectEqual(@as(usize, 2), decision.count());
-    var again = try parse(std.testing.allocator, out.written());
-    defer release(&again);
-    try std.testing.expectEqual(protocol.Protocol.systemone, again.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
-}
-test "decision declarations and owned pending clones are allocation failure safe" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, decisionAllocationCase, .{});
-}
-test "decision rejects removed fields even when disabled without protocol migration" {
-    try rejectedDecisionAllocationCase(std.testing.allocator);
-    const a = std.testing.allocator;
-    const cases = .{
-        .{ "{\"model\":\"p/m\",\"unknown\":1}", error.UnknownField },
-        .{ "{\"model\":\"p/m\",\"model\":\"p/m\"}", error.DuplicateField },
-        .{ "{\"model\":\"p/m\",\"backend\":\"model\",\"backend\":\"systemone\"}", error.DuplicateField },
-        .{ "{\"model\":\"p/m\",\"request_timeout_ms\":1,\"request_timeout_ms\":2}", error.DuplicateField },
-    };
-    inline for (cases) |case| {
-        const raw = try std.mem.concat(a, u8, &.{ decision_test_prefix, case[0], "}" });
-        defer a.free(raw);
-        try std.testing.expectError(case[1], parse(a, raw));
-    }
-    var migrated = try parse(a, decision_test_prefix ++ "{\"model\":\"p/m\",\"max_state_bytes\":1.5,\"max_input_tokens\":\"old\"}}");
-    defer release(&migrated);
-    var latest: std.Io.Writer.Allocating = .init(a);
-    defer latest.deinit();
-    try writeDisk(migrated.value, &latest.writer);
-    try std.testing.expect(std.mem.find(u8, latest.written(), "max_state_bytes") == null);
-    try std.testing.expect(std.mem.find(u8, latest.written(), "max_input_tokens") == null);
-    var parsed = try parse(a, decision_test_prefix ++ "{\"model\":\"p/m\"}}");
-    defer release(&parsed);
-    try std.testing.expectEqual(protocol.Protocol.chat, parsed.value.registry.?.find("p").?.patchFor("m").?.protocol.?);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.registry.?.find("p").?.models.len);
+test "removed decision section is rejected as an unknown root field" {
+    try rejectedDecisionSection(std.testing.allocator);
 }
 test "SystemOne has no required generative window but retains field and budget safety" {
     var model: Model = .{ .name = "reviewer", .protocol = .systemone, .context_tokens = 0 };
@@ -582,15 +539,6 @@ test "credential and image parser cleanup and release zero owned allocations" {
     // Observe production allocations inside each OOM attempt, not the testing
     // harness's own non-secret allocation bookkeeping.
     const FailureCase = struct {
-        fn run(a: std.mem.Allocator) !void {
-            var watched = Observer{ .backing = a };
-            decisionAllocationCase(watched.allocator()) catch |err| {
-                try std.testing.expect(!watched.dirty_free);
-                return err;
-            };
-            try std.testing.expect(!watched.dirty_free);
-        }
-
         fn image(a: std.mem.Allocator) !void {
             var watched = Observer{ .backing = a };
             imageAllocationCase(watched.allocator()) catch |err| {
@@ -610,23 +558,9 @@ test "credential and image parser cleanup and release zero owned allocations" {
             try std.testing.expect(watched.frees > 0);
             try std.testing.expect(!watched.dirty_free);
         }
-
-        fn reject(a: std.mem.Allocator) !void {
-            var watched = Observer{ .backing = a };
-            // Test-input construction bypasses the observer; only production
-            // parse allocations belong to the final rawFree wiping contract.
-            rejectedDecisionAllocationCase(watched.allocator()) catch |err| {
-                try std.testing.expect(!watched.dirty_free);
-                return err;
-            };
-            try std.testing.expect(watched.frees > 0);
-            try std.testing.expect(!watched.dirty_free);
-        }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.image, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.rejectImage, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.run, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, FailureCase.reject, .{});
     try std.testing.expect(observer.frees > 0);
     try std.testing.expect(!observer.dirty_free);
 }

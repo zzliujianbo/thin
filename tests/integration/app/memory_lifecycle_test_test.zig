@@ -208,7 +208,9 @@ test "discarded settings replacement leaves live Memory owner accepting work" {
     app.runtime.model = .{ .context = &primary, .call_fn = Primary.call };
     app.memory_coordinator.service_override = extractor.service();
 
-    var replacement = try app.prepareSettingsRefresh(app.config.value, &env, .decision);
+    var declaration = app.config.value;
+    declaration.memory.auto = false;
+    var replacement = try app.prepareSettingsRefresh(declaration, &env, .none);
     try std.testing.expect(replacement.replace_memory);
     replacement.deinit(); // Simulate a failed save: the live owner must survive.
     var cancel: p.Cancellation = .{};

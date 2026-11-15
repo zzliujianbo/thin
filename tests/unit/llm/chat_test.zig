@@ -289,7 +289,8 @@ test "chat refuses truncation length malformed arguments duplicate IDs and unkno
     var fail = Stream.init(a, test_support.chat_scope, .{});
     try fail.feed("error", "{\"error\":{\"message\":\"secret-key\"}}");
     const failure = (try fail.finish()).failure;
-    try std.testing.expect(std.mem.indexOf(u8, failure.message, "secret-key") == null);
+    // 原始错误文本按原样保留，供直接展示与排错。
+    try std.testing.expectEqualStrings("secret-key", failure.message);
 }
 test "chat omits all output caps with varying model capacity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

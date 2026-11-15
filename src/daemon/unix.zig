@@ -726,10 +726,6 @@ pub const Listener = struct {
     pub fn socketIdentity(self: *const Listener) Identity {
         return self.identity;
     }
-
-    pub fn expectedUid(self: *const Listener) u32 {
-        return self.uid;
-    }
 };
 
 fn connectPath(fd: c.fd_t, path: []const u8, deadline: *const Deadline) !void {

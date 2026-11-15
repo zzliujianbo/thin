@@ -1,4 +1,4 @@
-test "decision config quotes backslashes unicode and never interpolates script" {
+test "curl config quotes backslashes unicode and never interpolates script" {
     const a = std.testing.allocator;
     const key = "test-key-\\\"中文";
     const payload = "{\"text\":\"中文\\u4f60\\n\\\\\"}\n";
@@ -22,7 +22,7 @@ test "decision config quotes backslashes unicode and never interpolates script" 
     }
     try std.testing.expect(found);
 }
-test "decision validation rejects controls URL ambiguity and config metasyntax" {
+test "transport validation rejects controls URL ambiguity and config metasyntax" {
     const payload = "{}";
     for ([_][]const u8{ "file:///etc/passwd", "https://u:p@example.invalid/", "https://example.invalid/?", "https://example.invalid/#", "https://example.invalid/\n", "https://", "https://example.invalid\\evil/" }) |url| {
         try std.testing.expectError(error.InvalidUrl, validate(url, "fake", payload, 1000));
@@ -36,7 +36,7 @@ test "decision validation rejects controls URL ambiguity and config metasyntax" 
     try std.testing.expectError(error.InvalidTimeout, validate("http://example.invalid/", "fake", payload, 0));
     try validate("http://127.0.0.1:1234/api", "fake", "{\n\t\"ok\":true\r\n}", 1);
 }
-test "decision response exact suffix status errors overflow and incomplete rejection" {
+test "transport response exact suffix status errors overflow and incomplete rejection" {
     const a = std.testing.allocator;
     const original = "{\"text\":\"\\u4f60中文\"}\x00\xff\n";
     const response = try parseResponse(a, fakeResult(original ++ "\n200"));
@@ -47,16 +47,16 @@ test "decision response exact suffix status errors overflow and incomplete rejec
     defer denied.deinit(a);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
     for ([_][]const u8{ "", "200", "body200", "x\n20", "x\n2a0", "x\n000", "x\n200\n" }) |bytes| {
-        try std.testing.expectError(error.DecisionTransport, parseResponse(a, fakeResult(bytes)));
+        try std.testing.expectError(error.TransportFailure, parseResponse(a, fakeResult(bytes)));
     }
     var result = fakeResult("partial\n200");
     result.truncated = true;
-    try std.testing.expectError(error.DecisionTransport, parseResponse(a, result));
+    try std.testing.expectError(error.TransportFailure, parseResponse(a, result));
     result.truncated = false;
     result.term = .{ .exited = 18 };
-    try std.testing.expectError(error.DecisionTransport, parseResponse(a, result));
+    try std.testing.expectError(error.TransportFailure, parseResponse(a, result));
     result.term = null;
-    try std.testing.expectError(error.DecisionTransport, parseResponse(a, result));
+    try std.testing.expectError(error.TransportFailure, parseResponse(a, result));
     result.timed_out = true;
     try std.testing.expectError(error.Timeout, parseResponse(a, result));
     result.cleanup_failed = true;
@@ -72,9 +72,9 @@ test "decision response exact suffix status errors overflow and incomplete rejec
     try std.testing.expectEqualStrings(large[0 .. large.len - 4], response_large.body);
     var mismatched = fakeResult(large);
     mismatched.stdout_bytes -= 1;
-    try std.testing.expectError(error.DecisionTransport, parseResponse(a, mismatched));
+    try std.testing.expectError(error.TransportFailure, parseResponse(a, mismatched));
 }
-test "decision environment allowlist cancellation and poison reject before spawn" {
+test "transport environment allowlist cancellation and poison reject before spawn" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -101,7 +101,7 @@ test "decision environment allowlist cancellation and poison reject before spawn
     try env.put("HTTP_PROXY", "http://bad\nproxy");
     try std.testing.expectError(error.InvalidProxyEnvironment, Client.init(a, std.testing.io, &env));
 }
-test "decision anonymous input begins at zero CLOEXEC and wipes then truncates" {
+test "transport anonymous input begins at zero CLOEXEC and wipes then truncates" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
     const config = try makeConfig(a, "https://example.invalid/", "fake-test-key", "{}", 100);
@@ -125,7 +125,7 @@ test "decision anonymous input begins at zero CLOEXEC and wipes then truncates" 
     try std.testing.expectEqual(c.E.SUCCESS, c.errno(end));
     try std.testing.expectEqual(@as(c.off_t, 0), end);
 }
-test "decision cleanup failure without PID is sticky even over cancellation" {
+test "transport cleanup failure without PID is sticky even over cancellation" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -139,7 +139,7 @@ test "decision cleanup failure without PID is sticky even over cancellation" {
     try std.testing.expect(client.poisoned and client.unreaped_pid == null);
     try std.testing.expectError(error.CleanupFailed, client.post(a, "", "", "", 0, &cancel));
 }
-test "decision deinit reaps only its owned direct child and clears PID" {
+test "transport deinit reaps only its owned direct child and clears PID" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -162,7 +162,7 @@ test "decision deinit reaps only its owned direct child and clears PID" {
     const rc = c.waitpid(pid, &status, c.W.NOHANG);
     try std.testing.expect(rc < 0 and c.errno(rc) == .CHILD);
 }
-test "decision config environment and response allocation failures preserve ownership" {
+test "transport config environment and response allocation failures preserve ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
 }
 test "curl stream origin headers interim responses and every split deliver exact body" {

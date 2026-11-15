@@ -374,7 +374,6 @@ const Supervisor = struct {
             .login,
             .preference,
             .setting,
-            .decision_model,
             .image_model,
             .proxy_model,
             .proxy_address,

@@ -296,7 +296,7 @@ async function scenario(app, pty, kind) {
         assert(row.event === 'diagnostic' && row.schema === 1, 'only diagnostics may follow finished');
         const d = row.data;
         assert(d && typeof d === 'object' && !Array.isArray(d), 'invalid diagnostic data');
-        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','operation','protocol','backend','route_hash','timeout_ms','http_status','model_failure','decision_failure','candidate_index','count','origin_turn','memory_job_id'];
+        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','protocol','route_hash','timeout_ms','http_status','model_failure','candidate_index','count','origin_turn','memory_job_id'];
         assert(Object.keys(d).length === keys.length && keys.every(k => Object.hasOwn(d,k)), 'invalid diagnostic schema');
         assert(['observer','checkpoint','host_emit','finished_emit'].includes(d.stage), 'unexpected diagnostic stage');
         assert(['begin','end'].includes(d.phase) && Number.isSafeInteger(d.span_id) && d.span_id > 0, 'invalid diagnostic span');
@@ -315,7 +315,7 @@ async function scenario(app, pty, kind) {
         if (date) assert(results[0].text.includes(actualDate) && !results[0].is_error, 'real time missing from log');
         if (redact) assert(results[0].text.includes('[redacted]'), 'JSON result not redacted');
         assert(!results[0].is_error && !results[0].canceled, 'default tool execution failed');
-        assert(events('permission').length === 0 && events('decision').length === 0, 'default execution asked approval');
+        assert(events('permission').length === 0, 'default execution asked approval');
         assert(!events('state').some(d=>d.state==='awaiting_permission'), 'default execution waited for approval');
         assert(events('tool_started').length === 1, 'default execution did not start');
         if (writeAuto) assert(await readFile(join(project,'automatic.txt'),'utf8') === 'automatic', 'shell write did not execute');

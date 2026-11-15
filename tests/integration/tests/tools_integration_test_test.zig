@@ -75,46 +75,6 @@ test "file tools preserve content beyond former response quota" {
     try std.testing.expect(!read.is_error and !read.truncated);
     try std.testing.expect(std.mem.indexOf(u8, read.text, content) != null);
 }
-test "executor selects decision-aware descriptions without changing tool parameters" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [4096]u8 = undefined;
-    const n = try tmp.dir.realPath(std.testing.io, &buffer);
-    var root = try fs.Root.open(a, std.testing.io, buffer[0..n]);
-    defer root.deinit();
-    var store = mem.Store.init(&root);
-    var environment = std.process.Environ.Map.init(a);
-    defer environment.deinit();
-    var config = configuration;
-    config.registry = .{ .default = "judge/fake", .providers = &.{.{
-        .name = "judge",
-        .connection = .{ .base_url = "https://fixture.invalid/v1", .api_key = "fake-reviewer" },
-        .models = &.{
-            .{ .name = "fake", .patch = .{ .protocol = .chat, .context_tokens = 32768 } },
-            .{ .name = "native/raw", .patch = .{ .protocol = .systemone } },
-        },
-    }} };
-    var tools = t.Tools{ .root = &root, .memory = &store, .config = &config, .environment = &environment };
-    const plain = tools.executor().schemas;
-    try std.testing.expect(std.mem.indexOf(u8, plain[2].description, "decision review disabled") != null);
-    for ([_]cfg.DecisionConfig{
-        .{ .model = "judge/fake" },
-        .{ .model = "judge/native/raw" },
-    }) |decision| {
-        config.decision = decision;
-        const reviewed = tools.executor().schemas;
-        try std.testing.expectEqual(plain.len, reviewed.len);
-        for (plain, reviewed) |old, current| {
-            try std.testing.expectEqualStrings(old.name, current.name);
-            try std.testing.expectEqualStrings(old.parameters_json, current.parameters_json);
-        }
-        try std.testing.expect(std.mem.indexOf(u8, reviewed[2].description, "ask=false removes") != null);
-        try std.testing.expectEqualStrings(plain[3].description, reviewed[3].description);
-    }
-    config.decision = null;
-    try std.testing.expectEqualStrings(plain[2].description, tools.executor().schemas[2].description);
-}
 test "file observations reflect actual returned ranges and pre-write snapshot changes" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -658,7 +618,7 @@ test "mutating file and Memory tool allocation failures precede commits" {
         try std.testing.expect(reached_success);
     }
 }
-test "tools prepare review inputs without side effects and use ordinary command timeouts" {
+test "tools classify high-risk commands without side effects and use ordinary command timeouts" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -682,13 +642,12 @@ test "tools prepare review inputs without side effects and use ordinary command 
         .name = "memory",
         .arguments = "{\"action\":\"write\",\"topic\":\"style\",\"content\":\"Prefer concise reports.\"}",
     });
-    try std.testing.expect(write.decision_input == null);
     const action: *const t.Action = @ptrCast(@alignCast(write.payload));
     try std.testing.expectEqualStrings("style", action.memory.topic.?);
     try std.testing.expect(write.explicit_denial == null);
     try std.testing.expectError(error.FileNotFound, store.read(alloc, "style"));
     const list = try executor.prepare_fn(executor.context, alloc, .{ .id = "list", .name = "memory", .arguments = "{\"action\":\"list\"}" });
-    try std.testing.expect(list.decision_input == null);
+    try std.testing.expect(@as(*const t.Action, @ptrCast(@alignCast(list.payload))).memory.action == .list);
     for ([_]struct { args: []const u8, label: ?[]const u8 }{
         .{ .args = "{\"command\":\"printf hello\"}", .label = null },
         .{ .args = "{\"command\":\"rm -rf example\"}", .label = null },
@@ -702,22 +661,13 @@ test "tools prepare review inputs without side effects and use ordinary command 
             .name = "bash",
             .arguments = case.args,
         });
-        try std.testing.expect(prepared.decision_input.? == .command);
-        const candidate = prepared.decision_input.?.command;
         const bash_action: *const t.Action = @ptrCast(@alignCast(prepared.payload));
-        try std.testing.expectEqualStrings(bash_action.bash.command, candidate.command);
-        try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(candidate)).@"struct".field_names.len);
-        try std.testing.expect(@hasField(@TypeOf(candidate), "command"));
-        try std.testing.expect(@hasField(@TypeOf(candidate), "risk"));
-        const risk = candidate.risk;
+        try std.testing.expect(bash_action.* == .bash);
         if (case.label) |label| {
-            try std.testing.expectEqualStrings(label, risk.?);
-            const approval = try std.fmt.allocPrint(alloc, "DANGEROUS bash ({s}). Explicit approval is required each time", .{label});
-            const denial = try std.fmt.allocPrint(alloc, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{label});
-            try std.testing.expect(std.mem.indexOf(u8, prepared.description, approval) != null);
-            try std.testing.expectEqualStrings(denial, prepared.explicit_denial.?);
+            try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS bash") != null);
+            try std.testing.expect(std.mem.indexOf(u8, prepared.description, label) != null);
+            try std.testing.expect(std.mem.indexOf(u8, prepared.explicit_denial.?, label) != null);
         } else {
-            try std.testing.expect(risk == null);
             try std.testing.expect(prepared.explicit_denial == null);
         }
     }
@@ -727,8 +677,8 @@ test "tools prepare review inputs without side effects and use ordinary command 
         .name = "bash",
         .arguments = "{\"command\":\"printf touched > prepare-only-marker\",\"timeout_ms\":5000}",
     });
-    try std.testing.expectEqualStrings("printf touched > prepare-only-marker", marker.decision_input.?.command.command);
-    try std.testing.expect(marker.decision_input.?.command.risk == null);
+    try std.testing.expectEqualStrings("printf touched > prepare-only-marker", @as(*const t.Action, @ptrCast(@alignCast(marker.payload))).bash.command);
+    try std.testing.expect(marker.explicit_denial == null);
     try std.testing.expectError(error.FileNotFound, root.read(alloc, "prepare-only-marker", 0, 64));
 
     // 默认 500ms：命令阻塞 30s，必然超时，不依赖调度快慢。
@@ -743,8 +693,8 @@ test "tools prepare review inputs without side effects and use ordinary command 
             .name = "bash",
             .arguments = case.arguments,
         });
-        try std.testing.expectEqualStrings(case.command, prepared.decision_input.?.command.command);
-        try std.testing.expect(prepared.decision_input.?.command.risk == null);
+        try std.testing.expectEqualStrings(case.command, @as(*const t.Action, @ptrCast(@alignCast(prepared.payload))).bash.command);
+        try std.testing.expect(prepared.explicit_denial == null);
         // 每个用例使用独立 token，避免前一个用例的取消状态影响下一个。
         var cancel: p.Cancellation = .{};
         const result = try executor.execute_fn(executor.context, alloc, prepared, &cancel);

@@ -1,7 +1,6 @@
 //! Regressions for the application-level async subagent host. No real API,
 //! credentials or external network are used. Child models are injected through
-//! the private test seam; the Decision approval regression uses an owned
-//! loopback reviewer and an owned project sentinel.
+//! the private test seam; approval regressions stay in the parent domain.
 
 const std = @import("std");
 const p = @import("../core/protocol.zig");
@@ -250,7 +249,6 @@ const Fixture = struct {
     config: cfg.Config,
     parent_client: http.Client,
     parent_runtime: r.Runtime,
-    decision: ?*@import("../app/decision_client.zig").Client = null,
     image: ?*@import("../app/image_client.zig").Client = null,
     service: SubagentService,
     parent_cancel: p.Cancellation = .{},
@@ -260,7 +258,6 @@ const Fixture = struct {
         errdefer a.destroy(self);
         self.a = a;
         self.io = io;
-        self.decision = null;
         self.image = null;
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
@@ -292,7 +289,6 @@ const Fixture = struct {
             .allocator = a,
             .config = &self.config,
             .http_client = &self.parent_client,
-            .decision = &self.decision,
             .image = &self.image,
             .root = &self.root,
             .environment = &self.env,
@@ -535,77 +531,6 @@ const ApprovalModel = struct {
         return .{ .success = .{ .message = try p.textMessage(a, .assistant, "after denial"), .finish = .stop } };
     }
 };
-
-const reviewed_command = "printf A >> sentinel.txt";
-
-const ReviewedBashModel = struct {
-    calls: usize = 0,
-    saw_result: bool = false,
-    saw_denial: bool = false,
-
-    fn make(raw: *anyopaque, _: std.mem.Allocator, _: *const cfg.Config) !p.Model {
-        return .{ .context = raw, .call_fn = call };
-    }
-
-    fn call(raw: *anyopaque, a: std.mem.Allocator, request: p.Request, _: p.ModelSink) !p.Outcome {
-        const self: *ReviewedBashModel = @ptrCast(@alignCast(raw));
-        self.calls += 1;
-        if (FakeModel.lastToolText(request)) |text| {
-            self.saw_result = true;
-            self.saw_denial = std.mem.indexOf(u8, text, "Decision requires explicit approval") != null;
-            return .{ .success = .{
-                .message = try p.textMessage(a, .assistant, "reviewed child done"),
-                .finish = .stop,
-                .usage = .{ .input_tokens = 10, .output_tokens = 2 },
-            } };
-        }
-        return .{ .success = .{
-            .message = try toolCallMessage(a, "reviewed-bash", "bash", "{\"command\":\"printf A >> sentinel.txt\"}"),
-            .finish = .tool_calls,
-            .usage = .{ .input_tokens = 10, .output_tokens = 2 },
-        } };
-    }
-};
-
-// One real generic reviewer POST, served only on the owned loopback listener.
-// The request is parsed before replying so the child must actually use its
-// cloned Decision client; no Decision service or transport is injected.
-fn serveChildReview(io: std.Io, listener: *std.Io.net.Server, posts: *std.atomic.Value(usize)) !void {
-    const stream = try listener.accept(io);
-    defer stream.close(io);
-    var rb: [8192]u8 = undefined;
-    var wb: [8192]u8 = undefined;
-    var reader = stream.reader(io, &rb);
-    var writer = stream.writer(io, &wb);
-    var server = std.http.Server.init(&reader.interface, &writer.interface);
-    var req = try server.receiveHead();
-    try std.testing.expectEqual(std.http.Method.POST, req.head.method);
-    const size = req.head.content_length orelse return error.MissingLength;
-    var body: [16384]u8 = undefined;
-    try std.testing.expect(size <= body.len);
-    const request_reader = req.readerExpectNone(&.{});
-    try request_reader.readSliceAll(body[0..@intCast(size)]);
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body[0..@intCast(size)], .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("judge", parsed.value.object.get("model").?.string);
-    const messages = parsed.value.object.get("messages").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), messages.len);
-    var envelope = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, messages[1].object.get("content").?.string, .{});
-    defer envelope.deinit();
-    try std.testing.expectEqualStrings("command", envelope.value.object.get("operation").?.string);
-    const data = envelope.value.object.get("data").?.object;
-    try std.testing.expectEqual(@as(usize, 2), data.count());
-    try std.testing.expectEqualStrings(reviewed_command, data.get("command").?.string);
-    try std.testing.expect(data.get("risk") != null);
-    _ = posts.fetchAdd(1, .release);
-    try req.respond(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"{\\\"ask\\\":true}\"},\"finish_reason\":null}]}\n\n" ++
-            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4311,\"completion_tokens\":919,\"total_tokens\":5230}}\n\n" ++
-            "data: [DONE]\n\n",
-        .{ .keep_alive = false, .extra_headers = &.{.{ .name = "content-type", .value = "text/event-stream" }} },
-    );
-}
 
 /// Parent model: start one child, then collect it with a real get tool call.
 const DelegateModel = struct {

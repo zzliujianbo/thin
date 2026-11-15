@@ -356,11 +356,11 @@ fn publicReasoningFixture(listing: *metadata.Listing, name: []const u8) void {
 }
 
 const proxy_session_config =
-    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"review/raw/id":{"protocol":"chat","context_tokens":32768},"native/raw":{"protocol":"systemone"},"unknown/raw":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"PROXY_MISSING_KEY","models":{"m":{"protocol":"chat","context_tokens":65536}}}}},"decision":{"model":"aux/native/raw","enabled":true},"limits":{"low_price_input":false},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/review/raw/id"]}}
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"review/raw/id":{"protocol":"chat","context_tokens":32768},"native/raw":{"protocol":"systemone"},"unknown/raw":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"PROXY_MISSING_KEY","models":{"m":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/review/raw/id"]}}
 ;
 
 const proxy_helper_config =
-    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"systemone"},"review/raw/id":{"protocol":"chat","context_tokens":32768}}},"img":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"PROXY_IMG_KEY","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"decision":{"model":"aux/native/raw","enabled":true},"image":{"model":"img/deepseek-flash"},"limits":{"low_price_input":false},"proxy":{"address":"127.0.0.1","port":18080,"models":["aux/review/raw/id"]}}
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"systemone"},"review/raw/id":{"protocol":"chat","context_tokens":32768}}},"img":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"PROXY_IMG_KEY","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"image":{"model":"img/deepseek-flash"},"limits":{"low_price_input":false},"proxy":{"address":"127.0.0.1","port":18080,"models":["aux/review/raw/id"]}}
 ;
 
 const proxy_pending_config =
@@ -375,17 +375,6 @@ fn proxyToggle(session: *Session, name: []const u8, enabled: bool) !void {
     const connection = session.connection();
     const callback = connection.proxy_fn orelse return error.ProxyCallbackUnavailable;
     try callback(connection.context, name, enabled);
-}
-
-fn prepareNativeRouteForTest(client: *@import("decision_client.zig").Client) !void {
-    const a = std.testing.allocator;
-    try std.testing.expect(client.native == null and client.resolved == null);
-    var cancel: p.Cancellation = .{};
-    const output = try client.service().decide(a, .{ .refine_outputs = &.{} }, &cancel);
-    defer @import("../core/decision.zig").freeOutput(a, output);
-    try std.testing.expect(output == .refine_outputs and output.refine_outputs.len == 0);
-    try std.testing.expect(client.native != null and client.resolved != null);
-    try std.testing.expectEqual(@as(u64, 0), client.calls);
 }
 
 fn setProxyEndpoint(session: *Session, raw: []const u8) !void {

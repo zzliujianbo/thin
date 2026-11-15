@@ -27,7 +27,6 @@ pub const QueueKind = inbox.Kind;
 // Coalescing quantum only; individual owned events are never clipped to it.
 pub const max_item_bytes = 64 * 1024;
 pub const max_previews = 3;
-pub const max_notice_bytes = 64 * 1024;
 
 /// One canonical success wording for a restored conversation. Backend
 /// resume outcomes and the owner's settings notices publish exactly this
@@ -46,20 +45,23 @@ pub const Terminal = struct {
     failure: Failure = .other,
     model_failure: ?p.FailureKind = null,
     http_status: ?u16 = null,
-    decision_failure: ?@import("../core/decision.zig").Diagnostic = null,
+    /// 原始失败原因（提供方原文或本地错误名），原样展示，不翻译。
+    failure_message: [r.failure_message_max]u8 = @splat(0),
+    failure_message_len: u16 = 0,
     usage: r.UsageTotals = .{},
     context: ?r.ContextSnapshot = null,
 
     pub fn toRuntime(self: Terminal) r.Terminal {
-        return .{
+        var terminal: r.Terminal = .{
             .status = self.status,
             .detail = if (self.status == .success) null else self.failure.toError(),
             .model_failure = self.model_failure,
             .http_status = self.http_status,
-            .decision_failure = self.decision_failure,
             .usage = self.usage,
             .context_snapshot = self.context,
         };
+        terminal.setFailureText(self.failure_message[0..@min(self.failure_message_len, self.failure_message.len)]);
+        return terminal;
     }
 };
 

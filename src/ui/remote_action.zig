@@ -7,10 +7,10 @@ const runtime = @import("../core/runtime.zig");
 const config = @import("../core/config.zig");
 const settings = @import("../core/settings.zig");
 const activity = @import("../presentation/activity.zig");
-const Choice = @import("decision_picker.zig").Choice;
+const Choice = @import("settings_model_picker.zig").Choice;
 const codex_login = @import("../core/codex_login.zig");
 
-pub const Setting = enum { low_price_input, decision_enabled };
+pub const Setting = enum { low_price_input };
 pub const Action = union(enum) {
     submit: struct { kind: session.TaskKind, text: []const u8 },
     cancel,
@@ -28,7 +28,6 @@ pub const Action = union(enum) {
     cycle_effort,
     preference: struct { key: settings.Key, value: ?u32 },
     setting: struct { key: Setting, value: bool },
-    decision: Choice,
     image: Choice,
     proxy: struct { model: []const u8, enabled: bool },
     proxy_address: []const u8,
@@ -47,10 +46,6 @@ pub const Action = union(enum) {
             .model => |v| .{ .model = try text(a, v) },
             .proxy_address => |v| .{ .proxy_address = try text(a, v) },
             .proxy => |v| .{ .proxy = .{ .model = try text(a, v.model), .enabled = v.enabled } },
-            .decision => |v| .{ .decision = switch (v) {
-                .off => .off,
-                .model => |name| .{ .model = try text(a, name) },
-            } },
             .image => |v| .{ .image = switch (v) {
                 .off => .off,
                 .model => |name| .{ .model = try text(a, name) },

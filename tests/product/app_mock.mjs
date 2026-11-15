@@ -18,7 +18,6 @@ import assert from 'node:assert/strict';
 import {reviewRegressions} from './review_mock.mjs';
 import {logRegressions} from './log_mock.mjs';
 import {settingsRegressions} from './settings_mock.mjs';
-import {decisionModelRegressions} from './decision_model_mock.mjs';
 import {imageModelRegressions} from './image_model_mock.mjs';
 import {settingsValuesRegressions} from './settings_values_mock.mjs';
 import {selectionRestoreRegressions} from './selection_restore_mock.mjs';
@@ -757,11 +756,10 @@ async function runScenario(name, protocol, kind, isPty = false) {
     if (kind === 'auth-reject401' || kind === 'auth-reject403') {
       assert.equal(requests, 1, 'authentication failure must not retry');
       assert(result.output.includes(`[HTTP ${kind.slice(-3)}]`), 'HTTP status lost');
-      // The row names the next step instead of leaking the internal category tag.
+      // The row shows the provider's own error text, not a category or a hint.
+      assert(result.output.includes('fixture-provider-secret-must-not-render'), 'raw provider cause lost');
       assert(!result.output.includes('/ authentication'), 'internal failure category leaked');
-      assert(result.output.includes(kind === 'auth-reject401' ? 'check /login' : 'check workspace/model permissions'), 'actionable hint lost');
-      assert(result.output.includes(kind === 'auth-reject401' ? 'credentials rejected' : 'workspace/model permissions'));
-      assert(!result.output.includes('fixture-provider-secret-must-not-render'));
+      assert(!result.output.includes('check /login'));
       assert(!result.output.includes(KEY));
     }
     // 帮助与缺少新配置时的诊断均应指向 config.json，而不是旧文件名。
@@ -852,7 +850,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
       const files = (await readdir(join(project,'.thin/sessions'))).filter(f=>f.endsWith('.jsonl'));
       for (const file of files) {
         const events = (await readFile(join(project,'.thin/sessions',file),'utf8')).trimEnd().split('\n').map(line=>JSON.parse(line));
-        assert(!events.some(row=>row.event==='permission'||row.event==='decision'||(row.event==='state'&&row.data.state==='awaiting_permission')), 'default execution entered authorization');
+        assert(!events.some(row=>row.event==='permission'||(row.event==='state'&&row.data.state==='awaiting_permission')), 'default execution entered authorization');
         assert(events.some(row=>row.event==='tool_started'), 'real tool execution did not start');
       }
     }
@@ -948,8 +946,6 @@ try {
     await timed('suite', 'settings-values', () => settingsValuesRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--image-model-only')) {
     await timed('suite', 'image-model', () => imageModelRegressions({app,pty,execute,send}));
-  } else if (process.argv.includes('--decision-model-only')) {
-    await timed('suite', 'decision-model', () => decisionModelRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--settings-only')) {
     await timed('suite', 'settings', () => settingsRegressions({app,pty,execute,send}));
   } else if (process.argv.includes('--log-only')) {
@@ -987,7 +983,6 @@ try {
   await timed('suite', 'review', () => reviewRegressions(app));
   await timed('suite', 'log', () => logRegressions(app,pty));
   await timed('suite', 'settings', () => settingsRegressions({app,pty,execute,send}));
-  await timed('suite', 'decision-model', () => decisionModelRegressions({app,pty,execute,send}));
   await timed('suite', 'image-model', () => imageModelRegressions({app,pty,execute,send}));
   await timed('suite', 'settings-values', () => settingsValuesRegressions({app,pty,execute,send}));
   await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));

@@ -721,9 +721,8 @@ test "settings requests route to worker epoch or connect setup project" {
     const ops = [_]protocol.Op{
         .settings,      .model_select,   .effort,
         .cycle_effort,  .login,          .preference,
-        .setting,       .decision_model, .image_model,
-        .proxy_model,   .proxy_address,  .refresh_models,
-        .poll_metadata,
+        .setting,       .image_model,    .proxy_model,
+        .proxy_address, .refresh_models, .poll_metadata,
     };
 
     var worker = try pairOf(a);
@@ -1399,9 +1398,9 @@ test "real host settings reply projects providers flags price states and pending
     try std.testing.expectEqual(@as(usize, 2), client.pubcfg.providers.len);
     try std.testing.expectEqualStrings("native", client.pubcfg.providers[0].name);
     try std.testing.expect(client.pubcfg.providers[0].allow_custom);
-    try std.testing.expectEqual(@as(usize, 3), decision_picker.count(client.pubcfg.models, client.pubcfg.providers, ""));
-    try std.testing.expectEqual(@as(usize, 1), decision_picker.indexOf(client.pubcfg.models, client.pubcfg.providers, "", "native/official-model"));
-    try std.testing.expectEqual(@as(usize, 2), decision_picker.indexOf(client.pubcfg.models, client.pubcfg.providers, "", "native/disabled-model"));
+    try std.testing.expectEqual(@as(usize, 3), settings_model_picker.count(client.pubcfg.models, client.pubcfg.providers, ""));
+    try std.testing.expectEqual(@as(usize, 1), settings_model_picker.indexOf(client.pubcfg.models, client.pubcfg.providers, "", "native/official-model"));
+    try std.testing.expectEqual(@as(usize, 2), settings_model_picker.indexOf(client.pubcfg.models, client.pubcfg.providers, "", "native/disabled-model"));
 
     // Both inline flags are index-aligned with the accepted model rows.
     try std.testing.expectEqual(@as(usize, 2), client.pubcfg.context_official.len);

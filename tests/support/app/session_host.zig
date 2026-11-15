@@ -260,7 +260,6 @@ const FakeCatalogView = struct {
         const self: *FakeCatalogView = @ptrCast(@alignCast(context));
         var state = self.prev_fn(self.prev_context);
         state.models = self.models;
-        state.decision_models = self.models;
         state.image_models = self.models;
         state.model_providers = self.providers;
         state.effort_levels = self.levels;

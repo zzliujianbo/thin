@@ -2562,7 +2562,7 @@ test "settings reply is one parseable JSON object with complete array elements" 
     try std.testing.expectEqualStrings("fake-login", providers_json.items[0].object.get("name").?.string);
     try std.testing.expectEqual(true, providers_json.items[1].object.get("allow_custom").?.bool);
 
-    for ([_][]const u8{ "models", "decision_models", "image_models" }) |name| {
+    for ([_][]const u8{ "models", "image_models" }) |name| {
         const list = root.get(name).?.array;
         try std.testing.expectEqual(models.len, list.items.len);
         try std.testing.expectEqualStrings("fake-one", list.items[0].object.get("name").?.string);

@@ -8,14 +8,14 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {assertConfigHome} from './assert_config_home.mjs';
 
-const MAIN_KEY = 'values-main-fake-never-log', AUX_KEY = 'values-aux-fake-never-log';
-const MAIN = 'fixture-main', AUX = 'family/judge';
+const MAIN_KEY = 'values-main-fake-never-log';
+const MAIN = 'fixture-main';
 const WARMUP = 'values-warmup-private-marker', TASK = 'values-task-private-marker';
 const COMMAND = "printf 'values-shell-proof\\n'", CALL = 'values-owned-bash';
 const phases = [
   'opened', 'compaction', 'current', 'invalid-empty', 'invalid-zero',
   'invalid-overflow', 'edit-cancel', 'staged-cancel', 'canceled', 'command-staged', 'command',
-  'request', 'task', 'decision-menu', 'closed',
+  'request', 'task', 'closed',
 ];
 const changes = {
   compaction:['limits','compaction_enabled',false],
@@ -27,7 +27,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
   const root = await mkdtemp(join(tmpdir(),'thin-settings-values-'));
   const home = join(root,'home'), project = join(root,'project');
   const configPath = join(home,'.thin/config.json');
-  let stage = 'prepare', fixtureError, mainPosts = 0, auxPosts = 0, connections = 0;
+  let stage = 'prepare', fixtureError, mainPosts = 0, connections = 0;
   let primarySocket, primarySystem, expected, previousBytes, closed = false, warmAt, driverResult;
   const sockets = new Set(), gates = [];
   let gateQueue = Promise.resolve();
@@ -41,30 +41,6 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       }
       const body = JSON.parse(raw);
       assert.equal(body.stream,true,'ordinary Chat must use SSE');
-      if (req.url === '/aux/v1/chat/completions') {
-        auxPosts++;
-        assert(closed); assert.equal(mainPosts,2); assert.equal(auxPosts,1);
-        assert.equal(req.headers.authorization,`Bearer ${AUX_KEY}`);
-        assert.equal(body.model,AUX);
-        assert(!body.tools || body.tools.length === 0);
-        for (const key of ['max_tokens','max_completion_tokens','max_output_tokens'])
-          assert(!Object.hasOwn(body,key));
-        assert.equal(body.messages.length,2);
-        const [system,input] = body.messages;
-        assert.equal(system.role,'system'); assert(system.content.startsWith('Review only'));
-        assert.notDeepEqual([system],primarySystem);
-        assert.equal(input.role,'user');
-        const envelope = JSON.parse(input.content);
-        assert.deepEqual(Object.keys(envelope).sort(),['data','operation']);
-        assert.equal(envelope.operation,'command'); assert.equal(envelope.data.command,COMMAND);
-        assert.deepEqual(Object.keys(envelope.data).sort(),Object.hasOwn(envelope.data,'risk') ? ['command','risk'] : ['command']);
-        if (Object.hasOwn(envelope.data,'risk')) assert.equal(envelope.data.risk,null);
-        for (const hidden of [WARMUP,TASK,'values-warmup-answer',MAIN_KEY,AUX_KEY])
-          assert(!JSON.stringify(body.messages).includes(hidden));
-        // Valid strict JSON review carried by normal streaming Chat chunks.
-        send(res,'chat','{"ask":false}');
-        return;
-      }
       assert.equal(req.url,'/primary/v1/chat/completions');
       mainPosts++; assert(mainPosts <= 3);
       assert.equal(req.headers.authorization,`Bearer ${MAIN_KEY}`);
@@ -74,7 +50,6 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         assert(!Object.hasOwn(body,key));
       if (mainPosts === 1) {
         primarySystem = system; primarySocket = req.socket; warmAt = performance.now();
-        assert.equal(auxPosts,0);
         assert.equal(body.messages.filter(m=>m.role==='user').at(-1).content,WARMUP);
         send(res,'chat','values-warmup-answer');
       } else {
@@ -86,10 +61,8 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         assert(body.messages.some(m=>m.role==='user' && m.content === TASK));
         if (mainPosts === 2) {
           assert(performance.now()-warmAt < 30000,'UI journey exceeded primary idle TTL');
-          assert.equal(auxPosts,0);
           send(res,'chat','',[{id:CALL,name:'bash',arguments:JSON.stringify({command:COMMAND})}]);
         } else {
-          assert.equal(auxPosts,1);
           const calls = body.messages.flatMap(m=>m.tool_calls ?? []);
           assert.equal(calls.length,1); assert.equal(calls[0].id,CALL);
           assert.equal(calls[0].function.name,'bash');
@@ -118,11 +91,9 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       llm:{default:`primary/${MAIN}`,reasoning_effort:'high',providers:{
         primary:provider('primary',MAIN_KEY,{[MAIN]:{protocol:'chat',context_tokens:32768,
           output_tokens:8192,reasoning:{format:'standard',map:{off:'none',high:'high'}}}}),
-        aux:provider('aux',AUX_KEY,{[AUX]:{protocol:'chat',context_tokens:4096}}),
       }},
       limits:{command_timeout_ms:123456,low_price_input:false,
         request_timeout_ms:10000,compaction_enabled:true},
-      decision:{enabled:true,model:`aux/${AUX}`},
     };
     previousBytes = JSON.stringify(expected);
     await writeFile(configPath,previousBytes,{mode:0o600});
@@ -138,7 +109,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
     async function gate(name) {
       stage = `gate ${name}`;
       assert.deepEqual(gates,phases.slice(0,gates.length));
-      assert.equal(mainPosts,1); assert.equal(auxPosts,0); assert.equal(connections,1);
+      assert.equal(mainPosts,1); assert.equal(connections,1);
       assert(primarySocket && !primarySocket.destroyed,'primary warm socket lost in menu');
       if (changes[name]) {
         const [section,key,value] = changes[name];
@@ -175,12 +146,12 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
     await gateQueue;
     if (fixtureError) throw fixtureError;
     assert.equal(result.code,0); assert.equal(result.signal,null);
-    for (const key of [MAIN_KEY,AUX_KEY]) assert(!result.output.includes(key));
+    assert(!result.output.includes(MAIN_KEY));
     const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([^\r\n]*)\r?$/gm)];
     assert.equal(ids.length,1); assert.match(ids[0][1],/^[0-9a-f]{32}$/);
     const id = ids[0][1];
-    assert.deepEqual(gates,phases); assert.equal(mainPosts,3); assert.equal(auxPosts,1);
-    assert.equal(connections,2); await saved();
+    assert.deepEqual(gates,phases); assert.equal(mainPosts,3);
+    assert.equal(connections,1); await saved();
     await assertConfigHome(home,{project,id});
     const sessionDir = join(project,'.thin/sessions');
     const journals = (await readdir(sessionDir)).filter(name=>name.endsWith('.jsonl'));
@@ -190,18 +161,18 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       assert(info.isFile() && !info.isSymbolicLink());
       assert.equal(info.mode & 0o777,0o600); assert(info.size > 0 && info.size <= 16*1024*1024);
       const log = await readFile(path,'utf8');
-      for (const key of [MAIN_KEY,AUX_KEY]) assert(!log.includes(key));
+      assert(!log.includes(MAIN_KEY));
       for (const line of log.trim().split('\n')) JSON.parse(line);
     }
     assert.deepEqual((await readdir(project)).sort(),['.thin',...phases.map(n=>`settings-values-release-${n}`)].sort());
-    console.log('PASS settings/values: four preferences and shared request timeout; eight-row root; decision menu has no timeout; stage/cancel/invalid unchanged; output caps absent; zero menu HTTP; warm socket and canonical bash verified');
+    console.log('PASS settings/values: four preferences and shared request timeout; seven-row root; stage/cancel/invalid unchanged; output caps absent; zero menu HTTP; warm socket and canonical bash verified');
   } catch (error) {
     // Never print assertion operands containing config/wire/terminal secrets.
     const safe = new Error('settings values fixture failed');
     safe.fixtureCase = 'settings/values';
     const line = /settings_values_mock\.mjs:(\d+):/.exec(error.stack ?? '')?.[1];
     const tag = /(?:error|Error): ([A-Za-z0-9_]+)/.exec(driverResult?.output ?? '')?.[1] ?? 'none';
-    safe.fixtureCheck = `${stage}${line ? ` at ${line}` : ''} primary:${mainPosts} aux:${auxPosts} connections:${connections} driver:${driverResult?.code ?? 'unknown'}/${driverResult?.signal ?? 'none'} tag:${tag}`;
+    safe.fixtureCheck = `${stage}${line ? ` at ${line}` : ''} primary:${mainPosts} connections:${connections} driver:${driverResult?.code ?? 'unknown'}/${driverResult?.signal ?? 'none'} tag:${tag}`;
     throw safe;
   } finally {
     for (const socket of sockets) socket.destroy();

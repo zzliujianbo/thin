@@ -17,7 +17,6 @@ const process = @import("../platform/process.zig");
 const j = @import("../util/json.zig");
 const runtime = @import("../core/runtime.zig");
 const command_risk = @import("command_risk.zig");
-const decision = @import("../core/decision.zig");
 const image = @import("../core/image.zig");
 const image_file = @import("image_file.zig");
 const text_edit = @import("text_edit.zig");
@@ -27,7 +26,7 @@ const Title = @import("../core/session_metadata.zig").Title;
 
 /// Foreground bash description. The background variant appends its own sentence
 /// so a child Tools without a service never advertises background capability.
-const bash_description = "Run bash in the startup project; cwd changes do not persist. With decision review disabled, ordinary commands run without approval prompts; classified high-risk commands require explicit approval each time. Denial means no execution. timeout_ms defaults to 5 minutes. stdout and stderr are captured in full.";
+const bash_description = "Run bash in the startup project; cwd changes do not persist. Ordinary commands run without approval prompts; classified high-risk commands require explicit approval each time. Denial means no execution. timeout_ms defaults to 5 minutes. stdout and stderr are captured in full.";
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -61,16 +60,10 @@ pub const schemas = [_]p.ToolSchema{
     },
 };
 
-// The configured reviewer, not the legacy shell classifier, owns the extra
-// command-confirmation decision. These static variants add no prompt allocation
-// and preserve tool IDs, order and parameter schemas.
-const decision_bash_description = "Run bash in the startup project; cwd changes do not persist. The configured reviewer's ask=true requires approval for this call; ask=false removes the extra command-approval prompt. Review decides only whether to ask. Unavailable or invalid review pauses without executing. Denial means no execution. timeout_ms uses the host default when omitted; built-in default is 5 minutes. Hard validation and cancellation apply. stdout and stderr are captured in full.";
-
 /// Background variants only appear when the host supplied a background service
-/// to a root Tools. They state that the bounded timeout covers startup only, so
-/// the command timeout is not mistaken for the lifetime of a handed-off service.
+/// to a root Tools. They state that the bounded timeout covers startup only,
+/// so the command timeout is not mistaken for the lifetime of a handed-off service.
 const background_bash_description = bash_description ++ " background=true starts a managed service in this Thin instance: the call returns after a bounded startup wait with an id; timeout_ms bounds only that startup wait, not how long the service keeps running. For long output needing later inspection, use background=true and read background.logs by offset. Manage it with the background tool.";
-const decision_background_bash_description = decision_bash_description ++ " background=true starts a managed service in this Thin instance: timeout_ms bounds only the startup wait; after handoff the service keeps running until it is stopped or Thin exits. For long output needing later inspection, use background=true and read background.logs by offset. Manage it with the background tool.";
 const bash_background_parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"background":{"type":"boolean"}},"required":["command"],"additionalProperties":false}
 ;
@@ -84,12 +77,6 @@ const background_schema: p.ToolSchema = .{
     \\{"type":"object","properties":{"action":{"type":"string","enum":["list","status","logs","stop"]},"id":{"type":"string","minLength":1,"maxLength":64},"after":{"type":"integer","minimum":0},"stdout_offset":{"type":"integer","minimum":0},"stderr_offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
     ,
 };
-const reviewed_schemas = blk: {
-    var result = schemas;
-    result[2].description = decision_bash_description;
-    break :blk result;
-};
-
 const image_schema: p.ToolSchema = .{
     .name = "read_image",
     .description = "Inspect a local PNG/JPEG/GIF/WebP inside the startup project using the independent image service. Returns bounded text and auxiliary usage only, never image bytes. No URLs. Maximum file size 4 MiB and dimensions 8192. question is optional.",
@@ -158,11 +145,10 @@ const title_schema: p.ToolSchema = .{
 };
 const schema_choices = 2;
 
-fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_on: bool, comptime channel: usize, comptime background_on: bool, comptime title_on: bool) [max_schemas]p.ToolSchema {
+fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime channel: usize, comptime background_on: bool, comptime title_on: bool) [max_schemas]p.ToolSchema {
     var result: [max_schemas]p.ToolSchema = undefined;
     var count: usize = 0;
-    const base = if (review) &reviewed_schemas else &schemas;
-    for (base, 0..) |schema, i| {
+    for (&schemas, 0..) |schema, i| {
         // Preserve read/write/bash/memory order; only memory is conditional.
         if (i == 3 and !memory_on) continue;
         if (i == 2 and background_on) {
@@ -171,7 +157,7 @@ fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_
             // timeouts. A Tools without a service keeps the old schema bytes.
             result[count] = .{
                 .name = schema.name,
-                .description = if (review) decision_background_bash_description else background_bash_description,
+                .description = background_bash_description,
                 .parameters_json = bash_background_parameters_json,
             };
         } else result[count] = schema;
@@ -207,9 +193,9 @@ fn buildSchemas(comptime review: bool, comptime image_on: bool, comptime memory_
 // a rebind never invalidates a previously handed-out schema slice.
 const schema_table = blk: {
     @setEvalBranchQuota(160000);
-    var table: [schema_choices][schema_choices][schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
-    for (0..schema_choices) |title_on| for (0..schema_choices) |background_on| for (0..schema_choices) |review| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
-        table[title_on][background_on][review][image_on][memory_on][channel] = buildSchemas(review == 1, image_on == 1, memory_on == 1, channel, background_on == 1, title_on == 1);
+    var table: [schema_choices][schema_choices][schema_choices][schema_choices][channel_choices][max_schemas]p.ToolSchema = undefined;
+    for (0..schema_choices) |title_on| for (0..schema_choices) |background_on| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| for (0..channel_choices) |channel| {
+        table[title_on][background_on][image_on][memory_on][channel] = buildSchemas(image_on == 1, memory_on == 1, channel, background_on == 1, title_on == 1);
     };
     break :blk table;
 };
@@ -223,8 +209,8 @@ fn schemaCount(image_on: bool, memory_on: bool, channel: usize, background_on: b
     return 5 + @as(usize, @intFromBool(image_on)) + channel_count + @as(usize, @intFromBool(background_on)) - @as(usize, @intFromBool(!memory_on));
 }
 
-fn schemasWithTitle(review: bool, image_on: bool, memory_on: bool, channel: usize, background_on: bool, title_on: bool) []const p.ToolSchema {
-    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(title_on)][@intFromBool(background_on)][@intFromBool(review)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
+fn schemasWithTitle(image_on: bool, memory_on: bool, channel: usize, background_on: bool, title_on: bool) []const p.ToolSchema {
+    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(title_on)][@intFromBool(background_on)][@intFromBool(image_on)][@intFromBool(memory_on)][channel];
     return set[0 .. schemaCount(image_on, memory_on, channel, background_on) + @as(usize, @intFromBool(title_on))];
 }
 
@@ -659,7 +645,7 @@ pub const Tools = struct {
     pub fn executor(self: *Tools) runtime.Executor {
         return .{
             .context = self,
-            .schemas = schemasWithTitle(self.config.decisionActive(), self.image != null, self.allow_memory, self.channelChoice(), self.backgroundActive(), self.session_title != null and self.parent_channel == null),
+            .schemas = schemasWithTitle(self.image != null, self.allow_memory, self.channelChoice(), self.backgroundActive(), self.session_title != null and self.parent_channel == null),
             .prepare_fn = prepare,
             .execute_fn = executePrepared,
             .preview_write_fn = previewWrite,
@@ -740,13 +726,6 @@ pub const Tools = struct {
             description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; choose Allow once or Deny in the confirmation popup.\n{s}", .{ finding.label, description });
             break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label});
         } else null;
-        const review: ?decision.Input = switch (action.*) {
-            .bash => |b| .{ .command = .{
-                .command = b.command,
-                .risk = if (risk) |finding| finding.label else null,
-            } },
-            else => null,
-        };
         const status = @import("../core/background_status.zig");
         const display: ?status.Caption = switch (action.*) {
             .bash => |b| if (b.background) .{ .action = .start, .command = self.background.?.caption(b.command) } else null,
@@ -762,7 +741,7 @@ pub const Tools = struct {
             },
             else => null,
         };
-        return .{ .payload = action, .description = description, .explicit_denial = denial, .decision_input = review, .display = display };
+        return .{ .payload = action, .description = description, .explicit_denial = denial, .display = display };
     }
 
     /// 从 prepare 生成的 payload 取回 Action 并执行；payload 指向同一个 arena 中的 Action。

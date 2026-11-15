@@ -1,65 +1,33 @@
-test "output limit pause explains shared output budget without implying network failure" {
+test "raw provider cause is shown verbatim after the status" {
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "Paused", error.OutputLimitReached, .output_limit, null);
-    try std.testing.expectEqualStrings("Paused: provider output limit reached; split the response or lower reasoning effort", writer.buffered());
-    try std.testing.expect(std.mem.find(u8, writer.buffered(), "HTTP") == null);
-    try std.testing.expect(std.mem.find(u8, writer.buffered(), "OutputLimitReached") == null);
+    try write(&writer, "Failed", error.ModelRequestFailed, 401, "Incorrect API key provided: sk-test");
+    try std.testing.expectEqualStrings("Failed [HTTP 401]: Incorrect API key provided: sk-test", writer.buffered());
 }
-test "decision summary stays concise and never borrows primary HTTP or error prose" {
-    var buffer: [512]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "Ready", error.DecisionUnavailable, .authentication, 401);
-    try std.testing.expectEqualStrings("Paused: decision review failed; operation not executed", writer.buffered());
-    var diagnostic: @import("../core/decision.zig").Diagnostic = .{ .stage = .http, .backend = .systemone, .http_status = 403 };
-    diagnostic.setError(error.DecisionUnavailable);
-    writer = std.Io.Writer.fixed(&buffer);
-    try writeDecision(&writer, diagnostic);
-    try std.testing.expectEqualStrings("Paused: decision review failed [HTTP 403]; operation not executed", writer.buffered());
-    try std.testing.expect(std.mem.find(u8, writer.buffered(), "DecisionUnavailable") == null);
-}
-test "failure diagnostics expose HTTP status early without provider text" {
-    const cases = [_]struct { status: ?u16, prefix: []const u8, hint: []const u8 }{
-        .{ .status = 401, .prefix = "Failed [HTTP 401]", .hint = "check /login" },
-        .{ .status = 403, .prefix = "Failed [HTTP 403]", .hint = "workspace/model permissions" },
-        .{ .status = null, .prefix = "Failed:", .hint = "credentials and access permissions" },
-    };
-    for (cases) |case| {
-        var buffer: [512]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
-        try write(&writer, "Failed", error.ModelRequestFailed, .authentication, case.status);
-        try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), case.prefix));
-        try std.testing.expect(std.mem.find(u8, writer.buffered(), case.hint) != null);
-        if (case.status == null) try std.testing.expect(std.mem.find(u8, writer.buffered(), "HTTP") == null);
-    }
-    var buffer: [128]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "Failed", error.ModelRequestFailed, .server, 503);
-    try std.testing.expectEqualStrings("Failed [HTTP 503]: provider service error; resend", writer.buffered());
-    writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "Canceled", error.Canceled, null, null);
-    try std.testing.expectEqualStrings("Canceled: Canceled", writer.buffered());
-}
-test "classified failures read as one actionable sentence without internal names" {
+test "without provider text the local error name is the cause" {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "\u{2717}", error.ModelRequestFailed, .transport, null);
-    try std.testing.expectEqualStrings("\u{2717}: cannot reach the model service; check network or proxy, then resend", writer.buffered());
-    // The same wording is reached when only the local error value is known.
+    try write(&writer, "\u{2717}", error.ConnectionRefused, 502, "");
+    try std.testing.expectEqualStrings("\u{2717} [HTTP 502]: ConnectionRefused", writer.buffered());
     writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "\u{2717}", error.ModelRequestFailed, null, null);
-    try std.testing.expectEqualStrings("\u{2717}: cannot reach the model service; check network or proxy, then resend", writer.buffered());
+    try write(&writer, "Canceled", error.Canceled, null, "");
+    try std.testing.expectEqualStrings("Canceled: Canceled", writer.buffered());
+}
+test "no category wording is added for any failure class" {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try write(&writer, "\u{2717}", error.ModelRequestFailed, 429, "Rate limit reached for gpt-5");
+    try std.testing.expectEqualStrings("\u{2717} [HTTP 429]: Rate limit reached for gpt-5", writer.buffered());
     writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "\u{2717}", error.Timeout, .timeout, null);
-    try std.testing.expectEqualStrings("\u{2717}: model request timed out; resend or lower reasoning effort", writer.buffered());
-    writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "\u{2717}", error.ModelRequestFailed, .rate_limit, 429);
-    try std.testing.expectEqualStrings("\u{2717} [HTTP 429]: provider rate limit reached; resend later", writer.buffered());
-    writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "\u{2717}", error.ModelRequestFailed, .context_limit, null);
-    try std.testing.expectEqualStrings("\u{2717}: provider context limit reached; run /compact", writer.buffered());
-    // A wire placeholder never reaches the row as a bare internal name.
-    writer = std.Io.Writer.fixed(&buffer);
-    try write(&writer, "\u{2717}", error.RemoteFailure, null, null);
-    try std.testing.expectEqualStrings("\u{2717}: model request failed; resend, or check the diagnostics log", writer.buffered());
+    try write(&writer, "\u{2717}", error.ModelRequestFailed, null, "finish_reason: length");
+    try std.testing.expectEqualStrings("\u{2717}: finish_reason: length", writer.buffered());
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "resend") == null);
+}
+test "output limit pause keeps the provider reason instead of a rewritten sentence" {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try write(&writer, "Paused", error.OutputLimitReached, null, "stop_reason: max_tokens");
+    try std.testing.expectEqualStrings("Paused: stop_reason: max_tokens", writer.buffered());
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "HTTP") == null);
+    try std.testing.expect(std.mem.find(u8, writer.buffered(), "OutputLimitReached") == null);
 }

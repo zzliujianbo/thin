@@ -16,7 +16,7 @@ test "direct choices intersect exact providers preserve raw IDs and never invent
     try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&changed, &logged).?));
     try std.testing.expect(!std.mem.eql(u8, &before, &fingerprint(&profiles, null).?));
 }
-test "direct decision windows keep selection visible and reject paste or clipping" {
+test "direct settings windows keep selection visible and reject paste or clipping" {
     const a = std.testing.allocator;
     for (0..count(&profiles, &logged, "")) |selected| for (0..7) |height| for (0..65) |columns| {
         const rendered = try rows(a, .{ .selected = selected }, &profiles, &logged, "", columns, height);
@@ -34,10 +34,10 @@ test "direct decision windows keep selection visible and reject paste or clippin
     defer freeRows(a, pasted);
     try std.testing.expect(!pasted.can_confirm);
 }
-test "decision rows release every partial allocation" {
+test "settings rows release every partial allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
 }
-test "decision search AND tokens fold ASCII preserve slash IDs and filter Off" {
+test "settings search AND tokens fold ASCII preserve slash IDs and filter Off" {
     const providers = [_]Provider{ .{ .name = "login" }, .{ .name = "second" } };
     try std.testing.expectEqual(@as(usize, 2), count(&profiles, &providers, " JUDGE\tFAMILY/ "));
     try std.testing.expectEqual(@as(usize, 1), count(&profiles, &providers, "SECOND /JUDGE"));

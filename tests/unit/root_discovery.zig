@@ -40,7 +40,6 @@ test {
     // These modules are otherwise reached only through transitive imports;
     // reference them explicitly so filtered test-unit groups always enumerate
     // every top-level test prefix.
-    _ = @import("core/systemone.zig");
     _ = @import("core/subagent_status.zig");
     _ = @import("llm/image_codec.zig");
     _ = @import("platform/anonymous_input.zig");

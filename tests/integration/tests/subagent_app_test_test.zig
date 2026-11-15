@@ -41,26 +41,6 @@ test "App installs the subagent capability unconditionally and keeps it across s
     try expectSubagentSurface(app);
     try std.testing.expectEqual(@intFromPtr(app.subagent.deps.config), @intFromPtr(&app.config.value));
 }
-test "Decision clone copies frozen declaration key into an independent lazy owner" {
-    const a = std.testing.allocator;
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("CURL_CA_BUNDLE", "/owned/decision-ca.pem");
-    var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"}}},"judge":{"base_url":"http://judge.invalid/v1","api_key":"fake-judge-key","models":{"mini":{"context_tokens":16384,"protocol":"chat"}}}}},"decision":{"model":"judge/mini"}}
-    );
-    defer cfg.release(&parsed);
-    const parent = (try DecisionClient.create(a, std.testing.io, parsed.value, &env)).?;
-    defer parent.deinit();
-    const unresolved = try parent.clone();
-    defer unresolved.deinit();
-    try std.testing.expect(unresolved.resolved == null and unresolved.native == null);
-    try std.testing.expectEqualStrings("judge/mini", unresolved.source.value.decision.?.model);
-    try std.testing.expectEqualStrings("fake-judge-key", unresolved.key.?);
-    try std.testing.expectEqualStrings("/owned/decision-ca.pem", unresolved.transport_env.get("CURL_CA_BUNDLE").?);
-    try std.testing.expect(unresolved.source.value.decision.?.model.ptr != parent.source.value.decision.?.model.ptr);
-    try std.testing.expectEqual(@as(u64, 0), unresolved.calls);
-}
 test "Image clone owns endpoint key timeout CA and route without sharing poison" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);

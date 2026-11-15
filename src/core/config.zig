@@ -250,17 +250,6 @@ fn validateProxy(proxy: ProxyConfig, registry: ?Registry) !void {
     }
 }
 
-/// Optional global auxiliary model; never a chat selection or capability source.
-pub const DecisionConfig = struct {
-    model: []const u8,
-    enabled: bool = true,
-    /// Shared by generic auxiliary resolution and its local model picker.
-    /// Never use primary price policy or command limits to resolve a reviewer.
-    pub fn modelLimits(_: DecisionConfig, shared_request_timeout_ms: u32) Limits {
-        return .{ .low_price_input = false, .request_timeout_ms = shared_request_timeout_ms };
-    }
-};
-
 /// Independent text-only image helper selection; no credentials or transport policy.
 pub const ImageConfig = struct {
     /// Presence is the only activation state. Off clears the selection.
@@ -275,7 +264,6 @@ pub const MemoryConfig = struct {
 /// registry may be absent only for a pure in-memory Runtime snapshot.
 pub const Config = struct {
     proxy: ?ProxyConfig = null,
-    decision: ?DecisionConfig = null,
     image: ImageConfig = .{},
     memory: MemoryConfig = .{},
     registry: ?Registry = null,
@@ -288,11 +276,6 @@ pub const Config = struct {
 
     pub fn imageActive(self: Config) bool {
         return self.image.model != null;
-    }
-
-    pub fn decisionActive(self: Config) bool {
-        const decision = self.decision orelse return false;
-        return decision.enabled;
     }
 
     /// Exact alias/raw-ID allowlist; absent identity or an empty list is direct.
@@ -315,7 +298,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
 }
 
 // No secret is needed to select an image helper; provider credentials are
-// resolved separately at use time, never borrowed from decision/primary state.
+// resolved separately at use time, never borrowed from selection state.
 
 /// Clone an already bounded, validated application configuration. Re-encoding
 /// default fields may exceed the input-file limit; it does not relax disk reads.
@@ -381,28 +364,14 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
             }
         };
     }
-    if (T == ModelPatch or T == Limits or T == DecisionConfig or T == ImageConfig or T == ProxyConfig) {
+    if (T == ModelPatch or T == Limits or T == ImageConfig or T == ProxyConfig) {
         const fields = try object(value);
-        if (T == DecisionConfig) _ = try string(fields.get("model") orelse return error.MissingField);
-        if (T == ImageConfig) {
-            if (fields.get("model")) |model| if (model != .null) {
-                _ = try string(model);
-            };
-        }
         var it = fields.iterator();
         while (it.next()) |entry| {
-            // Reject unknown decision keys regardless of the value's type.
-            // No removed field is interpreted or imported into declarations.
-            if (T == DecisionConfig or T == ImageConfig) {
-                const known = inline for (@typeInfo(T).@"struct".field_names) |field| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, field)) break true;
-                } else false;
-                if (!known and !(T == DecisionConfig and (std.mem.eql(u8, entry.key_ptr.*, "max_input_tokens") or std.mem.eql(u8, entry.key_ptr.*, "max_state_bytes")))) return error.UnknownField;
-            }
             // Removed policy fields are inert migration input, regardless of
-            // their former value. Current fields retain strict type validation.
+            // their former value. Current fields retain strict type validation;
+            // every other unknown key is still rejected by the strict parser.
             if (T == Limits and isRetiredLimit(entry.key_ptr.*)) continue;
-            if (T == DecisionConfig and (std.mem.eql(u8, entry.key_ptr.*, "max_input_tokens") or std.mem.eql(u8, entry.key_ptr.*, "max_state_bytes"))) continue;
             if (entry.value_ptr.* == .float or entry.value_ptr.* == .number_string) return error.InvalidNumber;
             inline for (@typeInfo(T).@"struct".field_names) |field| {
                 if (std.mem.eql(u8, entry.key_ptr.*, field)) {
@@ -418,14 +387,12 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
             }
         }
     }
-    if (T == Limits or T == DecisionConfig) {
+    if (T == Limits) {
         const original = try object(value);
         var migrated: std.json.ObjectMap = .{};
         var it = original.iterator();
         while (it.next()) |entry| {
-            const key = entry.key_ptr.*;
-            const retired = if (T == Limits) isRetiredLimit(key) else std.mem.eql(u8, key, "max_input_tokens") or std.mem.eql(u8, key, "max_state_bytes");
-            if (!retired) try migrated.put(a, key, entry.value_ptr.*);
+            if (!isRetiredLimit(entry.key_ptr.*)) try migrated.put(a, entry.key_ptr.*, entry.value_ptr.*);
         }
         return std.json.parseFromValueLeaky(T, a, .{ .object = migrated }, json_options);
     }
@@ -455,7 +422,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     const root = try object(tree.value);
     var keys = root.iterator();
     while (keys.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "decision") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory")) return error.UnknownField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory")) return error.UnknownField;
     }
     const llm_value = root.get("llm") orelse return error.MissingField;
     var result: Config = blk: {
@@ -498,11 +465,10 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const chosen = registry.find(selection.provider) orelse return error.UnknownProvider;
         const limits = if (root.get("limits")) |v| try decode(Limits, a, v) else Limits{};
         const context: u32 = 32768;
-        const decision = if (root.get("decision")) |v| if (v == .null) null else try decode(DecisionConfig, a, v) else null;
         const proxy = if (root.get("proxy")) |v| if (v == .null) null else try decode(ProxyConfig, a, v) else null;
         const image = if (root.get("image")) |v| try decode(ImageConfig, a, v) else ImageConfig{};
         const memory = if (root.get("memory")) |v| try decode(MemoryConfig, a, v) else MemoryConfig{};
-        break :blk .{ .proxy = proxy, .decision = decision, .image = image, .memory = memory, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+        break :blk .{ .proxy = proxy, .image = image, .memory = memory, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
     if (isCodexProvider(result.provider) and result.model.protocol == .auto) result.model.protocol = .responses;
     try validate(result);
@@ -568,10 +534,6 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         if (!config.memory.auto) {
             try s.objectField("memory");
             try s.write(config.memory);
-        }
-        if (config.decision) |decision| {
-            try s.objectField("decision");
-            try s.write(decision);
         }
         try s.endObject();
     }
@@ -784,11 +746,6 @@ fn validateConfig(config: Config, comptime unresolved: bool) !void {
     if (config.image.model) |model| {
         const selection = try splitDefault(model);
         if (!std.mem.eql(u8, selection.model, "deepseek-flash")) return error.InvalidImageModel;
-        const registry = config.registry orelse return error.MissingRegistry;
-        _ = registry.find(selection.provider) orelse return error.UnknownProvider;
-    }
-    if (config.decision) |decision| {
-        const selection = try splitDefault(decision.model);
         const registry = config.registry orelse return error.MissingRegistry;
         _ = registry.find(selection.provider) orelse return error.UnknownProvider;
     }

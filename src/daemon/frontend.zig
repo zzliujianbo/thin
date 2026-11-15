@@ -162,7 +162,6 @@ pub const Frontend = struct {
             .cycle_effort_fn = noCycle,
             .preference_fn = noPreference,
             .setting_fn = noSetting,
-            .decision_fn = noChoice,
             .image_fn = noChoice,
             .proxy_fn = noProxy,
             .proxy_address_fn = noConfigure,
@@ -196,7 +195,7 @@ pub const Frontend = struct {
     fn noSetting(_: *anyopaque, _: tui.Connection.Setting, _: bool) anyerror!void {
         return error.AsyncRequired;
     }
-    fn noChoice(_: *anyopaque, _: tui.Connection.DecisionChoice) anyerror!void {
+    fn noChoice(_: *anyopaque, _: tui.Connection.ModelChoice) anyerror!void {
         return error.AsyncRequired;
     }
     fn noProxy(_: *anyopaque, _: []const u8, _: bool) anyerror!void {

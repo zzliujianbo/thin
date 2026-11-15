@@ -133,7 +133,8 @@ fn expectFailureReason(a: std.mem.Allocator, kind: shared.tools.Kind, result: @i
 test "every failed tool owns a bounded reason and never a raw body" {
     const a = std.testing.allocator;
     try expectFailureReason(a, .write, .{ .text = "AccessDenied", .is_error = true }, "AccessDenied");
-    try expectFailureReason(a, .read, .{ .text = "FileNotFound", .is_error = true }, "FileNotFound: file not found");
+    // read 行只显示运行时给出的原始错误名，不再追加英文注释。
+    try expectFailureReason(a, .read, .{ .text = "FileNotFound", .is_error = true }, "FileNotFound");
     // bash results are our own envelope: only structured failure facts surface.
     try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":7,\"stderr\":\"boom\"}", .is_error = true }, "exit 7: boom");
     try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":2,\"stderr\":\"sed: can't read missing.zig\\nmore\"}", .is_error = true }, "exit 2: sed: can't read missing.zig");

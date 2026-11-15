@@ -285,7 +285,8 @@ test "anthropic errors truncation invalid sequence duplicate IDs bounds and sink
     try s.feed("", start);
     try s.feed("", "{\"type\":\"error\",\"error\":{\"message\":\"SECRET\"}}");
     const failure = (try s.finish()).failure;
-    try std.testing.expect(std.mem.indexOf(u8, failure.message, "SECRET") == null);
+    // 原始错误文本按原样保留，供直接展示与排错。
+    try std.testing.expectEqualStrings("SECRET", failure.message);
     try std.testing.expectEqual(@as(?u64, 15), failure.usage.input_tokens);
     s = adapter.Stream.init(a, scope, .{});
     try s.feed("", start);

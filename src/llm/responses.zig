@@ -177,6 +177,8 @@ pub const Stream = struct {
     /// 是否收到 error、response.failed 或 response.incomplete。
     failed: bool = false,
     output_limited: bool = false,
+    /// 上游失败事件的原文，供失败结果直接展示（不翻译、不遮盖）。
+    error_text: ?[]const u8 = null,
     /// 发生错误后置位；之后 feed 与 finish 都会被拒绝，避免使用不一致的状态。
     poisoned: bool = false,
     /// finish 已调用后置位，此后不再接受输入。
@@ -239,7 +241,7 @@ pub const Stream = struct {
             try self.sink.emit(.{ .usage = self.token_usage });
         };
 
-        // 失败类事件只记录状态，不在此处返回错误；具体失败信息在 finish 中脱敏生成。
+        // 失败类事件只记录状态，不在此处返回错误；具体失败原因在 finish 中给出。
         const done_incomplete = c.eq(typ, "response.done") and if (j.get(v, "response")) |response| blk: {
             const status = j.get(response, "status") orelse break :blk false;
             break :blk status == .string and c.eq(status.string, "incomplete");
@@ -260,16 +262,17 @@ pub const Stream = struct {
                     };
                 }
             }
+            self.error_text = c.rawValue(self.a, v, c.raw_max);
             self.failed = true;
             return;
         }
-
         // A done event with any other status is terminal failure, not a
         // transport parse error: retain usage and discard provisional tools.
         if (c.eq(typ, "response.done")) {
             const response = j.get(v, "response") orelse return error.InvalidEvent;
             const status = try c.text(response, "status");
             if (!c.eq(status, "completed")) {
+                self.error_text = c.rawValue(self.a, v, c.raw_max);
                 self.failed = true;
                 return;
             }
@@ -390,15 +393,6 @@ pub const Stream = struct {
         // 生命周期事件与未来新增的信息性事件被忽略，保证前向兼容。
     }
 
-    /// 统计已登记的 function_call 数量，用于工具数量上限检查。
-    fn toolCount(self: *Stream) usize {
-        var n: usize = 0;
-        for (self.items.items) |item| {
-            if (item.call_id != null) n += 1;
-        }
-        return n;
-    }
-
     /// 按 output_index 查找 item，并校验事件中的 item_id；找不到或 id 不一致都视为不一致的流。
     fn lookup(self: *Stream, v: j.Value) !*Item {
         const index = try outputIndex(v);
@@ -424,7 +418,10 @@ pub const Stream = struct {
         if (self.poisoned or self.committed) return error.InvalidStreamState;
         self.committed = true;
         // 失败结果不包含 Message，只带上用量与内容观察状态。
-        if (self.failed) return if (self.output_limited) c.outputLimit(self.observed, self.token_usage, self.raw_usage) else c.failure(self.observed, self.token_usage, self.raw_usage);
+        if (self.failed) return if (self.output_limited)
+            c.outputLimit(self.observed, self.token_usage, self.raw_usage, "incomplete_details.reason: max_output_tokens")
+        else
+            c.failure(self.observed, self.token_usage, self.raw_usage, self.error_text orelse "error event");
         if (!self.completed) return error.TruncatedStream;
 
         var blocks: std.ArrayList(p.Block) = .empty;

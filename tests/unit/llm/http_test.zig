@@ -315,7 +315,19 @@ test "auto fallback requires explicit machine-readable endpoint evidence" {
     try std.testing.expectEqual(p.FailureKind.authentication, classifyHttpError(a, 401, "{\"error\":{\"code\":\"unsupported_protocol\"}}").failure.kind);
     try std.testing.expectEqual(p.FailureKind.server, classifyHttpError(a, 500, "{\"error\":{\"code\":\"unsupported_protocol\"}}").failure.kind);
 
+    // 原始原因直接上行：有 message 用它，否则给出 body 原文，不做分类翻译。
     const r = classifyHttpError(a, 400, "{\"error\":{\"code\":\"unsupported_protocol\",\"param\":\"response_format\"}}");
     try std.testing.expectEqual(p.FailureKind.invalid_argument, r.failure.kind);
-    try std.testing.expect(std.mem.find(u8, r.failure.message, "fake-secret") == null);
+    try std.testing.expectEqualStrings("{\"error\":{\"code\":\"unsupported_protocol\",\"param\":\"response_format\"}}", r.failure.message);
+
+    const denied = classifyHttpError(a, 401, "{\"error\":{\"message\":\"Incorrect API key provided: sk-fake\",\"type\":\"invalid_request_error\"}}");
+    try std.testing.expectEqual(p.FailureKind.authentication, denied.failure.kind);
+    try std.testing.expectEqualStrings("Incorrect API key provided: sk-fake", denied.failure.message);
+
+    const plain = classifyHttpError(a, 502, "upstream connect error");
+    try std.testing.expectEqual(p.FailureKind.server, plain.failure.kind);
+    try std.testing.expectEqualStrings("upstream connect error", plain.failure.message);
+
+    const empty = classifyHttpError(a, 500, "");
+    try std.testing.expectEqualStrings("empty error response body", empty.failure.message);
 }

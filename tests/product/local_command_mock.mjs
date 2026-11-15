@@ -19,7 +19,7 @@ const server = createServer(async (req, res) => {
   try {
     // The only allowed HTTP is the explicit normal turn AFTER local execution.
     assert.equal(active?.mode, 'accept', 'command-only scenario sent HTTP');
-    assert.equal(requests, 1, 'extra primary/summary/decision HTTP');
+    assert.equal(requests, 1, 'extra primary/summary HTTP');
     const chunks = []; let bytes = 0;
     for await (const chunk of req) {
       bytes += chunk.length; assert(bytes <= 512 * 1024); chunks.push(chunk);
@@ -56,7 +56,6 @@ async function run(mode, url) {
   const config = JSON.stringify({
     memory:{auto:false},
     llm:{default:'local/fixture-model', providers:{local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{'fixture-model':{protocol:'chat', context_tokens:32768}}}}},
-    ...(mode === 'deny' ? {decision:{enabled:false,model:'local/fixture-model'}} : {}),
     limits:{low_price_input:false,request_timeout_ms:3000,command_timeout_ms:mode === 'timeout' ? 250 : 5000},
   }, null, 2)+'\n';
   const path = join(home, '.thin/config.json'); await writeFile(path, config, {mode:0o600});

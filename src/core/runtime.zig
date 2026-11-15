@@ -7,7 +7,6 @@ const cfg = @import("config.zig");
 const thinking = @import("thinking.zig");
 const llm = @import("../llm/llm.zig");
 const context = @import("context.zig");
-const decision = @import("decision.zig");
 const diagnostics = @import("diagnostics.zig");
 const knowledge = @import("knowledge.zig");
 
@@ -64,7 +63,6 @@ pub const Prepared = struct {
     /// 非空：本次必须人工批准；批准只放行这一次，之后的非空调用仍会询问。
     /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
     explicit_denial: ?[]const u8 = null,
-    decision_input: ?decision.Input = null,
     display: ?@import("background_status.zig").Caption = null,
 };
 
@@ -140,6 +138,9 @@ fn zeroUsage() p.Usage {
     return .{ .input_tokens = 0, .output_tokens = 0, .cached_input_tokens = 0, .cache_write_tokens = 0, .reasoning_tokens = 0, .total_tokens = 0 };
 }
 
+/// 失败原因原文的展示上限；仅限制内存，行宽裁剪由前端负责。
+pub const failure_message_max = 480;
+
 /// run() 的结果。每个被接受的 run 恰好产生一条 finished 事件与一个 Terminal。
 pub const Terminal = struct {
     status: Status,
@@ -149,10 +150,24 @@ pub const Terminal = struct {
     model_failure: ?p.FailureKind = null,
     /// 最后一次模型请求的 HTTP 状态码（若有）。
     http_status: ?u16 = null,
-    /// Independent auxiliary failure; never reuse primary HTTP/usage fields.
-    decision_failure: ?decision.Diagnostic = null,
+    /// 原始失败原因（提供方原文或本地错误名），供前端直接展示。
+    failure_message: [failure_message_max]u8 = @splat(0),
+    failure_message_len: u16 = 0,
     usage: UsageTotals = .{},
     context_snapshot: ?ContextSnapshot = null,
+
+    pub fn failureText(self: *const Terminal) []const u8 {
+        return self.failure_message[0..self.failure_message_len];
+    }
+
+    /// 复制一份原始失败原因；超长只截断，不改写、不分类。截断点必须落在
+    /// UTF-8 边界上，渲染层才能把它当作完整字符处理。
+    pub fn setFailureText(self: *Terminal, text: []const u8) void {
+        var n = @min(text.len, self.failure_message.len);
+        while (n > 0 and !std.unicode.utf8ValidateSlice(text[0..n])) n -= 1;
+        @memcpy(self.failure_message[0..n], text[0..n]);
+        self.failure_message_len = @intCast(n);
+    }
 };
 
 /// Latest request's provider-reported total, not an estimate or cumulative bill.
@@ -168,7 +183,7 @@ pub fn inputBudgetPause(detail: ?anyerror) bool {
 /// Policy/auxiliary pauses need their own explanation, not a round-limit hint.
 pub fn policyPause(detail: ?anyerror) bool {
     const cause = detail orelse return false;
-    return inputBudgetPause(detail) or cause == error.DecisionUnavailable or cause == error.SubagentInteractionRequired;
+    return inputBudgetPause(detail) or cause == error.SubagentInteractionRequired;
 }
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
@@ -404,7 +419,6 @@ pub const Runtime = struct {
     /// 当前使用的模型描述。
     model: p.Model,
     /// Independent auxiliary client: never part of checkpoint or primary accounting.
-    decision_service: ?decision.Service = null,
     memory_hooks: ?MemoryHooks = null,
     /// Borrowed only during a prompt task; never accessed by tool worker jobs.
     memory_capture: ?*knowledge.Capture = null,
@@ -823,7 +837,7 @@ pub const Runtime = struct {
     }
 
     /// Execute an explicit user !command without primary inference or compaction.
-    /// Uses the same executor, decision review and host permissions as model tools.
+    /// Uses the same executor and host permissions as model tools.
     pub fn executeCommand(self: *Runtime, full_text_with_bang: []const u8, cancel: *p.Cancellation) !Terminal {
         return self.runTask(.{ .command = full_text_with_bang }, cancel);
     }
@@ -868,7 +882,7 @@ pub const Runtime = struct {
             .command => |text| self.commandInner(text, cancel, &task),
         };
         result catch |err| {
-            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or err == error.DecisionUnavailable or err == error.SubagentInteractionRequired or inputBudgetPause(err)) .paused else .failed;
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or err == error.SubagentInteractionRequired or inputBudgetPause(err)) .paused else .failed;
             task.terminal.detail = err;
             if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
         };
@@ -1383,6 +1397,7 @@ pub const Runtime = struct {
                 .failure => |failure| {
                     task.terminal.model_failure = failure.kind;
                     task.terminal.http_status = failure.http_status;
+                    task.terminal.setFailureText(failure.message);
                     return switch (failure.kind) {
                         .canceled => error.Canceled,
                         .output_limit => error.OutputLimitReached,
@@ -1672,7 +1687,6 @@ pub const Runtime = struct {
             .automatic => context.plan(a, self.config.*, self.estimator, self.system, self.executor.schemas, planning_messages, self.protected_index),
             .manual => context.planManual(a, self.config.*, self.estimator, self.system, self.executor.schemas, planning_messages, self.protected_index),
         };
-        try self.refineOutputs(a, planning_messages[0..selection.cut], cancel);
         const instruction = try context.summaryInstruction(a, selection, planning_messages);
         const view = try context.summaryView(a, selection, planning_messages);
         const messages_ = try a.alloc(p.Message, 1);
@@ -1713,6 +1727,7 @@ pub const Runtime = struct {
                 if (self.config.limits.low_price_input) {
                     task.terminal.model_failure = f.kind;
                     task.terminal.http_status = f.http_status;
+                    task.terminal.setFailureText(f.message);
                 }
                 return switch (f.kind) {
                     .canceled => error.Canceled,
@@ -1772,117 +1787,6 @@ pub const Runtime = struct {
         try self.emit(.{ .compacted = .{ .before = before, .after = after } }, cancel);
     }
 
-    /// Optional bounded optimization of summary scratch only. All replacements
-    /// are staged before publication; a bad item discards the ENTIRE batch.
-    fn refineOutputs(self: *Runtime, a: std.mem.Allocator, scratch_messages: []p.Message, cancel: *p.Cancellation) !void {
-        self.refineOutputsImpl(a, scratch_messages, cancel) catch |err| {
-            if (err == error.Canceled) return err;
-            if (err == error.CleanupFailed) {
-                self.poisoned = true;
-                return err;
-            }
-            // Includes allocation failures: no partial batch is published.
-        };
-    }
-
-    fn refineOutputsImpl(self: *Runtime, a: std.mem.Allocator, scratch_messages: []p.Message, cancel: *p.Cancellation) !void {
-        const service = self.decision_service orelse return;
-        var items: std.ArrayList(decision.RefineItem) = .empty;
-        const Location = struct { message: usize, block: usize, metadata: std.json.Value };
-        var locations: std.ArrayList(Location) = .empty;
-        for (scratch_messages, 0..) |message, mi| for (message.blocks, 0..) |block, bi| {
-            if (block != .tool_result) continue;
-            const result = block.tool_result;
-            var bash = false;
-            for (scratch_messages[0..mi]) |earlier| for (earlier.blocks) |earlier_block| {
-                if (earlier_block == .tool_call and std.mem.eql(u8, earlier_block.tool_call.id, result.call_id) and std.mem.eql(u8, earlier_block.tool_call.name, "bash")) bash = true;
-            };
-            if (!bash or result.text.len < 2048) continue;
-            // Only known JSON bash output is eligible. Unknown/truncated raw
-            // fragments retain their exact original text, including status.
-            const parsed = std.json.parseFromSlice(std.json.Value, a, result.text, .{ .allocate = .alloc_always }) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                continue;
-            };
-            var metadata = parsed.value;
-            if (metadata != .object) continue;
-            const stdout = metadata.object.get("stdout") orelse continue;
-            const stderr = metadata.object.get("stderr") orelse continue;
-            if (stdout != .string or stderr != .string) continue;
-            _ = metadata.object.swapRemove("stdout");
-            _ = metadata.object.swapRemove("stderr");
-            const source = try std.fmt.allocPrint(a, "stdout (untrusted data):\n{s}\nstderr (untrusted data):\n{s}", .{ stdout.string, stderr.string });
-            // Do not hide middle errors from the refiner. Oversized records stay
-            // ORIGINAL in the primary summary view rather than excerpting data.
-            if (source.len < 2048) continue;
-            // Duplicate IDs are invalid history, not auxiliary authority.
-            var duplicate = false;
-            for (items.items) |item| if (std.mem.eql(u8, item.id, result.call_id)) {
-                duplicate = true;
-            };
-            if (duplicate) continue;
-            try items.append(a, .{ .id = result.call_id, .text = source });
-            try locations.append(a, .{ .message = mi, .block = bi, .metadata = metadata });
-        };
-        if (items.items.len == 0) return;
-        const input: decision.Input = .{ .refine_outputs = items.items };
-        const output = service.decide(a, input, cancel) catch |err| {
-            if (err == error.Canceled or err == error.CleanupFailed) return err;
-            return; // Quality failure: whole original scratch remains available.
-        };
-        try checkCanceled(cancel);
-        const Replacement = struct { message: usize, blocks: []p.Block };
-        if (output != .refine_outputs or output.refine_outputs.len != items.items.len) return error.InvalidDecisionOutput;
-        var replacements: std.ArrayList(Replacement) = .empty;
-        for (items.items, 0..) |item, i| {
-            var matched: ?[]const u8 = null;
-            for (output.refine_outputs) |refined| if (std.mem.eql(u8, item.id, refined.id)) {
-                if (matched != null) return error.InvalidDecisionOutput;
-                matched = refined.text;
-            };
-            const summary = matched orelse return error.InvalidDecisionOutput;
-            if (summary.len == 0 or summary.len > item.text.len or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidDecisionOutput;
-            const location = locations.items[i];
-            const original = scratch_messages[location.message].blocks[location.block].tool_result;
-            // The model NEVER owns execution metadata. JSON exit/error/timeout,
-            // canceled/truncated/byte counts and canonical flags stay CODE-owned.
-            const candidate = try std.json.Stringify.valueAlloc(a, .{
-                .original_execution_metadata = location.metadata,
-                .output_summary_untrusted = summary,
-                .summary_is_lossy = true,
-            }, .{});
-            if (candidate.len >= original.text.len) continue;
-
-            // Only a profitable replacement owns mutable blocks. Reuse that
-            // clone for later profitable results in the same message.
-            var prior: ?[]p.Block = null;
-            for (replacements.items) |replacement| {
-                if (replacement.message == location.message) {
-                    prior = replacement.blocks;
-                    break;
-                }
-            }
-            const blocks = prior orelse blk: {
-                const owned = try a.dupe(p.Block, scratch_messages[location.message].blocks);
-                try replacements.append(a, .{ .message = location.message, .blocks = owned });
-                break :blk owned;
-            };
-            var result = original;
-            result.text = candidate;
-            blocks[location.block] = .{ .tool_result = result };
-        }
-        // Allocation-free publication after the whole batch succeeded. Shared
-        // message replacements already contain every refined block.
-        try checkCanceled(cancel);
-        if (replacements.items.len == 0) return;
-        for (replacements.items) |replacement| {
-            scratch_messages[replacement.message].blocks = replacement.blocks;
-            scratch_messages[replacement.message].replay = null;
-        }
-    }
-
-    /// 顺序执行 assistant 批次中的所有 tool_call，每个 call 都写入一条 tool_result。
-    /// 不变量：批次一旦提交（emit assistant_committed），每个 tool_call 都必须获得结果，即使中途失败。
     const BatchKind = enum { normal, local };
 
     /// The confirmation modal gates only NEW launches, not an in-flight model
@@ -1984,7 +1888,7 @@ pub const Runtime = struct {
             const a = temporary.allocator();
 
             // prepare 失败：不执行工具，但仍回填错误结果，保持 call 与 result 一一对应。
-            var prepared = self.executor.prepare_fn(self.executor.context, a, call) catch |err| {
+            const prepared = self.executor.prepare_fn(self.executor.context, a, call) catch |err| {
                 const result = Execution{ .text = @errorName(err), .is_error = true, .cleanup_failed = err == error.CleanupFailed };
                 // Readiness may expose an already-poisoned helper. Preserve this
                 // safety failure before any fallible history/host publication.
@@ -2005,30 +1909,6 @@ pub const Runtime = struct {
                 // republish unguarded raw argument previews in this refresh.
                 try self.emit(.{ .tool_view = .{ .key = key, .name = call.name, .ready = true, .display = prepared.display } }, cancel);
             };
-            if (self.decision_service) |service| if (prepared.decision_input) |input| {
-                const output = service.decide(a, input, cancel) catch |err| {
-                    if (err == error.Canceled) return err;
-                    if (err == error.CleanupFailed) {
-                        self.poisoned = true;
-                        return err;
-                    }
-                    if (kind == .normal and self.reserveSteering()) break :calls;
-                    task.terminal.decision_failure = service.failureDiagnostic(input, err);
-                    return error.DecisionUnavailable;
-                };
-                try checkCanceled(cancel);
-                if (kind == .normal and self.reserveSteering()) break :calls;
-                switch (input) {
-                    .command => {
-                        prepared.explicit_denial = if (output.command.ask)
-                            "Decision requires explicit approval; command was not executed."
-                        else
-                            null;
-                    },
-                    .refine_outputs => return error.DecisionUnavailable,
-                }
-            };
-
             var allowed = true;
 
             // 仅本次明确要求批准的调用询问；普通操作直接执行。

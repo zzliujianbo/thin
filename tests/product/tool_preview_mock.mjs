@@ -39,7 +39,7 @@ const server = createServer(async (req, res) => {
     for await (const chunk of req) { size += chunk.length; assert(size <= 512*1024); chunks.push(chunk); }
     const body = JSON.parse(Buffer.concat(chunks));
     f.requests++;
-    assert(f.requests <= (f.mode === 'cancel' ? 1 : 2), 'extra inference/summary/decision');
+    assert(f.requests <= (f.mode === 'cancel' ? 1 : 2), 'extra inference/summary');
     res.writeHead(200, {'content-type':'text/event-stream','cache-control':'no-cache'});
     if (f.requests === 1) {
       assert.equal(body.messages.at(-1).content, 'preview-task');

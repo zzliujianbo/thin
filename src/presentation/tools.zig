@@ -141,58 +141,19 @@ pub const Completion = struct {
     }
 };
 
-/// Read failures are known local error identifiers, never arbitrary tool output
-/// or JSON. Exact matching keeps hostile/control/secret-bearing bodies out of
-/// captions; all returned strings are static and frontend-neutral.
-pub fn readFailure(result: r.Execution) ?[]const u8 {
-    if (!result.is_error or result.canceled) return null;
-    const reasons = .{
-        .{ "FileNotFound", "FileNotFound: file not found" },
-        .{ "AccessDenied", "AccessDenied: permission denied" },
-        .{ "OutsideRoot", "OutsideRoot: outside project root" },
-        .{ "PathEscape", "PathEscape: outside project root" },
-        .{ "InvalidPath", "InvalidPath: invalid file path" },
-        .{ "IsDir", "IsDir: path is a directory" },
-        .{ "NotDir", "NotDir: parent is not a directory" },
-        .{ "NotRegularFile", "NotRegularFile: not a regular file" },
-        .{ "SymlinkNotAllowed", "SymlinkNotAllowed: symlink refused" },
-        .{ "BinaryFile", "BinaryFile: binary file is not readable as text" },
-        .{ "InvalidUtf8", "InvalidUtf8: file is not valid UTF-8" },
-        .{ "InvalidOffset", "InvalidOffset: invalid byte offset" },
-        .{ "InvalidLimit", "InvalidLimit: invalid read limit" },
-        .{ "InvalidReadLimit", "InvalidReadLimit: invalid read limit" },
-        .{ "ReadLimitTooSmall", "ReadLimitTooSmall: limit cannot fit a character" },
-        .{ "NameTooLong", "NameTooLong: file path is too long" },
-        .{ "FileChanged", "FileChanged: file changed while reading" },
-        .{ "ProtectedAuthFile", "ProtectedAuthFile: protected credential file" },
-        .{ "ProtectedSettingsFile", "ProtectedSettingsFile: protected settings" },
-        .{ "ProtectedSessionFile", "ProtectedSessionFile: protected session data" },
-        .{ "UseMemoryTool", "UseMemoryTool: use memory tool for this path" },
-        .{ "UnknownField", "UnknownField: unsupported read argument" },
-        .{ "MissingField", "MissingField: required read argument missing" },
-        .{ "ArgumentsTooLarge", "ArgumentsTooLarge: read arguments too large" },
-        .{ "FileSystemError", "FileSystemError: filesystem read failed" },
-        .{ "OutOfMemory", "OutOfMemory: insufficient memory" },
-    };
-    inline for (reasons) |reason| {
-        if (std.mem.eql(u8, result.text, reason[0])) return reason[1];
-    }
-    return "Read failed: details unavailable";
-}
-
 /// Bounded excerpt kept from an arbitrary failure body. The row clips it again to
 /// the terminal width, so this is a memory bound, not a layout decision.
 const reason_bytes = 128;
 
 /// Owned, bounded, frontend-neutral reason for one failed call; the caller owns
-/// the returned slice. Every failure with a body gets a reason: the read mapping
-/// stays exact, bash results are our own JSON envelope so only its failure facts
-/// (timeout, signal, exit code, first stderr line) surface instead of the raw
-/// envelope, and other tools expose their JSON error message or the sanitized
-/// first line of their result. An empty body has nothing to show.
+/// the returned slice. The failed call's own text is shown as-is (read errors are
+/// the runtime's raw error names); bash results are our own JSON envelope so only
+/// its failure facts (timeout, signal, exit code, first stderr line) surface
+/// instead of the raw envelope, and other tools expose their JSON error message
+/// or the sanitized first line of their result. An empty body has nothing to show.
 pub fn failureReason(a: std.mem.Allocator, kind: Kind, result: r.Execution) !?[]const u8 {
     if (!result.is_error or result.canceled) return null;
-    if (kind == .read) return try a.dupe(u8, readFailure(result) orelse return null);
+    if (kind == .read) return try excerpt(a, result.text);
     if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
     if (kind == .bash) return try bashReason(a, result.text) orelse try a.dupe(u8, "command failed");
     if (try jsonError(a, result.text)) |message| return message;

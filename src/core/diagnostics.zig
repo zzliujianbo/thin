@@ -1,8 +1,7 @@
 //! Bounded, value-only, optional timing diagnostics. Never carries model text.
 const std = @import("std");
 const p = @import("protocol.zig");
-const decision = @import("decision.zig");
-pub const Stage = enum { assistant_commit, observer, checkpoint, host_emit, end_task, watchdog_join, memory_submit, memory_finalize, memory_extract, memory_write, memory_request, decision_request, finished_emit };
+pub const Stage = enum { assistant_commit, observer, checkpoint, host_emit, end_task, watchdog_join, memory_submit, memory_finalize, memory_extract, memory_write, memory_request, finished_emit };
 pub const Phase = enum { begin, end, point };
 pub const Result = enum { ok, failed, canceled, skipped };
 pub const ErrorName = struct {
@@ -33,14 +32,11 @@ pub const Record = struct {
     elapsed_ms: ?u64 = null,
     result: ?Result = null,
     error_name: ?ErrorName = null,
-    operation: ?decision.Diagnostic.Operation = null,
     protocol: ?p.Protocol = null,
-    backend: ?decision.Diagnostic.Backend = null,
     route_hash: ?u64 = null,
     timeout_ms: ?u32 = null,
     http_status: ?u16 = null,
     model_failure: ?p.FailureKind = null,
-    decision_failure: ?decision.Diagnostic = null,
     candidate_index: ?u32 = null,
     count: ?u32 = null,
 };

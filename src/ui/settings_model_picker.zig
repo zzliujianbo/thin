@@ -1,4 +1,4 @@
-//! Bounded searchable decision choices. No custom identities or protocol routing.
+//! Bounded searchable settings model choices. No custom identities or protocol routing.
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const text = @import("text.zig");

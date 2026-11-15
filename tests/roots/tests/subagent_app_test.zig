@@ -1,12 +1,11 @@
 //! App-level subagent ownership regressions: the capability is always wired,
-//! idle rebinding keeps it installed, and Decision/Image clones stay independent.
+//! idle rebinding keeps it installed, and helper clones stay independent.
 //! No network, real credentials or user configuration directories are touched.
 
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const fs = @import("../platform/filesystem.zig");
 const App = @import("../app/app.zig").App;
-const DecisionClient = @import("../app/decision_client.zig").Client;
 const image_client = @import("../app/image_client.zig");
 const ImageClient = image_client.Client;
 const model_resolver = @import("../app/model_resolver.zig");

@@ -3,7 +3,6 @@ const std = @import("std");
 const p = @import("../core/protocol.zig");
 const r = @import("../core/runtime.zig");
 const cfg = @import("../core/config.zig");
-const d = @import("../core/decision.zig");
 const cp = @import("../core/checkpoint.zig");
 const chat = @import("../llm/chat.zig");
 const a = std.testing.allocator;
@@ -16,9 +15,7 @@ const Fake = struct {
     permissions: usize = 0,
     finished: usize = 0,
     submitted: usize = 0,
-    reviewed: usize = 0,
     approve: r.Decision = .allow_once,
-    review_error: ?anyerror = null,
     prepare_error: bool = false,
     cancel_on_execute: ?*p.Cancellation = null,
     capture_command: bool = false,
@@ -39,7 +36,7 @@ const Fake = struct {
         const args = try std.json.parseFromSliceLeaky(struct { command: []const u8 }, alloc, call.arguments, .{});
         try std.testing.expect(args.command.len != 0);
         if (self.prepare_error) return error.BadCommand;
-        return .{ .payload = self, .description = args.command, .explicit_denial = "Fixture requires explicit approval; not executed.", .decision_input = .{ .command = .{ .command = args.command } } };
+        return .{ .payload = self, .description = args.command, .explicit_denial = "Fixture requires explicit approval; not executed." };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, prepared: r.Prepared, cancel: *const p.Cancellation) !r.Execution {
         const self: *Fake = @ptrCast(@alignCast(raw));
@@ -57,17 +54,6 @@ const Fake = struct {
             return .{ .text = captured.stdout, .truncated = captured.truncated };
         }
         return .{ .text = self.result_text, .cleanup_failed = self.cleanup, .canceled = cancel.isRequested() };
-    }
-    fn review(raw: *anyopaque, _: std.mem.Allocator, input: d.Input, _: *const p.Cancellation) !d.Output {
-        const self: *Fake = @ptrCast(@alignCast(raw));
-        try std.testing.expect(input == .command);
-        try std.testing.expectEqualStrings("review", input.command.command);
-        try std.testing.expect(input.command.risk == null);
-        try std.testing.expectEqual(@as(usize, 2), @typeInfo(@TypeOf(input.command)).@"struct".field_names.len);
-        try std.testing.expectEqual(@as(usize, 0), self.primary + self.permissions + self.executions);
-        self.reviewed += 1;
-        if (self.review_error) |err| return err;
-        return .{ .command = .{ .ask = true } };
     }
     fn authorize(raw: ?*anyopaque, _: r.Permission, _: *const p.Cancellation) !r.Decision {
         const self: *Fake = @ptrCast(@alignCast(raw.?));

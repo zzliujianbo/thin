@@ -4184,21 +4184,22 @@ test "terminal details publish once in conversation and never own the footer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     ui.notice = "Ready";
-    const result: r.Terminal = .{ .status = .paused, .detail = error.OutputLimitReached, .model_failure = .output_limit };
+    var result: r.Terminal = .{ .status = .paused, .detail = error.OutputLimitReached, .model_failure = .output_limit };
+    result.setFailureText("incomplete_details.reason: max_output_tokens");
     ui.last_terminal = result;
     ui.notice = Ui.terminalNotice(result);
     ui.queueTerminalNotice(result);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     const record = ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.failure, record.notice_level);
-    try std.testing.expect(std.mem.find(u8, record.body.items, "provider output limit reached") != null);
-    try std.testing.expect(std.mem.find(u8, record.body.items, "OutputLimitReached") == null);
+    try std.testing.expect(std.mem.find(u8, record.body.items, "incomplete_details.reason: max_output_tokens") != null);
+    try std.testing.expect(std.mem.find(u8, record.body.items, "provider output limit") == null);
     try std.testing.expect(std.mem.find(u8, record.body.items, "limits.max_output_tokens") == null);
     const hint = try ui.hint(arena.allocator(), ui.connection.current());
     try std.testing.expect(std.mem.find(u8, hint, "OutputLimitReached") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, hint, '\x1b') == null);
 }
-test "input and decision policy pauses stay red in conversation and out of the footer" {
+test "input policy pauses stay red in conversation and out of the footer" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -4207,7 +4208,7 @@ test "input and decision policy pauses stay red in conversation and out of the f
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     ui.notice = "Ready";
-    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed, error.DecisionUnavailable }) |detail| {
+    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed }) |detail| {
         try std.testing.expect(r.policyPause(detail));
         const result: r.Terminal = .{ .status = .paused, .detail = detail };
         ui.last_terminal = result;
@@ -4215,7 +4216,7 @@ test "input and decision policy pauses stay red in conversation and out of the f
         ui.queueTerminalNotice(result);
         const record = ui.records.items[ui.records.items.len - 1];
         try std.testing.expectEqual(NoticeLevel.failure, record.notice_level);
-        try std.testing.expect(std.mem.find(u8, record.body.items, if (detail == error.DecisionUnavailable) "decision review failed" else @errorName(detail)) != null);
+        try std.testing.expect(std.mem.find(u8, record.body.items, @errorName(detail)) != null);
         const hint = try ui.hint(arena.allocator(), ui.connection.current());
         try std.testing.expect(std.mem.find(u8, hint, "round limit") == null);
         try std.testing.expect(std.mem.find(u8, hint, "HTTP") == null);
@@ -4235,14 +4236,14 @@ test "neutral footer keeps queue and capability pending but not terminal or stor
     state.pending_default_effort = .medium;
     ui.notice = "Ready";
     // The deliberate policy pause is conversation detail only.
-    var result: r.Terminal = .{ .status = .paused, .detail = error.DecisionUnavailable };
+    var result: r.Terminal = .{ .status = .paused, .detail = error.InputBudgetExceeded };
     ui.last_terminal = result;
     ui.notice = Ui.terminalNotice(result);
     ui.queueTerminalNotice(result);
     const expected = "Default thinking: medium; awaiting model capabilities | Saved thinking level not applied: model capabilities unknown";
     try std.testing.expectEqualStrings(expected, try ui.footerHint(arena.allocator(), state));
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "decision review failed") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Paused: InputBudgetExceeded") != null);
     testAcknowledgeFullFrame(&ui);
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "retained queued input");
     ui.inbox.pause();
@@ -4255,7 +4256,7 @@ test "neutral footer keeps queue and capability pending but not terminal or stor
         queued_state.pending_default_effort = null;
         const queued = try ui.footerHint(arena.allocator(), queued_state);
         try std.testing.expect(std.mem.find(u8, queued, "S:0 F:1 paused (/queue resume)") != null);
-        try std.testing.expect(std.mem.find(u8, queued, "decision review failed") == null);
+        try std.testing.expect(std.mem.find(u8, queued, "InputBudgetExceeded") == null);
         break :states;
     }
     // Storage faults are migrated by observeAdvisories, not aggregated here.
@@ -4450,14 +4451,15 @@ test "read command errors include a safe reason after error and never display ra
     const caption = try presentation.fromCall(std.testing.allocator, call);
     defer caption.deinit(std.testing.allocator);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .duration_ms = 3 }, false);
-    try std.testing.expectEqualStrings("r README.md ✗ FileNotFound: file not found", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("r README.md ✗ FileNotFound", ui.records.items[0].body.items);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "✗ FileNotFound: file not found") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "✗ FileNotFound") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
     testAcknowledgeFullFrame(&ui);
     try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true }, false);
-    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "✗ Read failed: details unavailable") != null);
-    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "secret") == null);
+    // 原始首行原样上行，只做单行化与控制字符清洗。
+    try std.testing.expect(std.mem.find(u8, ui.records.items[1].body.items, "✗ {\"private-result\":\"secret\"}") != null);
+    try std.testing.expect(std.mem.findScalar(u8, ui.records.items[1].body.items, 0x1b) == null);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true }, false);
     try std.testing.expectEqualStrings("r README.md [canceled]", ui.records.items[2].body.items);
 }
@@ -5722,7 +5724,7 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try std.testing.expect(!fixture.state.image_enabled);
     try std.testing.expect((Connection.State{ .runtime = null, .model = "", .base_url = "" }).image_models.len == 0);
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
@@ -5731,7 +5733,6 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "login/deepseek-flash") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/deepseek-flash") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "family/judge") == null);
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("no-match", sink);
     try ui.draw();
@@ -5745,9 +5746,8 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(fixture.state.image_enabled and ui.settings_model_picker != .image and ui.settings_menu.selected == 5);
+    try std.testing.expect(fixture.state.image_enabled and ui.settings_model_picker != .image and ui.settings_menu.selected == 4);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
-    try std.testing.expectEqualStrings("login/family/judge", fixture.state.decision_model.?);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -5756,25 +5756,14 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
-    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 5);
+    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 4);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\rquery\x1b[D\r", sink); // Root open discards the entire tail.
     try std.testing.expect(ui.settings_model_picker == .image and ui.editor.bytes.items.len == 0);
     try ui.parser.feed("query\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 5 and ui.editor.bytes.items.len == 0);
-    ui.settings_menu.selected = 1;
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.decision_calls);
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
-    try std.testing.expectEqualStrings("primary", fixture.state.model);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 4 and ui.editor.bytes.items.len == 0);
 }
 test "Image settings fresh ACK pending partial resize changed candidates paste failed saves" {
     try text.initLocale();
@@ -5787,7 +5776,7 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -5831,12 +5820,11 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     ui.closeSettingsMenu();
     try std.testing.expect(ui.settings_model_picker == .none and ui.editor.bytes.items.len == 0);
-    try std.testing.expect(ui.displayed_decision_fingerprint == null and ui.frame_decision_fingerprint == null);
-    try std.testing.expectEqual(@as(usize, 0), fixture.decision_calls);
+    try std.testing.expect(ui.displayed_picker_fingerprint == null and ui.frame_picker_fingerprint == null);
 }
-test "Decision direct list isolates selection and consumes failed save ACK and input batch" {
+test "Image picker refuses saves while global settings are unavailable" {
     try text.initLocale();
-    var fixture: DecisionModelFixture = .{};
+    var fixture: ImageModelFixture = .{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5845,90 +5833,28 @@ test "Decision direct list isolates selection and consumes failed save ACK and i
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    try ui.parser.feed("\x1b[B", sink);
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
-    try ui.parser.feed("\x1b[B", sink);
-    try std.testing.expect(ui.settings_open and ui.settings_model_picker == .decision and ui.model_picker == null);
-    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "unlogged/private-model") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "second/family/judge") == null);
-    try ui.parser.feed("\r", sink);
-    ui.frame_offset = 1;
+    testAcknowledgeFullFrame(&ui);
+    fixture.state.global_settings_available = false;
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    testAcknowledgeFullFrame(&ui);
-    // Same-index rename, protocol-only replacement, and logout all revoke ACK.
-    var replacement = DecisionModelFixture.profiles;
-    for (0..3) |scenario| {
-        if (scenario != 0) try ui.draw();
-        replacement = DecisionModelFixture.profiles;
-        switch (scenario) {
-            0 => {
-                replacement[0].name = "login/replaced/Judge";
-                fixture.state.decision_models = &replacement;
-            },
-            1 => {
-                replacement[0].protocol = .responses;
-                fixture.state.decision_models = &replacement;
-            },
-            2 => fixture.state.model_providers = &.{},
-            else => unreachable,
-        }
-        if (scenario != 0) testAcknowledgeFullFrame(&ui); // Publish only the frame's old identity.
-        try ui.parser.feed("\r\r", sink);
-        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-        fixture.state.decision_models = &DecisionModelFixture.profiles;
-        fixture.state.model_providers = &DecisionModelFixture.logged;
-        try ui.parser.feed("\r", sink); // Owner ABA cannot restore consumed ACK.
-        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    }
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    // The same raw ID on a different newly visible alias cannot inherit ACK.
-    fixture.state.model_providers = &DecisionModelFixture.other;
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    fixture.state.model_providers = &DecisionModelFixture.logged;
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    const size = ui.size;
-    ui.resize(.{ .columns = 8, .rows = size.rows });
-    ui.resize(size);
-    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqualStrings("Global settings unavailable; changes disabled", ui.notice);
+    fixture.state.global_settings_available = true;
+    try ui.parser.feed("\r", sink); // The refused attempt consumed the acknowledgement.
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
-    fixture.fail = true;
-    try ui.parser.feed("\r\r", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(ui.settings_model_picker == .decision and !fixture.state.decision_enabled);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    fixture.fail = false;
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r\r\x1b[A", sink);
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
-    try std.testing.expectEqualStrings("login/family/judge", fixture.saved[0..fixture.saved_len]);
-    try std.testing.expectEqual(@as(usize, 0), fixture.main_calls);
-    try std.testing.expectEqualStrings("primary", fixture.state.model);
-    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .decision and ui.model_picker == null);
-    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision and ui.settings_menu.selected == 1);
-    try ui.parser.feed("\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .decision and ui.settings_menu.selected == 1);
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 4);
 }
-test "Decision list offers Off without providers and never invents search identities or accepts paste" {
+test "Image list offers Off without providers and never invents search identities or accepts paste" {
     try text.initLocale();
-    var fixture: DecisionModelFixture = .{};
+    var fixture: ImageModelFixture = .{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5936,16 +5862,17 @@ test "Decision list offers Off without providers and never invents search identi
     defer ui.deinit();
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
-    fixture.state.decision_model = "login/ghost-current";
+    fixture.state.image_enabled = true;
+    fixture.state.image_model = "login/ghost-current";
     fixture.state.model_providers = &.{};
     ui.openSettingsMenu();
-    ui.settings_model_picker = .decision;
+    ui.settings_model_picker = .image;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "login/deepseek-flash") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "ghost-current") == null);
     try std.testing.expect(ui.frame_settings_generation != null); // Off remains available.
     testAcknowledgeFullFrame(&ui);
-    fixture.state.model_providers = &DecisionModelFixture.logged;
+    fixture.state.model_providers = &ImageModelFixture.logged;
     try ui.parser.feed("\r", sink); // Availability changed since ACK, even for Off.
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.parser.feed("arbitrary-raw-id", sink);
@@ -5954,23 +5881,22 @@ test "Decision list offers Off without providers and never invents search identi
     try std.testing.expect(ui.model_picker == null);
     testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .escape);
-    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .decision and ui.settings_menu.selected == 1);
+    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .image and ui.settings_menu.selected == 4);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision);
+    try std.testing.expect(ui.settings_model_picker == .image);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\x1b[200~login/family/judge\x1b[201~\r", sink);
+    try ui.parser.feed("\x1b[200~login/deepseek-flash\x1b[201~\r", sink);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try std.testing.expectEqual(@as(usize, 0), fixture.main_calls);
 }
-test "Decision search edits revoke query ACK including pending frames and clear on return" {
+test "Image search edits revoke query ACK including pending frames and clear on return" {
     try text.initLocale();
-    var fixture: DecisionModelFixture = .{};
+    var fixture: ImageModelFixture = .{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5979,11 +5905,11 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_model_picker = .decision;
+    ui.settings_model_picker = .image;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("LOGIN FAMILY/JUDGE\r", sink);
-    try std.testing.expectEqualStrings("LOGIN FAMILY/JUDGE", ui.editor.bytes.items);
+    try ui.parser.feed("LOGIN DEEPSEEK\r", sink);
+    try std.testing.expectEqualStrings("LOGIN DEEPSEEK", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try std.testing.expectEqual(@as(usize, 0), ui.settings_menu.selected);
     try ui.draw();
@@ -5999,7 +5925,7 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     try ui.parser.feed("\x1b[A\x1b[B\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     try ui.parser.feed("\x7f", sink);
-    try std.testing.expectEqualStrings("LOGIN FAMILY/JUDGE", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("LOGIN DEEPSEEK", ui.editor.bytes.items);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     // Query changes and changes back cannot resurrect the old identity proof.
@@ -6009,16 +5935,16 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(ui.settings_model_picker != .decision and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.editor.bytes.items.len == 0);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "login/family/judge") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "login/deepseek-flash") != null);
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.settings_model_picker == .image and ui.editor.bytes.items.len == 0);
     try ui.parser.feed("oFf\x15missing", sink);
     try std.testing.expectEqualStrings("missing", ui.editor.bytes.items);
     try Ui.key(&ui, .escape);
-    try std.testing.expect(ui.settings_model_picker != .decision and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.editor.bytes.items.len == 0);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -6033,11 +5959,11 @@ test "Decision search edits revoke query ACK including pending frames and clear 
     ui.closeSettingsMenu();
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try std.testing.expectEqualStrings("Command timeout (s)", Ui.settingsValueTitle(.command_timeout_ms));
-    try std.testing.expect(std.mem.find(u8, Ui.settingsValueTitle(.request_timeout_ms), "(s;") != null);
+    try std.testing.expect(std.mem.find(u8, Ui.settingsValueTitle(.request_timeout_ms), "timeout (s)") != null);
 }
-test "Decision search clips UTF8 controls and tiny windows without granting authority" {
+test "Image search clips UTF8 controls and tiny windows without granting authority" {
     try text.initLocale();
-    var fixture: DecisionModelFixture = .{};
+    var fixture: ImageModelFixture = .{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -6045,7 +5971,7 @@ test "Decision search clips UTF8 controls and tiny windows without granting auth
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_model_picker = .decision;
+    ui.settings_model_picker = .image;
     try ui.settingsKey(.{ .text = .{ .value = "中文中文中文中文中文\x1b[2J", .pasted = false } });
     for ([_]terminal_module.Size{ .{ .columns = 0, .rows = 0 }, .{ .columns = 8, .rows = 6 }, .{ .columns = 18, .rows = 8 }, .{ .columns = 40, .rows = 12 } }) |size| {
         ui.resize(size);
@@ -6062,10 +5988,10 @@ test "Decision search clips UTF8 controls and tiny windows without granting auth
     try ui.settingsKey(.end);
     try ui.settingsKey(.kill_end);
     try ui.settingsKey(.cancel);
-    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .decision and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .image and ui.editor.bytes.items.len == 0);
 }
-test "Decision search OOM preserves bytes but revokes every old ACK" {
-    var fixture: DecisionModelFixture = .{};
+test "Image search OOM preserves bytes but revokes every old ACK" {
+    var fixture: ImageModelFixture = .{};
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -6073,18 +5999,18 @@ test "Decision search OOM preserves bytes but revokes every old ACK" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_model_picker = .decision;
+    ui.settings_model_picker = .image;
     ui.displayed_settings_generation = ui.settings_menu.generation;
     ui.frame_settings_generation = ui.settings_menu.generation;
-    ui.displayed_decision_fingerprint = decision_picker_module.fingerprint(fixture.state.decision_models, fixture.state.model_providers);
-    ui.frame_decision_fingerprint = ui.displayed_decision_fingerprint;
+    ui.displayed_picker_fingerprint = settings_model_module.fingerprint(fixture.state.image_models, fixture.state.model_providers);
+    ui.frame_picker_fingerprint = ui.displayed_picker_fingerprint;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     ui.editor.allocator = failing.allocator();
     defer ui.editor.allocator = std.testing.allocator;
-    try std.testing.expectError(error.OutOfMemory, ui.settingsKey(.{ .text = .{ .value = "judge", .pasted = false } }));
+    try std.testing.expectError(error.OutOfMemory, ui.settingsKey(.{ .text = .{ .value = "flash", .pasted = false } }));
     try std.testing.expectEqualStrings("", ui.editor.bytes.items);
     try std.testing.expect(ui.displayed_settings_generation == null and ui.frame_settings_generation == null);
-    try std.testing.expect(ui.displayed_decision_fingerprint == null and ui.frame_decision_fingerprint == null);
+    try std.testing.expect(ui.displayed_picker_fingerprint == null and ui.frame_picker_fingerprint == null);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }
@@ -6098,7 +6024,7 @@ test "settings TUI custom seconds stages equivalent milliseconds" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 3;
+    ui.settings_menu.selected = 2;
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
@@ -6127,7 +6053,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -6136,7 +6062,7 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.memory_auto);
     try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
-    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 6);
+    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 5);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try ui.draw();
@@ -6164,7 +6090,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 2;
+    ui.settings_menu.selected = 1;
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -6172,7 +6098,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.limits.compaction_enabled);
-    ui.settings_menu.selected = 3;
+    ui.settings_menu.selected = 2;
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 60000);
     try ui.draw();
@@ -6199,7 +6125,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try ui.parser.feed("\r\r\x1b[B", sink);
     try std.testing.expectEqual(@as(usize, 3), fixture.calls);
     try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.command_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 3 and ui.settings_open);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 2 and ui.settings_open);
     try std.testing.expectEqualStrings("unchanged-primary", fixture.state.model);
 }
 test "settings custom request timeout stages before a second fresh ACK and preserves parent" {
@@ -6214,7 +6140,7 @@ test "settings custom request timeout stages before a second fresh ACK and prese
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 4;
+    ui.settings_menu.selected = 3;
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
@@ -6235,7 +6161,7 @@ test "settings custom request timeout stages before a second fresh ACK and prese
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqual(@as(u32, 8192), fixture.state.limits.request_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 4);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 3);
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 300000);
     try ui.draw();
@@ -6243,7 +6169,7 @@ test "settings custom request timeout stages before a second fresh ACK and prese
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqual(@as(u32, 300000), fixture.state.limits.request_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 4);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 3);
 }
 test "settings shared request timeout rejects pasted numbers and preserves parent" {
     try text.initLocale();
@@ -6256,7 +6182,7 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 4;
+    ui.settings_menu.selected = 3;
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
@@ -6271,7 +6197,7 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     try ui.parser.feed("\x1b[D\r", sink);
     try std.testing.expect(!ui.settings_value_picker.?.editing);
     try ui.parser.feed("\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_model_picker != .decision and ui.settings_menu.selected == 4);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 60000);
     try ui.draw();
@@ -6279,12 +6205,12 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.request_timeout_ms);
-    try std.testing.expect(ui.settings_model_picker != .decision and !fixture.state.decision_enabled and ui.settings_menu.selected == 4);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
 }
-test "settings callbacks owner publication ACK paste batch and cursor" {
+test "settings callbacks owner publication ACK batch and cursor" {
     try text.initLocale();
     const Fixture = struct {
-        state: Connection.State = .{ .runtime = null, .model = "fixture", .base_url = "", .decision_models = &DecisionModelFixture.profiles, .model_providers = &DecisionModelFixture.logged },
+        state: Connection.State = .{ .runtime = null, .model = "fixture", .base_url = "" },
         calls: usize = 0,
         fail: bool = false,
         fn current(raw: *anyopaque) Connection.State {
@@ -6292,25 +6218,14 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
             return self.state;
         }
         fn configure(_: *anyopaque, _: []const u8) !void {}
-        fn choose(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            if (self.fail) return error.SaveFailed;
-            self.state.decision_enabled = choice != .off;
-            self.state.decision_model = switch (choice) {
-                .off => null,
-                .model => |name| name,
-            };
-            self.state.initial_context = .{ .tokens = 42, .limit = 100 };
-        }
         fn save(raw: *anyopaque, setting: Connection.Setting, enabled: bool) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.fail) return error.SaveFailed;
             switch (setting) {
                 .low_price_input => self.state.low_price_input_enabled = enabled,
-                .decision_enabled => self.state.decision_enabled = enabled,
             }
+            self.state.initial_context = .{ .tokens = 42, .limit = 100 };
         }
     };
     var fixture: Fixture = .{};
@@ -6319,7 +6234,7 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .setting_fn = Fixture.save, .decision_fn = Fixture.choose };
+    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .setting_fn = Fixture.save };
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/settings\r\r", sink);
     try std.testing.expect(ui.settings_open);
@@ -6336,158 +6251,12 @@ test "settings callbacks owner publication ACK paste batch and cursor" {
     try ui.parser.feed("\r\r\x1b[B", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.low_price_input_enabled and ui.settings_menu.selected == 0);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try ui.parser.feed("\x1b[B", sink);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision and !fixture.state.decision_enabled);
-    const before_choice = fixture.calls;
-    try ui.parser.feed("\x1b[B\r", sink); // Stale navigation cannot confirm.
-    try std.testing.expectEqual(before_choice, fixture.calls);
-    try ui.draw();
-    ui.frame_offset = 1;
-    try ui.parser.feed("\r", sink); // Partial child output cannot confirm.
-    try std.testing.expectEqual(before_choice, fixture.calls);
-    testAcknowledgeFullFrame(&ui);
-    // Save the direct identity without changing chat.
-    try ui.parser.feed("\r\r\x1b[A", sink);
-    try std.testing.expect(fixture.state.decision_enabled);
-    try std.testing.expectEqualStrings("login/family/judge", fixture.state.decision_model.?);
-    try std.testing.expect(ui.settings_model_picker != .decision and ui.settings_menu.selected == 1);
     try std.testing.expectEqual(@as(u32, 42), ui.display.context.?.tokens);
-    fixture.fail = true;
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink); // Open the selected model, not toggle.
-    try std.testing.expect(ui.settings_model_picker == .decision);
-    try ui.parser.feed("\x1b[A", sink); // Off.
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(fixture.state.decision_enabled);
-    try std.testing.expectEqualStrings("Could not save setting; previous value kept", ui.notice);
-    const calls = fixture.calls;
-    try ui.parser.feed("\r", sink); // Failed save revoked authority.
-    try std.testing.expectEqual(calls, fixture.calls);
-    try ui.parser.feed("\x1b[D\r", sink); // Left discards read tail, retains Decision.
-    try std.testing.expect(ui.settings_model_picker != .decision and ui.settings_menu.selected == 1);
-    try std.testing.expectEqual(calls, fixture.calls);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision);
-    try Ui.key(&ui, .escape);
-    try std.testing.expect(ui.settings_model_picker != .decision and ui.settings_menu.selected == 1);
-    try std.testing.expectEqual(calls, fixture.calls);
-    fixture.state.global_settings_available = false;
-    try ui.parser.feed("\x1b[A", sink);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(calls, fixture.calls);
-    fixture.state.global_settings_available = true;
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    const original = ui.size;
-    ui.resize(.{ .columns = 8, .rows = original.rows });
-    ui.resize(original); // Resize ABA cannot restore authority.
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(calls, fixture.calls);
-    ui.resize(.{ .columns = 12, .rows = original.rows });
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(calls, fixture.calls);
-    ui.resize(original);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\x1b[200~pasted\x1b[201~\r", sink);
-    try std.testing.expectEqual(calls, fixture.calls);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(calls, fixture.calls);
+    try ui.parser.feed("\r", sink); // The consumed ACK cannot save twice.
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try ui.parser.feed("\x1b[D", sink);
     try std.testing.expect(!ui.settings_open);
     try std.testing.expectEqual(command_menu_module.Command.settings, ui.command_menu.choice(ui.command_matches).?);
-}
-test "decision child requires full fresh unclipped ACK and never saves pasted batch tails" {
-    try text.initLocale();
-    const Fixture = struct {
-        state: Connection.State = .{ .runtime = null, .model = "", .base_url = "", .decision_models = &DecisionModelFixture.profiles, .model_providers = &DecisionModelFixture.logged },
-        calls: usize = 0,
-        fn current(raw: *anyopaque) Connection.State {
-            return @as(*@This(), @ptrCast(@alignCast(raw))).state;
-        }
-        fn configure(_: *anyopaque, _: []const u8) !void {}
-        fn choose(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            self.state.decision_enabled = choice != .off;
-            self.state.decision_model = switch (choice) {
-                .off => null,
-                .model => |name| name,
-            };
-        }
-    };
-    var fixture: Fixture = .{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .decision_fn = Fixture.choose };
-    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
-    ui.openSettingsMenu();
-    try ui.parser.feed("\x1b[B", sink);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try ui.parser.feed("\x1b[B", sink);
-    try ui.draw();
-    try ui.parser.feed("\r", sink);
-    ui.frame_offset = 1;
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    testAcknowledgeFullFrame(&ui);
-    const size = ui.size;
-    ui.resize(.{ .columns = 8, .rows = size.rows });
-    ui.resize(size);
-    try ui.parser.feed("\r", sink); // Resize ABA.
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.resize(.{ .columns = 17, .rows = size.rows });
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink); // Complete provider/raw ID does not fit.
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    ui.resize(size);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\x1b[200~\r\x1b[D\x1b[201~\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    try ui.parser.feed("\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_model_picker != .decision and ui.settings_menu.selected == 1);
-    try ui.parser.feed("\r", sink); // Old child ACK cannot open parent.
-    try std.testing.expect(ui.settings_model_picker != .decision);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(ui.settings_model_picker == .decision);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r\r", sink); // Off works without a declaration.
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(!fixture.state.decision_enabled and ui.settings_model_picker != .decision);
-    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
-    try std.testing.expect(ui.displayed_settings_generation == null and ui.frame_settings_generation == null);
 }
 test "menus stay above composer share colors and Left returns to acknowledged parent" {
     try text.initLocale();
@@ -7307,13 +7076,14 @@ test "complete publishes a failed terminal once and keeps it out of the footer" 
     ui.job = .{ .runtime = undefined, .cancel = &cancel, .prompt = ui.prompt.? };
     ui.busy = true;
     ui.job.terminal = .{ .status = .failed, .detail = error.ModelRequestFailed };
+    ui.job.terminal.?.setFailureText("ConnectionRefused");
     ui.job.done.store(true, .release);
     try ui.complete();
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
     try std.testing.expectEqualStrings("Failed", ui.notice);
     try std.testing.expect(std.mem.startsWith(u8, ui.records.items[0].body.items, "\u{2717}"));
-    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "cannot reach the model service") != null);
+    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "ConnectionRefused") != null);
     try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "ModelRequestFailed") == null);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -7604,13 +7374,15 @@ test "authentication terminal detail is red in conversation and absent from the 
     state.settings_notice = "Saved thinking level not applied: model capabilities unknown";
     ui.notice = "Failed";
     for ([_]u16{ 401, 403 }) |code| {
-        const result: r.Terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .model_failure = .authentication, .http_status = code };
+        var result: r.Terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .model_failure = .authentication, .http_status = code };
+        result.setFailureText(if (code == 401) "Incorrect API key provided: sk-test" else "permission_denied: model not allowed");
         ui.last_terminal = result;
         ui.queueTerminalNotice(result);
         const record = ui.records.items[ui.records.items.len - 1];
         try std.testing.expectEqual(NoticeLevel.failure, record.notice_level);
         try std.testing.expect(std.mem.startsWith(u8, record.body.items, if (code == 401) "\u{2717} [HTTP 401]" else "\u{2717} [HTTP 403]"));
-        try std.testing.expect(std.mem.find(u8, record.body.items, if (code == 401) "check /login" else "workspace/model permissions") != null);
+        // The row shows the provider's own text, not a category or a next step.
+        try std.testing.expect(std.mem.find(u8, record.body.items, if (code == 401) "Incorrect API key provided: sk-test" else "permission_denied: model not allowed") != null);
         try std.testing.expect(std.mem.find(u8, record.body.items, "authentication") == null);
         const hint = try ui.hint(arena.allocator(), state);
         try std.testing.expect(std.mem.find(u8, hint, "HTTP") == null);
@@ -9264,7 +9036,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     // Settings-root draft: the child must never destroy it.
     _ = try ui.editor.insert("draft");
     try ui.draw();
@@ -9343,7 +9115,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.escape);
     try std.testing.expect(!ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 7), ui.settings_menu.selected);
+    try std.testing.expectEqual(@as(usize, 6), ui.settings_menu.selected);
     try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
 }
 test "proxy picker owns its query while the parent submenu stays marked" {
@@ -9361,7 +9133,7 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9406,7 +9178,7 @@ test "settings proxy submenu reports a missing endpoint instead of stalling" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9468,10 +9240,10 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
-    // Root 7 -> second level -> Address, prefilled empty when nothing is set.
+    // Root 6 -> second level -> Address, prefilled empty when nothing is set.
     try ui.settingsKey(.enter);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -9559,7 +9331,7 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9603,7 +9375,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9843,7 +9615,7 @@ test "regression idle Custom Ctrl-C cancels child before parent via parser" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 3;
+    ui.settings_menu.selected = 2;
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     ui.settings_value_picker.?.beginCustom();
@@ -9857,34 +9629,34 @@ test "regression idle Custom Ctrl-C cancels child before parent via parser" {
     try std.testing.expectEqual(@as(usize, 0), ui.settings_value_picker.?.input_len);
     try ui.parser.feed("\x03", sink);
     try std.testing.expect(ui.settings_value_picker == null and ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 3), ui.settings_menu.selected);
+    try std.testing.expectEqual(@as(usize, 2), ui.settings_menu.selected);
     try ui.parser.feed("\x03", sink);
     try std.testing.expect(!ui.settings_open and !ui.stop_open and !cancel.isRequested());
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }
 test "regression idle selectors Ctrl-C reaches child modal via parser" {
-    for (0..4) |kind| {
+    for (0..3) |kind| {
         var cancel: p.Cancellation = .{};
         var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
         defer bridge.deinit();
         var ui = fixtureUi(&bridge, &cancel);
         defer ui.deinit();
         switch (kind) {
-            0, 1 => {
+            0 => {
                 ui.openSettingsMenu();
-                ui.settings_model_picker = if (kind == 0) .decision else .image;
+                ui.settings_model_picker = .image;
             },
-            2 => ui.openModelPicker(),
-            3 => ui.openProviderPicker(),
+            1 => ui.openModelPicker(),
+            2 => ui.openProviderPicker(),
             else => unreachable,
         }
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-        if (kind < 3) try ui.parser.feed("query", sink);
+        if (kind < 2) try ui.parser.feed("query", sink);
         try ui.parser.feed("\x03", sink);
         try std.testing.expect(!ui.settingsModelOpen() and ui.model_picker == null and !ui.provider_open);
-        if (kind < 2) {
+        if (kind == 0) {
             try std.testing.expect(ui.settings_open);
-            try std.testing.expectEqual(@as(usize, if (kind == 0) 1 else 5), ui.settings_menu.selected);
+            try std.testing.expectEqual(@as(usize, 4), ui.settings_menu.selected);
             try std.testing.expectEqualStrings("", ui.editor.bytes.items);
         }
         try std.testing.expect(!ui.stop_open and !cancel.isRequested());
@@ -13501,7 +13273,7 @@ test "remote finished terminal is consumed from an idle local view without a fut
     try ui.finishReadyTask();
     try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
 }
-test "remote decision diagnostic survives terminal copies and empty paused queue stays hidden" {
+test "remote paused failure text publishes once and empty paused queue stays hidden" {
     var fake = FakeRemote{ .snapshot = .{
         .available = true,
         .attached = true,
@@ -13513,29 +13285,22 @@ test "remote decision diagnostic survives terminal copies and empty paused queue
     defer bridge.deinit();
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
-    var diagnostic: @import("../core/decision.zig").Diagnostic = .{
-        .stage = .http,
-        .backend = .systemone,
-        .operation = .command,
-        .http_status = 403,
-    };
-    diagnostic.setError(error.DecisionUnavailable);
-    fake.item = try session_client.ownEvent(std.testing.allocator, 12, .{ .finished = (session_client.Terminal{
-        .status = .paused,
-        .failure = .decision_unavailable,
-        .decision_failure = diagnostic,
-    }).toRuntime() });
-    // Source reuse cannot mutate any queued diagnostic storage.
-    diagnostic.setError(error.UnrelatedLaterFailure);
+    var terminal: session_client.Terminal = .{ .status = .paused, .failure = .input_budget_exceeded };
+    const message = "input budget exceeded: request would cost $0.42";
+    @memcpy(terminal.failure_message[0..message.len], message);
+    terminal.failure_message_len = message.len;
+    fake.item = try session_client.ownEvent(std.testing.allocator, 12, .{ .finished = terminal.toRuntime() });
+    // Owner-side reuse cannot mutate the delivered terminal copy.
+    @memset(terminal.failure_message[0..message.len], 'x');
     try ui.pumpRemote();
     try ui.finishReadyTask();
-    try std.testing.expectEqualStrings("DecisionUnavailable", ui.last_terminal.?.decision_failure.?.causeName());
-    try std.testing.expect(ui.last_terminal.?.decision_failure.?.stage == .http);
-    try std.testing.expectEqual(@as(?u16, 403), ui.last_terminal.?.decision_failure.?.http_status);
+    try std.testing.expectEqualStrings(message, ui.last_terminal.?.failureText());
+    try std.testing.expectEqual(@as(?anyerror, error.InputBudgetExceeded), ui.last_terminal.?.detail);
+    try std.testing.expectEqual(@as(?u16, null), ui.last_terminal.?.http_status);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
-    try std.testing.expectEqualStrings("Paused: decision review failed [HTTP 403]; operation not executed", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("Paused: input budget exceeded: request would cost $0.42", ui.records.items[0].body.items);
     ui.notice = "Ready";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

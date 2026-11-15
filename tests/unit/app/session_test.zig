@@ -1003,7 +1003,6 @@ test "Anthropic session resume invalidates null-hash replay when title tools are
     const app = restored.app.?;
     try std.testing.expectEqual(id, restored.session_id);
     try std.testing.expect(restored.resume_lease.?.writable and !restored.read_only);
-    try std.testing.expect(restored.global_config.?.value.decision == null);
     try std.testing.expect(!restored.global_config.?.value.imageActive());
     try std.testing.expect(app.executor.session_title != null);
     var title_schemas: usize = 0;
@@ -2598,7 +2597,6 @@ test "proxy allowlist revalidates exact rows credentials and preserves unrelated
     try std.testing.expectEqualStrings("aux/review/raw/id", parsed.value.proxy.?.models[0]);
     try std.testing.expectEqualStrings("aux/unknown/raw", parsed.value.proxy.?.models[1]);
     try std.testing.expectEqualStrings("main/chat", parsed.value.proxy.?.models[2]);
-    try std.testing.expectEqualStrings("aux/native/raw", parsed.value.decision.?.model);
     try std.testing.expect(!parsed.value.limits.low_price_input);
     try std.testing.expectEqualStrings("fake-main-key", parsed.value.registry.?.find("main").?.connection.api_key.?);
 }
@@ -2615,31 +2613,22 @@ test "proxy refresh switches helper routes while primary client and history stay
     const auth = app.client.authorization.ptr;
     const session_id = app.client.session_id;
     const messages = app.runtime.messages().len;
-    const decision_before = app.decision_client.?;
     const image_before = app.image_client.?;
     const memory_before = app.memory_coordinator;
-    try prepareNativeRouteForTest(decision_before);
-    try std.testing.expect(decision_before.native.?.proxy_url == null);
     try std.testing.expect(image_before.transport.proxy_url == null);
-    try std.testing.expectEqual(@as(u64, 0), decision_before.calls);
     // The memory coordinator owns an independent extractor route.
     try std.testing.expect(memory_before.extractor != null);
     try std.testing.expect(memory_before.extractor.?.transport != null);
     try std.testing.expect(memory_before.extractor.?.transport.?.proxy_http == null);
 
     try proxyToggle(&session, "aux/native/raw", true);
-    const decision_after = app.decision_client.?;
-    try std.testing.expect(decision_after != decision_before);
-    try prepareNativeRouteForTest(decision_after);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", decision_after.native.?.proxy_url.?);
-    try std.testing.expectEqual(@as(u64, 0), decision_after.calls);
-    // Both auxiliary owners are replaced, even when only one route changed.
+    // The auxiliary owner is replaced, even when its own route did not change.
     try std.testing.expect(app.image_client.? != image_before);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
     // The extractor keeps its own primary-model route.
     const memory_after = app.memory_coordinator;
     try std.testing.expect(memory_after != memory_before);
-    try std.testing.expectEqual(@as(usize, 2), decision_after.source.value.proxy.?.models.len);
+    try std.testing.expectEqual(@as(usize, 2), session.global_config.?.value.proxy.?.models.len);
     try std.testing.expect(memory_after.extractor.?.transport.?.proxy_http == null);
     // The primary transport, auth, model, session and history never move.
     try std.testing.expect(app.client.authorization.ptr == auth);
@@ -2650,26 +2639,23 @@ test "proxy refresh switches helper routes while primary client and history stay
     try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
     try std.testing.expectEqual(messages, app.runtime.messages().len);
     var helper_route = false;
-    for (decision_after.source.value.proxy.?.models) |name| {
+    for (session.global_config.?.value.proxy.?.models) |name| {
         if (std.mem.eql(u8, name, "aux/native/raw")) helper_route = true;
     }
     try std.testing.expect(helper_route);
 
-    // Removing the membership returns the decision client to a direct route.
+    // Removing the membership leaves the image route direct.
     try proxyToggle(&session, "aux/native/raw", false);
     const memory_direct = app.memory_coordinator;
     try std.testing.expect(memory_direct != memory_after);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
-    try std.testing.expectEqual(@as(usize, 1), app.decision_client.?.source.value.proxy.?.models.len);
+    try std.testing.expect(app.image_client.?.transport.proxy_url == null);
+    try std.testing.expectEqual(@as(usize, 1), session.global_config.?.value.proxy.?.models.len);
     try std.testing.expect(memory_direct.extractor.?.transport.?.proxy_http == null);
+    // A membership for an unrelated model still does not route image calls.
     try proxyToggle(&session, "aux/native/raw", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expect(app.image_client.?.transport.proxy_url == null);
 
     try proxyToggle(&session, "img/deepseek-flash", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     const current = session.connection().current();
     try std.testing.expectEqual(@as(usize, 3), current.proxy_models.len);
@@ -2677,8 +2663,7 @@ test "proxy refresh switches helper routes while primary client and history stay
     // The extractor's coordinator config carries the latest allowlist too, so an
     // explicit primary membership proxies only that helper transport.
     try proxyToggle(&session, "main/chat", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 4), session.connection().current().proxy_models.len);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
     try std.testing.expect(app.client.proxy_http == null);
@@ -2686,18 +2671,15 @@ test "proxy refresh switches helper routes while primary client and history stay
     // An ordinary preference save must not revoke the already installed helper
     // routes or republish a primary client. The rebuilt memory coordinator must
     // keep the latest list rather than reverting to the frozen proxy config.
-    const decision_now = app.decision_client.?;
     const image_now = app.image_client.?;
     const memory_now = app.memory_coordinator;
     const connection = session.connection();
     try connection.preference_fn.?(connection.context, .compaction_enabled, 0);
-    try std.testing.expect(app.decision_client.? == decision_now);
     try std.testing.expect(app.image_client.? == image_now);
     try std.testing.expect(app.memory_coordinator != memory_now);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
-    try std.testing.expectEqual(@as(usize, 4), app.decision_client.?.source.value.proxy.?.models.len);
+    try std.testing.expectEqual(@as(usize, 4), session.global_config.?.value.proxy.?.models.len);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);
     try std.testing.expect(app.client.proxy_http == null);
@@ -2717,24 +2699,23 @@ test "proxy membership CAS conflict rolls back declaration and helper ownership"
     const a = std.testing.allocator;
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
-    try writeSessionTestConfig(fixture.tmp.dir, proxy_session_config);
+    try writeSessionTestConfig(fixture.tmp.dir, proxy_helper_config);
     try fixture.env.put("PROXY_AUX_KEY", "fake-aux-key");
+    try fixture.env.put("PROXY_IMG_KEY", "fake-img-key");
     var session = try fixture.open(.{});
     defer session.deinit();
     const app = session.app.?;
-    try proxyToggle(&session, "aux/native/raw", true);
+    try proxyToggle(&session, "img/deepseek-flash", true);
     const saved = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(saved);
-    const decision = app.decision_client.?;
-    try prepareNativeRouteForTest(decision);
-    try std.testing.expectEqualStrings("http://10.0.0.9:3128", decision.native.?.proxy_url.?);
+    const helper = app.image_client.?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", helper.transport.proxy_url.?);
     const auth = app.client.authorization.ptr;
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = "{}" });
     try std.testing.expectError(error.AuthVersionConflict, proxyToggle(&session, "main/chat", true));
     try std.testing.expectEqual(@as(usize, 2), session.global_config.?.value.proxy.?.models.len);
-    try std.testing.expect(app.decision_client.? == decision);
-    try std.testing.expectEqualStrings("http://10.0.0.9:3128", decision.native.?.proxy_url.?);
-    try std.testing.expectEqual(@as(u64, 0), decision.calls);
+    try std.testing.expect(app.image_client.? == helper);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", helper.transport.proxy_url.?);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);
     try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
@@ -2743,8 +2724,7 @@ test "proxy membership CAS conflict rolls back declaration and helper ownership"
     try std.testing.expectEqualStrings("{}", failed);
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = saved });
     try proxyToggle(&session, "main/chat", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://10.0.0.9:3128", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 3), session.global_config.?.value.proxy.?.models.len);
 }
 test "pending snapshot adopts an explicit proxy save without activating a route" {
@@ -2780,32 +2760,25 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     const auth = app.client.authorization.ptr;
     const session_id = app.client.session_id;
     const messages = app.runtime.messages().len;
-    const decision_before = app.decision_client.?;
     const image_before = app.image_client.?;
-    try prepareNativeRouteForTest(decision_before);
-    try std.testing.expect(decision_before.native.?.proxy_url == null);
     try std.testing.expect(image_before.transport.proxy_url == null);
 
     // Install exact memberships so every independent helper uses the route.
     try proxyToggle(&session, "aux/native/raw", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expect(app.image_client.?.transport.proxy_url == null);
     try proxyToggle(&session, "img/deepseek-flash", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try proxyToggle(&session, "main/chat", true);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
 
     const saved = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(saved);
     // Surrounding whitespace and an identical host/port are no-write no-ops.
-    const before_noop = app.decision_client.?;
+    const before_noop = app.image_client.?;
     try setProxyEndpoint(&session, "  127.0.0.1:18080\n");
-    try std.testing.expect(app.decision_client.? == before_noop);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", before_noop.native.?.proxy_url.?);
+    try std.testing.expect(app.image_client.? == before_noop);
+    try std.testing.expectEqualStrings("http://127.0.0.1:18080", before_noop.transport.proxy_url.?);
     const after_noop = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(after_noop);
     try std.testing.expectEqualStrings(saved, after_noop);
@@ -2819,11 +2792,9 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectEqual(@as(u16, 8443), state.proxy_port);
     try std.testing.expectEqual(@as(usize, 4), state.proxy_models.len);
     // Auxiliary owners follow the new endpoint with the same exact members.
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
-    try std.testing.expectEqual(@as(usize, 4), app.decision_client.?.source.value.proxy.?.models.len);
+    try std.testing.expectEqual(@as(usize, 4), session.global_config.?.value.proxy.?.models.len);
 
     // The primary client, auth, identity and history never move; its frozen
     // declaration keeps the original endpoint and allowlist.
@@ -2838,26 +2809,23 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
 
     // An ordinary preference save must not revert helper routes to the frozen
     // primary endpoint, and must keep unrelated settings intact.
-    const decision_now = app.decision_client.?;
     const image_now = app.image_client.?;
     const connection = session.connection();
     try connection.preference_fn.?(connection.context, .compaction_enabled, 0);
-    try std.testing.expect(app.decision_client.? == decision_now);
     try std.testing.expect(app.image_client.? == image_now);
-    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.decision_client.?.native.?.proxy_url.?);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.image_client.?.transport.proxy_url.?);
     try std.testing.expect(!app.config.value.limits.compaction_enabled);
     try std.testing.expect(app.client.authorization.ptr == auth);
 
     // CAS conflict rolls the declaration, disk and helper ownership back.
     const persisted = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(persisted);
-    const decision_before_conflict = app.decision_client.?;
+    const image_before_conflict = app.image_client.?;
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".thin/config.json", .data = "{}" });
     try std.testing.expectError(error.AuthVersionConflict, setProxyEndpoint(&session, "192.0.2.5:8888"));
     try std.testing.expectEqualStrings("2001:db8::5", session.global_config.?.value.proxy.?.address);
-    try std.testing.expect(app.decision_client.? == decision_before_conflict);
-    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", decision_before_conflict.native.?.proxy_url.?);
-    try std.testing.expectEqual(@as(u64, 0), decision_before_conflict.calls);
+    try std.testing.expect(app.image_client.? == image_before_conflict);
+    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", image_before_conflict.transport.proxy_url.?);
     try std.testing.expect(app.client.authorization.ptr == auth);
     const failed = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(failed);
@@ -2871,8 +2839,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expect(state.proxy_address == null);
     try std.testing.expectEqual(@as(u16, 0), state.proxy_port);
     try std.testing.expectEqual(@as(usize, 0), state.proxy_models.len);
-    try prepareNativeRouteForTest(app.decision_client.?);
-    try std.testing.expect(app.decision_client.?.native.?.proxy_url == null);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
     try std.testing.expect(app.memory_coordinator.extractor.?.transport.?.proxy_http == null);
     try std.testing.expect(app.client.authorization.ptr == auth);
@@ -2884,7 +2850,7 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     var parsed_cleared = try cfg.parse(a, cleared);
     defer cfg.release(&parsed_cleared);
     try std.testing.expect(parsed_cleared.value.proxy == null);
-    try std.testing.expectEqualStrings("aux/native/raw", parsed_cleared.value.decision.?.model);
+    try std.testing.expectEqualStrings("img/deepseek-flash", parsed_cleared.value.image.model.?);
 }
 test "pending proxy endpoint save updates the pending snapshot only" {
     var fixture = try SessionTestFixture.init();

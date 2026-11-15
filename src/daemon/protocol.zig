@@ -163,7 +163,6 @@ pub fn failureCode(err: anyerror) []const u8 {
         error.InputBudgetExceeded => "input_budget_exceeded",
         error.UnknownInputPriceThreshold => "unknown_input_price_threshold",
         error.InputBudgetSummaryFailed => "input_budget_summary_failed",
-        error.DecisionUnavailable => "decision_unavailable",
         error.SubagentInteractionRequired => "subagent_interaction_required",
         error.NoCompactionCandidate => "no_compaction_candidate",
         error.Canceled => "canceled",
@@ -205,7 +204,6 @@ pub const Op = enum {
     login,
     preference,
     setting,
-    decision_model,
     image_model,
     /// Proxy allowlist mutation: one exact provider/raw model id plus an
     /// explicit enable flag. Never carries an endpoint or a credential.
@@ -244,13 +242,6 @@ pub const QueueKind = enum {
 
     pub fn toInbox(self: QueueKind) @import("../core/inbox.zig").Kind {
         return switch (self) {
-            .steering => .steering,
-            .follow_up => .follow_up,
-        };
-    }
-
-    pub fn fromInbox(kind: @import("../core/inbox.zig").Kind) QueueKind {
-        return switch (kind) {
             .steering => .steering,
             .follow_up => .follow_up,
         };
@@ -576,11 +567,6 @@ pub const Out = struct {
     pub fn field(self: *Out, name: []const u8, v: anytype) !void {
         try self.key(name);
         try self.value(v);
-    }
-
-    pub fn rawField(self: *Out, name: []const u8, json: []const u8) !void {
-        try self.key(name);
-        try self.buf.appendSlice(self.a, json);
     }
 
     pub fn beginObject(self: *Out, name: []const u8) !void {
@@ -926,17 +912,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("failure", if (terminal.detail) |detail| failureCode(detail) else "other");
             try out.field("model_failure", terminal.model_failure);
             try out.field("http", terminal.http_status);
-            if (terminal.decision_failure) |diagnostic| {
-                try out.beginObject("decision_failure");
-                try out.field("stage", diagnostic.stage);
-                try out.field("backend", diagnostic.backend);
-                try out.field("operation", diagnostic.operation);
-                try out.field("cause", diagnostic.causeName());
-                try out.field("http_status", diagnostic.http_status);
-                try out.field("model_failure", diagnostic.model_failure);
-                try out.field("transport_exit_code", diagnostic.transport_exit_code);
-                try out.endObject();
-            }
+            if (terminal.failureText().len != 0) try out.field("failure_message", terminal.failureText());
             try out.beginObject("usage");
             try out.field("normal_calls", terminal.usage.normal_calls);
             try out.field("summary_calls", terminal.usage.summary_calls);
@@ -1682,34 +1658,20 @@ fn decodeTerminalChecked(object: std.json.ObjectMap) !r.Terminal {
         .limit = try requireU64(value, "limit"),
         .known = try optionalBool(value, "known") orelse true,
     } else null;
-    return .{
+    var terminal: r.Terminal = .{
         .status = status,
         .detail = detail,
         .model_failure = try optionalEnum(p.FailureKind, object, "model_failure"),
         .http_status = if (try optionalU64(object, "http")) |code| @intCast(@min(code, 999)) else null,
-        .decision_failure = if (try optionalObject(object, "decision_failure")) |value| try decodeDecisionDiagnostic(value) else null,
         .usage = usage,
         .context_snapshot = context,
     };
-}
-
-fn decodeDecisionDiagnostic(object: std.json.ObjectMap) !@import("../core/decision.zig").Diagnostic {
-    const Diagnostic = @import("../core/decision.zig").Diagnostic;
-    var value: Diagnostic = .{
-        .stage = try requireEnum(Diagnostic.Stage, object, "stage"),
-        .backend = try requireEnum(Diagnostic.Backend, object, "backend"),
-        .operation = try requireEnum(Diagnostic.Operation, object, "operation"),
-        .model_failure = try optionalEnum(p.FailureKind, object, "model_failure"),
-    };
-    try value.setCause(try requireText(object, "cause"));
-    if (try optionalU64(object, "http_status")) |status| {
-        if (status < 100 or status > 599) return error.BadRequest;
-        value.http_status = @intCast(status);
+    // 原始失败原因按原样带回前端；超长或非法 UTF-8 视为非法帧，不在解码时截断。
+    if (try optionalText(object, "failure_message")) |text| {
+        if (text.len > r.failure_message_max or !std.unicode.utf8ValidateSlice(text)) return error.BadRequest;
+        terminal.setFailureText(text);
     }
-    if (try optionalU64(object, "transport_exit_code")) |code| {
-        value.transport_exit_code = std.math.cast(u8, code) orelse return error.BadRequest;
-    }
-    return value;
+    return terminal;
 }
 
 // ---------------------------------------------------------------------------

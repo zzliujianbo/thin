@@ -54,30 +54,6 @@ test "local command default approval and explicit denial never execute" {
         try std.testing.expectEqual(@as(usize, 1), fake.finished);
     }
 }
-test "local command decision ask and review failure preserve pairing" {
-    for ([_]?anyerror{ null, error.AuxiliaryTimeout, error.CleanupFailed }) |failure| {
-        var fake: Fake = .{ .review_error = failure };
-        const config = configuration();
-        var runtime = try fake.init(&config, false);
-        defer runtime.deinit();
-        fake.runtime = &runtime;
-        runtime.decision_service = .{ .context = &fake, .decide_fn = Fake.review };
-        var cancel: p.Cancellation = .{};
-        const terminal = try runtime.executeCommand("!review", &cancel);
-        try paired(&runtime);
-        try std.testing.expectEqual(@as(usize, 1), fake.reviewed);
-        try std.testing.expectEqual(@as(usize, 1), fake.finished);
-        try std.testing.expectEqual(@as(usize, 0), fake.primary);
-        if (failure) |err| {
-            try std.testing.expectEqual(if (err == error.CleanupFailed) error.CleanupFailed else error.DecisionUnavailable, terminal.detail.?);
-            try std.testing.expectEqual(@as(usize, 0), fake.executions + fake.permissions);
-        } else {
-            try std.testing.expectEqual(r.Status.success, terminal.status);
-            try std.testing.expectEqual(@as(usize, 1), fake.executions);
-            try std.testing.expectEqual(@as(usize, 1), fake.permissions);
-        }
-    }
-}
 test "local command approval and execution cancellation cleanup prepare and host errors finish once" {
     for (0..6) |mode| {
         var cancel: p.Cancellation = .{};

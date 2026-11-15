@@ -232,7 +232,7 @@ test "App protects actual configuration behind HOME and file symlinks" {
             try env.put("HOME", home);
             const app = try App.init(a, io, &env, project, .{});
             defer app.deinit();
-            try std.testing.expect(app.config.value.limits.low_price_input and !app.config.value.decisionActive());
+            try std.testing.expect(app.config.value.limits.low_price_input and !app.config.value.imageActive());
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const allocator = arena.allocator();
@@ -339,45 +339,4 @@ test "App session title capability survives settings and connection rebinds" {
     defer child.deinit();
     try std.testing.expect(child.executor.session_title == null);
     try expectSessionTitleSchema(child, 0);
-}
-test "App unavailable decision key never blocks startup and chat replacement keeps independent reference" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [4096]u8 = undefined;
-    const n = try tmp.dir.realPath(io, &buffer);
-    var root = try fs.Root.open(a, io, buffer[0..n]);
-    defer root.deinit();
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("HOME", root.path);
-    var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"},"alternate":{"context_tokens":32768,"protocol":"chat"}}},"judge":{"base_url":"http://judge.invalid/v1","api_key_env":"MISSING_JUDGE_KEY","models":{"mini":{"context_tokens":16384,"protocol":"responses"}}}}},"decision":{"model":"judge/mini"}}
-    );
-    model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &.{}) catch |err| {
-        cfg.release(&parsed);
-        return err;
-    };
-    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, parsed);
-    defer app.deinit();
-    try std.testing.expect(app.decision_client != null and app.runtime.decision_service != null);
-    try std.testing.expect(app.decision_client.?.resolved == null and app.decision_client.?.calls == 0);
-    const previous = app.decision_client.?;
-    var candidate = try cfg.clone(a, app.config.value);
-    candidate.value.model.name = "alternate";
-    const replacement = try app.prepareConnection(candidate, &env);
-    app.installConnection(replacement);
-    try std.testing.expectEqualStrings("alternate", app.config.value.model.name);
-    try std.testing.expect(app.decision_client.? != previous);
-    try std.testing.expectEqualStrings("judge/mini", app.decision_client.?.source.value.decision.?.model);
-    try std.testing.expect(app.runtime.decision_service.?.context == @as(*anyopaque, @ptrCast(app.decision_client.?)));
-    const sink = app.journal.diagnosticSink();
-    try std.testing.expect(app.runtime.diagnostics.context == sink.context);
-    try std.testing.expect(app.decision_client.?.diagnostics.context == sink.context);
-    try std.testing.expect(app.memory_coordinator.diagnostics.context == sink.context);
-    if (app.memory_coordinator.extractor) |extractor| try std.testing.expect(extractor.diagnostics.context == sink.context);
-    const checkpoint = try app.runtime.checkpoint();
-    try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision"));
-    try std.testing.expect(!@hasField(@TypeOf(checkpoint), "decision_service"));
 }

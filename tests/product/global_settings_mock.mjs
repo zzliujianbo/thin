@@ -153,7 +153,7 @@ async function proxyFixture(name, url, configured) {
   return {home, project, config, configPath, settings:join(home, '.thin/settings.json'), proxy:{address, port, models}};
 }
 
-async function fixture(name, decision, url) {
+async function fixture(name, url) {
   const home = join(base, name, 'home'), project = join(base, name, 'project');
   await mkdir(join(home, '.thin'), {recursive:true});
   await mkdir(project, {recursive:true});
@@ -168,7 +168,6 @@ async function fixture(name, decision, url) {
       'family/native-review':{protocol:'systemone'},
     }},
     }},
-    ...(decision ? {decision:{model:'native/family/native-review'}} : {}),
     limits:{low_price_input:true, request_timeout_ms:3000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
@@ -192,37 +191,29 @@ const limitsDefaults = {
   request_timeout_ms:300000, compaction_enabled:true,
 };
 
-async function values(f, low, decision, newlySelected = false) {
+async function values(f, low) {
   const expected = JSON.parse(f.config);
-  if (newlySelected) expected.decision = {model:'native/family/native-review'};
   // Mirror only known core/config.zig writeDisk canonical defaults, never
   // derive expected fields from the saved file (unknown additions must fail).
   // Provider fields are written individually, including optional nulls;
-  // Limits/Decision structs omit optional nulls. ModelPatch stays sparse.
+  // Limits structs omit optional nulls. ModelPatch stays sparse.
   for (const provider of Object.values(expected.llm.providers)) {
     Object.assign(provider, {api_key:null, api_key_env:'', chat_max_tokens:false, kind:null, ...provider});
   }
   expected.limits = {...limitsDefaults, ...expected.limits, low_price_input:low};
-  expected.decision = {
-    enabled:true,
-    ...expected.decision,
-    enabled:decision,
-  };
   // Whole-object equality excludes changes to models, routes, credential
   // declarations, other limits, or any field beyond these explicit defaults.
   assert.deepEqual(JSON.parse(await readFile(f.configPath, 'utf8')), expected);
   assert.equal((await stat(f.configPath)).mode & 0o777, 0o600);
 }
 // Canonical whole-object expectation for a save that only edits proxy.models.
-// Providers, limits and an already declared decision are written with the
-// same explicit defaults as values(); an absent decision stays absent.
+// Providers and limits are written with the same explicit defaults as values().
 function canonicalConfig(f, proxy) {
   const expected = JSON.parse(f.config);
   for (const provider of Object.values(expected.llm.providers)) {
     Object.assign(provider, {api_key:null, api_key_env:'', chat_max_tokens:false, kind:null, ...provider});
   }
   expected.limits = {...limitsDefaults, ...expected.limits};
-  if (expected.decision) expected.decision = {enabled:true, ...expected.decision};
   if (proxy !== undefined) expected.proxy = proxy;
   return expected;
 }
@@ -259,23 +250,23 @@ async function untouched(path, before) {
 try {
   await new Promise((res, rej) => { server.once('error', rej); server.listen(0, '127.0.0.1', res); });
   const url = `http://127.0.0.1:${server.address().port}/v1`;
-  const f = await fixture('configured', true, url);
+  const f = await fixture('configured', url);
   // Invalid retired settings must neither affect startup nor be repaired.
   await writeFile(f.settings, '{ broken legacy settings\n', {mode:0o600});
   const legacy = await snapshot(f.settings);
   await run('settings-global-off', f.home, f.project, url);
-  await values(f, false, false);
+  await values(f, false);
   await untouched(f.settings, legacy);
   await run('settings-global-on', f.home, f.project, url);
-  await values(f, true, true);
+  await values(f, true);
   await untouched(f.settings, legacy);
   const saved = await snapshot(f.configPath);
   await run('settings-global-verify', f.home, f.project, url);
-  await values(f, true, true);
+  await values(f, true);
   await untouched(f.configPath, saved);
   await untouched(f.settings, legacy);
 
-  const n = await fixture('unconfigured', false, url);
+  const n = await fixture('unconfigured', url);
   const unconfigured = await snapshot(n.configPath);
   await run('settings-global-unconfigured', n.home, n.project, url);
   await missing(n.settings);
@@ -283,24 +274,13 @@ try {
   await untouched(n.configPath, unconfigured);
   await thinHome(n.home, ['config.json']);
   // Reverse preferences in a retired file must be ignored, including low-price.
-  const existing = '{ "version": 1, "low_price_input": false, "decision_enabled": false }\n';
+  const existing = '{ "version": 1, "low_price_input": false }\n';
   await writeFile(n.settings, existing, {mode:0o600});
   const baseline = await snapshot(n.settings);
   await run('settings-global-unconfigured', n.home, n.project, url);
   await untouched(n.settings, baseline);
   await untouched(n.configPath, unconfigured);
   await unchanged(n);
-  const p = await fixture('native-selection', false, url);
-  await writeFile(p.settings, existing, {mode:0o600});
-  const nativeLegacy = await snapshot(p.settings);
-  await run('settings-global-native', p.home, p.project, url);
-  await values(p, true, true, true);
-  await untouched(p.settings, nativeLegacy);
-  const nativeSaved = await snapshot(p.configPath);
-  await run('settings-global-verify', p.home, p.project, url);
-  await values(p, true, true, true);
-  await untouched(p.configPath, nativeSaved);
-  await untouched(p.settings, nativeLegacy);
 
   // Proxy allowlist: preserved pre-existing entry, a literal-key SystemOne
   // model, and a second literal-key model whose raw ID keeps a slash and case.
@@ -389,7 +369,7 @@ try {
   await thinHome(off.home, ['config.json']);
   assert.deepEqual((await readdir(off.project)).sort(), [...offPhases.map(n => `settings-proxy-release-${n}`), ...(await readdir(off.project)).includes('.thin') ? ['.thin'] : []].sort());
 
-  for (const x of [f, n, p]) await thinHome(x.home, ['config.json','settings.json']);
+  for (const x of [f, n]) await thinHome(x.home, ['config.json','settings.json']);
   console.log(`PASS test-settings: scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);
 } catch (error) {
   console.error(`FAIL test-settings: completed scenarios=${scenarios}, HTTP requests=${requests}, connections=${connections}`);

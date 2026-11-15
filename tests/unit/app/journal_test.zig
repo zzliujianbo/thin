@@ -338,18 +338,10 @@ test "journal structured records redaction turns and first response" {
     observer.notify(.{ .event = .{ .tool_started = .{ .id = 7, .name = "read" } } });
     observer.notify(.{ .tool_completed = .{ .call_id = "call_1", .result = .{ .text = "{\"value\":\"fake\\u0022\\u005csecret\"}", .canceled = true } } });
     observer.notify(.{ .event = .{ .tool_result = .{ .id = 7, .name = "read", .result = .{ .text = "NEVER_DUPLICATE_BODY" } } } });
-    var diagnostic: @import("../core/decision.zig").Diagnostic = .{
-        .stage = .http,
-        .backend = .systemone,
-        .operation = .command,
-        .http_status = 403,
-    };
-    diagnostic.setError(error.DecisionUnavailable);
     observer.notify(.{ .event = .{ .finished = .{
         .status = .failed,
         .detail = error.TestFailure,
         .http_status = 503,
-        .decision_failure = diagnostic,
     } } });
     observer.notify(.{ .submitted = "second" });
     observer.notify(.{ .event = .{ .state = .compacting } });
@@ -408,15 +400,6 @@ test "journal structured records redaction turns and first response" {
         if (std.mem.eql(u8, event, "finished") and turn == 1) {
             try std.testing.expectEqualStrings("TestFailure", data.get("detail").?.string);
             try std.testing.expectEqual(@as(i64, 503), data.get("http_status").?.integer);
-            const diagnostic_fields = data.get("decision_failure").?.object;
-            try std.testing.expectEqual(@as(u32, 7), diagnostic_fields.count());
-            try std.testing.expectEqualStrings("http", diagnostic_fields.get("stage").?.string);
-            try std.testing.expectEqualStrings("systemone", diagnostic_fields.get("backend").?.string);
-            try std.testing.expectEqualStrings("command", diagnostic_fields.get("operation").?.string);
-            try std.testing.expectEqualStrings("DecisionUnavailable", diagnostic_fields.get("cause").?.string);
-            try std.testing.expectEqual(@as(i64, 403), diagnostic_fields.get("http_status").?.integer);
-            try std.testing.expect(diagnostic_fields.get("transport_exit_code").? == .null);
-            try std.testing.expect(diagnostic_fields.get("model_failure").? == .null);
         }
     }
     try std.testing.expectEqual(@as(usize, 2), first_count);
@@ -661,30 +644,6 @@ test "memory evidence rejection journal point retains background origin" {
         found = true;
     }
     try std.testing.expect(found);
-}
-test "diagnostic end preserves safe decision timeout cause" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try testRoot(tmp.dir);
-    defer root.deinit();
-    var journal = try Journal.init(std.testing.allocator, &root, "fake-key");
-    defer journal.deinit();
-    journal.observer().notify(.{ .submitted = "test" });
-    journal.flush();
-    const path = try std.testing.allocator.dupe(u8, journal.store.path());
-    defer std.testing.allocator.free(path);
-    var failure: decision.Diagnostic = .{ .stage = .transport };
-    failure.setError(error.Timeout);
-    journal.diagnosticSink().emit(.{ .stage = .decision_request, .phase = .end, .result = .failed, .error_name = diagnostics.ErrorName.fromError(error.DecisionUnavailable), .decision_failure = failure });
-    journal.flush();
-    const content = try root.read(std.testing.allocator, path, 0, record_limit);
-    defer std.testing.allocator.free(content.data);
-    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"event\":\"diagnostic\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"error_name\":\"DecisionUnavailable\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content.data, "\"cause\":\"Timeout\"") != null);
-    var invalid = failure;
-    invalid.cause[0] = ' ';
-    try std.testing.expect(safeDiagnosticCause(&invalid) == null);
 }
 test "journal flush resumes and finish drains joins and rejects subsequent records" {
     var tmp = std.testing.tmpDir(.{});

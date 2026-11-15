@@ -298,7 +298,7 @@ pub const Communication = struct {
         // configuration private until the matching completion; the independent
         // receiver still owns and bounds incoming frames during the save.
         self.hold_configuration = switch (request.action) {
-            .configure, .model, .effort, .cycle_effort, .preference, .setting, .decision, .image, .proxy, .proxy_address, .refresh_models => true,
+            .configure, .model, .effort, .cycle_effort, .preference, .setting, .image, .proxy, .proxy_address, .refresh_models => true,
             else => false,
         };
         defer {

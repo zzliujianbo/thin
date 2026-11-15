@@ -5,7 +5,6 @@ fn imageAllocationCase(a: std.mem.Allocator) !void {
         var parsed = try parse(a, image_test_prefix ++ suffix ++ "}");
         defer release(&parsed);
         try std.testing.expectEqual(index == 3, parsed.value.imageActive());
-        try std.testing.expect(parsed.value.decision == null);
         try std.testing.expectEqual(index >= 3, parsed.value.image.model != null);
         var copied = try clone(a, parsed.value);
         defer release(&copied);
@@ -61,64 +60,22 @@ fn rejectedImageAllocationCase(a: std.mem.Allocator) !void {
     }
 }
 
-const decision_fixture =
-    \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"http://127.0.0.1:1/v1","api_key":"fake-inline","models":{"main":{"protocol":"chat","context_tokens":32768},"org/reviewer":{"protocol":"systemone"}}}}},"limits":{"request_timeout_ms":123456},"decision":{"model":"p/org/reviewer","enabled":true,"max_input_tokens":8192,"max_state_bytes":16384}}
-;
+const decision_section_prefix = "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key\":\"fake-inline\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"decision\":";
 
-fn decisionAllocationCase(a: std.mem.Allocator) !void {
-    var parsed = try parse(a, decision_fixture);
-    defer release(&parsed);
-    try std.testing.expectEqual(protocol.Protocol.systemone, parsed.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
-    var copied = try clone(a, parsed.value);
-    defer release(&copied);
-    copied.value.provider.base_url = "";
-    copied.value.selection_pending = true;
-    var pending = try clonePendingSettings(a, copied.value);
-    defer release(&pending);
-    try std.testing.expect(pending.value.selection_pending);
-    try std.testing.expectEqualStrings("", pending.value.provider.base_url);
-    try std.testing.expectEqual(@as(u32, 123456), pending.value.decision.?.modelLimits(pending.value.limits.request_timeout_ms).request_timeout_ms);
-    try std.testing.expectEqual(protocol.Protocol.chat, pending.value.registry.?.find("p").?.patchFor("main").?.protocol.?);
-    try std.testing.expectEqualStrings("fake-inline", pending.value.provider.api_key.?);
-    var wiping = WipingAllocator{ .backing = a };
-    var out: std.Io.Writer.Allocating = .init(wiping.allocator());
-    defer out.deinit();
-    // This allocating writer maps allocation failures to WriteFailed.
-    // Expose OOM to the exhaustive test harness without changing production.
-    writeDisk(parsed.value, &out.writer) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-        else => return err,
-    };
-    var again = try parse(a, out.written());
-    defer release(&again);
-    try std.testing.expectEqual(protocol.Protocol.systemone, again.value.registry.?.find("p").?.patchFor("org/reviewer").?.protocol.?);
-    try std.testing.expectEqual(@as(u32, 123456), again.value.limits.request_timeout_ms);
-}
-
-const decision_test_prefix = "{\"llm\":{\"default\":\"p/m\",\"providers\":{\"p\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key\":\"fake-inline\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"decision\":";
-
-fn expectUnknownDecisionField(a: std.mem.Allocator, raw: []const u8) !void {
-    var parsed = parse(a, raw) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        try std.testing.expectEqual(error.UnknownField, err);
-        return;
-    };
-    defer release(&parsed);
-    return error.TestExpectedError;
-}
-
-fn rejectedDecisionAllocationCase(a: std.mem.Allocator) !void {
-    for ([_]bool{ true, false }) |enabled| {
-        for ([_][]const u8{ "\"model\"", "\"systemone\"", "\"other\"", "null", "17", "1.5" }) |backend| {
-            const raw = try std.fmt.allocPrint(std.testing.allocator, "{s}{{\"model\":\"p/m\",\"enabled\":{},\"backend\":{s}}}}}", .{ decision_test_prefix, enabled, backend });
-            defer std.testing.allocator.free(raw);
-            try expectUnknownDecisionField(a, raw);
-        }
-        for ([_][]const u8{ "1", "17", "0", "-1", "3600001", "\"1\"", "null", "true", "1.5", "1e100" }) |timeout| {
-            const raw = try std.fmt.allocPrint(std.testing.allocator, "{s}{{\"model\":\"p/m\",\"enabled\":{},\"request_timeout_ms\":{s}}}}}", .{ decision_test_prefix, enabled, timeout });
-            defer std.testing.allocator.free(raw);
-            try expectUnknownDecisionField(a, raw);
-        }
+/// The reviewer section is gone; any value is now an unknown root field, not
+/// an inert migration input.
+fn rejectedDecisionSection(a: std.mem.Allocator) !void {
+    const values = [_][]const u8{ "null", "{}", "{\"model\":\"p/m\"}", "{\"model\":\"p/m\",\"enabled\":false}" };
+    for (values) |value| {
+        const raw = try std.mem.concat(std.testing.allocator, u8, &.{ decision_section_prefix, value, "}" });
+        defer std.testing.allocator.free(raw);
+        var parsed = parse(a, raw) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(error.UnknownField, err);
+            continue;
+        };
+        release(&parsed);
+        return error.TestExpectedError;
     }
 }
 

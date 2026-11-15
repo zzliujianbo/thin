@@ -12,7 +12,6 @@ test "image Settings default Off exact logged candidates and independent transac
     defer session.deinit();
     const app = session.app.?;
     const primary = app.client.authorization.ptr;
-    const decision = app.decision_client.?;
     const state = session.connection().current();
     try std.testing.expect(!state.image_enabled and state.image_model == null);
     try std.testing.expectEqual(@as(usize, 1), state.image_models.len);
@@ -29,14 +28,14 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expectEqualStrings("https://vision.invalid/v1/chat/completions", app.image_client.?.endpoint);
     try expectImageSchemas(app, true);
     try std.testing.expectEqualStrings("read_image", app.runtime.executor.schemas[4].name);
-    try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    try std.testing.expect(app.client.authorization.ptr == primary);
     const selected = app.image_client.?;
     try env.put("VISION_OWN_KEY", "fake-refreshed-vision");
     try std.testing.expectEqualStrings("fake-vision-own", selected.key);
     try choose(&session, "vision/deepseek-flash");
     try std.testing.expect(app.image_client.? != selected);
     try std.testing.expectEqualStrings("fake-refreshed-vision", app.image_client.?.key);
-    try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    try std.testing.expect(app.client.authorization.ptr == primary);
     try expectPersistedImage(home, "vision/deepseek-flash");
     const connection = session.connection();
     try connection.image_fn.?(connection.context, .off);
@@ -45,7 +44,7 @@ test "image Settings default Off exact logged candidates and independent transac
     try std.testing.expect(!session.connection().current().image_enabled and session.connection().current().image_model == null);
     try expectPersistedImage(home, null);
     try expectImageSchemas(app, false);
-    try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    try std.testing.expect(app.client.authorization.ptr == primary);
     const bytes = try disk(home);
     defer a.free(bytes);
     var saved = try cfg.parse(a, bytes);
@@ -55,7 +54,7 @@ test "image Settings default Off exact logged candidates and independent transac
     try connection.image_fn.?(connection.context, .off);
     try std.testing.expect(app.image_client == null and app.config.value.image.model == null);
     try expectImageSchemas(app, false);
-    try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    try std.testing.expect(app.client.authorization.ptr == primary);
     const twice = try disk(home);
     defer a.free(twice);
     try std.testing.expectEqualStrings(bytes, twice);
@@ -84,7 +83,6 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
     defer session.deinit();
     const app = session.app.?;
     const primary = app.client.authorization.ptr;
-    const decision = app.decision_client.?;
     try env.put("VISION_OWN_KEY", "");
     try std.testing.expectError(error.UnknownImageModel, choose(&session, "vision/deepseek-flash"));
     try env.put("VISION_OWN_KEY", "fake-vision-own");
@@ -111,7 +109,7 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
     try std.testing.expect(app.image_client.? == selected and app.config.value.imageActive());
     try std.testing.expectEqualStrings("vision/deepseek-flash", app.config.value.image.model.?);
     try std.testing.expectEqualStrings("vision/deepseek-flash", session.connection().current().image_model.?);
-    try std.testing.expect(app.client.authorization.ptr == primary and app.decision_client.? == decision);
+    try std.testing.expect(app.client.authorization.ptr == primary);
     try expectImageSchemas(app, true);
     const after = try disk(home);
     defer a.free(after);

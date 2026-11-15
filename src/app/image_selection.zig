@@ -4,7 +4,7 @@ const std = @import("std");
 const cfg = @import("../core/config.zig");
 const image = @import("../core/image.zig");
 const metadata = @import("model_metadata.zig");
-pub const Choice = @import("decision_selection.zig").Choice;
+pub const Choice = @import("settings_selection.zig").Choice;
 
 /// Only this documented official Anthropic base has a proven Chat equivalent.
 /// Custom endpoints are never rewritten to a different host or provider.

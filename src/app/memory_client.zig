@@ -1,5 +1,5 @@
 //! Isolated generative memory extractor. Never touches Runtime/history/accounts,
-//! metadata resolution or Decision/Image selection. Construction does no network.
+//! metadata resolution or Image selection. Construction does no network.
 const std = @import("std");
 const diag = @import("../core/diagnostics.zig");
 const cfg = @import("../core/config.zig");

@@ -15,7 +15,6 @@ const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
 const Title = @import("../core/session_metadata.zig").Title;
 const model_resolver = @import("model_resolver.zig");
-const DecisionClient = @import("decision_client.zig").Client;
 const image = @import("../core/image.zig");
 const ImageClient = @import("image_client.zig").Client;
 const image_setup = @import("image_setup.zig");
@@ -127,9 +126,6 @@ pub const App = struct {
     client: http.Client,
     /// Stable source owner shared by Codex clients and their clones.
     codex_manager: ?*CodexManager = null,
-    /// Optional, independently owned auxiliary route. Never archived or inherited
-    /// from a restored selection; initialized lazily without startup requests.
-    decision_client: ?*DecisionClient = null,
     image_client: ?*ImageClient = null,
     memory_coordinator: *MemoryCoordinator,
     /// Owns the parent-domain subagent quota and any retained image cleanup
@@ -293,8 +289,6 @@ pub const App = struct {
         self.executor = .{ .root = &self.root, .memory = &self.memory, .config = &self.config.value, .environment = &self.environment, .auth_path = self.auth_path, .background = self.background.service() };
         self.client = try self.initPrimaryClient(&self.config.value, key, environ);
         errdefer self.client.deinit();
-        self.decision_client = try self.createDecisionClient(self.config.value, environ);
-        errdefer if (self.decision_client) |decision| decision.deinit();
         self.image_client = try image_setup.create(a, io, self.config.value, environ);
         errdefer if (self.image_client) |client| destroyImageClient(client);
         self.executor.image = self.imageService();
@@ -307,7 +301,6 @@ pub const App = struct {
             .allocator = a,
             .config = &self.config.value,
             .http_client = &self.client,
-            .decision = &self.decision_client,
             .image = &self.image_client,
             .root = &self.root,
             .environment = &self.environment,
@@ -326,7 +319,6 @@ pub const App = struct {
         errdefer self.memory_coordinator.deinit();
         self.memory_coordinator.bindNotifications(queue);
         self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
-        if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
         // Only small core is frozen into the initial prefix. Task-local memory
         // is read afresh through bounded hooks, never an ever-growing index.
         var snapshot_wiping: cfg.WipingAllocator = .{ .backing = a };
@@ -347,7 +339,6 @@ pub const App = struct {
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, safe_snapshot);
         self.runtime.thinking_control = &self.thinking_control;
         self.runtime.diagnostics = self.journal.diagnosticSink();
-        self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
         self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .submit_fn = submitMemory, .check_fn = memorySafe };
@@ -511,26 +502,8 @@ pub const App = struct {
         return client;
     }
 
-    fn createDecisionClient(self: *App, config: cfg.Config, environ: *const std.process.Environ.Map) !?*DecisionClient {
-        var source: ?codex_auth.CredentialSource = null;
-        if (config.decisionActive()) {
-            const reference = try cfg.splitDefault(config.decision.?.model);
-            if (config.registry) |registry| if (registry.find(reference.provider)) |provider| {
-                if (isCodexProvider(provider.connection) and provider.connection.codex_oauth != null)
-                    source = try self.ensureCodexSource(environ);
-            };
-        }
-        return DecisionClient.createWithCodexSource(self.allocator, self.root.io, config, environ, source);
-    }
-
     fn createMemoryCoordinator(self: *App, config: cfg.Config, environ: *const std.process.Environ.Map) !*MemoryCoordinator {
-        var needs_source = config.memory.auto and isCodex(config);
-        if (config.memory.auto and config.decisionActive()) {
-            const reference = try cfg.splitDefault(config.decision.?.model);
-            if (config.registry) |registry| if (registry.find(reference.provider)) |provider| {
-                if (isCodexProvider(provider.connection)) needs_source = true;
-            };
-        }
+        const needs_source = config.memory.auto and isCodex(config);
         const source: ?codex_auth.CredentialSource = if (needs_source) try self.ensureCodexSource(environ) else null;
         const coordinator = try MemoryCoordinator.createWithCodexSource(self.allocator, self.root.io, &self.root, config, environ, source);
         coordinator.secret_guard = .{ .context = &self.journal, .contains_fn = journalContainsSecret };
@@ -542,22 +515,19 @@ pub const App = struct {
         return journal.containsSecret(text);
     }
 
-    pub const SettingsRefresh = enum { none, decision, image_model, proxy_models };
+    pub const SettingsRefresh = enum { none, image_model, proxy_models };
     pub const SettingsReplacement = struct {
         config: ?std.json.Parsed(cfg.Config) = null,
         subagent_environment: ?std.process.Environ.Map = null,
-        replace_decision: bool,
         replace_image: bool,
         replace_memory: bool = false,
         memory_coordinator: ?*MemoryCoordinator = null,
         changes_tools: bool,
-        decision: ?*DecisionClient = null,
         image_client: ?*ImageClient = null,
         prefix: ?r.Runtime.ToolPrefix = null,
 
         pub fn deinit(self: *SettingsReplacement) void {
             if (self.memory_coordinator) |owner| owner.deinit();
-            if (self.decision) |client| client.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             if (self.prefix) |*prefix| prefix.deinit();
             if (self.subagent_environment) |*environment| wipeSubagentEnvironment(environment);
@@ -574,62 +544,34 @@ pub const App = struct {
     pub fn prepareSettingsRefresh(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map, refresh: SettingsRefresh) !SettingsReplacement {
         if (self.runtime.busy.load(.acquire)) return error.Busy;
         if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
-        if (self.decision_client) |client| {
-            const service = client.service();
-            if (service.check_fn) |check| try check(service.context);
-        }
         if (self.image_client) |client| if (client.isPoisoned()) return error.UnsafeToContinue;
-        const decision_enabled = declaration.decisionActive();
-        // Only decision edits, shared request deadlines or explicit reselect
-        // replace the auxiliary owner. Primary transport/session stay frozen.
-        var before: std.Io.Writer.Allocating = .init(self.allocator);
-        defer {
-            std.crypto.secureZero(u8, before.written());
-            before.deinit();
-        }
-        var after: std.Io.Writer.Allocating = .init(self.allocator);
-        defer {
-            std.crypto.secureZero(u8, after.written());
-            after.deinit();
-        }
-        try std.json.Stringify.value(self.config.value.decision, .{}, &before.writer);
-        try std.json.Stringify.value(declaration.decision, .{}, &after.writer);
+        // Only image-model edits, shared request deadlines or an explicit
+        // proxy reselect replace the auxiliary owner. Primary transport and
+        // session stay frozen.
         const proxy_refresh = refresh == .proxy_models;
         var result: SettingsReplacement = .{
-            // An explicit proxy edit replaces both auxiliary owners so their
-            // next request uses the new allowlist. The primary client/config
-            // stay frozen; result.config keeps the active proxy below.
-            .replace_decision = refresh == .decision or proxy_refresh or
-                self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
-                !std.mem.eql(u8, before.written(), after.written()),
+            // An explicit proxy edit replaces the auxiliary owner so its next
+            // request uses the new allowlist. The primary client/config stay
+            // frozen; result.config keeps the active proxy below.
             .replace_image = refresh == .image_model or proxy_refresh or
                 self.config.value.limits.request_timeout_ms != declaration.limits.request_timeout_ms or
                 !optionalStringEqual(self.config.value.image.model, declaration.image.model),
-            .changes_tools = self.config.value.decisionActive() != decision_enabled or
-                self.config.value.imageActive() != declaration.imageActive(),
+            .changes_tools = self.config.value.imageActive() != declaration.imageActive(),
         };
         errdefer result.deinit();
-        result.config = try @import("decision_selection.zig").activeClone(self.allocator, self.runtime.effectiveConfig(), declaration);
+        result.config = try @import("settings_selection.zig").activeClone(self.allocator, self.runtime.effectiveConfig(), declaration);
         result.subagent_environment = try captureSubagentEnvironment(self.allocator, result.config.?.value, environ);
-        result.replace_memory = result.replace_decision or self.config.value.memory.auto != declaration.memory.auto or
+        result.replace_memory = proxy_refresh or self.config.value.memory.auto != declaration.memory.auto or
             !std.meta.eql(self.config.value.limits, declaration.limits);
         if (result.replace_memory) {
-            // The coordinator owns independent extractor/reviewer clients, so it
-            // follows the latest auxiliary allowlist even when the active config
-            // keep its frozen proxy. This local borrow is valid only for the call;
-            // create() clones it, and later ordinary rebuilds reuse the same
-            // declaration list instead of reverting to the frozen route.
+            // The coordinator owns an independent extractor client, so it follows
+            // the latest proxy allowlist even when the active config keeps its
+            // frozen proxy. This local borrow is valid only for the call; create()
+            // clones it, and later ordinary rebuilds reuse the same declaration
+            // list instead of reverting to the frozen route.
             var memory_config = result.config.?.value;
             memory_config.proxy = declaration.proxy;
             result.memory_coordinator = try self.createMemoryCoordinator(memory_config, environ);
-        }
-        if (result.replace_decision) {
-            // Login may have replaced the global declaration since this chat's
-            // frozen config was installed. Own the latest auxiliary credentials
-            // without rebinding the primary config/client. Redaction may only
-            // expand on a failed prepare/save; never publish an unredacted key.
-            try rememberConfiguredKeys(&self.journal, declaration, environ);
-            result.decision = try self.createDecisionClient(declaration, environ);
         }
         if (result.replace_image) {
             try rememberConfiguredKeys(&self.journal, declaration, environ);
@@ -664,14 +606,6 @@ pub const App = struct {
             self.runtime.installToolPrefix(prefix);
             replacement.prefix = null;
         }
-        if (replacement.replace_decision) {
-            const previous = self.decision_client;
-            self.decision_client = replacement.decision;
-            if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
-            replacement.decision = null;
-            self.runtime.decision_service = if (self.decision_client) |client| client.service() else null;
-            if (previous) |client| client.deinit();
-        }
         if (replacement.replace_image) {
             if (self.image_client) |client| destroyImageClient(client);
             self.image_client = replacement.image_client;
@@ -702,7 +636,6 @@ pub const App = struct {
         config: std.json.Parsed(cfg.Config),
         subagent_environment: std.process.Environ.Map,
         client: http.Client,
-        decision_client: ?*DecisionClient = null,
         image_client: ?*ImageClient = null,
         memory_coordinator: *MemoryCoordinator,
         plan: r.Runtime.SelectionPlan,
@@ -711,7 +644,6 @@ pub const App = struct {
             const a = self.owner.allocator;
             self.client.deinit();
             self.memory_coordinator.deinit();
-            if (self.decision_client) |decision| decision.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             wipeSubagentEnvironment(&self.subagent_environment);
             cfg.release(&self.config);
@@ -747,8 +679,6 @@ pub const App = struct {
         errdefer wipeSubagentEnvironment(&replacement.subagent_environment);
         replacement.client = try self.initPrimaryClient(&replacement.config.value, key, environ);
         errdefer replacement.client.deinit();
-        replacement.decision_client = try self.createDecisionClient(replacement.config.value, environ);
-        errdefer if (replacement.decision_client) |client| client.deinit();
         replacement.image_client = try image_setup.create(self.allocator, self.root.io, replacement.config.value, environ);
         errdefer if (replacement.image_client) |client| destroyImageClient(client);
         replacement.memory_coordinator = try self.createMemoryCoordinator(replacement.config.value, environ);
@@ -778,11 +708,6 @@ pub const App = struct {
         self.memory_coordinator.deinit();
         self.memory_coordinator = replacement.memory_coordinator;
         self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
-        const previous_decision = self.decision_client;
-        self.decision_client = replacement.decision_client;
-        if (self.decision_client) |decision| decision.diagnostics = self.journal.diagnosticSink();
-        self.runtime.decision_service = if (self.decision_client) |decision| decision.service() else null;
-        if (previous_decision) |decision| decision.deinit();
         if (self.image_client) |client| destroyImageClient(client);
         self.image_client = replacement.image_client;
         self.executor.image = self.imageService();
@@ -851,7 +776,6 @@ pub const App = struct {
         // Interactive exit/model replacement cancels immediately. Headless
         // success explicitly drains with signal handling before destruction.
         self.memory_coordinator.deinit();
-        if (self.decision_client) |decision| decision.deinit();
         if (self.image_client) |client| destroyImageClient(client);
         self.journal.deinit();
         self.client.deinit();

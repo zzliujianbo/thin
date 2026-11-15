@@ -22,7 +22,7 @@ const preferences = @import("../core/settings.zig");
 const shared = @import("../presentation.zig");
 const bridge_module = @import("../ui/bridge.zig");
 const util_json = @import("../util/json.zig");
-const decision_picker = @import("../ui/decision_picker.zig");
+const settings_model_picker = @import("../ui/settings_model_picker.zig");
 const picker_module = @import("../ui/model_picker.zig");
 const session_client = @import("../ui/session_client.zig");
 const tui = @import("../ui/tui.zig");
@@ -497,9 +497,7 @@ const Pub = struct {
     low_price_enabled: bool = true,
     low_price_active: bool = false,
     memory_auto: bool = true,
-    decision_enabled: bool = false,
     image_enabled: bool = false,
-    decision_model: ?[]const u8 = null,
     image_model: ?[]const u8 = null,
     /// Public proxy state: whether the owner has a proxy allowlist, the exact
     /// bounded model ids on it, and the one non-secret host/port pair. Never a
@@ -518,7 +516,6 @@ const Pub = struct {
     providers: []picker_module.Provider = &.{},
     context_official: []bool = &.{},
     disabled: []bool = &.{},
-    decision_models: []core_config.Model = &.{},
     image_models: []core_config.Model = &.{},
 };
 
@@ -966,9 +963,6 @@ pub const Client = struct {
         state.image_models = try cloneModels(arena, cfg.image_models);
         state.image_model = if (cfg.image_model) |name| try arena.dupe(u8, name) else null;
         state.memory_auto = cfg.memory_auto;
-        state.decision_enabled = cfg.decision_enabled;
-        state.decision_models = try cloneModels(arena, cfg.decision_models);
-        state.decision_model = if (cfg.decision_model) |name| try arena.dupe(u8, name) else null;
         state.proxy_configured = cfg.proxy_configured;
         state.proxy_address = if (cfg.proxy_address) |address| try arena.dupe(u8, address) else null;
         state.proxy_port = cfg.proxy_port;
@@ -1054,9 +1048,7 @@ pub const Client = struct {
             .preference => |v| try preferenceFn(self, v.key, v.value),
             .setting => |v| try settingFn(self, switch (v.key) {
                 .low_price_input => .low_price_input,
-                .decision_enabled => .decision_enabled,
             }, v.value),
-            .decision => |choice| try decisionFn(self, choice),
             .image => |choice| try imageFn(self, choice),
             .proxy => |v| try proxyFn(self, v.model, v.enabled),
             .proxy_address => |address| try proxyAddressFn(self, address),
@@ -1366,9 +1358,7 @@ pub const Client = struct {
         next.low_price_active = read.flag(view, "low_price_input", false);
         next.low_price_enabled = read.flag(view, "low_price_input_enabled", next.low_price_active);
         next.memory_auto = read.flag(view, "memory_auto", true);
-        next.decision_enabled = read.flag(view, "decision_enabled", false);
         next.image_enabled = read.flag(view, "image_enabled", false);
-        next.decision_model = read.text(view, "decision_model");
         next.image_model = read.text(view, "image_model");
         next.proxy_configured = read.flag(view, "proxy_configured", false);
         adoptProxyEndpoint(&next, read.field(view, "proxy_address"), read.field(view, "proxy_port"), next.proxy_configured);
@@ -1380,7 +1370,6 @@ pub const Client = struct {
         next.metadata_notice = read.text(view, "metadata_notice");
         if (read.field(view, "limits")) |value| next.limits = parseLimits(value, next.limits);
         try parseModels(self.a, &next, read.field(view, "models"), .models);
-        try parseModels(self.a, &next, read.field(view, "decision_models"), .decision_models);
         try parseModels(self.a, &next, read.field(view, "image_models"), .image_models);
         try parseProviders(self.a, &next, read.field(view, "providers"));
 
@@ -1401,7 +1390,6 @@ pub const Client = struct {
 
     fn freePubValue(self: *Client, value: Pub) void {
         if (value.models.len != 0) self.a.free(value.models);
-        if (value.decision_models.len != 0) self.a.free(value.decision_models);
         if (value.image_models.len != 0) self.a.free(value.image_models);
         // Only the name array is owned here; each name is a window into
         // `doc`, which is released below.
@@ -2379,14 +2367,6 @@ pub const Client = struct {
         try self.joinWorker(record.endpoint, record.id, true, record.project);
     }
 
-    /// `hello`-verified readiness probe used before an attach decision. Liveness
-    /// is never inferred from the index, a pid or a marker.
-    fn probeEndpoint(self: *Client, endpoint: []const u8, id: ids.Id) bool {
-        const greeting = registry.helloEndpoint(self.a, self.io, self.uid, endpoint, quick_timeout_ms) catch return false;
-        if (!std.mem.eql(u8, &greeting.session, &id)) return false;
-        return greeting.pid == greeting.peer_pid and greeting.protocol == protocol.version;
-    }
-
     /// One complete, bounded checkpoint in `project`. Read-only: no writer lock is
     /// taken here and nothing is created, so the original `.resume-lock` inode
     /// stays the only execution authority.
@@ -2817,27 +2797,6 @@ pub const Client = struct {
         return fromContext(context).state;
     }
 
-    fn settingsCall(self: *Client, op: protocol.Op, timeout_ms: u32) !Response {
-        var req = try self.settingsRequest(op);
-        defer req.deinit();
-        try self.applySettingsArgs(&req, op);
-        var resp = try req.exchange(timeout_ms);
-        errdefer resp.deinit();
-        self.dirty = false;
-        self.refreshSettings();
-        self.refreshSnapshot();
-        self.rebuild();
-        return resp;
-    }
-
-    fn applySettingsArgs(self: *Client, req: *Request, op: protocol.Op) !void {
-        _ = self;
-        switch (op) {
-            .poll_metadata => try req.put("wait", true),
-            else => {},
-        }
-    }
-
     fn configureFn(context: *anyopaque, key: []const u8) anyerror!void {
         const self = fromContext(context);
         try self.login(null, key);
@@ -2942,14 +2901,9 @@ pub const Client = struct {
         self.rebuild();
     }
 
-    fn decisionFn(context: *anyopaque, choice: decision_picker.Choice) anyerror!void {
+    fn imageFn(context: *anyopaque, choice: settings_model_picker.Choice) anyerror!void {
         const self = fromContext(context);
-        try self.helperSelection(.decision_model, choice);
-    }
-
-    fn imageFn(context: *anyopaque, choice: decision_picker.Choice) anyerror!void {
-        const self = fromContext(context);
-        try self.helperSelection(.image_model, choice);
+        try self.imageSelection(choice);
     }
 
     /// One explicit proxy allowlist mutation. The callback carries the complete
@@ -2987,8 +2941,8 @@ pub const Client = struct {
         self.rebuild();
     }
 
-    fn helperSelection(self: *Client, op: protocol.Op, choice: decision_picker.Choice) !void {
-        var req = try self.settingsRequest(op);
+    fn imageSelection(self: *Client, choice: settings_model_picker.Choice) !void {
+        var req = try self.settingsRequest(.image_model);
         defer req.deinit();
         switch (choice) {
             .off => try req.put("off", true),
@@ -3243,7 +3197,7 @@ fn parseModelRow(value: std.json.Value) ?ModelRow {
     return row;
 }
 
-const ModelSlot = enum { models, decision_models, image_models };
+const ModelSlot = enum { models, image_models };
 
 fn parseModels(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value, slot: ModelSlot) !void {
     const array = switch (value orelse return) {
@@ -3279,7 +3233,6 @@ fn parseModels(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value, slot: M
             next.context_official = official.?;
             next.disabled = disabled.?;
         },
-        .decision_models => next.decision_models = models,
         .image_models => next.image_models = models,
     }
 }

@@ -13,7 +13,7 @@ const codex = @import("codex.zig");
 const anthropic = @import("anthropic.zig");
 const common = @import("common.zig");
 const pool = @import("http_pool.zig");
-const curl = @import("decision_http.zig");
+const curl = @import("curl_http.zig");
 const Io = std.Io;
 const uncanceled: p.Cancellation = .{};
 
@@ -215,7 +215,7 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(context));
         if (request.scope.protocol == .systemone or self.config.model.protocol == .systemone or
             cfg.providers.Id.fromSystemOneUrl(self.config.provider.base_url) != null)
-            return failure(.unsupported_protocol, "SystemOne does not support chat generation", null, false);
+            return failure(.unsupported_protocol, "unsupported_protocol: systemone", null, false);
         // auto 只能是配置层的占位值，进入 HTTP 层前必须已解析为具体协议。
         if (request.scope.protocol == .auto) return error.UnselectedProtocol;
         // 回放作用域必须与当前连接、模型一致，避免把历史 replay 发送到其他端点。
@@ -225,7 +225,7 @@ pub const Client = struct {
         try self.checkProxyRoute();
         // 开始传输前已取消则直接返回，不启动 worker。
         if (request.cancellation) |cancel| if (cancel.isRequested())
-            return failure(.canceled, "Model request canceled before transport", null, false);
+            return failure(.canceled, "canceled", null, false);
 
         // job 与 worker 共享，必须保证 worker 结束后才能让 job 失效。
         const start = Io.Clock.awake.now(self.io);
@@ -241,7 +241,7 @@ pub const Client = struct {
                 if (cancel.isRequested()) {
                     _ = future.cancel(self.io) catch {};
                     try self.checkProxyCleanup();
-                    var outcome = failure(.canceled, "Model request canceled", null, job.observed.load(.acquire));
+                    var outcome = failure(.canceled, "canceled", null, job.observed.load(.acquire));
                     outcome.failure.usage = job.last_usage;
                     return outcome;
                 }
@@ -249,7 +249,7 @@ pub const Client = struct {
             if (start.untilNow(self.io, .awake).toMilliseconds() >= self.config.limits.request_timeout_ms) {
                 _ = future.cancel(self.io) catch {};
                 try self.checkProxyCleanup();
-                var outcome = failure(.timeout, "Model request exceeded its time limit", null, job.observed.load(.acquire));
+                var outcome = failure(.timeout, "RequestTimeout", null, job.observed.load(.acquire));
                 outcome.failure.usage = job.last_usage;
                 return outcome;
             }
@@ -259,7 +259,7 @@ pub const Client = struct {
                 _ = future.cancel(self.io) catch {};
                 try self.checkProxyCleanup();
                 if (err != error.Canceled) return err;
-                var outcome = failure(.canceled, "Model request canceled", null, job.observed.load(.acquire));
+                var outcome = failure(.canceled, "canceled", null, job.observed.load(.acquire));
                 outcome.failure.usage = job.last_usage;
                 return outcome;
             };
@@ -268,9 +268,9 @@ pub const Client = struct {
         // worker 已结束，取回结果；OOM 原样上抛，取消与其他错误转换为对应的失败类型。
         var outcome = future.await(self.io) catch |err| switch (err) {
             error.OutOfMemory, error.CleanupFailed => return err,
-            error.Canceled => failure(.canceled, "Model request canceled", null, job.observed.load(.acquire)),
-            error.RequestTimeout => failure(.timeout, "Model request exceeded its time limit", null, job.observed.load(.acquire)),
-            else => failure(.transport, "Model transport failed", null, job.observed.load(.acquire)),
+            error.Canceled => failure(.canceled, "canceled", null, job.observed.load(.acquire)),
+            error.RequestTimeout => failure(.timeout, "RequestTimeout", null, job.observed.load(.acquire)),
+            else => failure(.transport, @errorName(err), null, job.observed.load(.acquire)),
         };
 
         // 失败时仍合并 worker 观察到的最新 usage，保证已消耗的 token 可以被统计。
@@ -399,15 +399,15 @@ pub const Client = struct {
         const head = transport.streamPost(a, address, headers[0..count], payload, @max(1, remaining), null, .{ .context = &body, .write_fn = ProxyBody.write, .check_fn = ProxyBody.check }, job.request.cancellation orelse &uncanceled) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled, error.CleanupFailed, error.RequestTimeout => return err,
             error.Timeout => return error.RequestTimeout,
-            error.InvalidHttpHead, error.ExpectedSse, error.InvalidModelEvent, error.CurlResponseTooLarge => return failure(.protocol, "Invalid or oversized proxied model response", if (body.head) |h| h.status else null, stream.observed()),
-            else => return failure(.transport, "Model proxy transport failed", if (body.head) |h| h.status else null, stream.observed()),
+            error.InvalidHttpHead, error.ExpectedSse, error.InvalidModelEvent, error.CurlResponseTooLarge => return failure(.protocol, @errorName(err), if (body.head) |h| h.status else null, stream.observed()),
+            else => return failure(.transport, @errorName(err), if (body.head) |h| h.status else null, stream.observed()),
         };
         if (head.status != 200) return classifyHttpError(job.allocator, head.status, body.error_body.items);
-        if (!head.is_sse) return failure(.protocol, "Expected an SSE response", head.status, false);
-        decoder.finish() catch return failure(.protocol, "Incomplete SSE event", head.status, stream.observed());
+        if (!head.is_sse) return failure(.protocol, "response was not text/event-stream", head.status, false);
+        decoder.finish() catch |err| return failure(.protocol, @errorName(err), head.status, stream.observed());
         return stream.finish() catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => failure(.protocol, "Model response did not complete safely", head.status, stream.observed()),
+            else => failure(.protocol, @errorName(err), head.status, stream.observed()),
         };
     }
 
@@ -532,11 +532,11 @@ pub const Client = struct {
 
         // 非 200：读取最多 64KB 的错误体后交给分类器；读取失败时不做错误分类。
         if (status != 200) {
-            const error_body = reader.allocRemaining(a, .unlimited) catch
-                return failure(if (status >= 500) .server else .protocol, "API error body could not be read safely", status, false);
+            const error_body = reader.allocRemaining(a, .unlimited) catch |err|
+                return failure(if (status >= 500) .server else .protocol, @errorName(err), status, false);
             // 错误体未读完（连接中断）时，不能依据残缺内容判断错误类型。
             switch (request.reader.state) {
-                .body_remaining_content_length, .body_remaining_chunk_len => return failure(.transport, "Incomplete HTTP error response body", status, false),
+                .body_remaining_content_length, .body_remaining_chunk_len => return failure(.transport, @tagName(request.reader.state), status, false),
                 else => {},
             }
             return classifyHttpError(job.allocator, status, error_body);
@@ -544,7 +544,7 @@ pub const Client = struct {
 
         // 成功状态码但不是 SSE：端点不符合流式协议预期，直接报协议错误。
         if (!is_sse)
-            return failure(.protocol, "Expected an SSE response", status, false);
+            return failure(.protocol, common.rawText(job.allocator, content_type, common.raw_max) orelse "unexpected content-type", status, false);
 
         // 根据协议创建对应的流解析器，解析器的事件通过 sink 转发出去。
         const sink = p.ModelSink{ .context = job, .emit_fn = Job.emit };
@@ -568,30 +568,30 @@ pub const Client = struct {
             // first, notably for EOF-delimited SSE coalesced with the headers.
             const n = readAvailable(reader, &buffer) catch |err| switch (err) {
                 error.EndOfStream => break,
-                error.ReadFailed => return failure(.transport, "Model stream was interrupted", status, stream.observed()),
+                error.ReadFailed => return failure(.transport, @errorName(err), status, stream.observed()),
             };
             // 0 字节只表示暂时没有数据，不是 EOF。
             if (n == 0) continue;
             // 解析错误（格式错误、事件过大）映射为协议错误；OOM 与取消原样上抛。
             decoder.feed(buffer[0..n]) catch |err| switch (err) {
                 error.OutOfMemory, error.Canceled => return err,
-                else => return failure(.protocol, "Malformed or oversized model event", status, stream.observed()),
+                else => return failure(.protocol, @errorName(err), status, stream.observed()),
             };
         }
 
         // 连接在正文未读完时断开，视为传输错误。
         switch (request.reader.state) {
-            .body_remaining_content_length, .body_remaining_chunk_len => return failure(.transport, "Incomplete HTTP response body", status, stream.observed()),
+            .body_remaining_content_length, .body_remaining_chunk_len => return failure(.transport, @tagName(request.reader.state), status, stream.observed()),
             else => {},
         }
 
         // 流结束时若仍有未完成的 SSE 事件，说明响应被截断。
-        decoder.finish() catch return failure(.protocol, "Incomplete SSE event", status, stream.observed());
+        decoder.finish() catch |err| return failure(.protocol, @errorName(err), status, stream.observed());
 
         // 由协议流决定最终成功或失败（例如缺少 finish_reason 时失败）。
         return stream.finish() catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => failure(.protocol, "Model response did not complete safely", status, stream.observed()),
+            else => failure(.protocol, @errorName(err), status, stream.observed()),
         };
     }
 };
@@ -682,7 +682,8 @@ const Stream = union(enum) {
     }
 };
 
-/// 构造失败结果。message 必须是静态字符串或不含上游敏感内容的文本，避免泄露 API 返回的原始信息。
+/// 构造失败结果。message 是给用户排查用的原始失败原因（提供方原文或本地错误名），
+/// 由调用方保证已做显示清洗与长度限制；这里不做分类翻译。
 fn failure(kind: p.FailureKind, message: []const u8, status: ?u16, observed: bool) p.Outcome {
     return .{ .failure = .{ .kind = kind, .message = message, .http_status = status, .observed_content = observed } };
 }
@@ -693,6 +694,8 @@ pub fn classifyHttpError(allocator: std.mem.Allocator, status: u16, bytes: []con
     const value = common.parse(allocator, bytes) catch .null;
     const detail = j.get(value, "error") orelse .null;
     var outcome = classifyFields(status, detail);
+    // 展示用原始原因：提供方自己的错误文本，拿不到就保留 body 首行；不翻译、不遮盖。
+    outcome.failure.message = common.rawText(allocator, bytes, common.raw_max) orelse "empty error response body";
 
     // usage 可能位于顶层或 error 对象内；根据字段名判断是 Chat 还是 Responses 格式。
     if (j.get(value, "usage") orelse j.get(detail, "usage")) |usage| {
@@ -717,15 +720,15 @@ fn classifyFields(status: u16, detail: j.Value) p.Outcome {
     // 只有服务端明确声明不支持该协议时，才返回 unsupported_protocol 以允许降级。
     if ((status == 400 or status == 404 or status == 405) and endpoint_param and
         (std.mem.eql(u8, code, "unsupported_protocol") or std.mem.eql(u8, code, "unsupported_endpoint")))
-        return failure(.unsupported_protocol, "Endpoint explicitly reports unsupported protocol", status, false);
+        return failure(.unsupported_protocol, "", status, false);
 
     // Never infer fallback from arbitrary error prose or a generic HTTP status.
-    if (status == 401 or status == 403) return failure(.authentication, "API authentication failed", status, false);
-    if (status == 429) return failure(.rate_limit, "API rate limit exceeded", status, false);
-    if (status >= 500) return failure(.server, "API server error", status, false);
-    if (std.mem.eql(u8, code, "context_length_exceeded")) return failure(.context_limit, "Model context limit exceeded", status, false);
-    if (std.mem.eql(u8, code, "model_not_found")) return failure(.model, "Configured model was not found", status, false);
-    return failure(.invalid_argument, "API rejected the request; check configuration and protocol", status, false);
+    if (status == 401 or status == 403) return failure(.authentication, "", status, false);
+    if (status == 429) return failure(.rate_limit, "", status, false);
+    if (status >= 500) return failure(.server, "", status, false);
+    if (std.mem.eql(u8, code, "context_length_exceeded")) return failure(.context_limit, "", status, false);
+    if (std.mem.eql(u8, code, "model_not_found")) return failure(.model, "", status, false);
+    return failure(.invalid_argument, "", status, false);
 }
 
 // 验证：只有端点明确给出不支持协议的证据时才允许自动降级；错误文本不得回显密钥。

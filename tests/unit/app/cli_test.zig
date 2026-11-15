@@ -56,8 +56,7 @@ test "CLI ordinary tools run directly and print requires a prompt" {
     try std.testing.expectEqualStrings("hello", options.prompt.?);
     try std.testing.expect(std.mem.indexOf(u8, help, "run without approval prompts") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "No automatic command-risk classifier") == null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "Without Decision, static risk matches require approval each time; with Decision,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "approval follows its ask result, and a failed decision does not allow execution.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Static risk matches require explicit approval for that call.") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "Patterns: recursive rm, find -delete, git clean -f") == null);
     try std.testing.expect((try parse(&.{"thin"})).auto_refresh_models);
     try std.testing.expect(!(try parse(&.{ "thin", "--no-model-auto-refresh" })).auto_refresh_models);

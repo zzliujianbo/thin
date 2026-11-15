@@ -3,8 +3,6 @@ const std = @import("std");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const Client = @import("../llm/http.zig").Client;
-const DecisionClient = @import("../app/decision_client.zig").Client;
-const decision = @import("../core/decision.zig");
 const t = std.testing;
 const Io = std.Io;
 const messages = [_]p.Message{.{ .role = .user, .blocks = &.{.{ .text = "owned fixture" }} }};

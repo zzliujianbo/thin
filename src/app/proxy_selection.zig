@@ -3,7 +3,7 @@
 //! Never guess an endpoint or normalize a declared model identity.
 const std = @import("std");
 const cfg = @import("../core/config.zig");
-const decision_selection = @import("decision_selection.zig");
+const settings_selection = @import("settings_selection.zig");
 
 /// Exact alias/raw-ID membership. Duplicate adds and absent removals are
 /// intentional no-write no-ops. Existing order is preserved; new names append.
@@ -61,9 +61,9 @@ fn adopt(a: std.mem.Allocator, config: *cfg.Config, proxy: ?cfg.ProxyConfig) !vo
 
 /// Pending snapshots have no established primary transport, so an explicit
 /// proxy save may update them. The active App path keeps its frozen primary
-/// proxy through `decision_selection.activeClone`.
+/// proxy through `settings_selection.activeClone`.
 pub fn pendingClone(a: std.mem.Allocator, active: cfg.Config, declaration: cfg.Config, adopt_proxy: bool) !std.json.Parsed(cfg.Config) {
-    var owned = try decision_selection.activeClone(a, active, declaration);
+    var owned = try settings_selection.activeClone(a, active, declaration);
     errdefer cfg.release(&owned);
     if (adopt_proxy) try adopt(owned.arena.allocator(), &owned.value, declaration.proxy);
     return owned;

@@ -117,6 +117,30 @@ test "every runtime display event round-trips through the wire" {
     };
     for (events) |event| try expectEventRoundTrip(a, event);
 }
+test "finished frame carries the raw failure cause and rejects oversize text" {
+    const a = std.testing.allocator;
+    var terminal: r.Terminal = .{
+        .status = .failed,
+        .detail = error.ModelRequestFailed,
+        .model_failure = .authentication,
+        .http_status = 401,
+    };
+    terminal.setFailureText("Incorrect API key provided: sk-test");
+    try expectEventRoundTrip(a, .{ .finished = terminal });
+
+    const encoded = try encodeEvent(a, .{ .finished = terminal });
+    defer a.free(encoded);
+    var doc = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
+    defer doc.deinit();
+    const allocator = doc.arena.allocator();
+    // Invalid UTF-8 is a malformed frame, not something a row may receive.
+    try doc.value.object.put(allocator, "failure_message", .{ .string = "\xff" });
+    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
+    const long = try allocator.alloc(u8, r.failure_message_max + 1);
+    @memset(long, 'x');
+    try doc.value.object.put(allocator, "failure_message", .{ .string = long });
+    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
+}
 test "tool_view decodes its display fields instead of an unsupported event" {
     const a = std.testing.allocator;
     const json =
@@ -765,44 +789,4 @@ test "wire error codes classify configuration rejections as invalid input" {
     // Reclassification never widens the neighbors it sits between.
     try std.testing.expectEqual(.unsupported, errorCode(error.Unsupported));
     try std.testing.expectEqual(.internal, errorCode(error.CleanupFailed));
-}
-test "decision diagnostic terminal roundtrip owns labels and rejects invalid wire values" {
-    const a = std.testing.allocator;
-    var diagnostic: @import("../core/decision.zig").Diagnostic = .{
-        .stage = .transport,
-        .backend = .systemone,
-        .operation = .command,
-        .transport_exit_code = 60,
-    };
-    diagnostic.setError(error.DecisionTransport);
-    const event: r.Event = .{ .finished = .{
-        .status = .paused,
-        .detail = error.DecisionUnavailable,
-        .decision_failure = diagnostic,
-    } };
-    try expectEventRoundTrip(a, event);
-    const encoded = try encodeEvent(a, event);
-    defer a.free(encoded);
-    var decoded = try decodeEvent(a, encoded);
-    defer decoded.deinit();
-    try std.testing.expectEqualStrings("DecisionTransport", decoded.event.finished.decision_failure.?.causeName());
-    try std.testing.expectEqual(@as(?u8, 60), decoded.event.finished.decision_failure.?.transport_exit_code);
-    try std.testing.expect(decoded.event.finished.http_status == null);
-    var doc = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always });
-    defer doc.deinit();
-    const allocator = doc.arena.allocator();
-    const fields = &doc.value.object.getPtr("decision_failure").?.object;
-    try fields.put(allocator, "cause", .{ .string = "raw response\nsecret" });
-    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
-    try fields.put(allocator, "cause", .{ .string = "DecisionTransport" });
-    try fields.put(allocator, "http_status", .{ .integer = 600 });
-    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
-    try fields.put(allocator, "http_status", .{ .null = {} });
-    try fields.put(allocator, "transport_exit_code", .{ .integer = 256 });
-    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
-    try fields.put(allocator, "transport_exit_code", .{ .integer = 60 });
-    try fields.put(allocator, "stage", .{ .string = "unknown-stage" });
-    try std.testing.expectError(error.BadRequest, decodeTerminalChecked(doc.value.object));
-    _ = doc.value.object.swapRemove("decision_failure");
-    try std.testing.expect((try decodeTerminalChecked(doc.value.object)).decision_failure == null);
 }

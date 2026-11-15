@@ -17,7 +17,7 @@ const corecodex = @import("../core/codex_login.zig");
 const command_menu_module = @import("command_menu.zig");
 const resume_picker_module = @import("resume_picker.zig");
 const settings_menu_module = @import("settings_menu.zig");
-const decision_picker_module = @import("decision_picker.zig");
+const settings_model_module = @import("settings_model_picker.zig");
 const proxy_picker_module = @import("proxy_picker.zig");
 const preference = @import("../core/settings.zig");
 const settings_value_module = @import("settings_value_picker.zig");
@@ -474,10 +474,9 @@ const Permission = struct {
 
 /// UI-owned callbacks; the application owns the runtime and configuration lifetime.
 pub const Connection = struct {
-    pub const Setting = enum { low_price_input, decision_enabled };
-    pub const DecisionChoice = decision_picker_module.Choice;
-    decision_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
-    image_fn: ?*const fn (*anyopaque, DecisionChoice) anyerror!void = null,
+    pub const Setting = enum { low_price_input };
+    pub const ModelChoice = settings_model_module.Choice;
+    image_fn: ?*const fn (*anyopaque, ModelChoice) anyerror!void = null,
     setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     preference_fn: ?*const fn (*anyopaque, preference.Key, ?u32) anyerror!void = null,
     /// Exact proxy-model routing toggle: the owner saves the list and
@@ -573,10 +572,6 @@ pub const Connection = struct {
         background: background_status.View = .{},
         subagents: @import("../core/subagent_status.zig").View = .{},
         subagents_supported: bool = false,
-        decision_enabled: bool = false,
-        /// Owned by the session, resolved with auxiliary rather than chat limits.
-        decision_models: []const core_config.Model = &.{},
-        decision_model: ?[]const u8 = null,
         /// Owner-published proxy host/port availability; never inferred or guessed.
         proxy_configured: bool = false,
         /// Owner-published bare host (IPv6 without brackets); null means none.
@@ -662,8 +657,8 @@ fn setupHint(state: Connection.State) ?[]const u8 {
     const notice = state.settings_notice orelse return null;
     if (std.mem.eql(u8, notice, "Not logged in; history available, use /login to activate"))
         return "Not configured: /login, then /model";
-    if (std.mem.eql(u8, notice, "SystemOne is decision-only; history available, select a chat model"))
-        return "SystemOne is decision-only; select /model";
+    if (std.mem.eql(u8, notice, "SystemOne is not a chat model; history available, select a chat model"))
+        return "SystemOne is not a chat model; select /model";
     if (std.mem.eql(u8, notice, "Default model unavailable locally; select a configured model") or
         std.mem.eql(u8, notice, "Saved model unavailable locally; history available, use /model"))
         return "Model unavailable: select /model";
@@ -725,7 +720,7 @@ fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *con
 const pending_session_notice = "Waiting for session...";
 
 /// TUI 的全部状态。只在 UI 线程（run/loop）中访问；后台 Job 只通过 bridge 与之通信。
-const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, queue_resume, configure, codex_login, model, effort, preference, setting, decision, image, proxy, proxy_address, refresh };
+const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, queue_resume, configure, codex_login, model, effort, preference, setting, image, proxy, proxy_address, refresh };
 const AsyncPending = struct {
     ticket: u64,
     purpose: AsyncPurpose,
@@ -862,7 +857,7 @@ const Ui = struct {
     codex_cancel_waiting: bool = false,
     codex_view_hash: u64 = 0,
     settings_open: bool = false,
-    settings_model_picker: enum { none, decision, image } = .none,
+    settings_model_picker: enum { none, image } = .none,
     /// Searchable multi-select proxy child. Enter saves one exact model.
     proxy_open: bool = false,
     /// Proxy second level: Address and Models rows.
@@ -874,8 +869,8 @@ const Ui = struct {
     settings_menu: settings_menu_module.Menu = .{},
     displayed_settings_generation: ?u64 = null,
     frame_settings_generation: ?u64 = null,
-    displayed_decision_fingerprint: ?decision_picker_module.Fingerprint = null,
-    frame_decision_fingerprint: ?decision_picker_module.Fingerprint = null,
+    displayed_picker_fingerprint: ?settings_model_module.Fingerprint = null,
+    frame_picker_fingerprint: ?settings_model_module.Fingerprint = null,
     displayed_proxy_fingerprint: ?proxy_picker_module.Fingerprint = null,
     frame_proxy_fingerprint: ?proxy_picker_module.Fingerprint = null,
     /// Settings-root editor draft captured while the proxy child owns the editor.
@@ -1372,7 +1367,7 @@ const Ui = struct {
                     },
                     .configure => "Could not save configuration; use /login to retry",
                     .model => "Could not switch; selection is unchanged",
-                    .preference, .setting, .decision, .image, .proxy, .proxy_address => "Could not save setting; previous value kept",
+                    .preference, .setting, .image, .proxy, .proxy_address => "Could not save setting; previous value kept",
                     else => session_client.describe(err),
                 };
                 self.publishNoticeAlias(self.asyncFailureLevel(pending.purpose));
@@ -1497,13 +1492,13 @@ const Ui = struct {
                 self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 5000 };
                 self.notice = "Ready";
             },
-            .preference, .setting, .decision, .image, .proxy, .proxy_address => {
+            .preference, .setting, .image, .proxy, .proxy_address => {
                 self.display.context = self.connection.current().initial_context;
                 self.frame_settings_generation = null;
                 const same_menu = self.settings_open and self.settings_menu.generation == pending.settings_generation;
                 if (same_menu) switch (pending.purpose) {
                     .preference => if (self.settings_value_picker != null) self.backFromSettingsValue(),
-                    .decision, .image => if (self.settingsModelOpen()) self.backToSettings(),
+                    .image => if (self.settingsModelOpen()) self.backToSettings(),
                     .proxy_address => if (self.proxy_address_open) self.backToProxySubmenu(0),
                     else => {},
                 };
@@ -2176,8 +2171,8 @@ const Ui = struct {
         self.frame_provider_generation = null;
         self.displayed_settings_generation = null;
         self.frame_settings_generation = null;
-        self.displayed_decision_fingerprint = null;
-        self.frame_decision_fingerprint = null;
+        self.displayed_picker_fingerprint = null;
+        self.frame_picker_fingerprint = null;
         self.displayed_proxy_fingerprint = null;
         self.frame_proxy_fingerprint = null;
         self.delivery_proven = 0;
@@ -2274,8 +2269,8 @@ const Ui = struct {
         self.displayed_command_generation = null;
         self.displayed_provider_generation = null;
         self.displayed_settings_generation = null;
-        self.displayed_decision_fingerprint = null;
-        self.frame_decision_fingerprint = null;
+        self.displayed_picker_fingerprint = null;
+        self.frame_picker_fingerprint = null;
         self.displayed_proxy_fingerprint = null;
         self.frame_proxy_fingerprint = null;
         self.model_epoch +%= 1;
@@ -3533,9 +3528,6 @@ const Ui = struct {
     fn settingsQueryOpen(self: *const Ui) bool {
         return self.settingsModelOpen() or self.proxy_open;
     }
-    fn settingsModels(self: *const Ui, state: Connection.State) []const core_config.Model {
-        return if (self.settings_model_picker == .image) state.image_models else state.decision_models;
-    }
     fn dropProxyRestore(self: *Ui) void {
         if (self.proxy_restore) |*draft| {
             draft.clear();
@@ -3620,8 +3612,8 @@ const Ui = struct {
         self.proxy_open = false;
         self.proxy_sub_open = false;
         self.proxy_address_open = false;
-        self.displayed_decision_fingerprint = null;
-        self.frame_decision_fingerprint = null;
+        self.displayed_picker_fingerprint = null;
+        self.frame_picker_fingerprint = null;
         self.displayed_proxy_fingerprint = null;
         self.frame_proxy_fingerprint = null;
         self.settings_value_picker = null;
@@ -3640,11 +3632,11 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
-        const parent: usize = if (self.settings_model_picker == .image) 5 else if (self.anyProxyOpen()) 7 else 1;
+        const parent: usize = if (self.settings_model_picker == .image) 4 else if (self.anyProxyOpen()) 6 else 1;
         if (self.settingsModelOpen()) self.wipeEditor();
         if (self.proxyEditorBorrowed()) self.endProxyEditor();
-        self.displayed_decision_fingerprint = null;
-        self.frame_decision_fingerprint = null;
+        self.displayed_picker_fingerprint = null;
+        self.frame_picker_fingerprint = null;
         self.displayed_proxy_fingerprint = null;
         self.frame_proxy_fingerprint = null;
         self.settings_value_picker = null;
@@ -3664,7 +3656,7 @@ const Ui = struct {
             .compaction_enabled => "Auto compaction",
             .memory_auto => "Auto memory",
             .command_timeout_ms => "Command timeout (s)",
-            .request_timeout_ms => "All inference request timeout (s; including decisions)",
+            .request_timeout_ms => "All inference request timeout (s)",
         };
     }
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
@@ -3786,15 +3778,16 @@ const Ui = struct {
             else => {},
         }
     }
-    /// The main editor is exclusively a bounded child query while Decision is
-    /// open. Revoke before allocating: an insertion OOM cannot retain old ACK.
-    fn decisionQueryChanged(self: *Ui) void {
+    /// The main editor is exclusively a bounded child query while a settings
+    /// model picker is open. Revoke before allocating: an insertion OOM cannot
+    /// retain the old ACK.
+    fn pickerQueryChanged(self: *Ui) void {
         self.settings_menu.selected = 0;
         self.settings_menu.generation +%= 1;
         self.displayed_settings_generation = null;
         self.frame_settings_generation = null;
-        self.displayed_decision_fingerprint = null;
-        self.frame_decision_fingerprint = null;
+        self.displayed_picker_fingerprint = null;
+        self.frame_picker_fingerprint = null;
     }
     fn proxyQueryChanged(self: *Ui) void {
         self.settings_menu.selected = 0;
@@ -3805,7 +3798,7 @@ const Ui = struct {
         self.frame_proxy_fingerprint = null;
     }
     fn settingsQueryChanged(self: *Ui) void {
-        if (self.proxy_open) self.proxyQueryChanged() else self.decisionQueryChanged();
+        if (self.proxy_open) self.proxyQueryChanged() else self.pickerQueryChanged();
     }
     /// Any address edit revokes the acknowledgement; only a fresh complete
     /// frame can authorize a save, even inside one read or paste batch.
@@ -4079,7 +4072,7 @@ const Ui = struct {
                 const total: usize = if (self.proxy_open)
                     proxy_picker_module.count(state.models, state.model_providers, self.editor.bytes.items)
                 else if (self.settingsModelOpen())
-                    decision_picker_module.count(self.settingsModels(state), state.model_providers, self.editor.bytes.items)
+                    settings_model_module.count(state.image_models, state.model_providers, self.editor.bytes.items)
                 else
                     settings_menu_module.labels.len;
                 self.settings_menu.move(event_ == .down, total);
@@ -4091,9 +4084,9 @@ const Ui = struct {
                 // read batch tail; only a new complete frame can authorize again.
                 self.settings_menu.generation +%= 1;
                 self.displayed_settings_generation = null;
-                const acknowledged = self.displayed_decision_fingerprint;
-                self.displayed_decision_fingerprint = null;
-                self.frame_decision_fingerprint = null;
+                const acknowledged = self.displayed_picker_fingerprint;
+                self.displayed_picker_fingerprint = null;
+                self.frame_picker_fingerprint = null;
                 const acknowledged_proxy = self.displayed_proxy_fingerprint;
                 self.displayed_proxy_fingerprint = null;
                 self.frame_proxy_fingerprint = null;
@@ -4102,27 +4095,24 @@ const Ui = struct {
                 if (self.proxy_open) return self.toggleProxy(acknowledged_proxy, state);
                 if (self.settingsModelOpen()) {
                     const previous = acknowledged orelse return;
-                    const current = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers) orelse return;
+                    const current = settings_model_module.fingerprint(state.image_models, state.model_providers) orelse return;
                     if (!std.mem.eql(u8, &previous, &current)) return;
                 }
                 if (!state.global_settings_available) {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
                 }
-                if (!self.settingsQueryOpen() and (self.settings_menu.selected == 1 or self.settings_menu.selected == 5)) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 4) {
                     self.wipeEditor();
-                    self.settings_model_picker = if (self.settings_menu.selected == 5) .image else .decision;
+                    self.settings_model_picker = .image;
                     self.settings_menu.clear();
-                    const selected_ref = if (self.settings_model_picker == .image)
-                        (if (state.image_enabled) state.image_model else null)
-                    else
-                        (if (state.decision_enabled) state.decision_model else null);
-                    self.settings_menu.selected = decision_picker_module.indexOf(self.settingsModels(state), state.model_providers, self.editor.bytes.items, selected_ref);
+                    const selected_ref = if (state.image_enabled) state.image_model else null;
+                    self.settings_menu.selected = settings_model_module.indexOf(state.image_models, state.model_providers, self.editor.bytes.items, selected_ref);
                     self.frame_settings_generation = null;
                     self.notice = "Ready";
                     return;
                 }
-                if (!self.settingsQueryOpen() and self.settings_menu.selected == 7) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 6) {
                     self.backToProxySubmenu(0);
                     return;
                 }
@@ -4141,13 +4131,13 @@ const Ui = struct {
                     return;
                 };
                 if (self.settingsModelOpen()) {
-                    const save = (if (self.settings_model_picker == .image) self.connection.image_fn else self.connection.decision_fn) orelse {
+                    const save = self.connection.image_fn orelse {
                         self.notice = "Global settings unavailable; changes disabled";
                         return;
                     };
-                    const selected = decision_picker_module.choice(self.settingsModels(state), state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
+                    const selected = settings_model_module.choice(state.image_models, state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
                     if (self.connection.async_actions != null) {
-                        _ = self.beginAsync(if (self.settings_model_picker == .image) .{ .image = selected } else .{ .decision = selected }, if (self.settings_model_picker == .image) .image else .decision);
+                        _ = self.beginAsync(.{ .image = selected }, .image);
                         return;
                     }
                     save(self.connection.context, selected) catch {
@@ -4170,7 +4160,7 @@ const Ui = struct {
                     };
                 }
                 // Owner publishes, UI never speculates or mutates the snapshot.
-                // Decision schema rewrites may explicitly invalidate context.
+                // Schema rewrites may explicitly invalidate context.
                 const updated = self.connection.current();
                 self.display.context = updated.initial_context;
                 self.frame_settings_generation = null;
@@ -4612,9 +4602,9 @@ const Ui = struct {
         if (std.mem.eql(u8, command, "/help")) {
             self.wipeEditor();
             _ = try self.add(.notice, if (self.remote() != null)
-                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n/ls [--running] [--page N]  List sessions\n/resume [id]  Resume saved session\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
+                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n/ls [--running] [--page N]  List sessions\n/resume [id]  Resume saved session\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
             else
-                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Decision model)\n!command  Run a local command without main-model inference");
+                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n!command  Run a local command without main-model inference");
             return;
         }
         if (std.mem.eql(u8, command, "/settings") or std.mem.startsWith(u8, command, "/settings ") or std.mem.startsWith(u8, command, "/settings\t")) {
@@ -5932,10 +5922,8 @@ const Ui = struct {
         };
         if (result.status == .canceled and result.detail != null and result.detail.? == error.Canceled)
             writer.writeAll(label) catch return false
-        else if (result.detail != null and result.detail.? == error.DecisionUnavailable)
-            shared.failure.writeDecision(writer, result.decision_failure) catch return false
         else
-            shared.failure.write(writer, label, result.detail, result.model_failure, result.http_status) catch return false;
+            shared.failure.write(writer, label, result.detail, result.http_status, result.failureText()) catch return false;
         const level: NoticeLevel = if (result.status == .canceled) .plain else .failure;
         return self.tryAppendNotice(level, formatted.written());
     }
@@ -6418,8 +6406,8 @@ const Ui = struct {
         self.displayed_command_generation = null;
         self.displayed_provider_generation = null;
         self.displayed_settings_generation = null;
-        self.displayed_decision_fingerprint = null;
-        self.frame_decision_fingerprint = null;
+        self.displayed_picker_fingerprint = null;
+        self.frame_picker_fingerprint = null;
         self.displayed_stop = null;
         self.frame_stop = null;
         if (self.stop_open) self.stop_generation +%= 1;
@@ -6534,7 +6522,7 @@ const Ui = struct {
         self.displayed_command_generation = if (self.frame_fresh) self.frame_command_generation else null;
         self.displayed_provider_generation = if (self.frame_fresh) self.frame_provider_generation else null;
         self.displayed_settings_generation = if (self.frame_fresh) self.frame_settings_generation else null;
-        self.displayed_decision_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_decision_fingerprint else null;
+        self.displayed_picker_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_picker_fingerprint else null;
         self.displayed_proxy_fingerprint = if (self.frame_fresh and self.displayed_settings_generation != null) self.frame_proxy_fingerprint else null;
         self.tail_height = self.frame_height;
         if (self.frame_fresh) self.tail_hint_hash = self.frame_hint_hash;
@@ -7343,8 +7331,6 @@ const Ui = struct {
         self.frame_provider_generation = null;
         const settings_snapshot: settings_menu_module.Snapshot = .{
             .low_price_input_enabled = state.low_price_input_enabled,
-            .decision_enabled = state.decision_enabled,
-            .decision_model = state.decision_model,
             .image_enabled = state.image_enabled,
             .image_model = state.image_model,
             .memory_auto = state.memory_auto,
@@ -7355,12 +7341,12 @@ const Ui = struct {
             .global_settings_available = state.global_settings_available,
             .limits = state.limits,
         };
-        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.proxy_open) try proxy_picker_module.rows(a, self.settings_menu, state.models, state.model_providers, state.proxy_models, state.proxy_configured, state.proxy_address, state.proxy_port, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open and self.proxy_sub_open) try settings_menu_module.proxyRows(a, self.settings_menu, settings_snapshot, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try decision_picker_module.rows(a, self.settings_menu, self.settingsModels(state), state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, settings_snapshot, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
+        var settings_rows = if (self.settings_open and self.settings_value_picker != null) try settings_value_module.rows(a, self.settings_menu, self.settings_value_picker.?, cols, candidate_limit) else if (self.settings_open and self.proxy_open) try proxy_picker_module.rows(a, self.settings_menu, state.models, state.model_providers, state.proxy_models, state.proxy_configured, state.proxy_address, state.proxy_port, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open and self.proxy_sub_open) try settings_menu_module.proxyRows(a, self.settings_menu, settings_snapshot, cols, candidate_limit) else if (self.settings_open and self.settingsModelOpen()) try settings_model_module.rows(a, self.settings_menu, state.image_models, state.model_providers, self.editor.bytes.items, cols, candidate_limit) else if (self.settings_open) try settings_menu_module.rows(a, self.settings_menu, settings_snapshot, cols, candidate_limit) else settings_menu_module.Rows{ .lines = &.{} };
         if (self.settings_value_picker) |picker| {
             settings_rows.can_confirm = settings_rows.can_confirm and text.width(settingsValueTitle(picker.key)) <= cols;
         }
         self.frame_settings_generation = null;
-        self.frame_decision_fingerprint = null;
+        self.frame_picker_fingerprint = null;
         self.frame_proxy_fingerprint = null;
         const menu_visible = !release_idle and self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
@@ -7602,7 +7588,7 @@ const Ui = struct {
                     (!self.proxy_address_open or self.addressFits(cols)))
                 {
                     self.frame_settings_generation = self.settings_menu.generation;
-                    if (self.settingsModelOpen()) self.frame_decision_fingerprint = decision_picker_module.fingerprint(self.settingsModels(state), state.model_providers);
+                    if (self.settingsModelOpen()) self.frame_picker_fingerprint = settings_model_module.fingerprint(state.image_models, state.model_providers);
                     if (self.proxy_open) self.frame_proxy_fingerprint = proxy_picker_module.fingerprint(state.models, state.model_providers, state.proxy_models, state.proxy_configured, state.proxy_address, state.proxy_port);
                 }
                 if (!self.stop_open and self.provider_open and provider_rows.can_confirm) self.frame_provider_generation = self.provider_picker.generation;

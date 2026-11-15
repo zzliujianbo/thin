@@ -226,11 +226,12 @@ fn run(init: std.process.Init) !u8 {
         }
 
         reportLogFailure(init.io, app);
-        // 失败或取消时，把终止状态、错误名与模型失败类型拼成一行写入 stderr。
-        var buffer: [512]u8 = undefined;
+        // 失败或取消时，把终止状态、HTTP 码与原始失败原因拼成一行写入 stderr。
+        // 原因最多 480 字节，缓冲区按最坏情况留出标签和分隔符的空间。
+        var buffer: [640]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         try writer.writeAll("thin: ");
-        try @import("presentation.zig").failure.write(&writer, @tagName(terminal.status), terminal.detail, terminal.model_failure, terminal.http_status);
+        try @import("presentation.zig").failure.write(&writer, @tagName(terminal.status), terminal.detail, terminal.http_status, terminal.failureText());
         try writer.writeByte('\n');
         const message = writer.buffered();
 
@@ -264,21 +265,4 @@ pub fn exitCodeAfterRecording(code: u8, signal: u8) u8 {
 /// 是否需要终端：--print 与 daemon/worker 不要求 TTY，仅交互前台/connect/attach 要求。
 fn requiresInteractiveTty(options: cli.Options) bool {
     return options.prompt == null and options.ssh_owner == null and options.mode.requiresTty();
-}
-
-/// TUI/worker 已 join 所有 producer 并恢复终端属性后，由交互入口调用。
-pub fn reportResume(init: std.process.Init, session: *Session) void {
-    const saved = session.saveOnExit() catch |err| {
-        var buffer: [256]u8 = undefined;
-        const warning = std.fmt.bufPrint(&buffer, "thin: full conversation was NOT saved for resume: {s}. No resume command is available for this exit.\n", .{@errorName(err)}) catch return;
-        output(init.io, .stderr(), warning) catch {};
-        return;
-    };
-    if (!saved or interrupt.signal() != 0) return;
-    const command = @import("app/resume_command.zig").format(init.gpa, session.session_id) catch {
-        output(init.io, .stderr(), "thin: checkpoint saved, but a safe copyable resume command could not be produced.\n") catch {};
-        return;
-    };
-    defer init.gpa.free(command);
-    output(init.io, .stdout(), command) catch {};
 }

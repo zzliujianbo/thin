@@ -1,11 +1,18 @@
-test "read failure captions expose known reasons but never raw tool bodies" {
-    try std.testing.expectEqualStrings("FileNotFound: file not found", readFailure(.{ .text = "FileNotFound", .is_error = true }).?);
-    try std.testing.expectEqualStrings("AccessDenied: permission denied", readFailure(.{ .text = "AccessDenied", .is_error = true }).?);
-    for ([_][]const u8{ "{\"error\":\"private-body\"}", "FileNotFound\nprivate-body", "\x1b[2JFileNotFound", "unknown-private-error" }) |raw| {
-        try std.testing.expectEqualStrings("Read failed: details unavailable", readFailure(.{ .text = raw, .is_error = true }).?);
-    }
-    try std.testing.expect(readFailure(.{ .text = "FileNotFound" }) == null);
-    try std.testing.expect(readFailure(.{ .text = "FileNotFound", .is_error = true, .canceled = true }) == null);
+test "read failure captions show the raw error text with hostile bytes sanitized" {
+    const a = std.testing.allocator;
+    const missing = (try failureReason(a, .read, .{ .text = "FileNotFound", .is_error = true })).?;
+    defer a.free(missing);
+    try std.testing.expectEqualStrings("FileNotFound", missing);
+    const denied = (try failureReason(a, .read, .{ .text = "AccessDenied", .is_error = true })).?;
+    defer a.free(denied);
+    try std.testing.expectEqualStrings("AccessDenied", denied);
+    // The mapper is gone, so an unknown code stays as-is; only control bytes and
+    // the line break are sanitized, never replaced by a generic caption.
+    const unknown = (try failureReason(a, .read, .{ .text = "\x1b[2JUnknownCode\nprivate-body", .is_error = true })).?;
+    defer a.free(unknown);
+    try std.testing.expectEqualStrings("\u{fffd}[2JUnknownCode", unknown);
+    try std.testing.expect((try failureReason(a, .read, .{ .text = "FileNotFound" })) == null);
+    try std.testing.expect((try failureReason(a, .read, .{ .text = "FileNotFound", .is_error = true, .canceled = true })) == null);
 }
 test "typed tool fields keep unknown targets safe and preserve clipping provenance" {
     const a = std.testing.allocator;

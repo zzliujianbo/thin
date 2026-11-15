@@ -482,15 +482,15 @@ const ImageModelFixture = struct {
         .{ .name = "login/deepseek-flash", .protocol = .chat, .context_tokens = 16384 },
         .{ .name = "unlogged/deepseek-flash", .protocol = .chat, .context_tokens = 16384 },
     };
-    state: Connection.State = .{ .runtime = null, .model = "primary", .base_url = "", .image_models = &profiles, .decision_models = &DecisionModelFixture.profiles, .model_providers = &DecisionModelFixture.logged, .decision_enabled = true, .decision_model = "login/family/judge" },
+    const logged = [_]ModelProvider{.{ .name = "login" }};
+    state: Connection.State = .{ .runtime = null, .model = "primary", .base_url = "", .image_models = &profiles, .model_providers = &logged },
     calls: usize = 0,
-    decision_calls: usize = 0,
     fail: bool = false,
     fn current(raw: *anyopaque) Connection.State {
         return @as(*@This(), @ptrCast(@alignCast(raw))).state;
     }
     fn configure(_: *anyopaque, _: []const u8) !void {}
-    fn image(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
+    fn image(raw: *anyopaque, choice: Connection.ModelChoice) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.calls += 1;
         if (self.fail) return error.SaveFailed;
@@ -501,51 +501,8 @@ const ImageModelFixture = struct {
         };
         if (choice == .model) try std.testing.expectEqualStrings("login/deepseek-flash", choice.model);
     }
-    fn decision(raw: *anyopaque, _: Connection.DecisionChoice) !void {
-        @as(*@This(), @ptrCast(@alignCast(raw))).decision_calls += 1;
-    }
     fn connection(self: *@This()) Connection {
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .image_fn = image, .decision_fn = decision };
-    }
-};
-
-const DecisionModelFixture = struct {
-    const profiles = [_]core_config.Model{
-        .{ .name = "login/family/judge", .protocol = .chat, .context_tokens = 16384 },
-        .{ .name = "second/family/judge", .protocol = .chat, .context_tokens = 16384 },
-        .{ .name = "unlogged/private-model", .protocol = .chat, .context_tokens = 16384 },
-    };
-    const logged = [_]ModelProvider{.{ .name = "login" }};
-    const other = [_]ModelProvider{.{ .name = "second" }};
-    state: Connection.State = .{ .runtime = null, .model = "primary", .selection_name = "main/primary", .base_url = "", .decision_models = &profiles, .model_providers = &logged },
-    calls: usize = 0,
-    main_calls: usize = 0,
-    fail: bool = false,
-    saved: [1089]u8 = undefined,
-    saved_len: usize = 0,
-    fn current(raw: *anyopaque) Connection.State {
-        return @as(*@This(), @ptrCast(@alignCast(raw))).state;
-    }
-    fn configure(_: *anyopaque, _: []const u8) !void {}
-    fn mainSelect(raw: *anyopaque, _: []const u8) !void {
-        @as(*@This(), @ptrCast(@alignCast(raw))).main_calls += 1;
-        return error.UnexpectedMainSelection;
-    }
-    fn choose(raw: *anyopaque, choice: Connection.DecisionChoice) !void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        self.calls += 1;
-        if (self.fail) return error.SaveFailed;
-        const name = switch (choice) {
-            .model => |value| value,
-            else => return error.UnexpectedBackend,
-        };
-        @memcpy(self.saved[0..name.len], name);
-        self.saved_len = name.len;
-        self.state.decision_model = self.saved[0..name.len];
-        self.state.decision_enabled = true;
-    }
-    fn connection(self: *@This()) Connection {
-        return .{ .context = self, .current_fn = current, .configure_fn = configure, .select_model_fn = mainSelect, .decision_fn = choose };
+        return .{ .context = self, .current_fn = current, .configure_fn = configure, .image_fn = image };
     }
 };
 

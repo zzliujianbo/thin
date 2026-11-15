@@ -57,7 +57,7 @@
     {
       "virtual": "src/app/cli.zig",
       "production": "src/app/cli.zig",
-      "support": "tests/support/app/cli.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/cli_test.zig",
@@ -96,40 +96,6 @@
     {
       "virtual": "src/app/console.zig",
       "production": "src/app/console.zig",
-      "support": null,
-      "fragments": [],
-      "group": "app",
-      "unit": false
-    },
-    {
-      "virtual": "src/app/decision_client.zig",
-      "production": "src/app/decision_client.zig",
-      "support": "tests/support/app/decision_client.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/app/decision_client_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/decision_model_selection_test.zig",
-      "production": null,
-      "support": "tests/roots/app/decision_model_selection_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/app/decision_model_selection_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/decision_selection.zig",
-      "production": "src/app/decision_selection.zig",
       "support": null,
       "fragments": [],
       "group": "app",
@@ -177,7 +143,7 @@
     {
       "virtual": "src/app/image_selection.zig",
       "production": "src/app/image_selection.zig",
-      "support": "tests/support/app/image_selection.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/image_selection_test.zig",
@@ -211,7 +177,7 @@
     {
       "virtual": "src/app/json_bound.zig",
       "production": "src/app/json_bound.zig",
-      "support": "tests/support/app/json_bound.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/json_bound_test.zig",
@@ -302,7 +268,7 @@
     {
       "virtual": "src/app/memory_notifications.zig",
       "production": "src/app/memory_notifications.zig",
-      "support": "tests/support/app/memory_notifications.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/memory_notifications_test.zig",
@@ -341,7 +307,7 @@
     {
       "virtual": "src/app/model_directory.zig",
       "production": "src/app/model_directory.zig",
-      "support": "tests/support/app/model_directory.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/model_directory_test.zig",
@@ -385,7 +351,7 @@
     {
       "virtual": "src/app/model_resolver.zig",
       "production": "src/app/model_resolver.zig",
-      "support": "tests/support/app/model_resolver.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/model_resolver_test.zig",
@@ -411,7 +377,7 @@
     {
       "virtual": "src/app/provider_catalog.zig",
       "production": "src/app/provider_catalog.zig",
-      "support": "tests/support/app/provider_catalog.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/provider_catalog_test.zig",
@@ -463,7 +429,7 @@
     {
       "virtual": "src/app/resume_command.zig",
       "production": "src/app/resume_command.zig",
-      "support": "tests/support/app/resume_command.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/resume_command_test.zig",
@@ -545,7 +511,7 @@
     {
       "virtual": "src/app/session_id.zig",
       "production": "src/app/session_id.zig",
-      "support": "tests/support/app/session_id.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/session_id_test.zig",
@@ -569,9 +535,17 @@
       "unit": true
     },
     {
+      "virtual": "src/app/settings_selection.zig",
+      "production": "src/app/settings_selection.zig",
+      "support": null,
+      "fragments": [],
+      "group": "app",
+      "unit": false
+    },
+    {
       "virtual": "src/app/subagent_progress.zig",
       "production": "src/app/subagent_progress.zig",
-      "support": "tests/support/app/subagent_progress.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/subagent_progress_test.zig",
@@ -597,7 +571,7 @@
     {
       "virtual": "src/app/version.zig",
       "production": "src/app/version.zig",
-      "support": "tests/support/app/version.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/version_test.zig",
@@ -631,7 +605,7 @@
     {
       "virtual": "src/core/background_status.zig",
       "production": "src/core/background_status.zig",
-      "support": "tests/support/core/background_status.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/background_status_test.zig",
@@ -657,7 +631,7 @@
     {
       "virtual": "src/core/codex_auth.zig",
       "production": "src/core/codex_auth.zig",
-      "support": "tests/support/core/codex_auth.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/codex_auth_test.zig",
@@ -670,7 +644,7 @@
     {
       "virtual": "src/core/codex_login.zig",
       "production": "src/core/codex_login.zig",
-      "support": "tests/support/core/codex_login.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/codex_login_test.zig",
@@ -701,7 +675,7 @@
     {
       "virtual": "src/core/context.zig",
       "production": "src/core/context.zig",
-      "support": "tests/support/core/context.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/context_test.zig",
@@ -712,22 +686,9 @@
       "unit": true
     },
     {
-      "virtual": "src/core/decision.zig",
-      "production": "src/core/decision.zig",
-      "support": "tests/support/core/decision.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/core/decision_test.zig",
-          "container": []
-        }
-      ],
-      "group": "core",
-      "unit": true
-    },
-    {
       "virtual": "src/core/diagnostics.zig",
       "production": "src/core/diagnostics.zig",
-      "support": "tests/support/core/diagnostics.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/diagnostics_test.zig",
@@ -740,7 +701,7 @@
     {
       "virtual": "src/core/image.zig",
       "production": "src/core/image.zig",
-      "support": "tests/support/core/image.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/image_test.zig",
@@ -753,7 +714,7 @@
     {
       "virtual": "src/core/inbox.zig",
       "production": "src/core/inbox.zig",
-      "support": "tests/support/core/inbox.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/inbox_test.zig",
@@ -766,7 +727,7 @@
     {
       "virtual": "src/core/knowledge.zig",
       "production": "src/core/knowledge.zig",
-      "support": "tests/support/core/knowledge.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/knowledge_test.zig",
@@ -805,7 +766,7 @@
     {
       "virtual": "src/core/memory_status.zig",
       "production": "src/core/memory_status.zig",
-      "support": "tests/support/core/memory_status.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/memory_status_test.zig",
@@ -818,7 +779,7 @@
     {
       "virtual": "src/core/protocol.zig",
       "production": "src/core/protocol.zig",
-      "support": "tests/support/core/protocol.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/protocol_test.zig",
@@ -831,7 +792,7 @@
     {
       "virtual": "src/core/providers.zig",
       "production": "src/core/providers.zig",
-      "support": "tests/support/core/providers.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/providers_test.zig",
@@ -844,7 +805,7 @@
     {
       "virtual": "src/core/runtime.zig",
       "production": "src/core/runtime.zig",
-      "support": "tests/support/core/runtime.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/runtime_test.zig",
@@ -878,7 +839,7 @@
     {
       "virtual": "src/core/session_metadata.zig",
       "production": "src/core/session_metadata.zig",
-      "support": "tests/support/core/session_metadata.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/session_metadata_test.zig",
@@ -915,7 +876,7 @@
     {
       "virtual": "src/core/subagent_status.zig",
       "production": "src/core/subagent_status.zig",
-      "support": "tests/support/core/subagent_status.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/subagent_status_test.zig",
@@ -939,19 +900,6 @@
       "unit": true
     },
     {
-      "virtual": "src/core/systemone.zig",
-      "production": "src/core/systemone.zig",
-      "support": "tests/support/core/systemone.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/core/systemone_test.zig",
-          "container": []
-        }
-      ],
-      "group": "core",
-      "unit": true
-    },
-    {
       "virtual": "src/core/task.zig",
       "production": "src/core/task.zig",
       "support": null,
@@ -962,7 +910,7 @@
     {
       "virtual": "src/core/thinking.zig",
       "production": "src/core/thinking.zig",
-      "support": "tests/support/core/thinking.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/thinking_test.zig",
@@ -988,7 +936,7 @@
     {
       "virtual": "src/core/tool_stream.zig",
       "production": "src/core/tool_stream.zig",
-      "support": "tests/support/core/tool_stream.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/tool_stream_test.zig",
@@ -1001,7 +949,7 @@
     {
       "virtual": "src/core/write_preview.zig",
       "production": "src/core/write_preview.zig",
-      "support": "tests/support/core/write_preview.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/core/write_preview_test.zig",
@@ -1027,7 +975,7 @@
     {
       "virtual": "src/daemon/communication.zig",
       "production": "src/daemon/communication.zig",
-      "support": "tests/support/daemon/communication.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/daemon/communication_test.zig",
@@ -1100,7 +1048,7 @@
     {
       "virtual": "src/daemon/ssh.zig",
       "production": "src/daemon/ssh.zig",
-      "support": "tests/support/daemon/ssh.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/daemon/ssh_test.zig",
@@ -1113,7 +1061,7 @@
     {
       "virtual": "src/daemon/stream_receiver.zig",
       "production": "src/daemon/stream_receiver.zig",
-      "support": "tests/support/daemon/stream_receiver.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/daemon/stream_receiver_test.zig",
@@ -1205,7 +1153,7 @@
     {
       "virtual": "src/llm/anthropic.zig",
       "production": "src/llm/anthropic.zig",
-      "support": "tests/support/llm/anthropic.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/llm/anthropic_discovery.zig",
@@ -1243,6 +1191,14 @@
       "unit": true
     },
     {
+      "virtual": "src/llm/codex.zig",
+      "production": "src/llm/codex.zig",
+      "support": null,
+      "fragments": [],
+      "group": "core",
+      "unit": false
+    },
+    {
       "virtual": "src/llm/common.zig",
       "production": "src/llm/common.zig",
       "support": null,
@@ -1251,22 +1207,22 @@
       "unit": false
     },
     {
-      "virtual": "src/llm/decision_http.zig",
-      "production": "src/llm/decision_http.zig",
-      "support": "tests/support/llm/decision_http.zig",
+      "virtual": "src/llm/curl_http.zig",
+      "production": "src/llm/curl_http.zig",
+      "support": "tests/support/llm/curl_http.zig",
       "fragments": [
         {
-          "path": "tests/unit/llm/decision_http_test.zig",
+          "path": "tests/unit/llm/curl_http_test.zig",
           "container": []
         }
       ],
-      "group": "core",
-      "unit": true
+      "group": "integration",
+      "unit": false
     },
     {
       "virtual": "src/llm/http.zig",
       "production": "src/llm/http.zig",
-      "support": "tests/support/llm/http.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/llm/http_test.zig",
@@ -1334,14 +1290,6 @@
       "unit": true
     },
     {
-      "virtual": "src/llm/codex.zig",
-      "production": "src/llm/codex.zig",
-      "support": null,
-      "fragments": [],
-      "group": "core",
-      "unit": false
-    },
-    {
       "virtual": "src/llm/sse.zig",
       "production": "src/llm/sse.zig",
       "support": "tests/support/llm/sse.zig",
@@ -1357,7 +1305,7 @@
     {
       "virtual": "src/main.zig",
       "production": "src/main.zig",
-      "support": "tests/support/main.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/main_test.zig",
@@ -1384,7 +1332,7 @@
     {
       "virtual": "src/platform/anonymous_input.zig",
       "production": "src/platform/anonymous_input.zig",
-      "support": "tests/support/platform/anonymous_input.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/anonymous_input_test.zig",
@@ -1397,7 +1345,7 @@
     {
       "virtual": "src/platform/capabilities.zig",
       "production": "src/platform/capabilities.zig",
-      "support": "tests/support/platform/capabilities.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/capabilities_test.zig",
@@ -1423,7 +1371,7 @@
     {
       "virtual": "src/platform/filesystem_native.zig",
       "production": "src/platform/filesystem_native.zig",
-      "support": "tests/support/platform/filesystem_native.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/filesystem_native_test.zig",
@@ -1436,7 +1384,7 @@
     {
       "virtual": "src/platform/interrupt.zig",
       "production": "src/platform/interrupt.zig",
-      "support": "tests/support/platform/interrupt.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/interrupt_test.zig",
@@ -1457,7 +1405,7 @@
     {
       "virtual": "src/platform/metadata.zig",
       "production": "src/platform/metadata.zig",
-      "support": "tests/support/platform/metadata.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/metadata_test.zig",
@@ -1470,7 +1418,7 @@
     {
       "virtual": "src/platform/posix_terminal.zig",
       "production": "src/platform/posix_terminal.zig",
-      "support": "tests/support/platform/posix_terminal.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/posix_terminal_test.zig",
@@ -1517,7 +1465,7 @@
     {
       "virtual": "src/platform/terminal_abi.zig",
       "production": "src/platform/terminal_abi.zig",
-      "support": "tests/support/platform/terminal_abi.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/terminal_abi_test.zig",
@@ -1543,7 +1491,7 @@
     {
       "virtual": "src/platform/wakeup.zig",
       "production": "src/platform/wakeup.zig",
-      "support": "tests/support/platform/wakeup.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/platform/wakeup_test.zig",
@@ -1556,7 +1504,7 @@
     {
       "virtual": "src/presentation.zig",
       "production": "src/presentation.zig",
-      "support": "tests/support/presentation.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/presentation_discovery.zig",
@@ -1570,7 +1518,7 @@
     {
       "virtual": "src/presentation/activity.zig",
       "production": "src/presentation/activity.zig",
-      "support": "tests/support/presentation/activity.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/presentation/activity_test.zig",
@@ -1596,7 +1544,7 @@
     {
       "virtual": "src/presentation/failure.zig",
       "production": "src/presentation/failure.zig",
-      "support": "tests/support/presentation/failure.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/presentation/failure_test.zig",
@@ -1622,7 +1570,7 @@
     {
       "virtual": "src/presentation/tools.zig",
       "production": "src/presentation/tools.zig",
-      "support": "tests/support/presentation/tools.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/presentation/tools_test.zig",
@@ -1649,7 +1597,7 @@
     {
       "virtual": "src/root.zig",
       "production": "src/root.zig",
-      "support": "tests/support/root.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/root_discovery.zig",
@@ -1663,14 +1611,6 @@
       ],
       "group": "core",
       "unit": true
-    },
-    {
-      "virtual": "src/systemone_http_test_root.zig",
-      "production": null,
-      "support": "tests/roots/systemone_http_test_root.zig",
-      "fragments": [],
-      "group": "integration",
-      "unit": false
     },
     {
       "virtual": "src/terminal_test_root.zig",
@@ -2016,19 +1956,6 @@
       "unit": true
     },
     {
-      "virtual": "src/tests/systemone_http_test.zig",
-      "production": null,
-      "support": "tests/roots/tests/systemone_http_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/tests/systemone_http_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "integration",
-      "unit": false
-    },
-    {
       "virtual": "src/tests/thinking_contract_test.zig",
       "production": null,
       "support": "tests/roots/tests/thinking_contract_test.zig",
@@ -2122,7 +2049,7 @@
     {
       "virtual": "src/tools/knowledge_store.zig",
       "production": "src/tools/knowledge_store.zig",
-      "support": "tests/support/tools/knowledge_store.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/tools/knowledge_store_discovery.zig",
@@ -2179,7 +2106,7 @@
     {
       "virtual": "src/tools/text_edit.zig",
       "production": "src/tools/text_edit.zig",
-      "support": "tests/support/tools/text_edit.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/tools/text_edit_test.zig",
@@ -2244,7 +2171,7 @@
     {
       "virtual": "src/ui/command_menu.zig",
       "production": "src/ui/command_menu.zig",
-      "support": "tests/support/ui/command_menu.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/command_menu_test.zig",
@@ -2261,19 +2188,6 @@
       "fragments": [
         {
           "path": "tests/unit/ui/composer_layout_test.zig",
-          "container": []
-        }
-      ],
-      "group": "ui",
-      "unit": true
-    },
-    {
-      "virtual": "src/ui/decision_picker.zig",
-      "production": "src/ui/decision_picker.zig",
-      "support": "tests/support/ui/decision_picker.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/ui/decision_picker_test.zig",
           "container": []
         }
       ],
@@ -2309,7 +2223,7 @@
     {
       "virtual": "src/ui/local_command_output.zig",
       "production": "src/ui/local_command_output.zig",
-      "support": "tests/support/ui/local_command_output.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/local_command_output_test.zig",
@@ -2382,7 +2296,7 @@
     {
       "virtual": "src/ui/provider_picker.zig",
       "production": "src/ui/provider_picker.zig",
-      "support": "tests/support/ui/provider_picker.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/provider_picker_test.zig",
@@ -2408,7 +2322,7 @@
     {
       "virtual": "src/ui/remote_action.zig",
       "production": "src/ui/remote_action.zig",
-      "support": "tests/support/ui/remote_action.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/remote_action_test.zig",
@@ -2421,7 +2335,7 @@
     {
       "virtual": "src/ui/resume_picker.zig",
       "production": "src/ui/resume_picker.zig",
-      "support": "tests/support/ui/resume_picker.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/resume_picker_test.zig",
@@ -2434,7 +2348,7 @@
     {
       "virtual": "src/ui/session_client.zig",
       "production": "src/ui/session_client.zig",
-      "support": "tests/support/ui/session_client.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/session_client_test.zig",
@@ -2458,9 +2372,22 @@
       "unit": true
     },
     {
+      "virtual": "src/ui/settings_model_picker.zig",
+      "production": "src/ui/settings_model_picker.zig",
+      "support": "tests/support/ui/settings_model_picker.zig",
+      "fragments": [
+        {
+          "path": "tests/unit/ui/settings_model_picker_test.zig",
+          "container": []
+        }
+      ],
+      "group": "ui",
+      "unit": true
+    },
+    {
       "virtual": "src/ui/settings_time.zig",
       "production": "src/ui/settings_time.zig",
-      "support": "tests/support/ui/settings_time.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/settings_time_test.zig",
@@ -2551,7 +2478,7 @@
     {
       "virtual": "src/ui/theme.zig",
       "production": "src/ui/theme.zig",
-      "support": "tests/support/ui/theme.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/ui/theme_test.zig",
@@ -2625,7 +2552,7 @@
     {
       "virtual": "src/util/display_text.zig",
       "production": "src/util/display_text.zig",
-      "support": "tests/support/util/display_text.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/util/display_text_test.zig",
@@ -2646,7 +2573,7 @@
     {
       "virtual": "src/util/line_stats.zig",
       "production": "src/util/line_stats.zig",
-      "support": "tests/support/util/line_stats.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/util/line_stats_test.zig",

@@ -7,14 +7,6 @@ const p = @import("../core/protocol.zig");
 const diagnostics = @import("../core/diagnostics.zig");
 const logs = @import("log_store.zig");
 const selections = @import("selection.zig");
-const decision = @import("../core/decision.zig");
-
-fn safeDiagnosticCause(d: *const decision.Diagnostic) ?[]const u8 {
-    if (d.cause_len == 0 or d.cause_len > d.cause.len) return null;
-    const name = d.causeName();
-    for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return null;
-    return name;
-}
 
 const omitted = "[omitted]";
 
@@ -199,14 +191,11 @@ pub const Journal = struct {
                     .elapsed_ms = v.elapsed_ms,
                     .result = v.result,
                     .error_name = v.error_name,
-                    .operation = v.operation,
                     .protocol = v.protocol,
-                    .backend = v.backend,
                     .route_hash = v.route_hash,
                     .timeout_ms = v.timeout_ms,
                     .http_status = v.http_status,
                     .model_failure = v.model_failure,
-                    .decision_failure = if (v.decision_failure) |*d| .{ .stage = d.stage, .backend = d.backend, .operation = d.operation, .cause = safeDiagnosticCause(d), .http_status = d.http_status, .model_failure = d.model_failure } else null,
                     .candidate_index = v.candidate_index,
                     .count = v.count,
                 }, .dropped_total = event.dropped_total }, .{}, &writer.writer) catch return error.OutOfMemory;
@@ -603,15 +592,6 @@ pub const Journal = struct {
                     .detail = if (v.detail) |err| @errorName(err) else null,
                     .model_failure = v.model_failure,
                     .http_status = v.http_status,
-                    .decision_failure = if (v.decision_failure) |*diagnostic| .{
-                        .stage = diagnostic.stage,
-                        .backend = diagnostic.backend,
-                        .operation = diagnostic.operation,
-                        .cause = diagnostic.causeName(),
-                        .http_status = diagnostic.http_status,
-                        .model_failure = diagnostic.model_failure,
-                        .transport_exit_code = diagnostic.transport_exit_code,
-                    } else null,
                     .usage = v.usage,
                 }),
             },

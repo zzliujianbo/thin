@@ -41,13 +41,13 @@ pub const Selector = struct {
     pub fn call(self: *Selector, model: p.Model, allocator: std.mem.Allocator, original: p.Request, sink: p.ModelSink) !Result {
         // SystemOne is a question/threshold protocol, never a chat probe.
         if (self.configured == .systemone or self.effective() == .systemone or original.scope.protocol == .systemone) return .{
-            .outcome = .{ .failure = .{ .kind = .unsupported_protocol, .message = "SystemOne does not support chat generation" } },
+            .outcome = .{ .failure = .{ .kind = .unsupported_protocol, .message = "unsupported_protocol: systemone" } },
             .calls = 0,
         };
         // 调用前已取消：直接返回，不访问模型（calls = 0）。
         if (original.cancellation) |cancel| {
             if (cancel.isRequested()) return .{
-                .outcome = .{ .failure = .{ .kind = .canceled, .message = "Execution canceled" } },
+                .outcome = .{ .failure = .{ .kind = .canceled, .message = "canceled" } },
                 .calls = 0,
             };
         }
@@ -82,7 +82,7 @@ pub const Selector = struct {
                     if (original.cancellation) |cancel| {
                         if (cancel.isRequested()) return .{ .outcome = .{ .failure = .{
                             .kind = .canceled,
-                            .message = "Execution canceled before protocol fallback",
+                            .message = "canceled before protocol fallback",
                             .usage = f.usage,
                         } } };
                     }
