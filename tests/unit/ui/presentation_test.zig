@@ -110,6 +110,12 @@ test "failed rows keep the reason on its own bounded row" {
     try std.testing.expect(std.mem.startsWith(u8, narrow, theme.failure ++ "  exit 2: sed"));
     try std.testing.expect(std.mem.endsWith(u8, narrow, "..." ++ theme.reset));
     try std.testing.expect(output.displayWidth(narrow) <= commandColumns(40));
+    // Tiny rows drop the indent instead of overflowing.
+    inline for ([_]usize{ 1, 2, 3 }) |tiny_columns| {
+        const tiny_line = try failureReasonLine(a, "denied", tiny_columns);
+        defer a.free(tiny_line);
+        try std.testing.expect(output.displayWidth(tiny_line) <= tiny_columns);
+    }
     // No reason means no second row at all.
     failed.failure_reason = null;
     const silent = try commandText(a, failed, .failed, " ");
@@ -136,6 +142,17 @@ test "every failed tool owns a bounded reason and never a raw body" {
     try expectFailureReason(a, .bash, .{ .text = "{\"stdout\":\"secret\",\"stderr\":\"\",\"exit_code\":1}", .is_error = true }, "exit 1 (stderr empty); stdout: secret");
     try expectFailureReason(a, .bash, .{ .text = "{\"stderr\":\"has-error\",\"stdout\":\"normal-output\",\"exit_code\":1}", .is_error = true }, "exit 1: has-error");
     try expectFailureReason(a, .bash, .{ .text = "{\"exit_code\":137,\"stderr\":\"\"}", .is_error = true }, "exit 137 (stderr empty)");
+    // A capture larger than the old JSON string cap still exposes the exit code.
+    {
+        const big = try a.alloc(u8, 1024 * 1024 + 32);
+        defer a.free(big);
+        @memset(big, 'x');
+        const envelope = try std.fmt.allocPrint(a, "{{\"stdout\":\"{s}\",\"stderr\":\"\",\"exit_code\":1}}", .{big});
+        defer a.free(envelope);
+        const reason = (try shared.tools.failureReason(a, .bash, .{ .text = envelope, .is_error = true })).?;
+        defer a.free(reason);
+        try std.testing.expect(std.mem.startsWith(u8, reason, "exit 1 (stderr empty); stdout: xxx"));
+    }
     // Other tools expose the sanitized first line only.
     try expectFailureReason(a, .other, .{ .text = "Boom: line one\nline two", .is_error = true }, "Boom: line one");
     try expectFailureReason(a, .other, .{ .text = "{\"error\":\"invalid log offset\",\"id\":\"job-1\"}", .is_error = true }, "invalid log offset");

@@ -4225,10 +4225,16 @@ test "completed tasks append one muted total-time row" {
     ui.last_terminal = failed;
     ui.notice = Ui.terminalNotice(failed);
     ui.queueTerminalNotice(failed);
-    const second = ui.records.items[ui.records.items.len - 1];
+    const second_index = ui.records.items.len - 1;
+    const second = ui.records.items[second_index];
     try std.testing.expectEqual(NoticeLevel.failure, second.notice_level);
     try std.testing.expect(std.mem.find(u8, second.body.items, "boom") != null);
     try std.testing.expect(std.mem.find(u8, second.body.items, "\n" ++ theme.muted ++ "  \u{00b7} 42ms") != null);
+    // The two parts render as two transcript rows, the second one muted.
+    try ui.draw();
+    const drawn = ui.records.items[second_index];
+    try std.testing.expect(drawn.lines.len >= 2);
+    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], "42ms") != null);
     // A round-limit pause keeps its concise wording and still shows the time.
     const paused: r.Terminal = .{ .status = .paused, .detail = error.RoundLimit, .duration_ms = 5 };
     ui.queueTerminalNotice(paused);

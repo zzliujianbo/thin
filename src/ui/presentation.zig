@@ -283,10 +283,13 @@ pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indic
 /// One-row failure detail rendered below a failed command row. `reason` stays
 /// raw on the record so a width change re-clips it instead of keeping stale cuts.
 pub fn failureReasonLine(a: std.mem.Allocator, reason: []const u8, columns: usize) ![]const u8 {
-    const width = @max(1, columns -| 2);
+    // Keep the two-column indent while the row can afford it; a very narrow
+    // terminal drops the indent rather than overflowing the row.
+    const indent: []const u8 = if (columns > 2) "  " else "";
+    const width = @max(1, columns -| indent.len);
     const line = try singleLine(a, reason, width);
     defer a.free(line);
-    return std.fmt.allocPrint(a, "{s}  {s}{s}", .{ theme.failure, line, theme.reset });
+    return std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ theme.failure, indent, line, theme.reset });
 }
 
 /// Byte length of the fixed prefix `commandText` writes before its label; used

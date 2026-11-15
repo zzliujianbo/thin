@@ -181,7 +181,10 @@ fn jsonError(a: std.mem.Allocator, text: []const u8) !?[]const u8 {
 /// bash results are the executor's JSON envelope. Only its structured failure
 /// facts become a reason; a synthetic or malformed body never reaches a row.
 fn bashReason(a: std.mem.Allocator, text: []const u8) !?[]const u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{ .allocate = .alloc_if_needed, .max_value_len = 1024 * 1024 }) catch return null;
+    // The envelope is our own bash result: stdout/stderr may legitimately be
+    // larger than the old 1 MiB string cap, and parsing must still see the
+    // exit code and first lines.
+    var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{ .allocate = .alloc_if_needed }) catch return null;
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |map| map,
