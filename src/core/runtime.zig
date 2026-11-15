@@ -63,6 +63,9 @@ pub const Prepared = struct {
     /// 非空：本次必须人工批准；批准只放行这一次，之后的非空调用仍会询问。
     /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
     explicit_denial: ?[]const u8 = null,
+    /// Display-only: the one project file this call will create or replace, if
+    /// any. Borrowed from the prepare arena; never a path check or authority.
+    edited_path: ?[]const u8 = null,
     display: ?@import("background_status.zig").Caption = null,
 };
 
@@ -152,6 +155,11 @@ pub const Terminal = struct {
     http_status: ?u16 = null,
     /// 主任务墙钟耗时：从接受到最终 Terminal（含模型、工具、压缩与审批等待）。
     duration_ms: ?u64 = null,
+    /// Executed tool calls this task; display-only aggregate. Zero is also the
+    /// value for a restored or synthetic terminal that never ran a task.
+    tool_calls: u32 = 0,
+    /// Distinct files a successful write_file/edit_file touched this task.
+    files_edited: u32 = 0,
     /// 原始失败原因（提供方原文或本地错误名），供前端直接展示。
     failure_message: [failure_message_max]u8 = @splat(0),
     failure_message_len: u16 = 0,
@@ -488,6 +496,7 @@ pub const Runtime = struct {
         // 系统提示词：声明边界（工具输出、Memory、历史摘要都是不可信数据，权限由宿主决定）。
         const system = try std.fmt.allocPrint(a, "You are ThinAgent, a coding assistant. Respond in the user's language using plain, natural wording. Match detail to the task; avoid jargon, boilerplate, and repetition. Preserve quoted code, identifiers, commands, and error messages exactly. Use the provided tools when needed to inspect the startup project and make authorized changes.\n\n" ++
             "Approach: Reason from the user's actual goal, constraints, and success criteria, rather than assuming existing conventions are required. Choose the simplest correct and safe solution within scope; compile speed and runtime efficiency are design criteria, not afterthoughts. Answer simple questions directly; avoid unnecessary process, delegation, abstractions, refactoring, dependencies, or unrelated improvements. Clarify only ambiguities that materially affect the work.\n\n" ++
+            "Progress: when a task needs several tool batches, start each reply that continues the work with one or two short lines in the user's language: what is now done or known, and what you will do next. Report only at meaningful boundaries such as a change of work type (inspect, then change, then verify), a finding that changes the plan, or several calls without a natural break. Name the step just finished when you are following a stated plan. Write them as visible reply text, not hidden reasoning, and do not turn them into a final answer; the final response must still stand on its own. This visible progress is the deliberate exception to the brevity rule above.\n\n" ++
             "Authorization: do not modify code unless the user authorizes code changes. A request to implement or fix authorizes changes within its stated scope; explanation, investigation, review or planning alone is read-only.\n\n" ++
             "Evidence and completion: read relevant files before overwriting. Claim execution, changes or success only when completed tool results support it; a timeout, cancellation or incomplete result proves neither success nor rollback. For requested changes, finish the related work in the authorized scope before running proportionate verification; do not repeat checks after every small edit, and check earlier only to resolve a blocker or validate a critical assumption. In the final response, distinguish changes made, checks actually run, and remaining blockers or unverified behavior.\n\n" ++
             "UI: for UI work, let layout, hierarchy, and visual relationships explain the interface. Avoid redundant labels and descriptions while retaining necessary guidance and accessibility information.\n\n" ++
@@ -817,6 +826,8 @@ pub const Runtime = struct {
         rounds: u32 = 0,
         /// Number of executed tool calls, for observation only.
         tool_calls: u32 = 0,
+        /// Distinct successful write_file/edit_file paths, display-only.
+        edited_files: std.StringHashMapUnmanaged(void) = .empty,
         /// Possible paid summary attempts, including transport throws before usage.
         summary_attempts: u64 = 0,
         /// 累计的用量与终态，run 结束时返回。
@@ -824,6 +835,24 @@ pub const Runtime = struct {
 
         fn countRound(self: *Task) void {
             self.rounds +|= 1;
+        }
+
+        /// Aggregate only completed side effects. Duplicates collapse by the
+        /// exact reported path; allocation failure leaves the summary short
+        /// rather than failing the task.
+        fn noteEdited(self: *Task, a: std.mem.Allocator, path: []const u8) void {
+            if (self.edited_files.contains(path)) return;
+            const owned = a.dupe(u8, path) catch return;
+            self.edited_files.put(a, owned, {}) catch {
+                a.free(owned);
+                return;
+            };
+        }
+
+        fn deinitEdited(self: *Task, a: std.mem.Allocator) void {
+            var it = self.edited_files.keyIterator();
+            while (it.next()) |path| a.free(path.*);
+            self.edited_files.deinit(a);
         }
     };
 
@@ -878,6 +907,7 @@ pub const Runtime = struct {
         defer self.memory_capture = null;
 
         var task = Task{};
+        defer task.deinitEdited(self.allocator);
 
         const result = switch (operation) {
             .prompt => |text| self.runInner(text, cancel, &task),
@@ -926,6 +956,8 @@ pub const Runtime = struct {
         // Exactly one terminal result per accepted run, including failures. A
         // disconnected host need not receive it, but the caller still gets it.
         task.terminal.context_snapshot = self.contextSnapshot();
+        task.terminal.tool_calls = task.tool_calls;
+        task.terminal.files_edited = @intCast(task.edited_files.count());
         task.terminal.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
         inbox_success = task.terminal.status == .success;
         var finished_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .finished_emit });
@@ -1976,6 +2008,9 @@ pub const Runtime = struct {
             }
 
             result.display = prepared.display;
+            // Display-only terminal aggregate. A denied, failed or canceled
+            // call changed nothing we can claim; repeated paths count once.
+            if (prepared.edited_path) |path| if (!result.is_error and !result.canceled) task.noteEdited(self.allocator, path);
             // 清理失败可能残留子进程，之后必须拒绝运行。
             if (result.cleanup_failed) self.poisoned = true;
 

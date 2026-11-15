@@ -50,6 +50,9 @@ pub const Terminal = struct {
     failure_message_len: u16 = 0,
     usage: r.UsageTotals = .{},
     context: ?r.ContextSnapshot = null,
+    duration_ms: ?u64 = null,
+    tool_calls: u32 = 0,
+    files_edited: u32 = 0,
 
     pub fn toRuntime(self: Terminal) r.Terminal {
         var terminal: r.Terminal = .{
@@ -59,6 +62,9 @@ pub const Terminal = struct {
             .http_status = self.http_status,
             .usage = self.usage,
             .context_snapshot = self.context,
+            .duration_ms = self.duration_ms,
+            .tool_calls = self.tool_calls,
+            .files_edited = self.files_edited,
         };
         terminal.setFailureText(self.failure_message[0..@min(self.failure_message_len, self.failure_message.len)]);
         return terminal;

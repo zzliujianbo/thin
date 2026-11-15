@@ -913,6 +913,8 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("model_failure", terminal.model_failure);
             try out.field("http", terminal.http_status);
             try out.field("duration_ms", terminal.duration_ms);
+            try out.field("tool_calls", terminal.tool_calls);
+            try out.field("files_edited", terminal.files_edited);
             if (terminal.failureText().len != 0) try out.field("failure_message", terminal.failureText());
             try out.beginObject("usage");
             try out.field("normal_calls", terminal.usage.normal_calls);
@@ -1659,12 +1661,17 @@ fn decodeTerminalChecked(object: std.json.ObjectMap) !r.Terminal {
         .limit = try requireU64(value, "limit"),
         .known = try optionalBool(value, "known") orelse true,
     } else null;
+    // Counts are display-only and absent on frames from older daemons.
+    const tool_calls = std.math.cast(u32, try optionalU64(object, "tool_calls") orelse 0) orelse return error.BadRequest;
+    const files_edited = std.math.cast(u32, try optionalU64(object, "files_edited") orelse 0) orelse return error.BadRequest;
     var terminal: r.Terminal = .{
         .status = status,
         .detail = detail,
         .model_failure = try optionalEnum(p.FailureKind, object, "model_failure"),
         .http_status = if (try optionalU64(object, "http")) |code| @intCast(@min(code, 999)) else null,
         .duration_ms = try optionalU64(object, "duration_ms"),
+        .tool_calls = tool_calls,
+        .files_edited = files_edited,
         .usage = usage,
         .context_snapshot = context,
     };

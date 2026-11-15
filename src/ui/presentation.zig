@@ -268,6 +268,10 @@ pub const CommandSpan = struct {
     /// it keep their own colours and do not join the running flow. Zero means
     /// this span has no structured name prefix.
     label_start: usize = 0,
+    /// Flow phase in milliseconds for a running row, already stepped by the
+    /// owner. Null keeps the historical wall-clock phase for direct renderer
+    /// callers that do not own an animation clock.
+    flow_elapsed_ms: ?u64 = null,
 };
 
 /// Split a caption label into the separator after the tool name and the text
@@ -313,12 +317,19 @@ pub fn failureReasonLine(a: std.mem.Allocator, reason: []const u8, columns: usiz
     return std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ theme.failure, indent, line, theme.reset });
 }
 
-/// One muted total-time row below a terminal outcome. The duration stays a
-/// styled display line, never part of a sanitized notice body.
-pub fn taskDurationLine(a: std.mem.Allocator, duration_ms: u64, columns: usize) ![]const u8 {
-    var buffer: [32]u8 = undefined;
+/// One muted task-summary row below a terminal outcome: files edited, tool
+/// calls and wall-clock time. Stays a styled display line, never part of a
+/// sanitized notice body.
+pub fn taskSummaryLine(a: std.mem.Allocator, tool_calls: u32, files_edited: u32, duration_ms: u64, columns: usize) ![]const u8 {
+    var buffer: [160]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try writer.writeAll("  \u{00b7} ");
+    try writer.print("{d} {s} changed \u{00b7} {d} {s} \u{00b7} ", .{
+        files_edited,
+        if (files_edited == 1) "file" else "files",
+        tool_calls,
+        if (tool_calls == 1) "tool call" else "tool calls",
+    });
     try shared.activity.formatDuration(&writer, duration_ms);
     const line = try singleLine(a, writer.buffered(), columns);
     defer a.free(line);
@@ -428,7 +439,8 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         if (name_end > name_begin) try out.writer.print("{s}{s}", .{ theme.tool_name, safe[name_begin..name_end] });
         const command_begin = name_end;
         if (running) {
-            if (command_begin < end) try writeFlow(&out.writer, safe, command_begin, end, active_time_ms.?);
+            const flow_ms = span.flow_elapsed_ms orelse active_time_ms.?;
+            if (command_begin < end) try writeFlow(&out.writer, safe, command_begin, end, flow_ms);
             try out.writer.writeAll(theme.reset);
         } else if (span.generating) {
             try out.writer.writeAll(theme.muted);

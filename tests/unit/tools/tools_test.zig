@@ -53,6 +53,26 @@ test "memory prepare carries its parsed payload and no review input" {
         }
     }
 }
+test "prepare reports the one file a write or edit will change" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const write = try Tools.prepare(&tools, a, .{ .id = "w", .name = "write_file", .arguments = "{\"path\":\"a.zig\",\"content\":\"x\"}" });
+    try std.testing.expectEqualStrings("a.zig", write.edited_path.?);
+    const edit = try Tools.prepare(&tools, a, .{ .id = "e", .name = "edit_file", .arguments = "{\"path\":\"a.zig\",\"edits\":[{\"old_text\":\"x\",\"new_text\":\"y\"}]}" });
+    try std.testing.expectEqualStrings("a.zig", edit.edited_path.?);
+    const read = try Tools.prepare(&tools, a, .{ .id = "r", .name = "read_file", .arguments = "{\"path\":\"a.zig\"}" });
+    try std.testing.expect(read.edited_path == null);
+}
 test "tool arguments remain strict" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

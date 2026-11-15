@@ -273,4 +273,8 @@ test "wire failure codes round-trip the details the local TUI classifies" {
     try std.testing.expectEqual(r.Status.canceled, terminal.status);
     try std.testing.expectEqual(error.Canceled, terminal.detail.?);
     try std.testing.expectEqual(@as(?anyerror, null), (Terminal{ .status = .success }).toRuntime().detail);
+    const counted = (Terminal{ .status = .success, .duration_ms = 99, .tool_calls = 3, .files_edited = 2 }).toRuntime();
+    try std.testing.expectEqual(@as(?u64, 99), counted.duration_ms);
+    try std.testing.expectEqual(@as(u32, 3), counted.tool_calls);
+    try std.testing.expectEqual(@as(u32, 2), counted.files_edited);
 }

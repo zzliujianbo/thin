@@ -1034,6 +1034,57 @@ test "local command restore is adjacent display only with paired result" {
     for ([_][]const u8{ "stdout:", "stderr:", "exit:", "output encoding:" }) |label| try std.testing.expectEqual(@as(usize, 0), screen.count(label));
     try std.testing.expect(std.mem.indexOf(u8, ui.frame, "Program-generated") == null);
 }
+test "running tool flow advances one column per animation step" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    // The wall clock is deliberately far from zero; the row phase must come
+    // from the call's own step, not from this value.
+    ui.clock_ms = 5000;
+    ui.busy = true;
+    try emitToolUi(&ui, .{ .tool_started = .{ .id = 1, .name = "bash", .started_ms = 5000 } });
+    const first = try ui.pendingCommand(std.testing.allocator, 79);
+    defer std.testing.allocator.free(first);
+    const expected_first = try std.fmt.allocPrint(std.testing.allocator, "{s} bash {s}(", .{
+        theme.tool_name,
+        theme.flow_band[0],
+    });
+    defer std.testing.allocator.free(expected_first);
+    try std.testing.expect(std.mem.find(u8, first, expected_first) != null);
+
+    // One 40ms frame advances exactly one column: the first command character
+    // trails one shade and the next character owns the bright head.
+    ui.clock_ms += 40;
+    ui.animate();
+    try std.testing.expectEqual(@as(u64, 1), ui.flow_step);
+    const second = try ui.pendingCommand(std.testing.allocator, 79);
+    defer std.testing.allocator.free(second);
+    const expected_second = try std.fmt.allocPrint(std.testing.allocator, "{s} bash {s}({s}c", .{
+        theme.tool_name,
+        theme.flow_band[1],
+        theme.flow_band[0],
+    });
+    defer std.testing.allocator.free(expected_second);
+    try std.testing.expect(std.mem.find(u8, second, expected_second) != null);
+
+    // A long stall still advances only one column; it never catches up by
+    // jumping the head several cells.
+    ui.clock_ms += 200;
+    ui.animate();
+    try std.testing.expectEqual(@as(u64, 2), ui.flow_step);
+    const third = try ui.pendingCommand(std.testing.allocator, 79);
+    defer std.testing.allocator.free(third);
+    const expected_third = try std.fmt.allocPrint(std.testing.allocator, "{s} bash {s}({s}c{s}o", .{
+        theme.tool_name,
+        theme.flow_band[2],
+        theme.flow_band[1],
+        theme.flow_band[0],
+    });
+    defer std.testing.allocator.free(expected_third);
+    try std.testing.expect(std.mem.find(u8, third, expected_third) != null);
+}
 test "command elapsed time uses source timestamps freezes results and resets per call" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4206,14 +4257,14 @@ test "terminal details publish once in conversation and never own the footer" {
     try std.testing.expect(std.mem.find(u8, hint, "OutputLimitReached") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, hint, '\x1b') == null);
 }
-test "completed tasks append one muted total-time row" {
+test "completed tasks append one muted task summary row" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.notice = "Ready";
-    const success: r.Terminal = .{ .status = .success, .duration_ms = 1234 };
+    const success: r.Terminal = .{ .status = .success, .duration_ms = 1234, .tool_calls = 5, .files_edited = 2 };
     ui.last_terminal = success;
     ui.notice = Ui.terminalNotice(success);
     ui.queueTerminalNotice(success);
@@ -4221,8 +4272,10 @@ test "completed tasks append one muted total-time row" {
     const record = ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.plain, record.notice_level);
     try std.testing.expectEqual(@as(?u64, 1234), record.notice_duration_ms);
+    try std.testing.expectEqual(@as(u32, 5), record.notice_tool_calls);
+    try std.testing.expectEqual(@as(u32, 2), record.notice_files_edited);
     try std.testing.expect(record.body.items.len == 0);
-    var failed: r.Terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .duration_ms = 42 };
+    var failed: r.Terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .duration_ms = 42, .tool_calls = 1, .files_edited = 1 };
     failed.setFailureText("boom");
     ui.last_terminal = failed;
     ui.notice = Ui.terminalNotice(failed);
@@ -4233,16 +4286,18 @@ test "completed tasks append one muted total-time row" {
     try std.testing.expect(std.mem.find(u8, second.body.items, "boom") != null);
     try std.testing.expect(std.mem.findScalar(u8, second.body.items, '\x1b') == null);
     try std.testing.expectEqual(@as(?u64, 42), second.notice_duration_ms);
-    // The outcome text and the muted time render as separate transcript rows;
-    // no display SGR bytes enter the sanitized notice body.
+    try std.testing.expectEqual(@as(u32, 1), second.notice_tool_calls);
+    try std.testing.expectEqual(@as(u32, 1), second.notice_files_edited);
+    // The outcome text and the muted summary render as separate transcript
+    // rows; no display SGR bytes enter the sanitized notice body.
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     const drawn_success = ui.records.items[0];
     try std.testing.expectEqual(@as(usize, 1), drawn_success.lines.len);
-    try std.testing.expectEqualStrings(theme.muted ++ "  \u{00b7} 1.23s" ++ theme.reset, drawn_success.lines[0]);
+    try std.testing.expectEqualStrings(theme.muted ++ "  \u{00b7} 2 files changed \u{00b7} 5 tool calls \u{00b7} 1.23s" ++ theme.reset, drawn_success.lines[0]);
     const drawn = ui.records.items[second_index];
     try std.testing.expect(drawn.lines.len >= 2);
-    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], theme.muted ++ "  \u{00b7} 42ms") != null);
+    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], theme.muted ++ "  \u{00b7} 1 file changed \u{00b7} 1 tool call \u{00b7} 42ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, drawn.lines[drawn.lines.len - 1], "\u{fffd}") == null);
     // A round-limit pause keeps its concise wording and still shows the time.
     const paused: r.Terminal = .{ .status = .paused, .detail = error.RoundLimit, .duration_ms = 5 };
@@ -4254,7 +4309,7 @@ test "completed tasks append one muted total-time row" {
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     const drawn_third = ui.records.items[ui.records.items.len - 1];
-    try std.testing.expect(std.mem.find(u8, drawn_third.lines[drawn_third.lines.len - 1], "5ms") != null);
+    try std.testing.expect(std.mem.find(u8, drawn_third.lines[drawn_third.lines.len - 1], "0 files changed \u{00b7} 0 tool calls \u{00b7} 5ms") != null);
     // A synthetic success without a measurement stays silent.
     const legacy: r.Terminal = .{ .status = .success };
     const before = ui.records.items.len;

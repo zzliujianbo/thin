@@ -46,6 +46,10 @@ pub const ModelProvider = picker_module.Provider;
 /// measured from the previous draw's start; input and geometry never wait for it.
 const draw_interval_ms: u16 = 8;
 
+/// Running tool-row flow cadence: one column per 40ms frame at 25fps. Other
+/// animations keep their existing 80ms tick.
+const flow_interval_ms: u64 = 40;
+
 const StopIdentity = struct {
     runtime: ?*r.Runtime,
     session: ?[32]u8,
@@ -92,9 +96,12 @@ const Record = struct {
     /// Leading status marker bytes that keep their own colour (e.g. `M: ✓`).
     /// Zero colours the whole row with the notice severity.
     notice_marker_len: usize = 0,
-    /// Measured task time rendered as one separate muted notice row. Kept out
-    /// of `body` so the plain-text sanitizer never sees display SGR bytes.
+    /// Measured task aggregate rendered as one separate muted notice row. Kept
+    /// out of `body` so the plain-text sanitizer never sees display SGR bytes.
     notice_duration_ms: ?u64 = null,
+    /// Task aggregate rendered with the muted time row; display-only.
+    notice_tool_calls: u32 = 0,
+    notice_files_edited: u32 = 0,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
     agent_row: bool = false,
@@ -405,7 +412,7 @@ const Record = struct {
             const line = try presentation.singleLine(temp, self.body.items, @max(1, columns));
             const styled = try self.styleMarker(temp, line);
             const rows = try temp.dupe([]const u8, &.{styled});
-            self.lines = try self.appendNoticeDuration(temp, rows, columns);
+            self.lines = try self.appendTaskSummary(temp, rows, columns);
             self.excerpt = false;
             self.columns = columns;
             self.cache = arena;
@@ -420,7 +427,7 @@ const Record = struct {
             .failure => .failure,
         } else .normal });
         const styled = try self.styleMarkerRow(temp, rendered.lines);
-        self.lines = try self.appendNoticeDuration(temp, styled, columns);
+        self.lines = try self.appendTaskSummary(temp, styled, columns);
         self.excerpt = self.clipped or rendered.truncated or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
 
@@ -428,11 +435,11 @@ const Record = struct {
         self.cache = arena;
     }
 
-    fn appendNoticeDuration(self: *const Record, temp: std.mem.Allocator, lines: []const []const u8, columns: usize) ![]const []const u8 {
+    fn appendTaskSummary(self: *const Record, temp: std.mem.Allocator, lines: []const []const u8, columns: usize) ![]const []const u8 {
         const duration_ms = self.notice_duration_ms orelse return lines;
         const rows = try temp.alloc([]const u8, lines.len + 1);
         @memcpy(rows[0..lines.len], lines);
-        rows[lines.len] = try presentation.taskDurationLine(temp, duration_ms, columns);
+        rows[lines.len] = try presentation.taskSummaryLine(temp, self.notice_tool_calls, self.notice_files_edited, duration_ms, columns);
         return rows;
     }
 
@@ -1051,6 +1058,10 @@ const Ui = struct {
     /// UI receipt clock and bounded statistics; never read worker-owned timing.
     clock_ms: u64 = 0,
     animation_tick: u64 = 0,
+    /// Frame-counted band step for the active tool row. A late frame advances
+    /// once, never by the elapsed number of columns, so the head cannot jump.
+    flow_step: u64 = 0,
+    flow_next_ms: u64 = 0,
     display: shared.State = .{},
     model_flow: activity.Flow = .{},
     active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64, display_key: ?p.ToolDisplayKey = null, grouped: bool = false } = null,
@@ -2884,7 +2895,12 @@ const Ui = struct {
         const label_start = presentation.commandPrefixLen(caption, .pending, spinner);
         const start = self.active_tool.?.started_ms;
         const background_start = if (caption.display) |display| display.action == .start else false;
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .label_start = label_start }}, columns, if (background_start) null else self.clock_ms -| start, self.clock_ms);
+        // The band opens on the first character after the tool name and moves
+        // one column per 40ms frame; the status slot keeps the shared global
+        // pulse, and the duration stays wall-clock accurate.
+        const elapsed = self.clock_ms -| start;
+        const flow_elapsed = self.flow_step *| flow_interval_ms;
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .label_start = label_start, .flow_elapsed_ms = flow_elapsed }}, columns, if (background_start) null else elapsed, self.clock_ms);
     }
 
     fn waitingCommand(self: *Ui, a: std.mem.Allocator, entry: tool_views_module.Entry, columns: usize) ![]const u8 {
@@ -3342,6 +3358,8 @@ const Ui = struct {
                 const grouped = self.groupTools() and isSubagentTool(tool.name);
                 if (grouped and std.mem.eql(u8, tool.name, "subagent")) self.subagent_starting = true;
                 self.active_tool = .{ .id = tool.id, .caption = try self.executionCaption(tool.name, tool.display_key), .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key, .grouped = grouped };
+                self.flow_step = 0;
+                self.flow_next_ms = self.clock_ms +| flow_interval_ms;
             },
             .tool_result => |tool| {
                 // FIFO also covers prepare failures/denials without a start.
@@ -5930,8 +5948,8 @@ const Ui = struct {
     /// red; an explicit user cancellation remains plain.
     fn publishTerminalNotice(self: *Ui, result: r.Terminal) bool {
         // A successful task has no failure text, but every completed task owns a
-        // muted total-time line. Synthetic terminals without a measurement stay
-        // silent so existing event fixtures keep their shape.
+        // muted task-summary line. Synthetic terminals without a measurement
+        // stay silent so existing event fixtures keep their shape.
         if (result.status == .success and result.duration_ms == null) return true;
         // Ordinary round-limit pauses already have user-facing wording; do not
         // expose their internal error name. Policy and output pauses keep detail.
@@ -5939,7 +5957,7 @@ const Ui = struct {
             var concise: std.Io.Writer.Allocating = .init(self.allocator);
             defer concise.deinit();
             concise.writer.writeAll(terminalNotice(result)) catch return false;
-            return self.appendTerminalNotice(.failure, concise.written(), result.duration_ms);
+            return self.appendTerminalNotice(.failure, concise.written(), result);
         }
         var formatted: std.Io.Writer.Allocating = .init(self.allocator);
         defer formatted.deinit();
@@ -5958,15 +5976,18 @@ const Ui = struct {
                 shared.failure.write(writer, label, result.detail, result.http_status, result.failureText()) catch return false;
             level = if (result.status == .canceled) .plain else .failure;
         }
-        return self.appendTerminalNotice(level, formatted.written(), result.duration_ms);
+        return self.appendTerminalNotice(level, formatted.written(), result);
     }
 
-    /// Terminal notices keep their duration as a separate styled row. Embedding
-    /// SGR bytes in the body would make the plain-text sanitizer render garbage.
-    fn appendTerminalNotice(self: *Ui, level: NoticeLevel, message: []const u8, duration_ms: ?u64) bool {
+    /// Terminal notices keep their task summary as a separate styled row.
+    /// Embedding SGR bytes in the body would make the plain-text sanitizer
+    /// render garbage.
+    fn appendTerminalNotice(self: *Ui, level: NoticeLevel, message: []const u8, result: r.Terminal) bool {
         const index = self.addRecord(.notice, message, false) catch return false;
         self.records.items[index].notice_level = level;
-        self.records.items[index].notice_duration_ms = duration_ms;
+        self.records.items[index].notice_duration_ms = result.duration_ms;
+        self.records.items[index].notice_tool_calls = result.tool_calls;
+        self.records.items[index].notice_files_edited = result.files_edited;
         return true;
     }
 
@@ -6293,13 +6314,26 @@ const Ui = struct {
     }
 
     fn animate(self: *Ui) void {
+        if (self.resize_waiting) return;
         const tick = self.clock_ms / 80;
-        if (self.resize_waiting or self.animation_tick == tick) return;
+        const tick_due = self.animation_tick != tick;
+        // The running tool row owns a 40ms step. Counting frames, not elapsed
+        // time, keeps the band at one column per draw even when the loop is
+        // late; time-based catch-up would make the head skip columns.
+        var flow_due = false;
+        if (self.active_tool) |tool| {
+            if (!tool.grouped) flow_due = self.clock_ms >= self.flow_next_ms;
+        }
+        if (!tick_due and !flow_due) return;
         // Memory progress is a background owner: it rotates on the same 80 ms
         // tick and dirty-draw path as a running task, but it needs neither a
         // busy main task nor a second refresh source.
         if (!self.busy and !self.presentationWaiting() and !self.remoteSynchronizing() and !self.memoryAnimating() and !self.backgroundAnimating()) return;
-        self.animation_tick = tick;
+        if (tick_due) self.animation_tick = tick;
+        if (flow_due) {
+            self.flow_step +|= 1;
+            self.flow_next_ms = self.clock_ms +| flow_interval_ms;
+        }
         // An approval owns a full, non-sparse preview. Repainting that unchanged
         // preview for a composer pulse sends its title/body again every 80 ms.
         // Keep polling/cancellation alive, but redraw only for actual events,
@@ -6406,6 +6440,15 @@ const Ui = struct {
             if (!staged and !buffered and self.frame.len == 0 and self.resize_rescue.len == 0 and
                 self.drawReady() and !self.urgent_draw)
                 wait_ms = self.cadenceWaitMs();
+            // Align the last sleep with the next tool-flow frame instead of a
+            // fixed 16ms grid, which would sample a 40ms step late. The 16ms
+            // cap still bounds event/input latency.
+            if (!staged and !buffered and self.frame.len == 0 and self.resize_rescue.len == 0) {
+                if (self.active_tool) |tool| if (!tool.grouped) {
+                    const remaining = self.flow_next_ms -| self.clock_ms;
+                    wait_ms = @min(wait_ms, @as(u16, @intCast(@max(1, @min(remaining, flow_interval_ms)))));
+                };
+            }
             try self.terminal.wait(self.frame.len != 0 or self.resize_rescue.len != 0, wait_ms);
         }
     }

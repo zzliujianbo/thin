@@ -741,7 +741,14 @@ pub const Tools = struct {
             },
             else => null,
         };
-        return .{ .payload = action, .description = description, .explicit_denial = denial, .display = display };
+        // Display-only summary subject; the Runtime never parses tool arguments
+        // to discover it and never treats it as a validated path.
+        const edited_path: ?[]const u8 = switch (action.*) {
+            .write_file => |w| w.path,
+            .edit_file => |e| e.path,
+            else => null,
+        };
+        return .{ .payload = action, .description = description, .explicit_denial = denial, .edited_path = edited_path, .display = display };
     }
 
     /// 从 prepare 生成的 payload 取回 Action 并执行；payload 指向同一个 arena 中的 Action。

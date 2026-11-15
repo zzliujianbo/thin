@@ -125,6 +125,8 @@ test "finished frame carries the raw failure cause and rejects oversize text" {
         .model_failure = .authentication,
         .http_status = 401,
         .duration_ms = 1234,
+        .tool_calls = 5,
+        .files_edited = 2,
     };
     terminal.setFailureText("Incorrect API key provided: sk-test");
     try expectEventRoundTrip(a, .{ .finished = terminal });
@@ -134,6 +136,8 @@ test "finished frame carries the raw failure cause and rejects oversize text" {
         var decoded_finished = try decodeEvent(a, encoded_finished);
         defer decoded_finished.deinit();
         try std.testing.expectEqual(@as(?u64, 1234), decoded_finished.event.finished.duration_ms);
+        try std.testing.expectEqual(@as(u32, 5), decoded_finished.event.finished.tool_calls);
+        try std.testing.expectEqual(@as(u32, 2), decoded_finished.event.finished.files_edited);
     }
 
     const encoded = try encodeEvent(a, .{ .finished = terminal });

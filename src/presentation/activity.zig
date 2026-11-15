@@ -102,9 +102,10 @@ pub fn commandStep(now_ms: u64) usize {
     return @intCast((now_ms / 120) % 8);
 }
 
-/// Ping-pong execution flow: the band head advances one column per 40ms (two
-/// columns per 80ms animation tick), reverses at either row edge and travels
-/// back, so the row is never left dark between sweeps.
+/// Ping-pong execution flow: the band head advances one column per 40ms step,
+/// reverses at either row edge and travels back. The running tool row steps
+/// this clock once per 40ms frame, so the head moves exactly one cell per
+/// frame instead of two.
 pub const FlowHead = struct { column: usize, backward: bool };
 
 pub fn flowHead(now_ms: u64, limit: usize) FlowHead {

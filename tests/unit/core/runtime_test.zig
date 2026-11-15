@@ -590,6 +590,50 @@ test "subagent tool progress uses executing key and is absent outside execution"
     try std.testing.expectEqualDeep(runtime.contextSnapshot(), terminal.context_snapshot.?);
     try std.testing.expectEqual(@as(u64, 35), terminal.context_snapshot.?.tokens);
 }
+test "terminal counts executed tool calls and distinct edited files" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{
+                .{ .tool_call = .{ .id = "w1", .name = "write_file", .arguments = "{}" } },
+                .{ .tool_call = .{ .id = "e1", .name = "edit_file", .arguments = "{}" } },
+                .{ .tool_call = .{ .id = "w2", .name = "write_file", .arguments = "{}" } },
+                .{ .tool_call = .{ .id = "w3", .name = "write_file", .arguments = "{}" } },
+                .{ .tool_call = .{ .id = "b1", .name = "bash", .arguments = "{}" } },
+            } }, .finish = .tool_calls } };
+            return .{ .success = .{ .message = .{ .role = .assistant, .blocks = &.{.{ .text = "done" }} }, .finish = .stop } };
+        }
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, call_: p.ToolCall) !Prepared {
+            const path: ?[]const u8 = if (std.mem.eql(u8, call_.id, "w1") or std.mem.eql(u8, call_.id, "e1"))
+                "src/a.zig"
+            else if (std.mem.eql(u8, call_.id, "w2"))
+                "src/b.zig"
+            else if (std.mem.eql(u8, call_.id, "w3"))
+                "src/c.zig"
+            else
+                null;
+            return .{ .payload = raw, .description = call_.id, .edited_path = path };
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, prepared: Prepared, _: *const p.Cancellation) !Execution {
+            if (std.mem.eql(u8, prepared.description, "w3")) return .{ .text = "write failed", .is_error = true };
+            return .{ .text = "ok" };
+        }
+    };
+    var fake: Fake = .{};
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
+    config.limits.low_price_input = false;
+    config.limits.compaction_enabled = false;
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("edit files", &cancel);
+    try std.testing.expectEqual(Status.success, terminal.status);
+    try std.testing.expectEqual(@as(u32, 5), terminal.tool_calls);
+    // w1 and e1 touch a.zig; w2 touches b.zig; w3 failed; bash owns no file.
+    try std.testing.expectEqual(@as(u32, 2), terminal.files_edited);
+}
 test "system prompt carries approach, completion and UI constraints with quoted startup memory" {
     const Stub = struct {
         fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
@@ -615,6 +659,10 @@ test "system prompt carries approach, completion and UI constraints with quoted 
         "Approach: Reason from the user's actual goal, constraints, and success criteria, rather than assuming existing conventions are required.",
         "compile speed and runtime efficiency are design criteria, not afterthoughts",
         "Answer simple questions directly; avoid unnecessary process, delegation, abstractions, refactoring, dependencies, or unrelated improvements.",
+        "Progress: when a task needs several tool batches",
+        "what is now done or known, and what you will do next",
+        "do not turn them into a final answer",
+        "the deliberate exception to the brevity rule above",
         "Evidence and completion: read relevant files before overwriting.",
         "a timeout, cancellation or incomplete result proves neither success nor rollback",
         "For requested changes, finish the related work in the authorized scope before running proportionate verification;",
