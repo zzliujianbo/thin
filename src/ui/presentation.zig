@@ -234,19 +234,41 @@ fn outcomeColor(outcome: Outcome) []const u8 {
 
 fn prefixColor(outcome: Outcome) []const u8 {
     return switch (outcome) {
-        .pending => "", // Before execution: neutral; the flow owns a running row.
+        .pending => theme.muted, // Approval/generation slots stay neutral.
         .success => theme.success,
         .failed => theme.failure,
         .canceled => theme.caution,
     };
 }
 
-/// Composer busy marker palette; executing tool rows flow on their own.
+/// The settled status slot mirrors the result at the old spinner column. The
+/// one-column slot is never removed, so the tool name and command do not shift.
+pub fn statusGlyph(outcome: Outcome) []const u8 {
+    return switch (outcome) {
+        .pending => " ",
+        .success => "\u{2713}",
+        .failed => "\u{2717}",
+        .canceled => "-",
+    };
+}
+
+/// Composer busy marker palette; executing tool rows pulse the same phase and
+/// colour at the status slot, then leave the command band to the row flow.
 fn activeIndicatorColor(now_ms: u64) []const u8 {
     return theme.command_pulse[shared.activity.commandStep(now_ms)];
 }
 
-pub const CommandSpan = struct { start: usize, end: usize, outcome: Outcome, write_marks: ?WriteMarks = null, generating: bool = false };
+pub const CommandSpan = struct {
+    start: usize,
+    end: usize,
+    outcome: Outcome,
+    write_marks: ?WriteMarks = null,
+    generating: bool = false,
+    /// Byte offset where the command text begins. The slot and tool name before
+    /// it keep their own colours and do not join the running flow. Zero means
+    /// this span has no structured name prefix.
+    label_start: usize = 0,
+};
 
 /// Split a caption label into the separator after the tool name and the text
 /// that actually follows it. An unavailable detail is the tool name itself;
@@ -260,56 +282,46 @@ fn labelParts(name: []const u8, label: []const u8) LabelParts {
     return .{ .sep = " ", .text = label };
 }
 
-/// `indicator` fills the fixed one-column status slot: the dot-matrix spinner
-/// while the call runs, a plain space once it settles. The slot always exists so
-/// removing the animation never shifts the tool name or command by a column.
+/// `indicator` fills the fixed one-column status slot while the call is pending
+/// (the dot-matrix spinner during execution, a space for approval/generation).
+/// A settled row replaces it with its outcome glyph in the same column, so the
+/// tool name and command never shift. The glyph carries the outcome colour via
+/// the same prefix span used by the renderer.
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indicator: []const u8) ![]const u8 {
     const name = activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
-    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}{s}", .{
-        indicator,
+    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}", .{
+        if (outcome == .pending) indicator else statusGlyph(outcome),
         name,
         parts.sep,
         if (value.display != null) "B: " else "",
         parts.text,
-        switch (outcome) {
-            .failed => " \u{2717}",
-            .canceled => " [canceled]",
-            else => "",
-        },
     });
 }
 
 /// One-row failure detail rendered below a failed command row. `reason` stays
 /// raw on the record so a width change re-clips it instead of keeping stale cuts.
+/// The first two columns stay empty to keep the status slot aligned; the branch
+/// icon then marks the reason as a detail of the row above. Narrow rows drop the
+/// icon, then the indent, instead of overflowing.
 pub fn failureReasonLine(a: std.mem.Allocator, reason: []const u8, columns: usize) ![]const u8 {
-    // Keep the two-column indent while the row can afford it; a very narrow
-    // terminal drops the indent rather than overflowing the row.
-    const indent: []const u8 = if (columns > 2) "  " else "";
-    const width = @max(1, columns -| indent.len);
+    const branch = "  \u{21b3} ";
+    const indent: []const u8 = if (columns > text.width(branch)) branch else if (columns > 2) "  " else "";
+    const width = @max(1, columns -| text.width(indent));
     const line = try singleLine(a, reason, width);
     defer a.free(line);
     return std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ theme.failure, indent, line, theme.reset });
 }
 
 /// Byte length of the fixed prefix `commandText` writes before its label; used
-/// to shift label-relative diff marks onto the rendered row. Only settled and
-/// generating rows carry marks, so the indicator is always one space byte.
-pub fn commandPrefixLen(value: Caption) usize {
+/// to shift label-relative diff marks onto the rendered row. Settled rows use
+/// their status glyph; pending callers supply the exact indicator they passed
+/// to `commandText` (a braille spinner or one space).
+pub fn commandPrefixLen(value: Caption, outcome: Outcome, indicator: []const u8) usize {
     const name = activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
-    return 2 + name.len + parts.sep.len + @intFromBool(value.display != null) * "B: ".len;
-}
-
-/// Bytes at the end of `commandText` carrying only the outcome marker. The
-/// renderer reserves them before clipping, so a narrow row shortens the target
-/// first and drops the marker only when the row cannot hold it.
-pub fn commandSuffixLen(_: Caption, outcome: Outcome) usize {
-    return switch (outcome) {
-        .failed => " \u{2717}".len,
-        .canceled => " [canceled]".len,
-        else => 0,
-    };
+    const slot = if (outcome == .pending) indicator else statusGlyph(outcome);
+    return slot.len + 1 + name.len + parts.sep.len + @intFromBool(value.display != null) * "B: ".len;
 }
 
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.
@@ -319,15 +331,17 @@ pub fn commandColumns(columns: usize) usize {
     return columns;
 }
 
-/// One bright band bounces across an executing row: the head column is
+/// One bright band bounces across the command body: the head column is
 /// brightest and the band fades behind the moving head. Only foreground color
 /// changes between frames, so no cluster, column or cell width moves; at either
-/// edge the head reverses instead of leaving the row dark.
+/// edge the head reverses instead of leaving the row dark. The caller starts
+/// after the status slot and tool name, so neither joins the sweep.
 fn writeFlow(writer: *std.Io.Writer, row: []const u8, begin: usize, end: usize, now_ms: u64) !void {
-    // Bounce over the visible row, not the whole terminal: a short caption keeps
-    // its band moving instead of spending most of the cycle in empty columns.
-    const head = shared.activity.flowHead(now_ms, @max(1, text.width(row[0..end])));
-    var column = text.width(row[0..begin]);
+    // Bounce over the visible command, not the whole terminal: a short caption
+    // keeps its band moving instead of spending most of the cycle in empty
+    // columns.
+    const head = shared.activity.flowHead(now_ms, @max(1, text.width(row[begin..end])));
+    var column: usize = 0;
     var tone: []const u8 = "";
     var at = begin;
     while (at < end) {
@@ -354,12 +368,12 @@ fn flowTone(column: usize, head: shared.activity.FlowHead) []const u8 {
 
 /// `duration_ms` is the measured wall-clock execution time of this row. It is
 /// rendered last, in muted color, so it survives label clipping and never
-/// competes with the outcome color or diff marks. `active_time_ms` is the icon
-/// flow clock only; the two are deliberately independent. `keep_tail` is
-/// the byte offset of the outcome marker (` ✗` / ` [canceled]`), which is
-/// reserved before the label is clipped; zero keeps the whole body clip-able.
-/// A failed call's reason lives on its own row below, never in this line.
-pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64, keep_tail: usize) ![]const u8 {
+/// competes with the outcome color or diff marks. `active_time_ms` drives both
+/// the status-slot pulse and the command band; settled rows ignore it. Outcome
+/// glyphs live only in the fixed status slot, so the whole body stays clip-able
+/// and no trailing marker is reserved. A failed call's reason lives on its own
+/// row below, never in this line.
+pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const CommandSpan, columns: usize, duration_ms: ?u64, active_time_ms: ?u64) ![]const u8 {
     // Detail stays <=512 bytes; allow its prefix and bounded observed counts
     // without sanitizing/truncating the same path a second time at512 bytes.
     // Reserve the suffix inside the existing full-width limit, not after clipping.
@@ -371,26 +385,13 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         try shared.activity.formatDuration(&duration_writer, ms);
     }
     const limit = commandColumns(columns);
-    // The outcome tail is only the marker (` ✗` / ` [canceled]`); the reason is
-    // rendered on its own row below. Reserve the marker before clipping the
-    // label, and drop it only when the row is too narrow for it.
-    var tail: []const u8 = if (keep_tail != 0 and keep_tail < body.len) body[keep_tail..] else "";
-    var tail_width: usize = text.width(tail);
-    const marker: usize = if (tail.len == 0) 0 else @min(tail.len, if (std.mem.startsWith(u8, tail, " [canceled]")) " [canceled]".len else " \u{2717}".len);
-    const marker_width = text.width(tail[0..marker]);
-    // The duration is optional: it never takes room from the bare marker.
-    const suffix: []const u8 = if (duration_ms != null and limit >= marker_width + 4 + duration_writer.buffered().len) duration_writer.buffered() else "";
-    if (tail.len != 0 and tail_width + suffix.len > limit) {
-        tail = if (limit -| suffix.len >= marker_width) tail[0..marker] else "";
-        tail_width = if (tail.len == 0) 0 else marker_width;
-    }
-    const head = if (tail.len == 0) body else body[0..keep_tail];
-    const safe = try boundedLine(a, head, limit -| tail_width -| suffix.len, false, 640);
+    // The duration is optional; it never wraps the command onto another row.
+    const suffix: []const u8 = if (duration_ms != null and limit >= 4 + duration_writer.buffered().len) duration_writer.buffered() else "";
+    const safe = try boundedLine(a, body, limit -| suffix.len, false, 640);
     defer a.free(safe);
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     var at: usize = 0;
-    var tail_written = false;
     for (spans) |span| {
         const begin = @min(@max(at, span.start), safe.len);
         const end = @min(@max(begin, span.end), safe.len);
@@ -398,21 +399,29 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         const prefix_end = if (begin < end) @min(text.nextCluster(safe, begin, 0).end, end) else begin;
         // Never turn clipped ellipsis bytes into a phantom running tool icon.
         const has_prefix = begin == span.start and begin < body.len and std.mem.eql(u8, safe[begin..prefix_end], body[begin..text.nextCluster(body, begin, 0).end]);
-        // An executing call lights its whole row: one bright band sweeps across the
-        // icon and the summary, so glyph, column and cell width match the finished
-        // row exactly. A row that is still generating arguments (or awaiting
-        // approval) is not executing, so it stays neutral and static instead of
-        // claiming a running call.
-        if (span.outcome == .pending and active_time_ms != null and has_prefix) {
-            if (!span.generating) {
-                try writeFlow(&out.writer, safe, begin, end, active_time_ms.?);
-                try out.writer.writeAll(theme.reset);
-            } else {
-                try out.writer.print("{s}{s}{s}", .{ theme.muted, safe[begin..prefix_end], theme.muted });
-            }
-            if (span.generating and span.write_marks != null) {
-                var cursor = prefix_end;
-                const marks = span.write_marks.?;
+        const running = span.outcome == .pending and active_time_ms != null and !span.generating and has_prefix;
+        // The status slot owns its own colour. A running row pulses exactly like
+        // the composer's dot matrix; settled rows use the outcome colour.
+        if (has_prefix) {
+            const slot_color = if (span.outcome == .pending)
+                (if (running) activeIndicatorColor(active_time_ms.?) else theme.muted)
+            else
+                prefixColor(span.outcome);
+            try out.writer.print("{s}{s}{s}", .{ theme.reset, slot_color, safe[begin..prefix_end] });
+        }
+        const name_begin = if (has_prefix) prefix_end else begin;
+        // The tool name has its own colour and never joins the command flow.
+        // A clipped row has no reliable name boundary, so it stays one color.
+        const name_end = if (has_prefix and span.label_start != 0) @min(@max(span.label_start, name_begin), end) else name_begin;
+        if (name_end > name_begin) try out.writer.print("{s}{s}", .{ theme.tool_name, safe[name_begin..name_end] });
+        const command_begin = name_end;
+        if (running) {
+            if (command_begin < end) try writeFlow(&out.writer, safe, command_begin, end, active_time_ms.?);
+            try out.writer.writeAll(theme.reset);
+        } else if (span.generating) {
+            try out.writer.writeAll(theme.muted);
+            var cursor = command_begin;
+            if (span.write_marks) |marks| {
                 const ranges = [_]Range{ marks.added, marks.removed };
                 const colors = [_][]const u8{ theme.diff_added, theme.diff_removed };
                 for (ranges, colors) |range, tone| {
@@ -420,14 +429,12 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
                     try out.writer.print("{s}{s}{s}{s}", .{ safe[cursor..range.start], tone, safe[range.start..range.end], theme.muted });
                     cursor = range.end;
                 }
-                try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
-            } else if (span.generating) try out.writer.print("{s}{s}", .{ safe[prefix_end..end], theme.reset });
+            }
+            try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
         } else {
-            if (has_prefix) try out.writer.print("{s}{s}{s}", .{ theme.reset, prefixColor(span.outcome), safe[begin..prefix_end] });
-            const summary_start = if (has_prefix) prefix_end else begin;
             const color = outcomeColor(span.outcome);
             try out.writer.writeAll(color);
-            var cursor = summary_start;
+            var cursor = command_begin;
             if (span.write_marks) |marks| {
                 const ranges = [_]Range{ marks.added, marks.removed };
                 const colors = [_][]const u8{ theme.diff_added, theme.diff_removed };
@@ -439,18 +446,12 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
                     cursor = range.end;
                 }
             }
-            // The outcome tail shares the last span's color, so the failed row
-            // keeps one `✗` run in the same SGR context.
-            if (tail.len != 0 and end == safe.len) {
-                try out.writer.print("{s}{s}{s}", .{ safe[cursor..end], tail, theme.reset });
-                tail_written = true;
-            } else try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
+            try out.writer.print("{s}{s}", .{ safe[cursor..end], theme.reset });
         }
         at = end;
         if (at == safe.len) break;
     }
     try out.writer.writeAll(safe[at..]);
-    if (tail.len != 0 and !tail_written) try out.writer.print("{s}{s}{s}", .{ outcomeColor(if (spans.len != 0) spans[spans.len - 1].outcome else .pending), tail, theme.reset });
     if (suffix.len != 0) try out.writer.print("{s}{s}{s}", .{ theme.duration, suffix, theme.reset });
     return a.dupe(u8, out.written());
 }

@@ -80,9 +80,9 @@ test "normal preview captions show names until reliable typed fields arrive" {
     try std.testing.expect(std.mem.findScalar(u8, hostile.label, '\n') == null);
     const body = try commandText(a, target, .pending, " ");
     defer a.free(body);
-    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .pending }}, 80, null, null, 0);
+    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .pending, .label_start = commandPrefixLen(target, .pending, " ") }}, 80, null, null);
     defer a.free(line);
-    try std.testing.expect(std.mem.find(u8, line, theme.reset ++ " " ++ theme.muted ++ " write_file src/中文.zig") != null);
+    try std.testing.expect(std.mem.find(u8, line, theme.reset ++ theme.muted ++ " " ++ theme.tool_name ++ " write_file " ++ theme.muted ++ "src/中文.zig") != null);
     try std.testing.expect(std.mem.find(u8, line, "⠋") == null);
     try std.testing.expect(std.mem.find(u8, line, "0ms") == null);
 }
@@ -95,32 +95,34 @@ test "failed rows keep the reason on its own bounded row" {
     failed.failure_reason = "FileNotFound: file not found";
     const body = try commandText(a, failed, .failed, " ");
     defer a.free(body);
-    try std.testing.expect(std.mem.endsWith(u8, body, " ✗"));
+    try std.testing.expect(std.mem.startsWith(u8, body, "✗ read_file "));
+    try std.testing.expect(std.mem.indexOf(u8, body, " ✗") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "FileNotFound") == null);
-    try std.testing.expectEqual(@as(usize, 4), commandSuffixLen(failed, .failed));
-    // The reason row keeps the whole width and starts with the failure color.
+    // The reason row keeps the whole width, leaves the status slot empty and
+    // marks the detail as a branch of the failed row above.
     const wide = try failureReasonLine(a, failed.failure_reason.?, 200);
     defer a.free(wide);
-    try std.testing.expect(std.mem.startsWith(u8, wide, theme.failure ++ "  FileNotFound: file not found"));
+    try std.testing.expect(std.mem.startsWith(u8, wide, theme.failure ++ "  ↳ FileNotFound: file not found"));
     try std.testing.expect(output.displayWidth(wide) <= 200);
     // A narrow reason is clipped with dots, never dropped.
     const long = "exit 2: sed: can't read a/very/long/path/that/does/not/fit/in/the/row";
     const narrow = try failureReasonLine(a, long, 40);
     defer a.free(narrow);
-    try std.testing.expect(std.mem.startsWith(u8, narrow, theme.failure ++ "  exit 2: sed"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow, theme.failure ++ "  ↳ exit 2: sed"));
     try std.testing.expect(std.mem.endsWith(u8, narrow, "..." ++ theme.reset));
     try std.testing.expect(output.displayWidth(narrow) <= commandColumns(40));
-    // Tiny rows drop the indent instead of overflowing.
-    inline for ([_]usize{ 1, 2, 3 }) |tiny_columns| {
+    // Tiny rows drop the icon first, then the indent, instead of overflowing.
+    inline for ([_]usize{ 1, 2, 3, 4, 5, 6 }) |tiny_columns| {
         const tiny_line = try failureReasonLine(a, "denied", tiny_columns);
         defer a.free(tiny_line);
         try std.testing.expect(output.displayWidth(tiny_line) <= tiny_columns);
+        if (tiny_columns > 4) try std.testing.expect(std.mem.indexOf(u8, tiny_line, "↳") != null) else try std.testing.expect(std.mem.indexOf(u8, tiny_line, "↳") == null);
     }
     // No reason means no second row at all.
     failed.failure_reason = null;
     const silent = try commandText(a, failed, .failed, " ");
     defer a.free(silent);
-    try std.testing.expect(std.mem.indexOf(u8, silent, "✗") != null);
+    try std.testing.expect(std.mem.startsWith(u8, silent, "✗ read_file "));
 }
 fn expectFailureReason(a: std.mem.Allocator, kind: shared.tools.Kind, result: @import("../core/runtime.zig").Execution, expected: []const u8) !void {
     const reason = try shared.tools.failureReason(a, kind, result);
@@ -175,7 +177,13 @@ test "bash rows show the tool name then the command and keep the slot" {
     inline for (.{ Outcome.pending, Outcome.success, Outcome.failed, Outcome.canceled }) |outcome| {
         const body = try commandText(a, ready, outcome, " ");
         defer a.free(body);
-        try std.testing.expect(std.mem.startsWith(u8, body, "  bash printf owned"));
+        const expected = switch (outcome) {
+            .pending => "  bash printf owned",
+            .success => "✓ bash printf owned",
+            .failed => "✗ bash printf owned",
+            .canceled => "- bash printf owned",
+        };
+        try std.testing.expectEqualStrings(expected, body);
         try std.testing.expect(std.mem.find(u8, body, "> bash ") == null);
     }
     const done = try completed(a, canonical, null);
@@ -251,7 +259,7 @@ test "file captions expose safe paths and measured counts with unknown not guess
     try std.testing.expectEqualStrings("a.zig  ~1 +2 -3 lines", edit_done.label);
     const edit_text = try commandText(a, edit_done, .success, " ");
     defer a.free(edit_text);
-    try std.testing.expect(std.mem.startsWith(u8, edit_text, "  edit_file "));
+    try std.testing.expect(std.mem.startsWith(u8, edit_text, "✓ edit_file "));
     try std.testing.expect(std.mem.indexOf(u8, edit_text, "secret-") == null);
     const bad = try caption(a, "write_file", "{\"path\":\"unfinished");
     defer bad.deinit(a);
@@ -265,15 +273,15 @@ test "provisional write counts are explicit typed preview and generation stays m
     try std.testing.expectEqualStrings("preview.zig  +12 -3 preview", known.label);
     const body = try commandText(a, known, .pending, " ");
     defer a.free(body);
-    const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .pending, .write_marks = known.write_marks.?.shifted(commandPrefixLen(known)), .generating = true };
-    const first = try commandLine(a, body, &.{span}, 80, null, 0, 0);
+    const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .pending, .write_marks = known.write_marks.?.shifted(commandPrefixLen(known, .pending, " ")), .generating = true, .label_start = commandPrefixLen(known, .pending, " ") };
+    const first = try commandLine(a, body, &.{span}, 80, null, 0);
     defer a.free(first);
-    const second = try commandLine(a, body, &.{span}, 80, null, 900, 0);
+    const second = try commandLine(a, body, &.{span}, 80, null, 900);
     defer a.free(second);
     // Generation is not execution: the icon stays in place, neutral and static,
     // and no running brightness may claim the call has started.
     try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(std.mem.startsWith(u8, first, theme.muted ++ " " ++ theme.muted ++ " write_file preview.zig"));
+    try std.testing.expect(std.mem.startsWith(u8, first, theme.reset ++ theme.muted ++ " " ++ theme.tool_name ++ " write_file " ++ theme.muted ++ "preview.zig"));
     for (theme.flow_band) |tone| try std.testing.expect(std.mem.indexOf(u8, first, tone) == null);
     try std.testing.expect(std.mem.indexOf(u8, first, theme.diff_added ++ "+12") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, theme.diff_removed ++ "-3") != null);
@@ -288,14 +296,14 @@ test "write count colors use numeric metadata not patterns in a hostile path" {
     defer done.deinit(a);
     const body = try commandText(a, done, .success, " ");
     defer a.free(body);
-    const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .success, .write_marks = done.write_marks.?.shifted(commandPrefixLen(done)) };
-    const line = try commandLine(a, body, &.{span}, 200, null, null, 0);
+    const span: CommandSpan = .{ .start = 0, .end = body.len, .outcome = .success, .write_marks = done.write_marks.?.shifted(commandPrefixLen(done, .success, " ")), .label_start = commandPrefixLen(done, .success, " ") };
+    const line = try commandLine(a, body, &.{span}, 200, null, null);
     defer a.free(line);
-    try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ theme.success ++ " " ++ theme.muted ++ " write_file path +99 -88 中文  ~4 "));
+    try std.testing.expect(std.mem.startsWith(u8, line, theme.reset ++ theme.success ++ "✓" ++ theme.tool_name ++ " write_file " ++ theme.muted ++ "path +99 -88 中文  ~4 "));
     try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_added ++ "+12" ++ theme.muted) != null);
     try std.testing.expect(std.mem.indexOf(u8, line, theme.diff_removed ++ "-34" ++ theme.muted) != null);
     for ([_]usize{ 1, 4, 20, 45, 55 }) |columns| {
-        const clipped = try commandLine(a, body, &.{span}, columns, null, null, 0);
+        const clipped = try commandLine(a, body, &.{span}, columns, null, null);
         defer a.free(clipped);
         try std.testing.expect(@import("markdown_writer.zig").displayWidth(clipped) <= commandColumns(columns));
         try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
@@ -482,24 +490,32 @@ test "model keeps effort and TPS waves while context percent has static occupanc
         }
     }
 }
-test "composer busy marker keeps its own braille pulse while tool rows flow separately" {
+test "running tool status pulses with the composer while the band flows separately" {
     try text.initLocale();
     const a = std.testing.allocator;
+    const output = @import("markdown_writer.zig");
+    const value: Caption = .{ .kind = .bash, .label = "target" };
     for ([_]u64{ 0, 79, 80, 119, 120, 239, 960, std.math.maxInt(u64) }) |now| {
         const color = theme.command_pulse[shared.activity.commandStep(now)];
         const icon = activity.spinner(now);
         const ending = try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ color, icon, theme.reset });
         defer a.free(ending);
-        const tool = try commandLine(a, "> target", &.{.{ .start = 0, .end = 8, .outcome = .pending }}, 80, null, now, 0);
+        const body = try commandText(a, value, .pending, icon);
+        defer a.free(body);
+        const span = CommandSpan{ .start = 0, .end = body.len, .outcome = .pending, .label_start = commandPrefixLen(value, .pending, icon) };
+        const tool = try commandLine(a, body, &.{span}, 80, null, now);
         defer a.free(tool);
-        // The row is animated only by the SGRs of the flow, so its text, columns
-        // and width never depend on the composer's braille pulse.
-        try std.testing.expectEqual(@import("markdown_writer.zig").displayWidth("> target"), @import("markdown_writer.zig").displayWidth(tool));
+        // The status slot is the exact composer phase and palette; the flow
+        // starts only after the separately colored tool name.
+        const tool_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.reset, color, icon, theme.tool_name, " bash " });
+        defer a.free(tool_prefix);
+        try std.testing.expect(std.mem.startsWith(u8, tool, tool_prefix));
+        try std.testing.expectEqual(text.width(body), output.displayWidth(tool));
         for ([_]usize{ 0, 7, 12, 15, 80 }) |columns| for ([_]shared.activity.RateBand{ .slow, .fast, .unknown }) |band| {
             const rendered = try prompt(a, "model", .{ .tokens = 10, .limit = 100 }, columns, .{ .busy = true, .streaming = true, .now_ms = now, .phase = 7, .rate_band = band, .reasoning_effort = .high });
             defer rendered.deinit(a);
             try expectPromptSuffix(rendered.styled, ending);
-            try std.testing.expectEqual(text.width(rendered.plain), @import("markdown_writer.zig").displayWidth(rendered.styled));
+            try std.testing.expectEqual(text.width(rendered.plain), output.displayWidth(rendered.styled));
             try std.testing.expect(text.width(rendered.plain) <= @max(columns, 2));
         };
     }
@@ -511,41 +527,47 @@ test "all four tool rows flow without moving glyphs, columns or widths" {
     const spinner = "⠋";
     for ([_]activity.Tool{ .bash, .read, .write, .memory }) |kind| {
         const value: Caption = .{ .kind = kind, .label = "operation target" };
+        const name = activity.toolName(kind);
         const active_body = try commandText(a, value, .pending, spinner);
         defer a.free(active_body);
-        const settled_body = try commandText(a, value, .pending, " ");
+        const settled_body = try commandText(a, value, .success, " ");
         defer a.free(settled_body);
-        const spans = &.{CommandSpan{ .start = 0, .end = active_body.len, .outcome = .pending }};
-        const start = try commandLine(a, active_body, spans, 100, null, 0, 0);
+        const active_span = CommandSpan{ .start = 0, .end = active_body.len, .outcome = .pending, .label_start = commandPrefixLen(value, .pending, spinner) };
+        const start = try commandLine(a, active_body, &.{active_span}, 100, null, 0);
         defer a.free(start);
-        const later = try commandLine(a, active_body, spans, 100, null, 80, 0);
+        const later = try commandLine(a, active_body, &.{active_span}, 100, null, 80);
         defer a.free(later);
         // The band moved, yet every frame keeps the same glyphs and columns.
         try std.testing.expect(!std.mem.eql(u8, start, later));
-        const head_prefix = try std.fmt.allocPrint(a, "{s}{s}", .{ theme.flow_band[0], spinner });
+        // The status slot keeps the composer's pulse and the tool name keeps its
+        // own color; neither is repainted by the command band.
+        const head_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}{s} {s} ", .{ theme.reset, theme.command_pulse[0], spinner, theme.tool_name, name });
         defer a.free(head_prefix);
         try std.testing.expect(std.mem.startsWith(u8, start, head_prefix));
         try std.testing.expectEqual(text.width(active_body), output.displayWidth(start));
         try std.testing.expectEqual(output.displayWidth(start), output.displayWidth(later));
-        // The settled row keeps the same column by blanking the spinner slot.
+        // The settled row keeps the same one-column slot with its outcome glyph.
         try std.testing.expectEqual(text.width(settled_body), text.width(active_body));
-        // The band bounces at the row edge: the last column is fully lit at the
-        // turn, and one full period reproduces the first frame exactly.
-        const width = output.displayWidth(active_body);
-        const tail = try commandLine(a, active_body, spans, 100, null, 40 * (width - 1), 0);
+        // The band bounces over the command body: the last command column is
+        // fully lit at the turn. A full flow+pulse period reproduces the first
+        // frame, including the synchronized status color.
+        const width = output.displayWidth("operation target");
+        const tail = try commandLine(a, active_body, &.{active_span}, 100, null, 40 * (width - 1));
         defer a.free(tail);
-        const tail_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.flow_band[0], active_body[active_body.len - 1 ..], theme.reset });
+        const tail_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.flow_band[0], "operation target"[15..], theme.reset });
         defer a.free(tail_prefix);
         try std.testing.expect(std.mem.endsWith(u8, tail, tail_prefix));
-        const again = try commandLine(a, active_body, spans, 100, null, 40 * (2 * (width - 1)), 0);
+        const again = try commandLine(a, active_body, &.{active_span}, 100, null, 40 * (2 * (width - 1)) * 4);
         defer a.free(again);
         try std.testing.expectEqualStrings(start, again);
         // A settled row never flows, whatever clock the caller holds.
-        const done = try commandLine(a, settled_body, &.{.{ .start = 0, .end = settled_body.len, .outcome = .success }}, 100, null, 120, 0);
+        const done_span = CommandSpan{ .start = 0, .end = settled_body.len, .outcome = .success, .label_start = commandPrefixLen(value, .success, " ") };
+        const done = try commandLine(a, settled_body, &.{done_span}, 100, null, 120);
         defer a.free(done);
-        const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.reset ++ theme.success, settled_body[0..1], theme.muted, settled_body[1..], theme.reset });
+        const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s} {s} {s}{s}{s}", .{ theme.reset, theme.success, statusGlyph(.success), theme.tool_name, name, theme.muted, "operation target", theme.reset });
         defer a.free(expected);
         try std.testing.expectEqualStrings(expected, done);
+        for (theme.flow_band) |tone| try std.testing.expect(std.mem.indexOf(u8, done, tone) == null);
     }
     try std.testing.expectEqualStrings("read_file", activity.toolName(.read));
     try std.testing.expectEqualStrings("write_file", activity.toolName(.write));
@@ -565,7 +587,7 @@ test "tool details survive old cutoffs and rows clip at full width with complete
         const body = try commandText(a, value, .pending, " ");
         defer a.free(body);
         for ([_]usize{ 0, 1, 4, 10, 80, 200, 512 }) |columns| {
-            const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, columns, null, 80, 0);
+            const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, columns, null, 80);
             defer a.free(line);
             try std.testing.expect(output.displayWidth(line) <= commandColumns(columns));
             try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -573,7 +595,7 @@ test "tool details survive old cutoffs and rows clip at full width with complete
         }
     }
     const body = "r 中文é repeated-path 中文é repeated-path 中文é repeated-path";
-    const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, 80, null, 120, 0);
+    const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }}, 80, null, 120);
     defer a.free(line);
     try std.testing.expect(output.displayWidth(line) <= 80);
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -605,7 +627,7 @@ test "command duration stays last and inside the row width for every outcome" {
             const ending = try std.fmt.allocPrint(a, "  {s}{s}", .{ case.suffix, theme.reset });
             defer a.free(ending);
             for ([_]usize{ 0, 1, 7, 12, 16, 40, 79, 200 }) |columns| {
-                const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }}, columns, case.ms, 120, 0);
+                const line = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }}, columns, case.ms, 120);
                 defer a.free(line);
                 try std.testing.expect(output.displayWidth(line) <= commandColumns(columns));
                 try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -618,22 +640,24 @@ test "only the executing row flows while completed spans stay static and clipped
     const a = std.testing.allocator;
     const body = "> sleep 1";
     const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .pending }};
-    const first = try commandLine(a, body, spans, 79, null, 0, 0);
+    const first = try commandLine(a, body, spans, 79, null, 0);
     defer a.free(first);
-    const second = try commandLine(a, body, spans, 79, null, 180, 0);
+    const second = try commandLine(a, body, spans, 79, null, 180);
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
-    try std.testing.expect(std.mem.startsWith(u8, first, theme.flow_band[0] ++ ">"));
+    // The status slot pulses with the composer palette; the band starts after it.
+    try std.testing.expect(std.mem.startsWith(u8, first, theme.reset ++ theme.command_pulse[0] ++ ">"));
+    try std.testing.expect(std.mem.find(u8, first, theme.flow_band[0]) != null);
     // A clip that eats the icon cannot fabricate one: no prefix, no flow.
-    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 3, null, 1, 0);
+    const narrow = try commandLine(a, "r long-path", &.{CommandSpan{ .start = 0, .end = "r long-path".len, .outcome = .pending }}, 3, null, 1);
     defer a.free(narrow);
     try std.testing.expect(std.unicode.utf8ValidateSlice(narrow));
     try std.testing.expectEqualStrings(theme.muted ++ "..." ++ theme.reset, narrow);
     for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
         const complete = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
-        const one = try commandLine(a, body, complete, 79, null, 0, 0);
+        const one = try commandLine(a, body, complete, 79, null, 0);
         defer a.free(one);
-        const two = try commandLine(a, body, complete, 79, null, 180, 0);
+        const two = try commandLine(a, body, complete, 79, null, 180);
         defer a.free(two);
         try std.testing.expectEqualStrings(one, two);
     }
@@ -645,23 +669,29 @@ test "executing rows keep every column after the status slot while the band and 
     const spinner = "⠋";
     for ([_]activity.Tool{ .bash, .read, .write, .memory, .subagent, .other }) |kind| {
         const value: Caption = .{ .kind = kind, .label = "operation 中文 target" };
+        const name = activity.toolName(kind);
         const active_body = try commandText(a, value, .pending, spinner);
         defer a.free(active_body);
-        const settled_body = try commandText(a, value, .pending, " ");
+        const settled_body = try commandText(a, value, .success, " ");
         defer a.free(settled_body);
-        const done = try commandLine(a, settled_body, &.{.{ .start = 0, .end = settled_body.len, .outcome = .success }}, 80, 250, 900, 0);
+        const held_body = try commandText(a, value, .pending, " ");
+        defer a.free(held_body);
+        const active_span = CommandSpan{ .start = 0, .end = active_body.len, .outcome = .pending, .label_start = commandPrefixLen(value, .pending, spinner) };
+        const done_span = CommandSpan{ .start = 0, .end = settled_body.len, .outcome = .success, .label_start = commandPrefixLen(value, .success, " ") };
+        const done = try commandLine(a, settled_body, &.{done_span}, 80, 250, 900);
         defer a.free(done);
         const done_visible = try visibleRow(a, done);
         defer a.free(done_visible);
+        const done_suffix = done_visible[text.nextCluster(done_visible, 0, 0).end + 1 ..];
         var lit: [theme.flow_band.len]bool = @splat(false);
         for (times) |now| {
-            const line = try commandLine(a, active_body, &.{.{ .start = 0, .end = active_body.len, .outcome = .pending }}, 80, 250, now, 0);
+            const line = try commandLine(a, active_body, &.{active_span}, 80, 250, now);
             defer a.free(line);
             const visible = try visibleRow(a, line);
             defer a.free(visible);
             // Only the one-column status slot changes glyph; the tool name,
             // command and timer keep their exact columns on every frame.
-            try std.testing.expectEqualStrings(done_visible[2..], visible[spinner.len + 1 ..]);
+            try std.testing.expectEqualStrings(done_suffix, visible[text.nextCluster(visible, 0, 0).end + 1 ..]);
             try std.testing.expectEqual(text.styledWidth(done), text.styledWidth(line));
             for (theme.flow_band, 0..) |tone, index| {
                 if (std.mem.indexOf(u8, line, tone) != null) lit[index] = true;
@@ -671,12 +701,13 @@ test "executing rows keep every column after the status slot while the band and 
         var shades: usize = 0;
         for (lit) |seen| shades += @intFromBool(seen);
         try std.testing.expect(shades >= 4);
-        // Generation is not execution: the same slot stays blank and static,
-        // and it never borrows the band or a timer.
+        // Generation is not execution: the slot stays blank, the name keeps its
+        // own color, and no running brightness may claim the call has started.
         for ([_]u64{ 0, 180, 900, std.math.maxInt(u64) }) |now| {
-            const generating = try commandLine(a, settled_body, &.{.{ .start = 0, .end = settled_body.len, .outcome = .pending, .generating = true }}, 80, null, now, 0);
+            const held_span = CommandSpan{ .start = 0, .end = held_body.len, .outcome = .pending, .generating = true, .label_start = commandPrefixLen(value, .pending, " ") };
+            const generating = try commandLine(a, held_body, &.{held_span}, 80, null, now);
             defer a.free(generating);
-            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ theme.muted, settled_body[0..1], theme.muted, settled_body[1..], theme.reset });
+            const expected = try std.fmt.allocPrint(a, "{s}{s} {s} {s} {s}{s}{s}", .{ theme.reset, theme.muted, theme.tool_name, name, theme.muted, "operation 中文 target", theme.reset });
             defer a.free(expected);
             try std.testing.expectEqualStrings(expected, generating);
             for (theme.flow_band) |tone| try std.testing.expect(std.mem.indexOf(u8, generating, tone) == null);
@@ -698,7 +729,7 @@ test "long byte capped paths use complete clusters and only ascii truncation dot
         try std.testing.expect(value.label.len <= 512);
         const body = try commandText(a, value, .success, " ");
         defer a.free(body);
-        const row = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .success }}, 1000, null, null, 0);
+        const row = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .success }}, 1000, null, null);
         defer a.free(row);
         try std.testing.expect(std.mem.indexOf(u8, row, "[truncated]") == null);
         try std.testing.expect(std.mem.indexOf(u8, row, "e...") == null);
@@ -714,10 +745,12 @@ test "all tool outcome prefixes are colored without recoloring summaries or dura
     for ([_]activity.Tool{ .bash, .read, .memory, .write }) |kind| {
         for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
             const value: Caption = .{ .kind = kind, .label = "operation target" };
+            const name = activity.toolName(kind);
             const body = try commandText(a, value, outcome, " ");
             defer a.free(body);
-            const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome }};
-            const line = try commandLine(a, body, spans, 100, 250, 0, 0);
+            const label_start = commandPrefixLen(value, outcome, " ");
+            const spans = &.{CommandSpan{ .start = 0, .end = body.len, .outcome = outcome, .label_start = label_start }};
+            const line = try commandLine(a, body, spans, 100, 250, 0);
             defer a.free(line);
             const color = switch (outcome) {
                 .success => theme.success,
@@ -725,13 +758,16 @@ test "all tool outcome prefixes are colored without recoloring summaries or dura
                 .canceled => theme.caution,
                 .pending => unreachable,
             };
-            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, body[0..1], outcomeColor(outcome), body[1..], theme.reset, theme.duration, theme.reset });
+            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s} {s} {s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, statusGlyph(outcome), theme.tool_name, name, outcomeColor(outcome), "operation target", theme.reset, theme.duration, theme.reset });
             defer a.free(expected);
             try std.testing.expectEqualStrings(expected, line);
+            // The tool name always separates the status from the command.
+            try std.testing.expect(!std.mem.eql(u8, color, theme.tool_name));
+            try std.testing.expect(!std.mem.eql(u8, theme.tool_name, outcomeColor(outcome)));
             try std.testing.expect(!std.mem.eql(u8, theme.thinking, color));
             try std.testing.expect(!std.mem.eql(u8, theme.thinking, outcomeColor(outcome)));
             // Three columns cannot keep the icon, so the row is dots only.
-            const clipped = try commandLine(a, body, spans, 3, 250, 0, 0);
+            const clipped = try commandLine(a, body, spans, 3, 250, 0);
             defer a.free(clipped);
             const clipped_expected = try std.fmt.allocPrint(a, "{s}...{s}", .{ outcomeColor(outcome), theme.reset });
             defer a.free(clipped_expected);
@@ -742,10 +778,10 @@ test "all tool outcome prefixes are colored without recoloring summaries or dura
 test "individual command rows retain their icons and own outcome prefix colors" {
     const a = std.testing.allocator;
     const body = "> date ✗ error";
-    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 79, null, null, 0);
+    const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 79, null, null);
     defer a.free(line);
     const success = "> pwd";
-    const success_line = try commandLine(a, success, &.{.{ .start = 0, .end = success.len, .outcome = .success }}, 79, null, null, 0);
+    const success_line = try commandLine(a, success, &.{.{ .start = 0, .end = success.len, .outcome = .success }}, 79, null, null);
     defer a.free(success_line);
     try std.testing.expect(std.mem.find(u8, line, theme.reset ++ theme.failure ++ ">" ++ theme.failure ++ " date ✗ error") != null);
     try std.testing.expect(std.mem.find(u8, success_line, theme.reset ++ theme.success ++ ">" ++ theme.muted ++ " pwd") != null);
@@ -753,7 +789,7 @@ test "individual command rows retain their icons and own outcome prefix colors" 
     try std.testing.expect(std.mem.find(u8, success_line, "date") == null);
     try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
     try std.testing.expect(std.mem.findScalar(u8, success_line, '\n') == null);
-    const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10, null, null, 0);
+    const clipped = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .failed }}, 10, null, null);
     defer a.free(clipped);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "..." ++ theme.reset));
 }

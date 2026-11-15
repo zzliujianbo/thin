@@ -29,6 +29,9 @@ pub const user = "\x1b[38;5;255m\x1b[48;2;52;36;24m";
 pub const user_background = "\x1b[48;2;52;36;24m";
 
 pub const success = "\x1b[38;5;114m";
+/// Tool names stay distinct from both the status slot (success/failure/pulse)
+/// and the command summary (muted/failure/caution).
+pub const tool_name = "\x1b[38;5;75m";
 /// Row timing stays readable next to muted labels without competing with the
 /// outcome colour: a dim teal, not a second highlight.
 pub const duration = "\x1b[38;5;66m";
@@ -89,14 +92,16 @@ pub const command_pulse = [_][]const u8{
     "\x1b[38;5;223m", "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;208m",
 };
 
-/// An executing row is lit by one band that bounces across the whole row: the
+/// An executing command is lit by one 15-cell band that bounces across it: the
 /// column at the head is brightest and the band fades behind it, then the head
-/// reverses at the edge. Foreground-only warm 256-color levels (no truecolor,
-/// no background, no bold), so a cluster, its column and its cell width never
-/// move and no glyph is swapped frame to frame; the row is muted where the band
-/// is not.
+/// reverses at the edge. The status slot and tool name stay outside this sweep.
+/// Foreground-only warm 256-color levels (no truecolor, no background, no bold),
+/// so a cluster, its column and its cell width never move and no glyph is
+/// swapped frame to frame; the row is muted where the band is not.
 pub const flow_band = [_][]const u8{
-    "\x1b[38;5;223m", "\x1b[38;5;221m", "\x1b[38;5;220m",
-    "\x1b[38;5;214m", "\x1b[38;5;209m", "\x1b[38;5;208m",
-    "\x1b[38;5;202m", "\x1b[38;5;173m", "\x1b[38;5;137m",
+    "\x1b[38;5;223m", "\x1b[38;5;222m", "\x1b[38;5;221m",
+    "\x1b[38;5;220m", "\x1b[38;5;214m", "\x1b[38;5;209m",
+    "\x1b[38;5;208m", "\x1b[38;5;203m", "\x1b[38;5;202m",
+    "\x1b[38;5;197m", "\x1b[38;5;196m", "\x1b[38;5;173m",
+    "\x1b[38;5;137m", "\x1b[38;5;130m", "\x1b[38;5;94m",
 };

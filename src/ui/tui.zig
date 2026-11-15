@@ -94,8 +94,6 @@ const Record = struct {
     notice_marker_len: usize = 0,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
-    /// Byte offset in `body` where the clipped-immune outcome tail starts.
-    command_tail_start: usize = 0,
     agent_row: bool = false,
     agent_open: bool = false,
     /// Measured wall-clock execution time of this row; null when unobserved.
@@ -241,14 +239,14 @@ const Record = struct {
         defer a.free(label);
         try self.command_spans.ensureUnusedCapacity(a, 1);
         const start = self.body.items.len;
+        const label_start = start + presentation.commandPrefixLen(caption, outcome, " ");
         try self.append(a, label);
         self.command_row = true;
-        self.command_tail_start = self.body.items.len - presentation.commandSuffixLen(caption, outcome);
         self.duration_ms = duration_ms;
         if (outcome == .failed) {
             if (caption.failure_reason) |reason| self.failure_reason = try a.dupe(u8, reason);
         }
-        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(start + presentation.commandPrefixLen(caption)) else null });
+        self.command_spans.appendAssumeCapacity(.{ .start = start, .end = self.body.items.len, .outcome = outcome, .write_marks = if (caption.write_marks) |marks| marks.shifted(label_start) else null, .label_start = label_start });
     }
 
     /// Create the bounded thinking tail once, at the current terminal width.
@@ -386,7 +384,7 @@ const Record = struct {
         }
 
         if (self.command_row) {
-            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null, self.command_tail_start);
+            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null);
             if (self.failure_reason) |reason| {
                 const detail = try presentation.failureReasonLine(temp, reason, columns);
                 self.lines = try temp.dupe([]const u8, &.{ line, detail });
@@ -2866,11 +2864,14 @@ const Ui = struct {
 
     /// Only the currently running call is replaceable; every result owns a row.
     fn pendingCommand(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
-        const label = try presentation.commandText(a, self.active_tool.?.caption, .pending, activity.spinner(self.clock_ms));
+        const spinner = activity.spinner(self.clock_ms);
+        const caption = self.active_tool.?.caption;
+        const label = try presentation.commandText(a, caption, .pending, spinner);
         defer a.free(label);
+        const label_start = presentation.commandPrefixLen(caption, .pending, spinner);
         const start = self.active_tool.?.started_ms;
-        const background_start = if (self.active_tool.?.caption.display) |display| display.action == .start else false;
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending }}, columns, if (background_start) null else self.clock_ms -| start, self.clock_ms, 0);
+        const background_start = if (caption.display) |display| display.action == .start else false;
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .label_start = label_start }}, columns, if (background_start) null else self.clock_ms -| start, self.clock_ms);
     }
 
     fn waitingCommand(self: *Ui, a: std.mem.Allocator, entry: tool_views_module.Entry, columns: usize) ![]const u8 {
@@ -2882,10 +2883,11 @@ const Ui = struct {
         } else entry.caption;
         const label = try presentation.commandText(a, caption, .pending, " ");
         defer a.free(label);
+        const label_start = presentation.commandPrefixLen(caption, .pending, " ");
         const generating = !entry.ready and entry.write_progress != null and entry.caption.kind == .write;
         // Generating and approval rows remain muted and static, without an
         // execution time; tool_started owns the row flow clock and its timer.
-        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(presentation.commandPrefixLen(caption)) else null, .generating = generating }}, columns, null, if (generating) self.clock_ms else null, 0);
+        return presentation.commandLine(a, label, &.{.{ .start = 0, .end = label.len, .outcome = .pending, .write_marks = if (caption.write_marks) |marks| marks.shifted(label_start) else null, .generating = generating, .label_start = label_start }}, columns, null, if (generating) self.clock_ms else null);
     }
 
     /// Only actionable notices/errors use a temporary hint row. Completed,

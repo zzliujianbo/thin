@@ -15,13 +15,22 @@ test "Markdown uses vivid yellow green and cool violet without changing font sty
     try testing.expectEqualStrings("\x1b[38;5;1m", diff_removed);
     try testing.expectEqualStrings(reset, effortColor(.medium));
     try testing.expectEqualStrings("\x1b[38;5;75m", effortColor(.high));
+    try testing.expectEqualStrings("\x1b[38;5;75m", tool_name);
+    try testing.expect(!std.mem.eql(u8, tool_name, success));
+    try testing.expect(!std.mem.eql(u8, tool_name, failure));
     try testing.expectEqualStrings("\x1b[38;5;171m", effortColor(.xhigh));
 }
 test "executing row flow uses only warm foreground levels in a fading band" {
     const std = @import("std");
     const testing = std.testing;
-    const warm = [_][]const u8{ "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;202m", "\x1b[38;5;208m", "\x1b[38;5;209m", "\x1b[38;5;214m", "\x1b[38;5;220m", "\x1b[38;5;221m", "\x1b[38;5;223m" };
-    try testing.expect(flow_band.len >= 4);
+    const warm = [_][]const u8{
+        "\x1b[38;5;223m", "\x1b[38;5;222m", "\x1b[38;5;221m", "\x1b[38;5;220m",
+        "\x1b[38;5;214m", "\x1b[38;5;209m", "\x1b[38;5;208m", "\x1b[38;5;203m",
+        "\x1b[38;5;202m", "\x1b[38;5;197m", "\x1b[38;5;196m", "\x1b[38;5;173m",
+        "\x1b[38;5;137m", "\x1b[38;5;130m", "\x1b[38;5;94m",
+    };
+    // The requested band is 15 cells wide: one distinct foreground per column.
+    try testing.expectEqual(@as(usize, 15), flow_band.len);
     for (flow_band, 0..) |tone, i| {
         // Foreground-only standard palette; never truecolor, background or bold.
         for ([_][]const u8{ "38;2;", "48;", "\x1b[1m", "\x1b[4m", "\x1b[7m" }) |rejected| try testing.expect(std.mem.indexOf(u8, tone, rejected) == null);

@@ -42,7 +42,7 @@ test "background ready metadata refreshes one owned row" {
     try std.testing.expect(caption.display.?.action == .start);
     const line = try presentation.commandText(a, caption, .success, " ");
     defer a.free(line);
-    try std.testing.expectEqualStrings("  bash B: ▶ sleep 1", line);
+    try std.testing.expectEqualStrings("✓ bash B: ▶ sleep 1", line);
     event.display = null;
     event.fields.command = .{ .text = "unguarded preview" };
     try views.upsert(a, event);
