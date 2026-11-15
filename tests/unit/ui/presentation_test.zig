@@ -223,8 +223,8 @@ test "percent prompt has default input colors and real spinner not loading text"
     try expectPromptStyle(idle.plain, idle.styled);
     const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .streaming = true, .now_ms = 80, .phase = 2 });
     defer active.deinit(a);
-    try std.testing.expectEqualStrings("(deepseek-flash) ?%⠙ ", active.plain);
-    try expectPromptSuffix(active.styled, theme.reset ++ theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ");
+    try std.testing.expectEqualStrings("(deepseek-flash) ?%⠹ ", active.plain);
+    try expectPromptSuffix(active.styled, theme.reset ++ theme.command_pulse[0] ++ "⠹" ++ theme.reset ++ " ");
     try std.testing.expect(std.mem.find(u8, active.styled, "loading") == null);
     const narrow = try prompt(a, "long model name", null, 7, .{});
     defer narrow.deinit(a);
@@ -482,9 +482,9 @@ test "model keeps effort and TPS waves while context percent has static occupanc
             for ([_]bool{ false, true }) |busy| {
                 const narrow = try prompt(a, "model", null, columns, .{ .busy = busy, .now_ms = 80, .reasoning_effort = effort });
                 defer narrow.deinit(a);
-                try std.testing.expectEqualStrings(if (busy) "⠙ " else "> ", narrow.plain);
+                try std.testing.expectEqualStrings(if (busy) "⠹ " else "> ", narrow.plain);
                 if (busy) {
-                    try expectPromptStyle(theme.command_pulse[0] ++ "⠙" ++ theme.reset ++ " ", narrow.styled);
+                    try expectPromptStyle(theme.command_pulse[0] ++ "⠹" ++ theme.reset ++ " ", narrow.styled);
                 } else try expectPromptStyle(narrow.plain, narrow.styled);
             }
         }

@@ -97,7 +97,7 @@ pub const EffortSet = struct {
     }
 };
 
-/// Composer busy-marker palette cadence, a multiple of the TUI's 80ms tick so
+/// Composer busy-marker palette cadence, a multiple of the TUI's 40ms tick so
 /// every shade is painted for the same number of frames.
 const pulse_interval_ms: u64 = 160;
 

@@ -135,6 +135,11 @@ pub fn build(b: *std.Build) void {
         guard.setCwd(b.path("."));
         break :guard guard;
     } else null;
+    // Filters belong to separate compile artifacts, never to the full unit suite.
+    const focus_filter = b.option([]const u8, "test-filter", "Nonempty substring for test-focus");
+    const focus_group = b.option([]const u8, "test-group", "Optional unit group for test-focus: fast, ui, app, core, integration, daemon");
+    var focus_artifact: ?*std.Build.Step.Compile = null;
+
     // Independent group binaries are the fastest wall-clock entry: the build
     // runner executes them concurrently instead of serializing one big process.
     const parallel = b.step("test-unit-parallel", "Run the unit groups as separate concurrent processes");
@@ -171,17 +176,29 @@ pub fn build(b: *std.Build) void {
             guarded_run.step.dependOn(&guard.step);
             sharded.dependOn(&guarded_run.step);
         }
+        if (focus_filter) |filter| if (focus_group) |selected| if (std.mem.eql(u8, group, selected)) {
+            // Reuse the group's composed root and shared runtime module; only the
+            // test filter differs from the full group artifact.
+            const focused = b.addTest(.{ .use_llvm = platform_llvm, .root_module = grouped.root_module, .filters = &.{filter} });
+            focused.step.dependOn(&variant.run.step);
+            configureStack(focused);
+            focus_artifact = focused;
+        };
     }
 
-    // Filters belong to separate compile artifacts, never to the full unit suite.
-    const focus_filter = b.option([]const u8, "test-filter", "Nonempty substring for test-focus");
-    const focus_step = b.step("test-focus", "Run unit tests matching -Dtest-filter");
+    const focus_step = b.step("test-focus", "Run unit tests matching -Dtest-filter, optionally in one -Dtest-group");
     if (focus_filter) |filter| {
         if (std.mem.trim(u8, filter, " \t\r\n").len != 0) {
-            const focused = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = &.{filter} });
-            configureStack(focused);
-            focused.step.dependOn(&all.run.step);
-            focus_step.dependOn(&runTest(b, focused).step);
+            if (focus_group) |selected| {
+                if (focus_artifact) |focused| {
+                    focus_step.dependOn(&runTest(b, focused).step);
+                } else focus_step.dependOn(&b.addFail(b.fmt("test-focus unknown test group: {s}", .{selected})).step);
+            } else {
+                const focused = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = &.{filter} });
+                configureStack(focused);
+                focused.step.dependOn(&all.run.step);
+                focus_step.dependOn(&runTest(b, focused).step);
+            }
         } else focus_step.dependOn(&b.addFail("test-focus requires a nonempty -Dtest-filter").step);
     } else focus_step.dependOn(&b.addFail("test-focus requires a nonempty -Dtest-filter").step);
     const rendering = b.addTest(.{ .use_llvm = platform_llvm, .root_module = unit.root_module, .filters = &.{ "ui.", "util.display_text." } });

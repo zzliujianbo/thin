@@ -46,8 +46,15 @@ pub const ModelProvider = picker_module.Provider;
 /// measured from the previous draw's start; input and geometry never wait for it.
 const draw_interval_ms: u16 = 8;
 
-/// Running tool-row flow cadence: one column per 40ms frame at 25fps. Other
-/// animations keep their existing 80ms tick.
+/// Idle poll window: input and worker wakeups are fd-driven, so a quiet UI can
+/// sleep longer than the animation/draw cadence. Real timer deadlines still cap
+/// this wait in `baseWaitMs`.
+const idle_poll_ms: u16 = 100;
+const escape_expiry_ms: u64 = 150;
+
+/// Unified 40ms animation frame cadence: one tool-band column per frame, one
+/// spinner step, and the fast label slot. The busy pulse stays a wider
+/// multiple (160ms) on the same grid.
 const flow_interval_ms: u64 = 40;
 
 const StopIdentity = struct {
@@ -927,6 +934,10 @@ const Ui = struct {
     record_index: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     next_record_id: u64 = 1,
     draw_record_visits: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
+    /// First record that can still need drawing. Everything before it is
+    /// released output or reasoning-only and only contributes the spacing kind.
+    live_start: usize = 0,
+    live_previous_kind: ?Kind = null,
     /// 正在流式接收的助手正文记录索引；null 表示没有草稿。
     draft: ?usize = null,
     /// 正在流式接收的推理记录索引。
@@ -2063,6 +2074,7 @@ const Ui = struct {
                 } else record.deinit(self.allocator);
             }
             self.records.items.len = kept;
+            self.resetRecordScan();
             self.record_index.clearRetainingCapacity();
             for (self.records.items, 0..) |record, index| self.record_index.putAssumeCapacityNoClobber(record.id, index);
             self.draft = null;
@@ -2260,6 +2272,7 @@ const Ui = struct {
         self.discardResizedFrame();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.clearRetainingCapacity();
+        self.resetRecordScan();
         self.record_index.clearRetainingCapacity();
         self.draft = null;
         self.reasoning = null;
@@ -2679,6 +2692,7 @@ const Ui = struct {
         removed.deinit(self.allocator);
         if (self.draft) |i| self.draft = if (i == index) null else if (i > index) i - 1 else i;
         if (self.reasoning) |i| self.reasoning = if (i == index) null else if (i > index) i - 1 else i;
+        if (index < self.live_start) self.resetRecordScan();
     }
 
     fn discardReasoning(self: *Ui) void {
@@ -3030,7 +3044,7 @@ const Ui = struct {
         // terminal results are conversation notices and never return here.
         // The row is one braille frame plus, when waiting work exists, exactly
         // the queued count (the active job is never counted twice). The frame
-        // comes from the ordinary 80 ms animation clock; nothing here schedules
+        // comes from the shared 40 ms animation clock; nothing here schedules
         // a refresh of its own.
         if (self.permission == null and !self.stop_open and state.memory.enabled and
             (state.memory.active != null or state.memory.queued_count != 0))
@@ -6274,6 +6288,36 @@ const Ui = struct {
         return self.dirty and !self.resize_waiting and self.frame.len == 0 and self.resize_rescue.len == 0;
     }
 
+    /// Advance the draw scan past released output and released reasoning rows.
+    /// A live reasoning row stays at the tail head so removing it does not
+    /// reset the scan. This is O(records advanced) over a session, not
+    /// O(history) per frame.
+    fn recordScan(self: *Ui) struct { start: usize, previous_kind: ?Kind } {
+        while (self.live_start < self.records.items.len) {
+            const index = self.live_start;
+            const record = &self.records.items[index];
+            if (record.kind == .reasoning) {
+                // A released reasoning row is history; a live one stays at the
+                // tail head so removing it does not reset the whole scan.
+                if (!record.output) break;
+                self.live_start += 1;
+                continue;
+            }
+            if (record.output and self.draft != index) {
+                self.live_previous_kind = record.kind;
+                self.live_start += 1;
+                continue;
+            }
+            break;
+        }
+        return .{ .start = self.live_start, .previous_kind = self.live_previous_kind };
+    }
+
+    fn resetRecordScan(self: *Ui) void {
+        self.live_start = 0;
+        self.live_previous_kind = null;
+    }
+
     /// Pi-style ordinary display cadence: at most one fresh body frame per
     /// interval, counted from the previous draw's start so the draw's own cost is
     /// already used. Urgent input bypasses it; an unproven geometry waits for
@@ -6282,6 +6326,31 @@ const Ui = struct {
         if (!self.drawReady()) return false;
         if (self.urgent_draw) return true;
         return self.clock_ms -| self.last_draw_ms >= draw_interval_ms;
+    }
+
+    /// A quiet UI has no draw, animation, or local completion to poll. Input and
+    /// worker wakeups are fd-driven, so only real timer deadlines should shorten
+    /// the wait.
+    fn idlePolling(self: *const Ui) bool {
+        return !self.dirty and !self.busy and self.future == null and !self.presentationWaiting() and
+            !self.remoteSynchronizing() and self.mode == null and self.active_tool == null and
+            !self.memoryAnimating() and !self.backgroundAnimating() and self.deferred_submit == null and !self.resize_waiting;
+    }
+
+    /// Base wait before cadence/animation alignment. Idle sleeps are longer but
+    /// still capped by parser Escape expiry and the effort-flash deadline.
+    fn baseWaitMs(self: *const Ui) u16 {
+        if (!self.idlePolling()) return 16;
+        var wait: u16 = idle_poll_ms;
+        if (self.parser.escape_len != 0) {
+            const remaining = (self.last_input_ms +| escape_expiry_ms) -| self.clock_ms;
+            if (remaining < @as(u64, wait)) wait = @intCast(@max(1, remaining));
+        }
+        if (self.effort_flash) |flash| {
+            const remaining = flash.until_ms -| self.clock_ms;
+            if (remaining < @as(u64, wait)) wait = @intCast(@max(1, remaining));
+        }
+        return wait;
     }
 
     /// Remaining wait for a throttled dirty frame: the rest of the interval, not
@@ -6315,9 +6384,9 @@ const Ui = struct {
         return self.connection.current().background.active_count != 0;
     }
 
-    /// The one fast (sub-80ms) animation slot. The running tool band owns it
-    /// first; otherwise the streaming model label does. Null means only the
-    /// 80ms tick is animating. Both owners step the same frame-counted phase
+    /// The dedicated animation slot. The running tool band owns it first;
+    /// otherwise the streaming model label does. Null means only the shared
+    /// 40ms tick is animating. Both owners step the same frame-counted phase
     /// once per due frame, so a late loop slows the motion instead of skipping.
     fn fastInterval(self: *const Ui) ?u64 {
         if (self.active_tool) |tool| if (!tool.grouped) return flow_interval_ms;
@@ -6341,7 +6410,7 @@ const Ui = struct {
 
     /// Any animation owner: working task, tool row or mode (the fast slot's
     /// sources) plus memory/background progress. Memory rotates on the same
-    /// 80ms tick and dirty-draw path as a running task.
+    /// 40ms tick and dirty-draw path as a running task.
     fn animationActive(self: *const Ui) bool {
         return self.workingOnTask() or self.memoryAnimating() or self.backgroundAnimating();
     }
@@ -6349,12 +6418,12 @@ const Ui = struct {
     fn animate(self: *Ui) void {
         if (self.resize_waiting) return;
         if (!self.animationActive()) return;
-        const tick = self.clock_ms / 80;
+        const tick = self.clock_ms / flow_interval_ms;
         const tick_due = self.animation_tick != tick;
-        // The fast slot owns the sub-80ms phase: the tool band at 40ms or the
-        // streaming label at its TPS-driven interval. Counting frames, not
-        // elapsed time, keeps a late loop at one column or shade per draw;
-        // time-based catch-up would make the motion jump.
+        // The dedicated slot owns the tool band at 40ms or the streaming label
+        // at its TPS-driven interval; the shared tick owns the spinner and the
+        // 160ms pulse. Counting frames, not elapsed time, keeps a late loop at
+        // one column or shade per draw; catch-up would make the motion jump.
         const fast_interval = self.fastInterval();
         const fast_due = fast_interval != null and self.clock_ms >= self.fast_next_ms;
         if (!tick_due and !fast_due) return;
@@ -6364,7 +6433,7 @@ const Ui = struct {
             self.fast_next_ms = self.clock_ms +| fast_interval.?;
         }
         // An approval owns a full, non-sparse preview. Repainting that unchanged
-        // preview for a composer pulse sends its title/body again every 80 ms.
+        // preview for a composer pulse sends its title/body again every 40 ms.
         // Keep polling/cancellation alive, but redraw only for actual events,
         // input until the approval is cleared. Never clear dirty here.
         // A static pending preview needs no spinner-only repaint. Real events,
@@ -6382,7 +6451,7 @@ const Ui = struct {
             self.clock_ms = @intCast(@max(0, Io.Clock.awake.now(self.io).toMilliseconds()));
             self.animate();
             // 档位确认到期后自动恢复为上下文百分比，不必等下一次按键。
-            // 主循环每轮最多等待 16ms，因此到期后无需额外唤醒。
+            // 空闲等待由 baseWaitMs 的档位 deadline 收紧，到期后无需额外唤醒。
             self.expireEffortFlash();
             self.pumpAsync();
             // Both local and remote output share the bounded event budget;
@@ -6421,7 +6490,7 @@ const Ui = struct {
                 defer std.crypto.secureZero(u8, &buffer);
                 self.last_input_ms = self.clock_ms;
                 try self.parser.feed(buffer[0..n], .{ .context = self, .emit_fn = key });
-            } else if (self.clock_ms -| self.last_input_ms >= 150) {
+            } else if (self.clock_ms -| self.last_input_ms >= escape_expiry_ms) {
                 try self.parser.expireEscape(.{ .context = self, .emit_fn = key });
             }
 
@@ -6465,21 +6534,22 @@ const Ui = struct {
             // Wake at the coalescing deadline rather than a full tick after work
             // that already happened; buffered events are consumed immediately and
             // never spin merely because a throttled dirty frame exists.
-            var wait_ms: u16 = if (staged or buffered) 0 else 16;
+            var wait_ms: u16 = if (staged or buffered) 0 else self.baseWaitMs();
             if (!staged and !buffered and self.frame.len == 0 and self.resize_rescue.len == 0 and
                 self.drawReady() and !self.urgent_draw)
                 wait_ms = self.cadenceWaitMs();
             // Align the last sleep with the next animation boundary instead of
             // a fixed 16ms grid: the fast slot (tool band or streaming label)
-            // and the 80ms tick must both be sampled at their own deadline, not
-            // up to a grid step late. The 16ms cap still bounds input latency.
+            // and the 40ms tick must both be sampled at their own deadline, not
+            // up to a grid step late. The 16ms cap bounds active-animation
+            // polling; idle waits are interrupted by input/wake fds.
             if (!staged and !buffered and !self.resize_waiting and self.frame.len == 0 and self.resize_rescue.len == 0) {
                 if (self.fastInterval()) |interval| {
                     const remaining = self.fast_next_ms -| self.clock_ms;
                     wait_ms = @min(wait_ms, @as(u16, @intCast(@max(1, @min(remaining, interval)))));
                 }
                 if (self.animationActive()) {
-                    const remaining = 80 - (self.clock_ms % 80);
+                    const remaining = flow_interval_ms - (self.clock_ms % flow_interval_ms);
                     wait_ms = @min(wait_ms, @as(u16, @intCast(@max(1, remaining))));
                 }
             }
@@ -7145,7 +7215,8 @@ const Ui = struct {
         self.frame_delivery_shown = false;
         self.frame_delivery_reasoning = false;
 
-        const pending_transcript = for (self.records.items) |record| {
+        const scan = self.recordScan();
+        const pending_transcript = for (self.records.items[scan.start..]) |record| {
             if (record.kind != .reasoning and !record.output) break true;
         } else false;
         const release_idle = self.idleBreaksDrawable() and !pending_transcript and !self.abandon_tail and
@@ -7206,15 +7277,15 @@ const Ui = struct {
         var flow_continuation = false;
         var canonical_output = false;
         var transcript_rows: usize = 0;
-        var previous_kind: ?Kind = null;
+        var previous_kind: ?Kind = scan.previous_kind;
         var hold_from: ?usize = null;
-        for (self.records.items, 0..) |record, index| {
+        for (self.records.items[scan.start..], scan.start..) |record, index| {
             if (record.agent_row and record.agent_open and !record.output) {
                 hold_from = index;
                 break;
             }
         }
-        for (self.records.items, 0..) |*record, index| {
+        for (self.records.items[scan.start..], scan.start..) |*record, index| {
             if (@import("builtin").is_test) self.draw_record_visits += 1;
             if (record.kind == .reasoning) continue;
             const drafting = self.draft == index;

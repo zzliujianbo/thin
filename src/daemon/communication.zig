@@ -10,6 +10,10 @@ const Cancellation = @import("../core/protocol.zig").Cancellation;
 const Wakeup = @import("../platform/wakeup.zig").Wakeup;
 const AckRanges = @import("stream_receiver.zig").AckRanges;
 
+/// Idle poll window. Requests, ACKs, display pops and stream readiness all
+/// signal a wake fd, so a quiet owner can sleep longer without delaying work.
+const idle_poll_ms: c_int = 100;
+
 pub const View = struct {
     generation: u64,
     revision: u64,
@@ -459,7 +463,7 @@ pub const Communication = struct {
                 .{ .fd = if (room) (if (self.client.stream) |stream| stream.ready.fd else -1) else -1, .events = std.c.POLL.IN, .revents = 0 },
             };
             const local = room and (self.client.pending.items.len != 0 or if (self.client.stream) |stream| stream.buffered() else false);
-            const result = std.c.poll(&descriptors, descriptors.len, if (local) 0 else 30);
+            const result = std.c.poll(&descriptors, descriptors.len, if (local) 0 else idle_poll_ms);
             if (result < 0 and std.c._errno().* != @backingInt(std.c.E.INTR)) return error.Transport;
         }
     }

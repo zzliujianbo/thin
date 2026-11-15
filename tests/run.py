@@ -45,6 +45,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("group", choices=["preflight", *GROUPS])
     p.add_argument("--filter", help="required nonempty substring for focus only")
+    p.add_argument("--unit-group", choices=["fast", "ui", "app", "core", "integration", "daemon"], help="optional unit group for focus only")
     p.add_argument("--ssh-include")
     p.add_argument("--ssh-library")
     p.add_argument("--optimize", choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"], default="Debug")
@@ -62,6 +63,8 @@ def parse_args(argv):
             p.error("focus requires a nonempty --filter")
     elif args.filter is not None:
         p.error("--filter is only valid for focus")
+    if args.unit_group is not None and args.group != "focus":
+        p.error("--unit-group is only valid for focus")
     return args
 
 
@@ -69,6 +72,8 @@ def command_for(args):
     command = ["zig", "build", GROUPS[args.group], f"-j{args.jobs}", "-Doptimize=" + args.optimize, "--summary", "all"]
     if args.group == "focus":
         command.append("-Dtest-filter=" + args.filter)
+        if args.unit_group:
+            command.append("-Dtest-group=" + args.unit_group)
     if args.ssh_include:
         command.append("-Dssh-include=" + args.ssh_include)
     if args.ssh_library:

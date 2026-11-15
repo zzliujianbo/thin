@@ -1116,6 +1116,57 @@ test "streaming label advances one phase per animation frame" {
     ui.animate();
     try std.testing.expectEqual(@as(u64, 2), ui.fast_step);
 }
+test "committed record prefix is skipped by the draw scan" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    for (0..500) |_| {
+        const index = try ui.add(.notice, "committed history row");
+        ui.records.items[index].output = true;
+    }
+    _ = try ui.add(.notice, "live tail row");
+    ui.dirty = true;
+    ui.draw_record_visits = 0;
+    try ui.draw();
+    // Only the one live record enters the draw loop; the 500 released rows are
+    // skipped by the advancing scan, not revisited every frame.
+    try std.testing.expectEqual(@as(usize, 1), ui.draw_record_visits);
+    testAcknowledgeFullFrame(&ui);
+    ui.records.items[ui.records.items.len - 1].output = true;
+    ui.dirty = true;
+    ui.draw_record_visits = 0;
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 0), ui.draw_record_visits);
+}
+test "removing a released record behind the scan restarts the live scan" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    for (0..3) |_| {
+        const index = try ui.add(.notice, "released row");
+        ui.records.items[index].output = true;
+    }
+    _ = try ui.add(.notice, "live row");
+    ui.dirty = true;
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 3), ui.live_start);
+    testAcknowledgeFullFrame(&ui);
+    ui.records.items[3].output = true;
+    ui.dirty = true;
+    ui.draw_record_visits = 0;
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 4), ui.live_start);
+    try std.testing.expectEqual(@as(usize, 0), ui.draw_record_visits);
+    // The live scan has advanced past every released record. Removing one from
+    // behind it shifts every index and must restart the scan instead of
+    // skipping the new tail.
+    ui.removeRecord(0);
+    try std.testing.expectEqual(@as(usize, 0), ui.live_start);
+}
 test "command elapsed time uses source timestamps freezes results and resets per call" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -3547,6 +3598,30 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
     try std.testing.expect(ui.dirty); // Animation resumes once approval ends.
     try std.testing.expect(!cancel.isRequested());
 }
+test "idle poll sleeps longer but keeps escape and flash deadlines" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.dirty = false;
+    ui.clock_ms = 1000;
+    try std.testing.expectEqual(@as(u16, 100), ui.baseWaitMs());
+    // A working task keeps the short poll for progress/completion.
+    ui.busy = true;
+    try std.testing.expectEqual(@as(u16, 16), ui.baseWaitMs());
+    ui.busy = false;
+    // A pending Escape ambiguity expires in 150ms, not after the idle window.
+    ui.parser.escape_len = 1;
+    ui.last_input_ms = 1000;
+    try std.testing.expectEqual(@as(u16, 100), ui.baseWaitMs());
+    ui.clock_ms = 1080;
+    try std.testing.expectEqual(@as(u16, 70), ui.baseWaitMs());
+    ui.parser.escape_len = 0;
+    // The transient effort confirmation keeps its own deadline.
+    ui.effort_flash = .{ .level = .high, .until_ms = 1090 };
+    try std.testing.expectEqual(@as(u16, 10), ui.baseWaitMs());
+}
 test "ordinary redraws coalesce from the previous draw start while input stays urgent" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -4847,7 +4922,8 @@ test "single composer hides statistics and completion and uses flow and exact br
     try ui.draw();
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
     const pulse = theme.command_pulse[shared.activity.commandStep(ui.clock_ms)];
-    const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}⠧{s} typed-default-color", .{ theme.reset, pulse, theme.reset });
+    const icon = activity.spinner(ui.clock_ms);
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} typed-default-color", .{ theme.reset, pulse, icon, theme.reset });
     defer std.testing.allocator.free(marker);
     try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
     const palette = theme.modelPalette(ui.display.view(ui.clock_ms).rate_band);
@@ -4868,7 +4944,8 @@ test "single composer hides statistics and completion and uses flow and exact br
     ui.clock_ms = 680;
     try ui.draw();
     const pulse_next = theme.command_pulse[shared.activity.commandStep(ui.clock_ms)];
-    const marker_next = try std.fmt.allocPrint(std.testing.allocator, "{s}⠇{s} typed-default-color", .{ pulse_next, theme.reset });
+    const icon_next = activity.spinner(ui.clock_ms);
+    const marker_next = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s} typed-default-color", .{ pulse_next, icon_next, theme.reset });
     defer std.testing.allocator.free(marker_next);
     try std.testing.expect(std.mem.find(u8, ui.frame, marker_next) != null);
     testAcknowledgeFullFrame(&ui);
@@ -6861,9 +6938,9 @@ test "memory footer keeps rotating while only memory is active" {
     ui.connection.context = &fixture;
     ui.connection.current_fn = Fixture.current;
     try std.testing.expect(!ui.busy);
-    // Two real ticks of the existing 80 ms clock each stage an ordinary dirty
-    // draw; no timer, frame or refresh source is added for Memory.
-    ui.clock_ms = 80;
+    // Two real ticks of the 40 ms clock each stage an ordinary dirty draw; no
+    // timer, frame or refresh source is added for Memory.
+    ui.clock_ms = 40;
     ui.dirty = false;
     ui.animate();
     try std.testing.expect(ui.dirty);
@@ -6871,10 +6948,10 @@ test "memory footer keeps rotating while only memory is active" {
     try std.testing.expectEqual(@as(u64, 1), first);
     // Inside the same tick nothing is restaged.
     ui.dirty = false;
-    ui.clock_ms = 159;
+    ui.clock_ms = 79;
     ui.animate();
     try std.testing.expect(!ui.dirty);
-    ui.clock_ms = 160;
+    ui.clock_ms = 80;
     ui.animate();
     try std.testing.expect(ui.dirty);
     try std.testing.expectEqual(first + 1, ui.animation_tick);
@@ -6884,10 +6961,10 @@ test "memory footer keeps rotating while only memory is active" {
     const tick0 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(0)});
     ui.clock_ms = 0;
     try std.testing.expectEqualStrings(tick0, try ui.hint(arena.allocator(), state));
-    const tick80 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(80)});
-    ui.clock_ms = 80;
-    try std.testing.expectEqualStrings(tick80, try ui.hint(arena.allocator(), state));
-    try std.testing.expect(!std.mem.eql(u8, tick0, tick80));
+    const tick40 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(40)});
+    ui.clock_ms = 40;
+    try std.testing.expectEqualStrings(tick40, try ui.hint(arena.allocator(), state));
+    try std.testing.expect(!std.mem.eql(u8, tick0, tick40));
     // Nothing to animate once the owner reports no active/queued work.
     fixture.active = false;
     ui.dirty = false;
@@ -6915,7 +6992,7 @@ test "paused follow-up preview keeps idle memory animation ticking without hidde
     try std.testing.expectEqual(@as(usize, 1), ui.queueSnapshot().preview_count);
     for (1..3) |tick| {
         ui.dirty = false;
-        ui.clock_ms = @intCast(tick * 80);
+        ui.clock_ms = @intCast(tick * 40);
         ui.animate();
         try std.testing.expect(ui.dirty);
         try std.testing.expectEqual(@as(u64, @intCast(tick)), ui.animation_tick);
@@ -6959,7 +7036,7 @@ test "paused preview animates background alone on two ticks" {
     try std.testing.expect(ui.queueSnapshot().paused and ui.queueSnapshot().preview_count == 1);
     try std.testing.expect(!ui.busy and ui.active_tool == null and !ui.memoryAnimating());
     for (1..3) |tick| {
-        ui.clock_ms = @intCast(tick * 80);
+        ui.clock_ms = @intCast(tick * 40);
         ui.dirty = false;
         ui.animate();
         try std.testing.expect(ui.dirty);
