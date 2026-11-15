@@ -313,6 +313,18 @@ pub fn failureReasonLine(a: std.mem.Allocator, reason: []const u8, columns: usiz
     return std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ theme.failure, indent, line, theme.reset });
 }
 
+/// One muted total-time row below a terminal outcome. The duration stays a
+/// styled display line, never part of a sanitized notice body.
+pub fn taskDurationLine(a: std.mem.Allocator, duration_ms: u64, columns: usize) ![]const u8 {
+    var buffer: [32]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writer.writeAll("  \u{00b7} ");
+    try shared.activity.formatDuration(&writer, duration_ms);
+    const line = try singleLine(a, writer.buffered(), columns);
+    defer a.free(line);
+    return std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.muted, line, theme.reset });
+}
+
 /// Byte length of the fixed prefix `commandText` writes before its label; used
 /// to shift label-relative diff marks onto the rendered row. Settled rows use
 /// their status glyph; pending callers supply the exact indicator they passed

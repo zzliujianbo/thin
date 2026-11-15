@@ -92,6 +92,9 @@ const Record = struct {
     /// Leading status marker bytes that keep their own colour (e.g. `M: ✓`).
     /// Zero colours the whole row with the notice severity.
     notice_marker_len: usize = 0,
+    /// Measured task time rendered as one separate muted notice row. Kept out
+    /// of `body` so the plain-text sanitizer never sees display SGR bytes.
+    notice_duration_ms: ?u64 = null,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
     agent_row: bool = false,
@@ -401,7 +404,8 @@ const Record = struct {
             // native scrollback stay exactly as written.
             const line = try presentation.singleLine(temp, self.body.items, @max(1, columns));
             const styled = try self.styleMarker(temp, line);
-            self.lines = try temp.dupe([]const u8, &.{styled});
+            const rows = try temp.dupe([]const u8, &.{styled});
+            self.lines = try self.appendNoticeDuration(temp, rows, columns);
             self.excerpt = false;
             self.columns = columns;
             self.cache = arena;
@@ -415,12 +419,21 @@ const Record = struct {
             .warning => .warning,
             .failure => .failure,
         } else .normal });
-        self.lines = try self.styleMarkerRow(temp, rendered.lines);
+        const styled = try self.styleMarkerRow(temp, rendered.lines);
+        self.lines = try self.appendNoticeDuration(temp, styled, columns);
         self.excerpt = self.clipped or rendered.truncated or rendered.total_lines > rendered.lines.len;
         self.columns = columns;
 
         // arena 所有权转移给 Record；之后由 invalidate 统一释放。
         self.cache = arena;
+    }
+
+    fn appendNoticeDuration(self: *const Record, temp: std.mem.Allocator, lines: []const []const u8, columns: usize) ![]const []const u8 {
+        const duration_ms = self.notice_duration_ms orelse return lines;
+        const rows = try temp.alloc([]const u8, lines.len + 1);
+        @memcpy(rows[0..lines.len], lines);
+        rows[lines.len] = try presentation.taskDurationLine(temp, duration_ms, columns);
+        return rows;
     }
 
     fn noticeMarkerTone(self: *const Record) []const u8 {
@@ -5926,8 +5939,7 @@ const Ui = struct {
             var concise: std.Io.Writer.Allocating = .init(self.allocator);
             defer concise.deinit();
             concise.writer.writeAll(terminalNotice(result)) catch return false;
-            writeTaskDuration(&concise.writer, result.duration_ms, true) catch return false;
-            return self.tryAppendNotice(.failure, concise.written());
+            return self.appendTerminalNotice(.failure, concise.written(), result.duration_ms);
         }
         var formatted: std.Io.Writer.Allocating = .init(self.allocator);
         defer formatted.deinit();
@@ -5946,18 +5958,16 @@ const Ui = struct {
                 shared.failure.write(writer, label, result.detail, result.http_status, result.failureText()) catch return false;
             level = if (result.status == .canceled) .plain else .failure;
         }
-        writeTaskDuration(writer, result.duration_ms, result.status != .success) catch return false;
-        return self.tryAppendNotice(level, formatted.written());
+        return self.appendTerminalNotice(level, formatted.written(), result.duration_ms);
     }
 
-    /// Total wall-clock time of one completed task, muted under its outcome.
-    fn writeTaskDuration(writer: *std.Io.Writer, duration_ms: ?u64, leading_newline: bool) !void {
-        const ms = duration_ms orelse return;
-        if (leading_newline) try writer.writeByte('\n');
-        try writer.writeAll(theme.muted);
-        try writer.writeAll("  \u{00b7} ");
-        try shared.activity.formatDuration(writer, ms);
-        try writer.writeAll(theme.reset);
+    /// Terminal notices keep their duration as a separate styled row. Embedding
+    /// SGR bytes in the body would make the plain-text sanitizer render garbage.
+    fn appendTerminalNotice(self: *Ui, level: NoticeLevel, message: []const u8, duration_ms: ?u64) bool {
+        const index = self.addRecord(.notice, message, false) catch return false;
+        self.records.items[index].notice_level = level;
+        self.records.items[index].notice_duration_ms = duration_ms;
+        return true;
     }
 
     fn queueTerminalNotice(self: *Ui, result: r.Terminal) void {

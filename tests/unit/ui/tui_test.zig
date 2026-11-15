@@ -4220,7 +4220,8 @@ test "completed tasks append one muted total-time row" {
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     const record = ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.plain, record.notice_level);
-    try std.testing.expect(std.mem.find(u8, record.body.items, theme.muted ++ "  \u{00b7} 1.23s") != null);
+    try std.testing.expectEqual(@as(?u64, 1234), record.notice_duration_ms);
+    try std.testing.expect(record.body.items.len == 0);
     var failed: r.Terminal = .{ .status = .failed, .detail = error.ModelRequestFailed, .duration_ms = 42 };
     failed.setFailureText("boom");
     ui.last_terminal = failed;
@@ -4230,18 +4231,30 @@ test "completed tasks append one muted total-time row" {
     const second = ui.records.items[second_index];
     try std.testing.expectEqual(NoticeLevel.failure, second.notice_level);
     try std.testing.expect(std.mem.find(u8, second.body.items, "boom") != null);
-    try std.testing.expect(std.mem.find(u8, second.body.items, "\n" ++ theme.muted ++ "  \u{00b7} 42ms") != null);
-    // The two parts render as two transcript rows, the second one muted.
+    try std.testing.expect(std.mem.findScalar(u8, second.body.items, '\x1b') == null);
+    try std.testing.expectEqual(@as(?u64, 42), second.notice_duration_ms);
+    // The outcome text and the muted time render as separate transcript rows;
+    // no display SGR bytes enter the sanitized notice body.
     try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const drawn_success = ui.records.items[0];
+    try std.testing.expectEqual(@as(usize, 1), drawn_success.lines.len);
+    try std.testing.expectEqualStrings(theme.muted ++ "  \u{00b7} 1.23s" ++ theme.reset, drawn_success.lines[0]);
     const drawn = ui.records.items[second_index];
     try std.testing.expect(drawn.lines.len >= 2);
-    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], "42ms") != null);
+    try std.testing.expect(std.mem.find(u8, drawn.lines[drawn.lines.len - 1], theme.muted ++ "  \u{00b7} 42ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawn.lines[drawn.lines.len - 1], "\u{fffd}") == null);
     // A round-limit pause keeps its concise wording and still shows the time.
     const paused: r.Terminal = .{ .status = .paused, .detail = error.RoundLimit, .duration_ms = 5 };
     ui.queueTerminalNotice(paused);
     const third = ui.records.items[ui.records.items.len - 1];
     try std.testing.expect(std.mem.find(u8, third.body.items, "Paused at round limit; send a message to continue") != null);
-    try std.testing.expect(std.mem.find(u8, third.body.items, "  \u{00b7} 5ms") != null);
+    try std.testing.expectEqual(@as(?u64, 5), third.notice_duration_ms);
+    try std.testing.expect(std.mem.findScalar(u8, third.body.items, '\x1b') == null);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const drawn_third = ui.records.items[ui.records.items.len - 1];
+    try std.testing.expect(std.mem.find(u8, drawn_third.lines[drawn_third.lines.len - 1], "5ms") != null);
     // A synthetic success without a measurement stays silent.
     const legacy: r.Terminal = .{ .status = .success };
     const before = ui.records.items.len;
