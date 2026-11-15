@@ -102,10 +102,19 @@ pub fn commandStep(now_ms: u64) usize {
     return @intCast((now_ms / 120) % 8);
 }
 
-/// Whole-row execution flow: the lit band advances one column per 40ms, i.e.
-/// two columns per 80ms animation tick, so the sweep never stalls between frames.
-pub fn flowStep(now_ms: u64) usize {
-    return @intCast(now_ms / 40);
+/// Ping-pong execution flow: the band head advances one column per 40ms (two
+/// columns per 80ms animation tick), reverses at either row edge and travels
+/// back, so the row is never left dark between sweeps.
+pub const FlowHead = struct { column: usize, backward: bool };
+
+pub fn flowHead(now_ms: u64, limit: usize) FlowHead {
+    if (limit <= 1) return .{ .column = 0, .backward = false };
+    const period = 2 * (limit - 1);
+    const step: usize = @intCast((now_ms / 40) % period);
+    return if (step < limit)
+        .{ .column = step, .backward = false }
+    else
+        .{ .column = period - step, .backward = true };
 }
 
 /// Observed wall-clock execution time for one command row. Always a measurement

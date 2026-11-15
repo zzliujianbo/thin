@@ -514,12 +514,17 @@ test "all four tool rows flow without moving glyphs, columns or widths" {
         try std.testing.expect(std.mem.startsWith(u8, start, head_prefix));
         try std.testing.expectEqual(text.width(body), output.displayWidth(start));
         try std.testing.expectEqual(output.displayWidth(start), output.displayWidth(later));
-        // Far ahead of the row the band is elsewhere: the row is plain and muted.
-        const dark = try commandLine(a, body, spans, 100, null, 40 * (body.len + theme.flow_band.len), 0);
-        defer a.free(dark);
-        const expected_dark = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.muted, body, theme.reset });
-        defer a.free(expected_dark);
-        try std.testing.expectEqualStrings(expected_dark, dark);
+        // The band bounces at the row edge: the last column is fully lit at the
+        // turn, and one full period reproduces the first frame exactly.
+        const width = output.displayWidth(body);
+        const tail = try commandLine(a, body, spans, 100, null, 40 * (width - 1), 0);
+        defer a.free(tail);
+        const tail_prefix = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ theme.flow_band[0], body[body.len - 1 ..], theme.reset });
+        defer a.free(tail_prefix);
+        try std.testing.expect(std.mem.endsWith(u8, tail, tail_prefix));
+        const again = try commandLine(a, body, spans, 100, null, 40 * (2 * (width - 1)), 0);
+        defer a.free(again);
+        try std.testing.expectEqualStrings(start, again);
         // A settled row never flows, whatever clock the caller holds.
         const done = try commandLine(a, body, &.{CommandSpan{ .start = 0, .end = body.len, .outcome = .success }}, 100, null, 120, 0);
         defer a.free(done);

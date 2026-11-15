@@ -278,19 +278,21 @@ pub fn commandColumns(columns: usize) usize {
     return columns;
 }
 
-/// One bright band sweeps an executing row: the head column is brightest and the
-/// band fades behind it. Only foreground color changes between frames, so no
-/// cluster, column or cell width moves; the band wraps past the row end so a row
-/// goes dark between sweeps instead of holding a stale highlight.
-fn writeFlow(writer: *std.Io.Writer, row: []const u8, begin: usize, end: usize, limit: usize, now_ms: u64) !void {
-    const head = shared.activity.flowStep(now_ms) % (limit + theme.flow_band.len);
+/// One bright band bounces across an executing row: the head column is
+/// brightest and the band fades behind the moving head. Only foreground color
+/// changes between frames, so no cluster, column or cell width moves; at either
+/// edge the head reverses instead of leaving the row dark.
+fn writeFlow(writer: *std.Io.Writer, row: []const u8, begin: usize, end: usize, now_ms: u64) !void {
+    // Bounce over the visible row, not the whole terminal: a short caption keeps
+    // its band moving instead of spending most of the cycle in empty columns.
+    const head = shared.activity.flowHead(now_ms, @max(1, text.width(row[0..end])));
     var column = text.width(row[0..begin]);
     var tone: []const u8 = "";
     var at = begin;
     while (at < end) {
         const cluster = text.nextCluster(row, at, column);
         const stop = @min(cluster.end, end);
-        const next: []const u8 = if (head >= column and head - column < theme.flow_band.len) theme.flow_band[head - column] else theme.muted;
+        const next = flowTone(column, head);
         if (!std.mem.eql(u8, next, tone)) {
             try writer.writeAll(next);
             tone = next;
@@ -299,6 +301,14 @@ fn writeFlow(writer: *std.Io.Writer, row: []const u8, begin: usize, end: usize, 
         column += cluster.width;
         at = stop;
     }
+}
+
+/// The band trails the head: to the left on a forward sweep, to the right when
+/// the head travels back, so the brightest column always faces the motion.
+fn flowTone(column: usize, head: shared.activity.FlowHead) []const u8 {
+    const offset = if (head.backward) column -| head.column else head.column -| column;
+    const within = if (head.backward) column >= head.column else head.column >= column;
+    return if (within and offset < theme.flow_band.len) theme.flow_band[offset] else theme.muted;
 }
 
 /// `duration_ms` is the measured wall-clock execution time of this row. It is
@@ -368,7 +378,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         // claiming a running call.
         if (span.outcome == .pending and active_time_ms != null and has_prefix) {
             if (!span.generating) {
-                try writeFlow(&out.writer, safe, begin, end, limit, active_time_ms.?);
+                try writeFlow(&out.writer, safe, begin, end, active_time_ms.?);
                 try out.writer.writeAll(theme.reset);
             } else {
                 try out.writer.print("{s}{s}{s}", .{ theme.muted, safe[begin..prefix_end], theme.muted });

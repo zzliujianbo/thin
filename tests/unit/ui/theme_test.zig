@@ -20,7 +20,7 @@ test "Markdown uses vivid yellow green and cool violet without changing font sty
 test "executing row flow uses only warm foreground levels in a fading band" {
     const std = @import("std");
     const testing = std.testing;
-    const warm = [_][]const u8{ "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;208m", "\x1b[38;5;214m", "\x1b[38;5;220m", "\x1b[38;5;223m" };
+    const warm = [_][]const u8{ "\x1b[38;5;137m", "\x1b[38;5;173m", "\x1b[38;5;202m", "\x1b[38;5;208m", "\x1b[38;5;209m", "\x1b[38;5;214m", "\x1b[38;5;220m", "\x1b[38;5;221m", "\x1b[38;5;223m" };
     try testing.expect(flow_band.len >= 4);
     for (flow_band, 0..) |tone, i| {
         // Foreground-only standard palette; never truecolor, background or bold.
