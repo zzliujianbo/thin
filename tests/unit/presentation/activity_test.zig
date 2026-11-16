@@ -86,11 +86,6 @@ test "rate bands and configured effort have explicit unknown and stable mapping"
     inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
         try std.testing.expectEqual(@field(ReasoningEffort, name), ReasoningEffort.fromName(name));
     }
-    // Two 80ms ticks share one shade; the third advances exactly one step.
-    try std.testing.expectEqual(commandStep(0), commandStep(80));
-    try std.testing.expect(commandStep(0) != commandStep(160));
-    try std.testing.expectEqual(commandStep(0), commandStep(1280));
-    try std.testing.expect(commandStep(std.math.maxInt(u64)) < 8);
 }
 test "label interval speeds up with TPS and stays bounded" {
     try std.testing.expect(labelInterval(1000) < labelInterval(100));

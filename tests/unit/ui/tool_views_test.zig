@@ -1,30 +1,3 @@
-test "subagent tool progress allocation failure preserves old caption" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, subagentProgressAllocationScenario, .{});
-}
-test "subagent tool progress respects generation readiness and ownership" {
-    const a = std.testing.allocator;
-    var views: Views = .{};
-    defer views.deinit(a);
-    views.begin(a, 7);
-    var progress = [_]u8{ 'w', 'o', 'r', 'k' };
-    var event: r.ToolView = .{ .key = key(7, 1), .name = "get_subagent_result", .fields = .{ .id = .{ .text = "subagent_1" } }, .ready = true, .subagent_progress = &progress };
-    try views.upsert(a, event);
-    progress[0] = 'X';
-    try std.testing.expectEqualStrings("subagent_1 · work", views.get(event.key).?.caption.label);
-    event.ready = false;
-    event.subagent_progress = "late";
-    try views.upsert(a, event);
-    try std.testing.expectEqualStrings("subagent_1 · work", views.get(event.key).?.caption.label);
-    event.ready = true;
-    event.key = key(8, 1);
-    try views.upsert(a, event);
-    try std.testing.expect(views.get(event.key) == null);
-    event.key = key(7, 2);
-    event.name = "read_file";
-    event.fields = .{ .path = .{ .text = "file" } };
-    try views.upsert(a, event);
-    try std.testing.expectEqualStrings("file", views.get(event.key).?.caption.label);
-}
 test "background ready metadata refreshes one owned row" {
     const a = std.testing.allocator;
     const status = @import("../core/background_status.zig");
@@ -42,7 +15,7 @@ test "background ready metadata refreshes one owned row" {
     try std.testing.expect(caption.display.?.action == .start);
     const line = try presentation.commandText(a, caption, .success, " ");
     defer a.free(line);
-    try std.testing.expectEqualStrings("✓ bash B: ▶ sleep 1", line);
+    try std.testing.expectEqualStrings("✓ bash ▶ sleep 1", line);
     event.display = null;
     event.fields.command = .{ .text = "unguarded preview" };
     try views.upsert(a, event);

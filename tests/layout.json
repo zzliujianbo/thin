@@ -497,12 +497,6 @@
         {
           "path": "tests/unit/app/session_host_test.zig",
           "container": []
-        },
-        {
-          "path": "tests/unit/app/session_host_SessionHost_test.zig",
-          "container": [
-            "SessionHost"
-          ]
         }
       ],
       "group": "app",
@@ -541,32 +535,6 @@
       "fragments": [],
       "group": "app",
       "unit": false
-    },
-    {
-      "virtual": "src/app/subagent_progress.zig",
-      "production": "src/app/subagent_progress.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/app/subagent_progress_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/subagent_service.zig",
-      "production": "src/app/subagent_service.zig",
-      "support": "tests/support/app/subagent_service.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/app/subagent_service_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
     },
     {
       "virtual": "src/app/version.zig",
@@ -864,40 +832,6 @@
       "fragments": [],
       "group": "core",
       "unit": false
-    },
-    {
-      "virtual": "src/core/subagent.zig",
-      "production": "src/core/subagent.zig",
-      "support": null,
-      "fragments": [],
-      "group": "core",
-      "unit": false
-    },
-    {
-      "virtual": "src/core/subagent_status.zig",
-      "production": "src/core/subagent_status.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/core/subagent_status_test.zig",
-          "container": []
-        }
-      ],
-      "group": "fast",
-      "unit": true
-    },
-    {
-      "virtual": "src/core/subagent_test.zig",
-      "production": null,
-      "support": "tests/roots/core/subagent_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/core/subagent_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "integration",
-      "unit": true
     },
     {
       "virtual": "src/core/task.zig",
@@ -1930,32 +1864,6 @@
       "unit": true
     },
     {
-      "virtual": "src/tests/subagent_app_test.zig",
-      "production": null,
-      "support": "tests/roots/tests/subagent_app_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/tests/subagent_app_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "integration",
-      "unit": true
-    },
-    {
-      "virtual": "src/tests/subagent_service_test.zig",
-      "production": null,
-      "support": "tests/roots/tests/subagent_service_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/tests/subagent_service_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "integration",
-      "unit": true
-    },
-    {
       "virtual": "src/tests/thinking_contract_test.zig",
       "production": null,
       "support": "tests/roots/tests/thinking_contract_test.zig",
@@ -2088,19 +1996,6 @@
         }
       ],
       "group": "core",
-      "unit": true
-    },
-    {
-      "virtual": "src/tools/subagent_tool_test.zig",
-      "production": null,
-      "support": "tests/roots/tools/subagent_tool_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/tools/subagent_tool_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "integration",
       "unit": true
     },
     {

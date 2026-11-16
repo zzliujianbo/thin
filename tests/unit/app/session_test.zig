@@ -2017,10 +2017,6 @@ test "per-agent status rows are supported before app creation" {
     var session = try Session.init(a, std.testing.io, &env, home, .{});
     defer session.deinit();
     try std.testing.expect(session.app == null);
-    const state = session.connection().current();
-    try std.testing.expect(state.subagents_supported);
-    try std.testing.expectEqual(@as(usize, 0), state.subagents.agents.len);
-    try std.testing.expectEqual(@as(usize, 0), session.last_subagent_view.agents.len);
     try std.testing.expect(!Session.pollModels(&session, false));
     try std.testing.expect(!Session.pollModels(&session, true));
 }

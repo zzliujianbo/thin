@@ -21,8 +21,6 @@ const image_setup = @import("image_setup.zig");
 const knowledge = @import("../core/knowledge.zig");
 const MemoryCoordinator = @import("memory_service.zig").Coordinator;
 const MemoryNotifications = @import("memory_notifications.zig").Queue;
-const subagent_service = @import("subagent_service.zig");
-const SubagentService = subagent_service.SubagentService;
 const background_service = @import("background_service.zig");
 const BackgroundService = background_service.BackgroundService;
 
@@ -44,52 +42,6 @@ fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const
             if (environ.get(provider.connection.api_key_env)) |key| try journal.rememberKey(key);
         }
     };
-}
-
-/// Snapshot only names needed for independently selected subagent transports.
-/// putMove avoids leaving a freed, unwiped secret on allocation failure.
-fn captureSubagentEnvironment(a: std.mem.Allocator, config: cfg.Config, source: *const std.process.Environ.Map) !std.process.Environ.Map {
-    var result = std.process.Environ.Map.init(a);
-    errdefer wipeSubagentEnvironment(&result);
-    try captureSubagentVariable(&result, source, "CURL_CA_BUNDLE");
-    try captureSubagentVariable(&result, source, config.provider.api_key_env);
-    if (config.registry) |registry| for (registry.providers) |provider| {
-        try captureSubagentVariable(&result, source, provider.connection.api_key_env);
-    };
-    return result;
-}
-
-fn captureSubagentVariable(result: *std.process.Environ.Map, source: *const std.process.Environ.Map, name: []const u8) !void {
-    if (name.len == 0 or result.get(name) != null) return;
-    const value = source.get(name) orelse return;
-    const a = result.allocator;
-    const owned_name = try a.dupe(u8, name);
-    errdefer a.free(owned_name);
-    const owned_value = try a.dupe(u8, value);
-    errdefer {
-        std.crypto.secureZero(u8, owned_value);
-        a.free(owned_value);
-    }
-    try result.putMove(owned_name, owned_value);
-}
-
-fn wipeSubagentEnvironment(environment: *std.process.Environ.Map) void {
-    for (environment.values()) |value| std.crypto.secureZero(u8, @constCast(value));
-    environment.deinit();
-}
-
-/// Invalid or obsolete cache data is optional; filesystem and allocation
-/// failures are not evidence that an empty cache was requested.
-fn badSubagentMetadata(err: anyerror) bool {
-    const name = @errorName(err);
-    for ([_][]const u8{
-        "InvalidMetadata", "OutdatedMetadataCache", "MetadataTooLarge", "MetadataTooDeep",      "MetadataTooComplex",
-        "NotRegularFile",  "FileChanged",           "SyntaxError",      "UnexpectedEndOfInput", "UnexpectedToken",
-        "InvalidNumber",   "Overflow",              "InvalidEnumTag",   "DuplicateField",       "UnknownField",
-        "MissingField",    "LengthMismatch",        "ValueTooLong",     "InvalidCharacter",     "InvalidUtf8",
-        "InvalidFloat",    "BufferUnderrun",
-    }) |bad| if (std.mem.eql(u8, name, bad)) return true;
-    return false;
 }
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
@@ -118,8 +70,6 @@ pub const App = struct {
 
     /// 供工具子进程使用的环境变量副本（由 tools.commandEnvironment 生成）。
     environment: std.process.Environ.Map,
-    /// Private credential/transport snapshot; never passed to Tools.
-    subagent_environment: std.process.Environ.Map,
     /// 工具执行器，内部保存上述字段的指针。
     executor: tools.Tools,
     /// LLM HTTP 客户端，初始化时传入 API key。
@@ -128,9 +78,6 @@ pub const App = struct {
     codex_manager: ?*CodexManager = null,
     image_client: ?*ImageClient = null,
     memory_coordinator: *MemoryCoordinator,
-    /// Owns the parent-domain subagent quota and any retained image cleanup
-    /// owner. Its service is rebound to Tools on idle settings replacement.
-    subagent: SubagentService,
     /// Instance-owned background command registry. This is the only owner: it
     /// survives connection/settings replacement and every executor rebind only
     /// republishes its service value. Its deps are published once, after the
@@ -270,8 +217,6 @@ pub const App = struct {
         };
         self.environment = try tools.commandEnvironmentMany(a, environ, secret_names[0..secret_count]);
         errdefer self.environment.deinit();
-        self.subagent_environment = try captureSubagentEnvironment(a, self.config.value, environ);
-        errdefer wipeSubagentEnvironment(&self.subagent_environment);
         // Publish the background owner exactly once, now that the anchored root
         // and the minimal command environment are stable App fields. Each start
         // freezes its own cwd dirfd/environment copy; a later connection or
@@ -291,28 +236,6 @@ pub const App = struct {
         self.image_client = try image_setup.create(a, io, self.config.value, environ);
         errdefer if (self.image_client) |client| destroyImageClient(client);
         self.executor.image = self.imageService();
-
-        // The service borrows stable App field addresses. The parent Runtime is
-        // assigned below, but its address is stable and no service callback can
-        // run before the Runtime is fully initialized.
-        self.subagent = .{};
-        self.subagent.deps = .{
-            .allocator = a,
-            .config = &self.config.value,
-            .http_client = &self.client,
-            .image = &self.image_client,
-            .root = &self.root,
-            .environment = &self.environment,
-            .auth_path = self.auth_path,
-            .home_path = self.home_path,
-            .shell_name = self.shell_name,
-            .session_cwd = self.session_cwd,
-            .runtime = &self.runtime,
-            .client_factory = .{ .context = self, .prepare_fn = prepareSubagentClient },
-        };
-        // Subagent is a default capability: no settings gate, and the child
-        // runtime itself is the only recursion boundary (subagent = null).
-        self.executor.subagent = self.subagent.service();
 
         self.memory_coordinator = try self.createMemoryCoordinator(self.config.value, environ);
         errdefer self.memory_coordinator.deinit();
@@ -353,10 +276,6 @@ pub const App = struct {
 
     pub fn memoryView(self: *const App) @import("../core/memory_status.zig").View {
         return self.memory_coordinator.view();
-    }
-
-    pub fn subagentView(self: *App) @import("../core/subagent_status.zig").View {
-        return self.subagent.view();
     }
 
     pub fn backgroundView(self: *App) @import("../core/background_status.zig").View {
@@ -449,58 +368,6 @@ pub const App = struct {
         return http.Client.initWithEnv(self.allocator, self.root.io, config, key, environ);
     }
 
-    fn prepareSubagentClient(raw: *anyopaque, a: std.mem.Allocator, owned: *std.json.Parsed(cfg.Config), reference: []const u8, cancel: *const @import("../core/protocol.zig").Cancellation) !http.Client {
-        const self: *App = @ptrCast(@alignCast(raw));
-        if (cancel.isRequested()) return error.Canceled;
-        const selected = try cfg.splitDefault(reference);
-        const cache = try a.create(metadata.Cache);
-        defer a.destroy(cache);
-        cache.* = .{};
-        defer cache.deinit(a);
-        if (self.home_path.len != 0) {
-            const opened: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, self.root.io, self.home_path) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            };
-            if (opened) |store_value| {
-                var store = store_value;
-                defer store.deinit();
-                cache.* = metadata.load(&store.root) catch |err| blk: {
-                    if (!badSubagentMetadata(err)) return err;
-                    break :blk .{};
-                };
-            }
-        }
-        if (cancel.isRequested()) return error.Canceled;
-        const selection = try model_resolver.resolve(owned.arena.allocator(), owned.value, cache, selected.provider, selected.model, false);
-        model_resolver.apply(&owned.value, selection);
-        _ = reasoning_defaults.applyConfigured(&owned.value);
-        if (owned.value.model.protocol == .auto or owned.value.model.context_tokens == 0)
-            return error.UnsupportedSubagentProtocol;
-        try cfg.validate(owned.value);
-        if (cancel.isRequested()) return error.Canceled;
-        var client = if (isCodex(owned.value)) blk: {
-            if (owned.value.provider.codex_oauth == null) return error.ApiKeyNotFound;
-            const source = try self.ensureCodexSource(&self.subagent_environment);
-            break :blk try http.Client.initCodexWithEnv(a, self.root.io, &owned.value, source, &self.subagent_environment);
-        } else blk: {
-            const key = try cfg.resolveApiKey(a, owned.value, &self.subagent_environment);
-            defer {
-                std.crypto.secureZero(u8, key);
-                a.free(key);
-            }
-            try self.journal.rememberKey(key);
-            if (cancel.isRequested()) return error.Canceled;
-            break :blk try http.Client.initWithEnv(a, self.root.io, &owned.value, key, &self.subagent_environment);
-        };
-        if (cancel.isRequested()) {
-            // This client has never made a request or started a proxy process.
-            client.deinit();
-            return error.Canceled;
-        }
-        return client;
-    }
-
     fn createMemoryCoordinator(self: *App, config: cfg.Config, environ: *const std.process.Environ.Map) !*MemoryCoordinator {
         const needs_source = config.memory.auto and isCodex(config);
         const source: ?codex_auth.CredentialSource = if (needs_source) try self.ensureCodexSource(environ) else null;
@@ -517,7 +384,6 @@ pub const App = struct {
     pub const SettingsRefresh = enum { none, image_model, proxy_models };
     pub const SettingsReplacement = struct {
         config: ?std.json.Parsed(cfg.Config) = null,
-        subagent_environment: ?std.process.Environ.Map = null,
         replace_image: bool,
         replace_memory: bool = false,
         memory_coordinator: ?*MemoryCoordinator = null,
@@ -529,7 +395,6 @@ pub const App = struct {
             if (self.memory_coordinator) |owner| owner.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             if (self.prefix) |*prefix| prefix.deinit();
-            if (self.subagent_environment) |*environment| wipeSubagentEnvironment(environment);
             if (self.config) |*config| cfg.release(config);
         }
     };
@@ -559,7 +424,6 @@ pub const App = struct {
         };
         errdefer result.deinit();
         result.config = try @import("settings_selection.zig").activeClone(self.allocator, self.runtime.effectiveConfig(), declaration);
-        result.subagent_environment = try captureSubagentEnvironment(self.allocator, result.config.?.value, environ);
         result.replace_memory = proxy_refresh or self.config.value.memory.auto != declaration.memory.auto or
             !std.meta.eql(self.config.value.limits, declaration.limits);
         if (result.replace_memory) {
@@ -592,10 +456,6 @@ pub const App = struct {
         var previous_config = self.config;
         self.config = replacement.config.?;
         replacement.config = null;
-        var previous_subagent_environment = self.subagent_environment;
-        self.subagent_environment = replacement.subagent_environment.?;
-        replacement.subagent_environment = null;
-        wipeSubagentEnvironment(&previous_subagent_environment);
         // Keep the used pool/authorization/proxy storage in its original slot.
         self.client.config = &self.config.value;
         self.runtime.config = &self.config.value;
@@ -618,7 +478,6 @@ pub const App = struct {
             replacement.memory_coordinator = null;
         }
         self.executor.image = self.imageService();
-        self.executor.subagent = self.subagent.service();
         // Rebinding republishes the same instance-owned registry; running jobs
         // keep their frozen cwd/environment and are never touched here.
         self.executor.background = self.background.service();
@@ -633,7 +492,6 @@ pub const App = struct {
     pub const ConnectionReplacement = struct {
         owner: *App,
         config: std.json.Parsed(cfg.Config),
-        subagent_environment: std.process.Environ.Map,
         client: http.Client,
         image_client: ?*ImageClient = null,
         memory_coordinator: *MemoryCoordinator,
@@ -644,7 +502,6 @@ pub const App = struct {
             self.client.deinit();
             self.memory_coordinator.deinit();
             if (self.image_client) |client| destroyImageClient(client);
-            wipeSubagentEnvironment(&self.subagent_environment);
             cfg.release(&self.config);
             a.destroy(self);
         }
@@ -673,8 +530,6 @@ pub const App = struct {
         replacement.owner = self;
         replacement.config = owned;
         replacement.plan = plan;
-        replacement.subagent_environment = try captureSubagentEnvironment(self.allocator, replacement.config.value, environ);
-        errdefer wipeSubagentEnvironment(&replacement.subagent_environment);
         replacement.client = try self.initPrimaryClient(&replacement.config.value, key, environ);
         errdefer replacement.client.deinit();
         replacement.image_client = try image_setup.create(self.allocator, self.root.io, replacement.config.value, environ);
@@ -694,9 +549,6 @@ pub const App = struct {
         // Never relocate a used pool: destroy it in its original App slot.
         self.client.deinit();
         self.config = replacement.config;
-        var previous_subagent_environment = self.subagent_environment;
-        self.subagent_environment = replacement.subagent_environment;
-        wipeSubagentEnvironment(&previous_subagent_environment);
         self.client = replacement.client;
         self.client.config = &self.config.value;
         self.runtime.config = &self.config.value;
@@ -709,7 +561,6 @@ pub const App = struct {
         if (self.image_client) |client| destroyImageClient(client);
         self.image_client = replacement.image_client;
         self.executor.image = self.imageService();
-        self.executor.subagent = self.subagent.service();
         // A connection install rebinds the same background owner; existing
         // services keep their startup cwd/environment and cleanup policy.
         self.executor.background = self.background.service();
@@ -739,9 +590,6 @@ pub const App = struct {
         const path = try self.allocator.dupe(u8, opened.path);
         self.allocator.free(self.session_cwd);
         self.session_cwd = path;
-        // The subagent host borrows this slice; publish the replacement before
-        // the next delegated loadPolicy could read the freed old bytes.
-        self.subagent.deps.session_cwd = self.session_cwd;
     }
 
     fn loadSessionPolicy(ctx: *anyopaque, a: std.mem.Allocator) !session_context.Snapshot {
@@ -763,9 +611,8 @@ pub const App = struct {
         const a = self.allocator;
         var cleanup_error: ?anyerror = null;
         self.memory_coordinator.cancelAndJoin();
-        self.subagent.deinit();
         self.runtime.deinit();
-        // Foreground tasks and delegated children are joined above. Only then
+        // The foreground task is joined above. Only then
         // notify every background service to cancel and join the whole set, so
         // no worker can borrow a root/environment that is about to be released.
         self.background.close() catch |err| {
@@ -779,7 +626,6 @@ pub const App = struct {
         self.client.deinit();
         if (self.codex_manager) |manager| manager.deinit();
         self.environment.deinit();
-        wipeSubagentEnvironment(&self.subagent_environment);
         self.root.deinit();
         a.free(self.session_cwd);
         a.free(self.shell_name);

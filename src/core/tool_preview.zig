@@ -3,26 +3,25 @@
 const std = @import("std");
 
 pub const Field = struct { text: []const u8, truncated: bool = false };
-pub const Snapshot = struct { path: ?Field = null, command: ?Field = null, action: ?Field = null, topic: ?Field = null, task: ?Field = null, id: ?Field = null };
+pub const Snapshot = struct { path: ?Field = null, command: ?Field = null, action: ?Field = null, topic: ?Field = null };
 
 const capacity = 1024;
 const max_depth = 32;
 /// Top-level scalar previews. "content" streams through a hook instead of a
-/// buffer; "task" is the bounded delegation summary (never "context") and "id"
-/// addresses a started job without exposing any message body.
-const names = [_][]const u8{ "path", "command", "action", "topic", "task", "id", "content" };
-const content_index = 6;
+/// buffer.
+const names = [_][]const u8{ "path", "command", "action", "topic", "content" };
+pub const content_index = 4;
 const Phase = enum { object_first, object_key, colon, value, object_after, array_first, array_value, array_after };
 const Mode = enum { syntax, string, number, literal };
 const Escape = enum { normal, escaped, unicode, low_slash, low_u };
 const Number = enum { minus, zero, integer, dot, fraction, exponent, exponent_sign, exponent_digits };
 
 pub const Extractor = struct {
-    buffers: [6][capacity]u8 = undefined,
-    lengths: [6]usize = @splat(0),
-    truncated: [6]bool = @splat(false),
-    present: [6]bool = @splat(false),
-    seen: [7]bool = @splat(false),
+    buffers: [4][capacity]u8 = undefined,
+    lengths: [4]usize = @splat(0),
+    truncated: [4]bool = @splat(false),
+    present: [4]bool = @splat(false),
+    seen: [5]bool = @splat(false),
     stack: [max_depth]Phase = undefined,
     depth: usize = 0,
     started: bool = false,
@@ -71,7 +70,7 @@ pub const Extractor = struct {
     pub fn snapshot(self: *const Extractor) Snapshot {
         if (self.invalid) return .{};
         var result: Snapshot = .{};
-        inline for (.{ "path", "command", "action", "topic", "task", "id" }, 0..) |name, i| {
+        inline for (.{ "path", "command", "action", "topic" }, 0..) |name, i| {
             if (self.present[i]) @field(result, name) = .{ .text = self.buffers[i][0..self.lengths[i]], .truncated = self.truncated[i] };
         }
         return result;

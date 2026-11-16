@@ -287,16 +287,16 @@ test "image tool strict arguments schemas guards and bounded text output" {
     try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_image = .{ .path = ".thin/settings.json" } }, &cancel));
 }
 test "session title schema is appended across the static matrix" {
-    for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| for (0..channel_choices) |channel| {
-        const old = schemasFor(image_on, memory_on, channel, background_on);
+    for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| {
+        const old = schemasFor(image_on, memory_on, background_on);
         try std.testing.expectEqualStrings("edit_file", old[old.len - 1].name);
-        const with_title = schemasWithTitle(image_on, memory_on, channel, background_on, true);
+        const with_title = schemasWithTitle(image_on, memory_on, background_on, true);
         try std.testing.expectEqual(old.len + 1, with_title.len);
         for (old[0 .. old.len - 1], with_title[0 .. old.len - 1]) |before, after| try std.testing.expectEqualStrings(before.name, after.name);
         try std.testing.expectEqualStrings("set_session_title", with_title[old.len - 1].name);
         try std.testing.expectEqualStrings("edit_file", with_title[old.len].name);
     };
-    try std.testing.expectEqual(@as(usize, 12), schemasWithTitle(true, true, 1, true, true).len);
+    try std.testing.expectEqual(@as(usize, 8), schemasWithTitle(true, true, true, true).len);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, title_schema.parameters_json, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
@@ -335,36 +335,29 @@ test "session title prepare execution and capability boundaries" {
 }
 test "background schema is appended last and old schemas keep indexes" {
     {
-        const off = schemasFor(true, true, 1, false);
-        const on = schemasFor(true, true, 1, true);
-        try std.testing.expectEqual(@as(usize, 10), off.len);
-        try std.testing.expectEqual(@as(usize, 11), on.len);
+        const off = schemasFor(true, true, false);
+        const on = schemasFor(true, true, true);
+        try std.testing.expectEqual(@as(usize, 6), off.len);
+        try std.testing.expectEqual(@as(usize, 7), on.len);
         try std.testing.expectEqualStrings("read_image", off[4].name);
         try std.testing.expectEqualStrings("read_image", on[4].name);
-        for (off[0..9], on[0..9]) |old, new| try std.testing.expectEqualStrings(old.name, new.name);
-        try std.testing.expectEqualStrings("background", on[9].name);
-        try std.testing.expectEqualStrings("edit_file", off[9].name);
-        try std.testing.expectEqualStrings("edit_file", on[10].name);
+        for (off[0..5], on[0..5]) |old, new| try std.testing.expectEqualStrings(old.name, new.name);
+        try std.testing.expectEqualStrings("background", on[5].name);
+        try std.testing.expectEqualStrings("edit_file", off[5].name);
+        try std.testing.expectEqualStrings("edit_file", on[6].name);
         // A Tools without a service keeps the old bash parameters exactly.
         try std.testing.expect(std.mem.indexOf(u8, off[2].parameters_json, "background") == null);
         try std.testing.expect(std.mem.indexOf(u8, on[2].parameters_json, "\"background\":{\"type\":\"boolean\"}") != null);
         try std.testing.expect(std.mem.indexOf(u8, on[2].description, "not how long the service keeps running") != null or
             std.mem.indexOf(u8, on[2].description, "after handoff the service keeps running until it is stopped or Thin exits") != null);
-        for ([_]p.ToolSchema{ on[2], on[9] }) |schema| {
+        for ([_]p.ToolSchema{ on[2], on[5] }) |schema| {
             const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema.parameters_json, .{});
             defer parsed.deinit();
             try std.testing.expect(parsed.value == .object);
         }
     }
-    // Child Tools never advertise background capability or the management tool.
-    const child = schemasFor(false, false, 2, false);
-    try std.testing.expectEqual(@as(usize, 5), child.len);
-    try std.testing.expectEqualStrings("message_parent", child[3].name);
-    try std.testing.expectEqualStrings("edit_file", child[4].name);
-    try std.testing.expect(std.mem.indexOf(u8, child[2].parameters_json, "background") == null);
-    for (child) |schema| try std.testing.expect(!std.mem.eql(u8, schema.name, "background"));
-    // Root without subagent still appends the management tool last.
-    const root_only = schemasFor(true, true, 0, true);
+    // The management tool stays appended after the ordinary schemas.
+    const root_only = schemasFor(true, true, true);
     try std.testing.expectEqual(@as(usize, 7), root_only.len);
     try std.testing.expectEqualStrings("background", root_only[5].name);
 }
@@ -495,26 +488,9 @@ test "background capability is root-only approved and never re-encoded" {
     fake.poisoned = true;
     const controls_before = fake.controls;
     try std.testing.expectError(error.CleanupFailed, tools.execute(a, .{ .read_file = .{ .path = "x" } }, &cancel));
-    try std.testing.expectError(error.CleanupFailed, Tools.beforeFinish(&tools, a, &cancel));
     try std.testing.expectError(error.CleanupFailed, Tools.endTask(&tools, &cancel));
     try std.testing.expectEqual(controls_before, fake.controls);
     fake.poisoned = false;
-
-    // A child channel rejects background even with a forged service, in prepare
-    // and direct execute, and its schema surface is the old child one.
-    tools.parent_channel = .{ .context = &fake, .message_fn = fakeParentMessage };
-    try std.testing.expectError(error.BackgroundDisabled, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"true\",\"background\":true}" }));
-    try std.testing.expectError(error.BackgroundDisabled, tools.execute(a, .{ .bash = .{ .command = "true", .background = true } }, &cancel));
-    try std.testing.expectError(error.BackgroundDisabled, Tools.prepare(&tools, a, .{ .id = "m", .name = "background", .arguments = "{\"action\":\"list\"}" }));
-    try std.testing.expectError(error.BackgroundDisabled, tools.execute(a, .{ .background = .{ .action = .list } }, &cancel));
-    // A production child runs with memory disabled; mirror that here instead of
-    // changing the tools surface.
-    tools.allow_memory = false;
-    const child_schemas = tools.executor().schemas;
-    try std.testing.expectEqual(@as(usize, 5), child_schemas.len);
-    try std.testing.expect(std.mem.indexOf(u8, child_schemas[2].parameters_json, "background") == null);
-    tools.allow_memory = true;
-    tools.parent_channel = null;
 
     // Default foreground bash is unchanged and never calls the background service.
     var tmp = std.testing.tmpDir(.{});

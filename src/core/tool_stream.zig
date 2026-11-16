@@ -13,8 +13,6 @@ pub const View = struct {
     write_progress: ?write_preview.Progress = null,
     ready: bool = false,
     display: ?@import("background_status.zig").Caption = null,
-    /// Borrowed display-only child activity, at most 2048 UTF-8 bytes.
-    subagent_progress: ?[]const u8 = null,
 };
 pub const Digest = [32]u8;
 pub fn digest(value: []const u8) Digest {
@@ -106,7 +104,7 @@ pub const Controller = struct {
         self.tracker_count += 1;
         slot.extractor.attachContent(tracker, trackerScalar, trackerEnd, trackerRevoke);
         // Content decoded before the complete tool identity cannot be recovered.
-        if (slot.extractor.seen[6]) tracker.revoke();
+        if (slot.extractor.seen[preview.content_index]) tracker.revoke();
     }
 
     fn find(self: *Controller, index: usize) ?*Slot {

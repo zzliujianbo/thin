@@ -83,7 +83,7 @@ test "memory auto strict defaults sparse disk and roundtrip" {
 test "memory config allocation failures release parse clone and disk candidates" {
     try checkConfigAllocationFailures(memoryAllocationCase);
 }
-test "current config round trips and rejects removed subagent field" {
+test "current config round trips and rejects unknown root fields" {
     const a = std.testing.allocator;
     var parsed = try parse(a, image_test_prefix ++ "}");
     defer release(&parsed);
@@ -98,9 +98,9 @@ test "current config round trips and rejects removed subagent field" {
     try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
     try std.testing.expectEqualDeep(parsed.value.memory, again.value.memory);
     inline for (.{ "{}", "{\"enabled\":false}", "{\"enabled\":true}", "null" }) |value| {
-        try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"subagent\":" ++ value ++ "}"));
+        try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"retired\":" ++ value ++ "}"));
     }
-    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"subagent\":{},\"subagent\":{}}"));
+    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"retired\":{},\"retired\":{}}"));
 }
 test "current config allocation failures release parse clone and disk candidates" {
     try checkConfigAllocationFailures(currentConfigAllocationCase);

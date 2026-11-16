@@ -7,21 +7,6 @@ fn view(generation: u64, index: usize, label: []const u8, ready: bool) r.ToolVie
     };
 }
 
-fn subagentProgressAllocationScenario(a: Allocator) !void {
-    var views: Views = .{};
-    defer views.deinit(a);
-    views.begin(a, 7);
-    var event: r.ToolView = .{ .key = key(7, 1), .name = "get_subagent_result", .fields = .{ .id = .{ .text = "subagent_1" } }, .ready = true };
-    try views.upsert(a, event);
-    const old = views.get(event.key).?.caption.label;
-    event.subagent_progress = "working";
-    views.upsert(a, event) catch |err| {
-        try std.testing.expect(views.get(event.key).?.caption.label.ptr == old.ptr);
-        try std.testing.expectEqualStrings("subagent_1", views.get(event.key).?.caption.label);
-        return err;
-    };
-}
-
 fn allocationScenario(a: Allocator) !void {
     var views: Views = .{};
     defer views.deinit(a);

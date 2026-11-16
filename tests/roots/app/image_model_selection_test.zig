@@ -43,7 +43,7 @@ fn contains(models: []const cfg.Model, name: []const u8) bool {
 }
 fn expectImageSchemas(app: *App, image_on: bool) !void {
     const schemas = app.runtime.executor.schemas;
-    try std.testing.expectEqual(@as(usize, 11) + @as(usize, @intFromBool(image_on)), schemas.len);
+    try std.testing.expectEqual(@as(usize, 7) + @as(usize, @intFromBool(image_on)), schemas.len);
     try std.testing.expectEqualStrings("edit_file", schemas[schemas.len - 1].name);
     try std.testing.expectEqualStrings("set_session_title", schemas[schemas.len - 2].name);
     try std.testing.expectEqualStrings("background", schemas[schemas.len - 3].name);

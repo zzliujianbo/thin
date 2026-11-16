@@ -5,7 +5,6 @@ test "session failure exact error round trips and aliases" {
         .{ .code = .input_budget_exceeded, .err = error.InputBudgetExceeded },
         .{ .code = .unknown_input_price_threshold, .err = error.UnknownInputPriceThreshold },
         .{ .code = .input_budget_summary_failed, .err = error.InputBudgetSummaryFailed },
-        .{ .code = .subagent_interaction_required, .err = error.SubagentInteractionRequired },
         .{ .code = .no_compaction_candidate, .err = error.NoCompactionCandidate },
         .{ .code = .canceled, .err = error.Canceled },
         .{ .code = .transport, .err = error.Transport },

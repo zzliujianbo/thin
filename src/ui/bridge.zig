@@ -113,9 +113,6 @@ const Copy = struct {
                 c.fields.command = self.field(v.fields.command);
                 c.fields.action = self.field(v.fields.action);
                 c.fields.topic = self.field(v.fields.topic);
-                c.fields.task = self.field(v.fields.task);
-                c.fields.id = self.field(v.fields.id);
-                if (v.subagent_progress) |progress_text| c.subagent_progress = self.text(progress_text);
                 break :blk .{ .tool_view = c };
             },
             .permission => |v| .{ .permission = .{ .id = v.id, .tool_name = self.text(v.tool_name), .description = self.text(v.description) } },

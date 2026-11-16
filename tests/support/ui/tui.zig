@@ -809,8 +809,6 @@ const FakeRemote = struct {
             .control_epoch = self.snapshot.control_epoch,
             .model = "fixture",
             .codex_login = self.codex,
-            .subagents = self.snapshot.subagents,
-            .subagents_supported = self.snapshot.subagents_supported,
             .base_url = "",
         };
     }
@@ -850,14 +848,6 @@ fn drainBridge(ui: *Ui) !void {
 
 fn typeDraft(ui: *Ui, value: []const u8) !void {
     _ = try ui.editor.insert(value);
-}
-
-fn testAgent(id: u64, revision: u64, phase: @import("../core/subagent_status.zig").Phase, elapsed_ms: u64, detail: []const u8) @import("../core/subagent_status.zig").AgentView {
-    var agent: @import("../core/subagent_status.zig").AgentView = .{ .id = id, .revision = revision, .phase = phase, .elapsed_ms = elapsed_ms };
-    const n = @min(detail.len, agent.text_buf.len);
-    @memcpy(agent.text_buf[0..n], detail[0..n]);
-    agent.text_len = @intCast(n);
-    return agent;
 }
 
 const cropped_approval_body = "CROP-FIRST\n" ++

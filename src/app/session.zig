@@ -301,7 +301,6 @@ pub const Session = struct {
     /// Identity snapshot only: App publishes process-lifetime static notices.
     /// Never retain or inspect worker-owned mutable Runtime state here.
     last_memory_view: @import("../core/memory_status.zig").View = .{},
-    last_subagent_view: @import("../core/subagent_status.zig").View = .{},
     active_context_official: bool = false,
     display_origins: []bool = &.{},
     display_disabled: []bool = &.{},
@@ -570,7 +569,6 @@ pub const Session = struct {
 
     /// 必须等 TUI 取消并 join worker 后再释放；Connection 不得比 Session 活得更久。
     pub fn deinit(self: *Session) void {
-        self.last_subagent_view.deinitOwned(self.allocator);
         if (self.codex_job) |job| job.destroy(self.allocator);
         self.codex_job = null;
         self.releaseLoadedHistory();
@@ -921,8 +919,6 @@ pub const Session = struct {
             .memory_auto = config.memory.auto,
             .memory = if (self.app) |app| app.memoryView() else .{},
             .background = self.backgroundView(),
-            .subagents = if (self.app) |app| app.subagentView() else .{},
-            .subagents_supported = true,
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
             .pending_default_effort = if (self.app != null and self.initial_default_pending and config.model.reasoning_effort == null) self.preferred_effort else null,
@@ -1237,16 +1233,8 @@ pub const Session = struct {
         const idle = reported_idle and !self.owner_task_active;
         const memory_view = if (self.app) |app| app.memoryView() else @import("../core/memory_status.zig").View{};
         const memory_changed = self.memoryViewChanged(memory_view);
-        const subagent_view = if (self.app) |app| app.subagentView() else @import("../core/subagent_status.zig").View{};
-        const subagent_changed = !@import("../core/subagent_status.zig").View.eql(self.last_subagent_view, subagent_view);
-        if (subagent_changed) {
-            if (subagent_view.clone(self.allocator)) |copy| {
-                self.last_subagent_view.deinitOwned(self.allocator);
-                self.last_subagent_view = copy;
-            } else |_| {}
-        }
         const login_changed = self.pollCodexLogin() catch false;
-        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or subagent_changed or login_changed;
+        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or login_changed;
         if (self.metadata_job) |job| {
             official_pending: {
                 if (job.future) |*future| {

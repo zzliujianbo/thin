@@ -1,6 +1,6 @@
 fn expectEmpty(e: *const Extractor) !void {
     const s = e.snapshot();
-    try std.testing.expect(s.path == null and s.command == null and s.action == null and s.topic == null and s.task == null);
+    try std.testing.expect(s.path == null and s.command == null and s.action == null and s.topic == null);
 }
 
 fn checkGolden(e: *const Extractor) !void {

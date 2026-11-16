@@ -1,19 +1,3 @@
-test "stream task summary is previewed without the context body" {
-    const t = std.testing;
-    var c: Controller = .{ .allocator = t.allocator, .generation = 5, .schemas = &.{.{ .name = "subagent", .description = "", .parameters_json = "{}" }} };
-    defer c.deinit();
-    const view = c.observe(.{ .index = 0, .name = "subagent", .arguments = "{\"task\":\"check release paths\",\"context\":\"secret-parent-note\"}" }).?;
-    try t.expectEqualStrings("check release paths", view.fields.task.?.text);
-    try t.expect(view.fields.path == null and view.fields.command == null);
-}
-test "stream job id is previewed while message body stays hidden" {
-    const t = std.testing;
-    var c: Controller = .{ .allocator = t.allocator, .generation = 5, .schemas = &.{.{ .name = "send_subagent_message", .description = "", .parameters_json = "{}" }} };
-    defer c.deinit();
-    const view = c.observe(.{ .index = 0, .name = "send_subagent_message", .arguments = "{\"id\":\"job-9\",\"message\":\"private-body\"}" }).?;
-    try t.expectEqualStrings("job-9", view.fields.id.?.text);
-    try t.expect(view.fields.task == null and view.fields.path == null);
-}
 test "stream links require complete ids and raw arguments" {
     const t = std.testing;
     const c = try t.allocator.create(Controller);

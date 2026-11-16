@@ -163,7 +163,6 @@ pub fn failureCode(err: anyerror) []const u8 {
         error.InputBudgetExceeded => "input_budget_exceeded",
         error.UnknownInputPriceThreshold => "unknown_input_price_threshold",
         error.InputBudgetSummaryFailed => "input_budget_summary_failed",
-        error.SubagentInteractionRequired => "subagent_interaction_required",
         error.NoCompactionCandidate => "no_compaction_candidate",
         error.Canceled => "canceled",
         error.Transport, error.ConnectionLost, error.ConnectionClosed => "transport",
@@ -839,14 +838,9 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try encodeField(&out, "command", view.fields.command);
             try encodeField(&out, "action", view.fields.action);
             try encodeField(&out, "topic", view.fields.topic);
-            try encodeField(&out, "task", view.fields.task);
-            try encodeField(&out, "id", view.fields.id);
             try out.endObject();
             try encodeCaption(&out, "display", view.display);
             try encodeProgress(&out, "wprog", view.write_progress);
-            if (view.subagent_progress) |progress| {
-                try out.field("sprog", progress);
-            } else try out.field("sprog", @as(?[]const u8, null));
         },
         .permission => |value| {
             try out.field("t", "permission");
@@ -1004,8 +998,6 @@ pub const Snapshot = struct {
     codex_login: codex_login.View = .{},
     memory: memory_status.View = .{},
     background: background.View = .{},
-    subagents: @import("../core/subagent_status.zig").View = .{},
-    subagents_supported: bool = false,
     read_only: bool = false,
     truncated: bool = false,
 };
@@ -1059,41 +1051,8 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.beginObject("background");
     try out.field("active_count", snapshot.background.active_count);
     try out.endObject();
-    if (snapshot.subagents_supported) try encodeSubagentView(out, snapshot.subagents);
     try out.field("read_only", snapshot.read_only);
     try out.field("truncated", snapshot.truncated);
-    try out.endObject();
-}
-
-pub fn encodeSubagentView(out: *Out, view: @import("../core/subagent_status.zig").View) !void {
-    try out.beginObject("subagents");
-    try out.field("group_id", view.group_id);
-    try out.field("revision", view.revision);
-    try out.field("total", view.total);
-    try out.field("running", view.running);
-    try out.field("waiting", view.waiting);
-    try out.field("completed", view.completed);
-    try out.field("failed", view.failed);
-    try out.field("canceled", view.canceled);
-    try out.field("paused", view.paused);
-    try out.field("elapsed_ms", view.elapsed_ms);
-    try out.field("latest_id", view.latest_id);
-    try out.field("text", view.latestText());
-    if (view.page_offset) |offset| {
-        try out.field("page_offset", offset);
-        try out.field("page_total", view.page_total);
-    }
-    try out.beginArray("agents");
-    for (view.agents) |agent| {
-        try out.beginObjectElement();
-        try out.field("id", agent.id);
-        try out.field("revision", agent.revision);
-        try out.field("phase", @tagName(agent.phase));
-        try out.field("elapsed_ms", agent.elapsed_ms);
-        try out.field("text", agent.latestText());
-        try out.endObject();
-    }
-    try out.endArray();
     try out.endObject();
 }
 
@@ -1264,8 +1223,6 @@ fn decodeFields(object: std.json.ObjectMap, name: []const u8) !preview.Snapshot 
         .command = try decodeField(inner, "command"),
         .action = try decodeField(inner, "action"),
         .topic = try decodeField(inner, "topic"),
-        .task = try decodeField(inner, "task"),
-        .id = try decodeField(inner, "id"),
     };
 }
 
@@ -1283,10 +1240,6 @@ fn decodeProgress(object: std.json.ObjectMap, name: []const u8) !?write_preview.
         .added = try optionalU64(inner, "added"),
         .deleted = try optionalU64(inner, "deleted"),
     };
-}
-
-fn decodeSubagentProgress(object: std.json.ObjectMap) !?[]const u8 {
-    return optionalText(object, "sprog");
 }
 
 fn decodeFileStats(object: std.json.ObjectMap, name: []const u8) !?line_stats.File {
@@ -1558,7 +1511,7 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
             .phase = try requireEnum(ToolViewsPhase, object, "phase"),
         } };
     } else if (std.mem.eql(u8, kind, "tool_view")) {
-        try checkToolEventFields(object, &.{ "t", "gen", "idx", "name", "fields", "display", "wprog", "sprog", "ready", "epoch", "seq", "disp_trunc", "canon_complete" });
+        try checkToolEventFields(object, &.{ "t", "gen", "idx", "name", "fields", "display", "wprog", "ready", "epoch", "seq", "disp_trunc", "canon_complete" });
         event = .{ .tool_view = .{
             .key = .{
                 .generation = try requireU64(object, "gen"),
@@ -1568,7 +1521,6 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
             .fields = try decodeFields(object, "fields"),
             .display = try decodeCaption(object),
             .write_progress = try decodeProgress(object, "wprog"),
-            .subagent_progress = try decodeSubagentProgress(object),
             .ready = try optionalBool(object, "ready") orelse false,
         } };
     } else if (std.mem.eql(u8, kind, "tool_started")) {

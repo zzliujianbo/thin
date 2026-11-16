@@ -40,9 +40,9 @@ pub const Execution = struct {
     truncated: bool = false,
     /// 进程组清理失败：会使 Runtime poisoned，之后拒绝继续运行。
     cleanup_failed: bool = false,
-    /// Automatic Memory evidence policy. False marks a result (for example a
-    /// delegated child report) that must not become a "verified tool fact"
-    /// even when the call reports success. Evaluated per result, not per name.
+    /// Automatic Memory evidence policy. False marks a result that must not
+    /// become a "verified tool fact" even when the call reports success.
+    /// Evaluated per result, not per name.
     /// 中文：自动 Memory 证据策略；false 表示该成功结果不得作为已证实工具事实采集。
     memory_evidence: bool = true,
     /// Optional measured file observations, copied by value across Host/Bridge.
@@ -79,21 +79,9 @@ pub const Executor = struct {
     prepare_fn: *const fn (*anyopaque, std.mem.Allocator, p.ToolCall) anyerror!Prepared,
     /// 第二阶段：实际执行，必须响应传入的 cancellation。
     execute_fn: *const fn (*anyopaque, std.mem.Allocator, Prepared, *const p.Cancellation) anyerror!Execution,
-    /// Called once after run() actually accepts a task (busy swap won), before
-    /// the first model call. `cancel` is the accepted-root token, never a
-    /// local tool-call token. Used to
-    /// reset a per-root-task budget; a rejected Busy run must not call it.
-    /// Must not fail or run tools.
-    begin_task_fn: ?*const fn (*anyopaque, *const p.Cancellation) void = null,
-    /// Called after a normal model stop commits its assistant message and
-    /// discards tool views, but BEFORE the Inbox is sealed. A non-empty hint is
-    /// copied into the stable history arena as a `.context` message and the
-    /// model loop continues; it is never user input, Memory evidence or a
-    /// fabricated tool call. Returns null when nothing remains.
-    before_finish_fn: ?*const fn (*anyopaque, std.mem.Allocator, *const p.Cancellation) anyerror!?[]const u8 = null,
-    /// Unified end-of-accepted-task cleanup. Called on every exit path
-    /// before Memory finalization/finished. Cancel/join or retain
-    /// every child job here. A failure must poison the parent.
+    /// End-of-accepted-task hook. Called on every exit path before Memory
+    /// finalization. The host checks instance-owned background health here;
+    /// a failure poisons the parent.
     end_task_fn: ?*const fn (*anyopaque, *const p.Cancellation) anyerror!void = null,
     /// Optional display-only pre-write snapshot. It must never create or alter
     /// the target and any failure degrades only the provisional UI.
@@ -188,12 +176,6 @@ pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true
 pub fn inputBudgetPause(detail: ?anyerror) bool {
     const err = detail orelse return false;
     return err == error.InputBudgetExceeded or err == error.UnknownInputPriceThreshold or err == error.InputBudgetSummaryFailed;
-}
-
-/// Policy/auxiliary pauses need their own explanation, not a round-limit hint.
-pub fn policyPause(detail: ?anyerror) bool {
-    const cause = detail orelse return false;
-    return inputBudgetPause(detail) or cause == error.SubagentInteractionRequired;
 }
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
@@ -880,9 +862,6 @@ pub const Runtime = struct {
         // 占用运行权；defer 保证任何退出路径都会释放，防止永久 Busy。
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
-        // Accepted-task hook only: resets owner budgets (e.g. delegation slots).
-        // A rejected Busy run above never reaches it.
-        if (self.executor.begin_task_fn) |begin_task| begin_task(self.executor.context, cancel);
         if (self.inbox) |box| box.beginRun();
         var inbox_success = false;
         defer if (self.inbox) |box| {
@@ -915,7 +894,7 @@ pub const Runtime = struct {
             .command => |text| self.commandInner(text, cancel, &task),
         };
         result catch |err| {
-            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or err == error.SubagentInteractionRequired or inputBudgetPause(err)) .paused else .failed;
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or inputBudgetPause(err)) .paused else .failed;
             task.terminal.detail = err;
             if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
         };
@@ -1460,18 +1439,6 @@ pub const Runtime = struct {
                 try self.emit(.{ .assistant_committed = message.blocks }, cancel);
                 self.discardToolViews(cancel);
                 try checkCanceled(cancel);
-                // A child may still need collection or a reply. The host returns
-                // only a status/ID hint; it is a context message, not a
-                // user turn, Memory evidence or a tool call.
-                if (self.executor.before_finish_fn) |before_finish| {
-                    if (try before_finish(self.executor.context, result_arena.allocator(), cancel)) |hint| {
-                        const owned = self.arena.allocator();
-                        const copy = try owned.dupe(u8, hint);
-                        try appendContextMessage(owned, &self.history, copy);
-                        self.last_context_tokens = null;
-                        continue :model_loop;
-                    }
-                }
                 if (self.inbox) |box| {
                     // enqueue and sealing share one linearization lock. Late
                     // steering stays pending for idle host dispatch.
@@ -1534,13 +1501,6 @@ pub const Runtime = struct {
             if (err == error.CleanupFailed) self.poisoned = true;
             return err;
         };
-    }
-
-    /// Parent control thread only; strings are borrowed until the host returns.
-    pub fn publishSubagentProgress(self: *Runtime, id: []const u8, text: []const u8, cancel: *const p.Cancellation) void {
-        const active = self.active_display_tool orelse return;
-        if (!std.mem.eql(u8, active.name, "get_subagent_result") or text.len > 2048 or !std.unicode.utf8ValidateSlice(text)) return;
-        self.emit(.{ .tool_view = .{ .key = active.key, .name = active.name, .fields = .{ .id = .{ .text = id } }, .ready = true, .subagent_progress = text } }, cancel) catch {};
     }
 
     fn beginToolViews(self: *Runtime, cancel: *const p.Cancellation) void {

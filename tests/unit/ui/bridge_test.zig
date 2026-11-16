@@ -1,36 +1,3 @@
-test "subagent tool progress is complete and owned independently of producer" {
-    const t = std.testing;
-    var cancel: p.Cancellation = .{};
-    var bridge = Bridge.init(t.allocator, t.io, &cancel);
-    defer bridge.deinit();
-    const host_ = bridge.host();
-    {
-        const source = try t.allocator.alloc(u8, 3000);
-        defer t.allocator.free(source);
-        @memset(source, 'a');
-        @memcpy(source[2046..2049], "字");
-        try host_.emit_fn(host_.context, .{ .tool_view = .{
-            .key = .{ .generation = 42, .index = 7 },
-            .name = "subagent",
-            .fields = .{ .id = .{ .text = "job-9" } },
-            .subagent_progress = source,
-        } }, &cancel);
-        @memset(source, 'z');
-    }
-    var item = bridge.pop().?;
-    defer item.deinit();
-    const view = item.event.tool_view;
-    try t.expectEqual(@as(u64, 42), view.key.generation);
-    try t.expectEqual(@as(usize, 7), view.key.index);
-    try t.expectEqualStrings("job-9", view.fields.id.?.text);
-    const text = view.subagent_progress.?;
-    try t.expectEqual(@as(usize, 3000), text.len);
-    try t.expect(!item.display_truncated and std.unicode.utf8ValidateSlice(text));
-    try t.expectEqualStrings("字", text[2046..2049]);
-    try t.expectEqual(@as(u8, 'a'), text[0]);
-    try t.expect(@intFromPtr(text.ptr) >= @intFromPtr(item.storage.ptr));
-    try t.expect(@intFromPtr(text.ptr) + text.len <= @intFromPtr(item.storage.ptr) + item.storage.len);
-}
 test "user committed copy owns the entire bounded text including the last byte" {
     var cancel: p.Cancellation = .{};
     var bridge = Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -74,7 +41,7 @@ test "tool view copy owns all six snapshot fields after producer storage is free
     defer bridge.deinit();
     const host_ = bridge.host();
 
-    const expected = [_][]const u8{ "path.txt", "run.sh", "open", "topic-x", "delegate summary", "job-7" };
+    const expected = [_][]const u8{ "path.txt", "run.sh", "open", "topic-x" };
     var borrowed: [expected.len][]u8 = undefined;
     {
         // Producer-side arena: released and overwritten before the consumer pops.
@@ -89,8 +56,6 @@ test "tool view copy owns all six snapshot fields after producer storage is free
                 .command = .{ .text = borrowed[1], .truncated = true },
                 .action = .{ .text = borrowed[2] },
                 .topic = .{ .text = borrowed[3] },
-                .task = .{ .text = borrowed[4] },
-                .id = .{ .text = borrowed[5], .truncated = true },
             },
             .ready = true,
         } }, &cancel);
@@ -102,7 +67,7 @@ test "tool view copy owns all six snapshot fields after producer storage is free
     const view = item.event.tool_view;
     try t.expect(!item.display_truncated);
     try t.expectEqualStrings("background", view.name);
-    inline for (.{ "path", "command", "action", "topic", "task", "id" }, 0..) |name, i| {
+    inline for (.{ "path", "command", "action", "topic" }, 0..) |name, i| {
         const text = @field(view.fields, name).?.text;
         try t.expectEqualStrings(expected[i], text);
         // Ownership, not only equal bytes: every non-empty text lives in storage.
@@ -112,8 +77,7 @@ test "tool view copy owns all six snapshot fields after producer storage is free
     }
     // Producer-side truncation flags survive; no clipping happened here.
     try t.expect(view.fields.command.?.truncated);
-    try t.expect(view.fields.id.?.truncated);
-    try t.expect(!view.fields.task.?.truncated);
+    try t.expect(!view.fields.topic.?.truncated);
 }
 test "task snapshot retains full UTF8 content beyond former item cap" {
     const t = std.testing;
@@ -129,16 +93,16 @@ test "task snapshot retains full UTF8 content beyond former item cap" {
     try host_.emit_fn(host_.context, .{ .tool_view = .{
         .key = .{ .generation = 1, .index = 0 },
         .name = "",
-        .fields = .{ .task = .{ .text = huge } },
+        .fields = .{ .path = .{ .text = huge } },
     } }, &cancel);
 
     var item = bridge.pop().?;
     defer item.deinit();
-    const task = item.event.tool_view.fields.task.?;
-    try t.expectEqual(huge.len, task.text.len);
-    try t.expectEqualSlices(u8, huge, task.text);
-    try t.expect(!task.truncated and !item.display_truncated);
-    try t.expect(std.unicode.utf8ValidateSlice(task.text));
+    const path = item.event.tool_view.fields.path.?;
+    try t.expectEqual(huge.len, path.text.len);
+    try t.expectEqualSlices(u8, huge, path.text);
+    try t.expect(!path.truncated and !item.display_truncated);
+    try t.expect(std.unicode.utf8ValidateSlice(path.text));
 }
 test "multibyte text body above the item cap streams as ordered untruncated slices" {
     const t = std.testing;

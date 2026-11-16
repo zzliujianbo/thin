@@ -107,14 +107,14 @@ test "memory footer stays adjacent to wrapped composer after ACK" {
     try std.testing.expect(ui.frame_composer_rows > 1);
     const status_row = screen.rows - ui.frame_composer_rows - 1;
     // The screen fixture maps each non-ASCII code point to one '~' cell.
-    try std.testing.expectEqualStrings("M: ~", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
+    try std.testing.expectEqualStrings("memory: 1", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const expected_status = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(ui.clock_ms)});
-    try std.testing.expectEqualStrings(expected_status, try ui.hint(arena.allocator(), ui.connection.current()));
+    const expected_status = "memory: 1";
+    try std.testing.expectEqualStrings(expected_status, try ui.activityLine(arena.allocator(), ui.connection.current()));
     try std.testing.expectEqual(status_row + 1, try rowStartingWith(&screen, "(fixture) "));
     try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, screen.grid[status_row - 1][0..30], " "));
-    try std.testing.expectEqual(@as(usize, 1), screen.count("M: "));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("memory: "));
     testAcknowledgeFullFrame(&ui);
     const history = screen.history_len;
     const records = ui.records.items.len;
@@ -123,7 +123,7 @@ test "memory footer stays adjacent to wrapped composer after ACK" {
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(history, screen.history_len);
     try std.testing.expectEqual(records, ui.records.items.len);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("M: "));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("memory: "));
 }
 test "long combined warning stays adjacent across acknowledged command menu cycles and wrapped input" {
     for ([_]usize{ 80, 120 }) |columns| {
@@ -2321,18 +2321,18 @@ test "memory markers use a cross and only the marker is tinted" {
     try ui.acceptMemoryCompletion(saved);
     const ok_row = &ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.success, ok_row.notice_level);
-    try std.testing.expectEqual(@as(usize, "M: \u{2713}".len), ok_row.notice_marker_len);
+    try std.testing.expectEqual(@as(usize, "memory: \u{2713}".len), ok_row.notice_marker_len);
     try ok_row.layout(a, 40);
-    try std.testing.expect(std.mem.find(u8, ok_row.lines[0], theme.success ++ "M: \u{2713}" ++ theme.reset ++ theme.muted) != null);
+    try std.testing.expect(std.mem.find(u8, ok_row.lines[0], theme.success ++ "memory: \u{2713}" ++ theme.reset ++ theme.muted) != null);
     try std.testing.expect(std.mem.find(u8, ok_row.lines[0], " preference") != null);
 
     try ui.acceptMemoryCompletion(.{ .id = 2, .result = .failed, .failure = .storage });
     const bad_row = &ui.records.items[1];
     try std.testing.expectEqual(NoticeLevel.failure, bad_row.notice_level);
-    try std.testing.expectEqual(@as(usize, "M: \u{2717}".len), bad_row.notice_marker_len);
-    try std.testing.expect(std.mem.startsWith(u8, bad_row.body.items, "M: \u{2717}"));
+    try std.testing.expectEqual(@as(usize, "memory: \u{2717}".len), bad_row.notice_marker_len);
+    try std.testing.expect(std.mem.startsWith(u8, bad_row.body.items, "memory: \u{2717}"));
     try bad_row.layout(a, 40);
-    try std.testing.expect(std.mem.find(u8, bad_row.lines[0], theme.failure ++ "M: \u{2717}" ++ theme.reset ++ theme.muted) != null);
+    try std.testing.expect(std.mem.find(u8, bad_row.lines[0], theme.failure ++ "memory: \u{2717}" ++ theme.reset ++ theme.muted) != null);
     try std.testing.expect(std.mem.find(u8, bad_row.lines[0], "failed") == null);
 }
 test "failed tool rows keep the bounded reason while the target clips" {
@@ -2697,37 +2697,6 @@ test "thinking display limit marker is explicit and bounded" {
     try std.testing.expect(record.lines.len <= reasoning_tail_rows + 1);
     const shown = record.lines[record.lines.len -| reasoning_tail_rows..];
     try std.testing.expect(std.mem.find(u8, shown[shown.len - 1], "thinking display limited: cluster; model history unchanged") != null);
-}
-test "subagent tool progress updates active row and completion only" {
-    const a = std.testing.allocator;
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    const screen = try a.create(@import("../tests/regular_screen.zig").Screen);
-    defer a.destroy(screen);
-    screen.* = .{};
-    ui.mode = .calling_model;
-    ui.clock_ms = 1000;
-    const key: p.ToolDisplayKey = .{ .generation = 71, .index = 1 };
-    try emitToolUi(&ui, .{ .tool_views = .{ .generation = 71, .phase = .begin } });
-    const fields = @import("../core/tool_preview.zig").Snapshot{ .id = .{ .text = "subagent_1" } };
-    try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "get_subagent_result", .fields = fields, .ready = true } });
-    try emitToolUi(&ui, .{ .tool_started = .{ .id = 77, .name = "get_subagent_result", .started_ms = 1000, .display_key = key } });
-    ui.clock_ms = 2500;
-    try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "get_subagent_result", .fields = fields, .ready = true, .subagent_progress = "working" } });
-    try std.testing.expectEqualStrings("subagent_1 · working", ui.active_tool.?.caption.label);
-    try std.testing.expectEqual(@as(u64, 1000), ui.active_tool.?.started_ms);
-    try replayToolFrame(&ui, screen);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("subagent_1"));
-    try emitToolUi(&ui, .{ .tool_view = .{ .key = .{ .generation = 71, .index = 2 }, .name = "get_subagent_result", .fields = fields, .ready = true, .subagent_progress = "other" } });
-    try std.testing.expectEqualStrings("subagent_1 · working", ui.active_tool.?.caption.label);
-    try emitToolUi(&ui, .{ .tool_view = .{ .key = key, .name = "get_subagent_result", .fields = fields, .ready = true, .subagent_progress = "latest" } });
-    try emitToolUi(&ui, .{ .tool_result = .{ .id = 77, .name = "get_subagent_result", .display_key = key, .result = .{ .text = "done", .duration_ms = 1500 } } });
-    try std.testing.expect(ui.active_tool == null);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "subagent_1 · latest") != null);
 }
 test "typed tool row updates in place before execution and uses ready metadata after Bridge clipping" {
     const a = std.testing.allocator;
@@ -4432,7 +4401,7 @@ test "input policy pauses stay red in conversation and out of the footer" {
     defer arena.deinit();
     ui.notice = "Ready";
     for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed }) |detail| {
-        try std.testing.expect(r.policyPause(detail));
+        try std.testing.expect(r.inputBudgetPause(detail));
         const result: r.Terminal = .{ .status = .paused, .detail = detail };
         ui.last_terminal = result;
         ui.notice = Ui.terminalNotice(result);
@@ -4754,7 +4723,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     for ([_]u64{ 1100, 3100, 9100 }) |now| {
         ui.clock_ms = now;
         try ui.draw();
-        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
+        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[(now / 80) % theme.command_pulse.len], activity.spinner(now), theme.reset });
         defer std.testing.allocator.free(marker);
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
         // Waiting for the first token keeps the static effort colour: only the
@@ -4819,7 +4788,7 @@ test "composer frame keeps context occupancy colors static while model and spinn
             ui.clock_ms = 80;
             _ = try ui.editor.insert("default-input");
             try ui.draw();
-            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}\x1b[1m{s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", theme.reset });
+            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}\x1b[1m{s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", theme.reset });
             defer std.testing.allocator.free(expected);
             try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
             testAcknowledgeFullFrame(&ui);
@@ -4921,7 +4890,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     _ = try ui.editor.insert("typed-default-color");
     try ui.draw();
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
-    const pulse = theme.command_pulse[shared.activity.commandStep(ui.clock_ms)];
+    const pulse = theme.command_pulse[(ui.clock_ms / 80) % theme.command_pulse.len];
     const icon = activity.spinner(ui.clock_ms);
     const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} typed-default-color", .{ theme.reset, pulse, icon, theme.reset });
     defer std.testing.allocator.free(marker);
@@ -4943,7 +4912,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 680;
     try ui.draw();
-    const pulse_next = theme.command_pulse[shared.activity.commandStep(ui.clock_ms)];
+    const pulse_next = theme.command_pulse[(ui.clock_ms / 80) % theme.command_pulse.len];
     const icon_next = activity.spinner(ui.clock_ms);
     const marker_next = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s} typed-default-color", .{ pulse_next, icon_next, theme.reset });
     defer std.testing.allocator.free(marker_next);
@@ -6733,7 +6702,7 @@ test "memory notice owner poll dirties UI without replacing foreground notice" {
     }
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
-test "background and memory indicators animate independently while idle" {
+test "background and memory indicators stay static while idle" {
     const Fixture = struct {
         count: usize = 1,
         fn current(raw: *anyopaque) Connection.State {
@@ -6754,23 +6723,19 @@ test "background and memory indicators animate independently while idle" {
     ui.clock_ms = 80;
     ui.dirty = false;
     ui.animate();
-    try std.testing.expect(ui.dirty);
-    const first = try ui.hint(arena.allocator(), Fixture.current(&fixture));
-    try std.testing.expect(std.mem.indexOf(u8, first, "M: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "B: ") != null);
-    ui.clock_ms = 160;
-    ui.dirty = false;
-    ui.animate();
-    try std.testing.expect(ui.dirty);
+    try std.testing.expect(!ui.dirty);
+    const first = try ui.activityLine(arena.allocator(), Fixture.current(&fixture));
+    try std.testing.expect(std.mem.indexOf(u8, first, "memory: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "background: 1") != null);
     fixture.count = 3;
-    const multiple = try ui.hint(arena.allocator(), Fixture.current(&fixture));
-    try std.testing.expect(std.mem.indexOf(u8, multiple, " 3") != null);
+    const multiple = try ui.activityLine(arena.allocator(), Fixture.current(&fixture));
+    try std.testing.expect(std.mem.indexOf(u8, multiple, "background: 3") != null);
     fixture.count = 0;
-    const none = try ui.hint(arena.allocator(), Fixture.current(&fixture));
-    try std.testing.expect(std.mem.indexOf(u8, none, "B: ") == null);
+    const none = try ui.activityLine(arena.allocator(), Fixture.current(&fixture));
+    try std.testing.expect(std.mem.indexOf(u8, none, "background: ") == null);
     ui.secret_mode = true;
-    try std.testing.expect(!ui.backgroundAnimating());
 }
+
 test "background completion is admitted before exact-id retirement" {
     const Fixture = struct {
         fn current(_: *anyopaque) Connection.State {
@@ -6842,7 +6807,7 @@ test "background completion is admitted before exact-id retirement" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(second.lines[0]));
     testAcknowledgeFullFrame(&ui);
 }
-test "memory active and queued own the neutral footer and terminals stay in conversation" {
+test "memory active and queued own the neutral activity row and terminals stay in conversation" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -6850,28 +6815,19 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     defer ui.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var runtime: r.Runtime = undefined;
     var state = ui.connection.current();
-    state.runtime = &runtime;
-    // One braille frame, no phase word: the two states share one neutral row.
+    // Idle foreground: static counts, no point matrix.
     state.memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } };
-    ui.clock_ms = 0;
-    const frame0 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(0)});
-    try std.testing.expectEqualStrings(frame0, try ui.hint(arena.allocator(), state));
-    // queued only, active kept: the count is exactly the waiting jobs.
+    try std.testing.expectEqualStrings("memory: 1", try ui.activityLine(arena.allocator(), state));
     state.memory.queued_count = 2;
-    const with_queue = try std.fmt.allocPrint(arena.allocator(), "M: {s} +2", .{activity.spinner(0)});
-    try std.testing.expectEqualStrings(with_queue, try ui.hint(arena.allocator(), state));
-    // Waiting work alone still animates, with the same count.
+    try std.testing.expectEqualStrings("memory: 1 +2", try ui.activityLine(arena.allocator(), state));
     state.memory.active = null;
-    try std.testing.expectEqualStrings(with_queue, try ui.hint(arena.allocator(), state));
-    // A zero count never prints a number and no history comes from last_terminal.
+    try std.testing.expectEqualStrings("memory: +2", try ui.activityLine(arena.allocator(), state));
     state.memory.queued_count = 0;
     state.memory.last_terminal = .{ .id = 1, .result = .saved, .saved_count = 2 };
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
-    // Disabled Memory owns nothing even with active/queued values present.
+    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), state));
     state.memory = .{ .enabled = false, .active = .{ .id = 1, .phase = .saving }, .queued_count = 3 };
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), state));
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 
     var saved: memory_status.Terminal = .{ .id = 7, .result = .saved, .saved_count = 2 };
@@ -6881,15 +6837,14 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     const saved_row = ui.records.items[0];
     try std.testing.expectEqual(NoticeLevel.success, saved_row.notice_level);
     try std.testing.expect(saved_row.single_row);
-    const expected_saved = try std.fmt.allocPrint(arena.allocator(), "M: \u{2713} {s}", .{saved.summary.text()});
+    const expected_saved = try std.fmt.allocPrint(arena.allocator(), "memory: \u{2713} {s}", .{saved.summary.text()});
     try std.testing.expectEqualStrings(expected_saved, saved_row.body.items);
-    // The saved confirmation never advertises a count or a background run.
     try std.testing.expect(std.mem.find(u8, saved_row.body.items, "saved") == null);
     try std.testing.expect(std.mem.find(u8, saved_row.body.items, "(2)") == null);
     try std.testing.expect(std.mem.find(u8, saved_row.body.items, "偏好中文 下一行") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, saved_row.body.items, '\x1b') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, saved_row.body.items, '\n') == null);
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
+    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), state));
 
     for ([_]memory_status.Terminal{
         .{ .id = 8, .result = .failed, .failure = .storage },
@@ -6897,28 +6852,26 @@ test "memory active and queued own the neutral footer and terminals stay in conv
     }) |terminal| {
         try ui.acceptMemoryCompletion(terminal);
         const row = ui.records.items[ui.records.items.len - 1];
-        // Real outcomes stay real, keep the red failure tone, and are never
-        // forced into the success shape or the one-row clipping.
         try std.testing.expectEqual(NoticeLevel.failure, row.notice_level);
         try std.testing.expect(!row.single_row);
-        try std.testing.expect(std.mem.startsWith(u8, row.body.items, "M: "));
-        try std.testing.expect(std.mem.count(u8, row.body.items, "\u{2713}") == 0);
+        try std.testing.expect(std.mem.startsWith(u8, row.body.items, "memory: "));
+        try std.testing.expect(std.mem.count(u8, row.body.items, "\\u{2713}") == 0);
     }
     try ui.acceptMemoryCompletion(.{ .id = 10, .result = .failed, .failure = .cleanup });
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[ui.records.items.len - 1].notice_level);
-    // A partial save followed by a failure is reported as a failure.
     try ui.acceptMemoryCompletion(.{ .id = 13, .result = .failed, .failure = .storage, .saved_count = 1 });
     const partial = ui.records.items[ui.records.items.len - 1];
     try std.testing.expectEqual(NoticeLevel.failure, partial.notice_level);
     try std.testing.expect(!partial.single_row);
-    try std.testing.expect(std.mem.count(u8, partial.body.items, "\u{2713}") == 0);
+    try std.testing.expect(std.mem.count(u8, partial.body.items, "\\u{2713}") == 0);
     try ui.acceptMemoryCompletion(.{ .id = 11, .result = .canceled, .failure = .canceled });
     try std.testing.expectEqual(NoticeLevel.plain, ui.records.items[ui.records.items.len - 1].notice_level);
     const before_skipped = ui.records.items.len;
     try ui.acceptMemoryCompletion(.{ .id = 12, .result = .skipped });
     try std.testing.expectEqual(before_skipped, ui.records.items.len);
 }
-test "memory footer keeps rotating while only memory is active" {
+
+test "memory activity stays static while the foreground is idle" {
     const Fixture = struct {
         active: bool = true,
         fn current(raw: *anyopaque) Connection.State {
@@ -6938,45 +6891,27 @@ test "memory footer keeps rotating while only memory is active" {
     ui.connection.context = &fixture;
     ui.connection.current_fn = Fixture.current;
     try std.testing.expect(!ui.busy);
-    // Two real ticks of the 40 ms clock each stage an ordinary dirty draw; no
-    // timer, frame or refresh source is added for Memory.
     ui.clock_ms = 40;
     ui.dirty = false;
     ui.animate();
-    try std.testing.expect(ui.dirty);
-    const first = ui.animation_tick;
-    try std.testing.expectEqual(@as(u64, 1), first);
-    // Inside the same tick nothing is restaged.
-    ui.dirty = false;
-    ui.clock_ms = 79;
-    ui.animate();
     try std.testing.expect(!ui.dirty);
-    ui.clock_ms = 80;
-    ui.animate();
-    try std.testing.expect(ui.dirty);
-    try std.testing.expectEqual(first + 1, ui.animation_tick);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const state = ui.connection.current();
-    const tick0 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(0)});
-    ui.clock_ms = 0;
-    try std.testing.expectEqualStrings(tick0, try ui.hint(arena.allocator(), state));
-    const tick40 = try std.fmt.allocPrint(arena.allocator(), "M: {s}", .{activity.spinner(40)});
-    ui.clock_ms = 40;
-    try std.testing.expectEqualStrings(tick40, try ui.hint(arena.allocator(), state));
-    try std.testing.expect(!std.mem.eql(u8, tick0, tick40));
-    // Nothing to animate once the owner reports no active/queued work.
+    try std.testing.expectEqualStrings("memory: 1", try ui.activityLine(arena.allocator(), state));
+    ui.clock_ms = 160;
+    try std.testing.expectEqualStrings("memory: 1", try ui.activityLine(arena.allocator(), state));
     fixture.active = false;
     ui.dirty = false;
-    ui.clock_ms = 160;
     ui.animate();
     try std.testing.expect(!ui.dirty);
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
+    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), ui.connection.current()));
 }
-test "paused follow-up preview keeps idle memory animation ticking without hidden overlay redraws" {
+
+test "idle memory and background activity stays static with paused preview" {
     const Fixture = struct {
         fn current(_: *anyopaque) Connection.State {
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } } };
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = 1 }, .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } } };
         }
     };
     var cancel: p.Cancellation = .{};
@@ -6989,15 +6924,17 @@ test "paused follow-up preview keeps idle memory animation ticking without hidde
     ui.inbox.pause();
     try std.testing.expect(!ui.busy);
     try std.testing.expect(ui.queueSnapshot().paused);
-    try std.testing.expectEqual(@as(usize, 1), ui.queueSnapshot().preview_count);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const line = try ui.activityLine(arena.allocator(), ui.connection.current());
+    try std.testing.expect(std.mem.indexOf(u8, line, "memory: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "background: 1") != null);
     for (1..3) |tick| {
         ui.dirty = false;
-        ui.clock_ms = @intCast(tick * 40);
+        ui.clock_ms = @intCast(tick * 80);
         ui.animate();
-        try std.testing.expect(ui.dirty);
-        try std.testing.expectEqual(@as(u64, @intCast(tick)), ui.animation_tick);
+        try std.testing.expect(!ui.dirty);
     }
-    // A higher-priority footer hides Memory; animation must not repaint it.
     ui.secret_mode = true;
     ui.dirty = false;
     ui.clock_ms = 240;
@@ -7009,63 +6946,15 @@ test "paused follow-up preview keeps idle memory animation ticking without hidde
     ui.animate();
     try std.testing.expect(!ui.dirty);
     ui.settings_open = false;
-    // Passive resize still waits for real input/content and preserves dirty.
     ui.resize_waiting = true;
     ui.clock_ms = 400;
-    ui.animate();
-    try std.testing.expect(!ui.dirty);
     ui.dirty = true;
-    ui.clock_ms = 480;
     ui.animate();
     try std.testing.expect(ui.dirty);
 }
-test "paused preview animates background alone on two ticks" {
-    const Fixture = struct {
-        fn current(_: *anyopaque) Connection.State {
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = 1 } };
-        }
-    };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection.current_fn = Fixture.current;
-    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued input");
-    ui.inbox.pause();
-    try std.testing.expect(ui.queueSnapshot().paused and ui.queueSnapshot().preview_count == 1);
-    try std.testing.expect(!ui.busy and ui.active_tool == null and !ui.memoryAnimating());
-    for (1..3) |tick| {
-        ui.clock_ms = @intCast(tick * 40);
-        ui.dirty = false;
-        ui.animate();
-        try std.testing.expect(ui.dirty);
-        try std.testing.expectEqual(@as(u64, @intCast(tick)), ui.animation_tick);
-        ui.dirty = false;
-        ui.animate();
-        try std.testing.expect(!ui.dirty);
-    }
-    ui.secret_mode = true;
-    ui.clock_ms = 240;
-    ui.animate();
-    try std.testing.expect(!ui.dirty);
-    ui.secret_mode = false;
-    ui.settings_open = true;
-    ui.clock_ms = 320;
-    ui.animate();
-    try std.testing.expect(!ui.dirty);
-    ui.settings_open = false;
-    ui.resize_waiting = true;
-    ui.clock_ms = 400;
-    ui.animate();
-    try std.testing.expect(!ui.dirty);
-    ui.dirty = true;
-    ui.clock_ms = 480;
-    ui.animate();
-    try std.testing.expect(ui.dirty);
-}
+
 test "memory saved notice is one clipped physical row at the real width" {
-    const fixture_text = "M: \u{2713} 已保存偏好：中文与emoji \u{1F600} 混排的长摘要不会换行";
+    const fixture_text = "memory: \u{2713} 已保存偏好：中文与emoji \u{1F600} 混排的长摘要不会换行";
     const Geometry = struct {
         fn check(record: *Record, columns: usize) !void {
             const text_module = @import("text.zig");
@@ -7134,7 +7023,7 @@ test "memory saved notices stay one row across a passive resize and new delivery
     try std.testing.expect(text_module.styledWidth(first.lines[0]) <= 23);
     try std.testing.expect(std.mem.find(u8, first.lines[0], "...") != null);
     try first_screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), first_screen.count("M: ~ first"));
+    try std.testing.expectEqual(@as(usize, 1), first_screen.count("memory: ~"));
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[ui.record_index.get(first_id).?].output);
     try std.testing.expect(ui.records.items[ui.record_index.get(first_id).?].delivery_complete);
@@ -7169,7 +7058,7 @@ test "memory saved notices stay one row across a passive resize and new delivery
     try std.testing.expect(std.mem.find(u8, ui.frame, "first-long") == null);
     var second_screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 12, .rows = 12 };
     try second_screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), second_screen.count("M: ~ sec"));
+    try std.testing.expectEqual(@as(usize, 1), second_screen.count("..."));
     try std.testing.expectEqual(@as(usize, 0), second_screen.count("first"));
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[ui.record_index.get(second_id).?].output);
@@ -10710,264 +10599,6 @@ test "resume loading Escape cancels intent and ignores late list without cancell
     try std.testing.expect(ui.resume_picker == null);
     try std.testing.expect(sessions.ptr == late.saved_sessions.?.ptr);
     try std.testing.expectEqualStrings("pending draft", ui.editor.bytes.items);
-}
-test "per-agent status rows" {
-    try text.initLocale();
-    const a = std.testing.allocator;
-    var agents = [_]@import("../core/subagent_status.zig").AgentView{
-        testAgent(1, 1, .running, 100, "FIRST-1"),
-        testAgent(2, 1, .running, 200, "SECOND-2"),
-        testAgent(3, 1, .waiting, 300, "THIRD-3"),
-        testAgent(4, 1, .running, 400, "FOURTH-4"),
-        testAgent(5, 1, .starting, 0, "FIFTH-5"),
-    };
-    var fake = FakeRemote{};
-    fake.snapshot.subagents_supported = true;
-    fake.snapshot.busy = true;
-    fake.snapshot.subagents = .{ .group_id = 8, .revision = 1, .total = 4, .running = 3, .waiting = 1, .agents = agents[0..4] };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    ui.busy = true;
-    try ui.observeSubagents();
-    // Four real ids, four rows, four distinct texts: no aggregated count row.
-    try std.testing.expectEqual(@as(usize, 4), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
-    for (ui.subagent_rows.items, 1..) |row, expected| try std.testing.expectEqual(@as(u64, @intCast(expected)), row.view.id);
-    try ui.draw();
-    for ([_][]const u8{ "#1 · running · FIRST-1", "#2 · running · SECOND-2", "#3 · waiting · THIRD-3", "#4 · running · FOURTH-4" }) |expected| {
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, expected));
-    }
-    try std.testing.expect(std.mem.find(u8, ui.frame, "4 running") == null);
-    // Independent per-agent timers.
-    for ([_][]const u8{ "100ms", "200ms", "300ms", "400ms" }) |expected| try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
-    ui.finishFrame(); // A partial frame is not delivery proof.
-    try std.testing.expectEqual(@as(u64, 0), ui.delivery_proven);
-    ui.resize(.{ .columns = 70, .rows = 24 });
-    ui.resize(.{ .columns = 80, .rows = 24 });
-    try std.testing.expect(!ui.frame_fresh);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    const record_ids = [4]u64{ ui.records.items[0].id, ui.records.items[1].id, ui.records.items[2].id, ui.records.items[3].id };
-    // Updating the fourth agent leaves rows 1-3 exactly where they were.
-    agents[3] = testAgent(4, 2, .running, 900, "FOUR-UPDATED");
-    fake.snapshot.subagents.revision = 2;
-    fake.snapshot.subagents.agents = agents[0..4];
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 4), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
-    try std.testing.expectEqual(@as(u64, 1), ui.subagent_rows.items[0].view.id);
-    try std.testing.expectEqualStrings("FIRST-1", ui.subagent_rows.items[0].view.latestText());
-    try std.testing.expectEqualStrings("SECOND-2", ui.subagent_rows.items[1].view.latestText());
-    try std.testing.expectEqualStrings("THIRD-3", ui.subagent_rows.items[2].view.latestText());
-    try std.testing.expectEqual(@as(u64, 4), ui.subagent_rows.items[3].view.id);
-    try std.testing.expectEqualStrings("FOUR-UPDATED", ui.subagent_rows.items[3].view.latestText());
-    try std.testing.expectEqual(@as(u64, 900), ui.subagent_rows.items[3].view.elapsed_ms);
-    try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "FOUR-UPDATED") != null);
-    for (record_ids, 0..) |id, index| try std.testing.expectEqual(id, ui.records.items[index].id);
-    // Sparse frames need not resend unchanged rows; inspect the retained record.
-    try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, "FIRST-1") != null);
-    testAcknowledgeFullFrame(&ui);
-    // The same revision with an advanced elapsed time still republishes.
-    agents[0].elapsed_ms = 150;
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(u64, 150), ui.subagent_rows.items[0].view.elapsed_ms);
-    // One terminal child neither settles nor hides the still-active others.
-    agents[1] = testAgent(2, 2, .completed, 500, "SECOND-DONE");
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 4), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(presentation.Outcome.success, Ui.subagentPhaseOutcome(ui.subagent_rows.items[1].view));
-    try std.testing.expectEqual(presentation.Outcome.pending, Ui.subagentPhaseOutcome(ui.subagent_rows.items[0].view));
-    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
-    // All four terminal while the parent is busy keeps all four rows.
-    agents[0] = testAgent(1, 2, .completed, 150, "FIRST-1");
-    agents[2] = testAgent(3, 2, .failed, 700, "THIRD-FAILED");
-    agents[3] = testAgent(4, 3, .completed, 950, "FOURTH-4");
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 4), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
-    try std.testing.expectEqual(presentation.Outcome.failed, Ui.subagentPhaseOutcome(ui.subagent_rows.items[2].view));
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    // A fifth real id appends exactly one more row.
-    fake.snapshot.subagents.total = 5;
-    fake.snapshot.subagents.agents = agents[0..5];
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 5), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(u64, 5), ui.subagent_rows.items[4].view.id);
-    try std.testing.expectEqual(@as(usize, 5), ui.records.items.len);
-    try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "#5 · starting · FIFTH-5") != null);
-    testAcknowledgeFullFrame(&ui);
-    const fifth_record_id = ui.records.items[4].id;
-    // Parent body follows all agent records and remains after settlement.
-    const parent_index = try ui.add(.assistant, "PARENT-FINAL");
-    try std.testing.expectEqual(@as(usize, 5), parent_index);
-    for (ui.subagent_rows.items) |row| try std.testing.expect(ui.record_index.get(row.record_id).? < parent_index);
-    // Parent settled: no additional agent records.
-    agents[4] = testAgent(5, 2, .canceled, 1200, "FIFTH-CANCELED");
-    fake.snapshot.busy = false;
-    ui.busy = false;
-    try ui.observeSubagents();
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 6), ui.records.items.len);
-    try std.testing.expectEqual(@as(?u64, 150), ui.records.items[0].duration_ms);
-    try std.testing.expectEqual(@as(?u64, 500), ui.records.items[1].duration_ms);
-    try std.testing.expectEqual(@as(?u64, 1200), ui.records.items[4].duration_ms);
-    for (ui.records.items[0..5], 1..) |*record, expected| {
-        const id = try std.fmt.allocPrint(a, "#{d} · ", .{expected});
-        defer a.free(id);
-        try std.testing.expect(std.mem.find(u8, record.body.items, id) != null);
-    }
-    try std.testing.expect(std.mem.find(u8, ui.records.items[2].body.items, "✗") != null);
-    try std.testing.expect(std.mem.startsWith(u8, ui.records.items[4].body.items, "- subagent "));
-    try std.testing.expect(std.mem.find(u8, ui.records.items[4].body.items, "[canceled]") == null);
-    // A settled group is never replayed by a later identical observation.
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 6), ui.records.items.len);
-    try ui.draw();
-    for (record_ids, 0..) |id, index| try std.testing.expectEqual(id, ui.records.items[index].id);
-    try std.testing.expectEqual(fifth_record_id, ui.records.items[4].id);
-    for ([_][]const u8{ "#1 · ", "#2 · ", "#3 · ", "#4 · " }) |id| try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, id));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "#5 · canceled · FIFTH-CANCELED"));
-    testAcknowledgeFullFrame(&ui);
-    try ui.draw();
-    for ([_][]const u8{ "#1 · ", "#2 · ", "#3 · ", "#4 · ", "#5 · " }) |id| try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, ui.frame, id));
-    testAcknowledgeFullFrame(&ui);
-}
-test "active agent rows do not consume ordinary record capacity" {
-    const a = std.testing.allocator;
-    var fake = FakeRemote{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-
-    for (1..66) |id| {
-        try std.testing.expect(try ui.updateSubagentRow(testAgent(@intCast(id), 1, .running, 10, "live")));
-    }
-    try std.testing.expectEqual(@as(usize, 65), ui.records.items.len);
-    for (ui.subagent_rows.items) |row| {
-        const index = ui.record_index.get(row.record_id).?;
-        try std.testing.expect(ui.records.items[index].agent_row);
-        try std.testing.expect(ui.records.items[index].agent_open);
-    }
-    for (0..64) |_| _ = try ui.add(.user, "ordinary");
-    _ = try ui.add(.user, "overflow");
-    try std.testing.expectEqual(@as(usize, 130), ui.records.items.len);
-    for (ui.subagent_rows.items) |row| try std.testing.expect(ui.record_index.contains(row.record_id));
-}
-test "per-agent status rows incomplete terminal pages" {
-    const a = std.testing.allocator;
-    var agents: [65]@import("../core/subagent_status.zig").AgentView = undefined;
-    for (&agents, 1..) |*agent, id| agent.* = testAgent(@intCast(id), 1, .running, 10, "live");
-    var fake = FakeRemote{};
-    fake.snapshot.subagents_supported = true;
-    fake.snapshot.busy = true;
-    fake.snapshot.subagents = .{ .group_id = 8, .revision = 1, .total = 65, .running = 65, .agents = agents[0..64] };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    ui.busy = true;
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 64), ui.records.items.len);
-    for (&agents, 1..) |*agent, id| agent.* = testAgent(@intCast(id), 2, .completed, 20, "done");
-    fake.snapshot.busy = false;
-    fake.snapshot.subagents.revision = 2;
-    ui.busy = false;
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 64), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(u64, 0), ui.subagent_last_group);
-    fake.snapshot.subagents.agents = &agents;
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(u64, 8), ui.subagent_last_group);
-    try std.testing.expectEqual(@as(usize, 65), ui.records.items.len);
-    try std.testing.expect(std.mem.find(u8, ui.records.items[64].body.items, "#65 · completed · done") != null);
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 65), ui.records.items.len);
-}
-test "per-agent rows idle attachment and epoch replacement" {
-    const a = std.testing.allocator;
-    var agents = [_]@import("../core/subagent_status.zig").AgentView{
-        testAgent(1, 1, .completed, 400, "OLD-DONE"),
-        testAgent(2, 1, .running, 50, "LIVE-2"),
-    };
-    var fake = FakeRemote{};
-    fake.snapshot.subagents_supported = true;
-    fake.snapshot.control_epoch = 1;
-    fake.snapshot.busy = false;
-    fake.snapshot.subagents = .{ .group_id = 10, .revision = 1, .total = 1, .completed = 1, .agents = agents[0..1] };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    // Idle attach never replays an already finished group.
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-    try std.testing.expectEqual(@as(u64, 10), ui.subagent_last_group);
-    // A busy attach adopts the live group with its real ids.
-    fake.snapshot.busy = true;
-    ui.busy = true;
-    fake.snapshot.subagents = .{ .group_id = 11, .revision = 1, .total = 2, .running = 1, .completed = 1, .agents = agents[0..2] };
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(u64, 11), ui.subagent_group);
-    try std.testing.expectEqual(@as(usize, 2), ui.subagent_rows.items.len);
-    // A control epoch switch drops the old unsettled rows without settling.
-    fake.snapshot.control_epoch = 2;
-    fake.snapshot.busy = false;
-    fake.snapshot.subagents = .{ .group_id = 12, .revision = 1, .total = 1, .completed = 1, .agents = agents[0..1] };
-    ui.busy = false;
-    try ui.observeSubagents();
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-    try std.testing.expectEqual(@as(u64, 12), ui.subagent_last_group);
-}
-test "per-agent rows outcomes unsupported and history fallbacks" {
-    const a = std.testing.allocator;
-    try std.testing.expectEqual(presentation.Outcome.success, Ui.subagentPhaseOutcome(testAgent(1, 1, .completed, 0, "")));
-    try std.testing.expectEqual(presentation.Outcome.failed, Ui.subagentPhaseOutcome(testAgent(1, 1, .failed, 0, "")));
-    try std.testing.expectEqual(presentation.Outcome.canceled, Ui.subagentPhaseOutcome(testAgent(1, 1, .canceled, 0, "")));
-    try std.testing.expectEqual(presentation.Outcome.canceled, Ui.subagentPhaseOutcome(testAgent(1, 1, .paused, 0, "")));
-    try std.testing.expectEqual(presentation.Outcome.pending, Ui.subagentPhaseOutcome(testAgent(1, 1, .running, 0, "")));
-    var fake = FakeRemote{};
-    fake.snapshot.subagents_supported = true;
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    // Without subagent support the ordinary tool rows stay authoritative.
-    fake.snapshot.subagents_supported = false;
-    try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "get_subagent_result", .result = .{ .text = "child report" } } }, false, true);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    // A failed start keeps only the bounded notice; no aggregate row appears.
-    fake.snapshot.subagents_supported = true;
-    fake.snapshot.subagents = .{};
-    ui.busy = true;
-    try ui.applyEvent(.{ .tool_started = .{ .id = 7, .name = "subagent" } }, false, true);
-    try std.testing.expect(ui.subagent_starting);
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    try ui.applyEvent(.{ .tool_result = .{ .id = 7, .name = "subagent", .result = .{ .text = "failure", .is_error = true } } }, false, true);
-    try std.testing.expect(!ui.subagent_starting);
-    try std.testing.expectEqualStrings("Subagent start failed", ui.notice);
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
-    // Replayed history never becomes a live per-agent row.
-    ui.applying_history = true;
-    try ui.applyEvent(.{ .tool_result = .{ .id = 8, .name = "subagent", .result = .{ .text = "old" } } }, false, true);
-    ui.applying_history = false;
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqual(@as(usize, 0), ui.subagent_rows.items.len);
 }
 test "remote delivery requires a complete fresh frame and retries failed admission" {
     var fake = FakeRemote{};

@@ -97,16 +97,6 @@ pub const EffortSet = struct {
     }
 };
 
-/// Composer busy-marker palette cadence, a multiple of the TUI's 40ms tick so
-/// every shade is painted for the same number of frames.
-const pulse_interval_ms: u64 = 160;
-
-/// Renderer-independent execution pulse shared by the composer busy marker
-/// and the running tool status slot.
-pub fn commandStep(now_ms: u64) usize {
-    return @intCast((now_ms / pulse_interval_ms) % 8);
-}
-
 /// Ping-pong execution flow: the band head advances one column per 40ms step,
 /// reverses at either row edge and travels back. The running tool row steps
 /// this clock once per 40ms frame, so the head moves exactly one cell per

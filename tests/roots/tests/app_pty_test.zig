@@ -571,9 +571,9 @@ const Driver = struct {
             // its reset may follow; no other escape or stray byte.
             const theme = @import("../ui/theme.zig");
             var expected_buffer: [128]u8 = undefined;
-            const expected_tail = std.fmt.bufPrint(&expected_buffer, "\n{s}thin --resume {s}{s}\n", .{ theme.success, id, theme.reset }) catch unreachable;
+            const expected_tail = std.fmt.bufPrint(&expected_buffer, "\n{s}thin --resume {s}{s}\n", .{ theme.muted, id, theme.reset }) catch unreachable;
             var translated_buffer: [128]u8 = undefined;
-            const translated_tail = std.fmt.bufPrint(&translated_buffer, "\r\n{s}thin --resume {s}{s}\r\n", .{ theme.success, id, theme.reset }) catch unreachable;
+            const translated_tail = std.fmt.bufPrint(&translated_buffer, "\r\n{s}thin --resume {s}{s}\r\n", .{ theme.muted, id, theme.reset }) catch unreachable;
             try check(std.mem.eql(u8, bytes[after_leave..], expected_tail) or std.mem.eql(u8, bytes[after_leave..], translated_tail));
             // Only validated immutable metadata leaves this capture buffer.
             std.debug.print("PTY_SESSION_ID={s}\n", .{id});

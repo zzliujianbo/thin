@@ -67,10 +67,7 @@ pub const Views = struct {
             defer plain.deinit(a);
             break :blk try presentation.withBackground(a, plain, metadata);
         } else plain;
-        const candidate = if (event.ready and event.subagent_progress != null) blk: {
-            defer base.deinit(a);
-            break :blk try presentation.subagentProgress(a, base, event.subagent_progress.?);
-        } else base;
+        const candidate = base;
         errdefer candidate.deinit(a);
         if (index) |i| {
             const entry = &self.entries.items[i];

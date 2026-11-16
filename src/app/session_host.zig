@@ -1215,26 +1215,9 @@ pub const SessionHost = struct {
             .codex_login = self.codexView(),
             .memory = state.memory,
             .background = state.background,
-            .subagents = state.subagents,
-            .subagents_supported = state.subagents_supported,
             .read_only = self.session.read_only,
             .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
         };
-    }
-
-    const SubagentPage = struct { next: u64, group: u64 };
-
-    fn pageSnapshot(snapshot: *protocol.Snapshot, requested: u64, group: ?u64) SubagentPage {
-        const view = &snapshot.subagents;
-        if (!snapshot.subagents_supported) return .{ .next = 0, .group = view.group_id };
-        const total = view.agents.len;
-        const start: usize = if (group != null and group.? != view.group_id) 0 else @intCast(@min(requested, total));
-        const aligned = if (start % 64 == 0 and (start < total or start == 0)) start else 0;
-        const end = @min(total, aligned + 64);
-        view.page_offset = aligned;
-        view.page_total = total;
-        view.agents = view.agents[aligned..end];
-        return .{ .next = if (end < total) end else 0, .group = view.group_id };
     }
 
     /// `snapshot` may carry `receipt:u64` to read the disposition of an earlier
@@ -1250,12 +1233,7 @@ pub const SessionHost = struct {
         // Inbox snapshot supplies the counts, the revision and the preview text.
         const queue = self.inbox.snapshot();
         var previews: [protocol.max_previews]protocol.QueuePreview = undefined;
-        const row_cursor = request.optionalU64("row_cursor") catch return errorReply(a, request.id, error.BadRequest);
-        const row_group = request.optionalU64("row_group") catch return errorReply(a, request.id, error.BadRequest);
-        if ((row_cursor == null) != (row_group == null)) return errorReply(a, request.id, error.BadRequest);
-        if (row_cursor) |cursor| if (cursor % 64 != 0) return errorReply(a, request.id, error.BadRequest);
-        var snapshot = self.snapshotFor(connection_id, &queue, previews[0..]);
-        _ = pageSnapshot(&snapshot, row_cursor orelse 0, row_group);
+        const snapshot = self.snapshotFor(connection_id, &queue, previews[0..]);
         try protocol.encodeSnapshot(&out, snapshot);
         const receipt_id = request.optionalU64("receipt") catch return errorReply(a, request.id, error.BadRequest);
         if (receipt_id) |id| {
@@ -1315,14 +1293,11 @@ pub const SessionHost = struct {
         codex: codex_login.View,
         memory: @import("../core/memory_status.zig").View = .{},
         background: background_status.View = .{},
-        subagents: @import("../core/subagent_status.zig").View = .{},
-        subagents_supported: bool = false,
-        subagent_rows_hash: u64 = 0,
 
         pub fn eql(left: WatchStamp, right: WatchStamp) bool {
             // sequence is a coverage watermark, not a snapshot invalidation.
             return left.revision == right.revision and
-                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.memory, right.memory) and std.meta.eql(left.background, right.background) and @import("../core/subagent_status.zig").View.eql(left.subagents, right.subagents) and left.subagent_rows_hash == right.subagent_rows_hash and left.subagents_supported == right.subagents_supported;
+                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.memory, right.memory) and std.meta.eql(left.background, right.background);
         }
     };
 
@@ -1389,17 +1364,6 @@ pub const SessionHost = struct {
     pub fn watchStamp(self: *SessionHost) WatchStamp {
         const queue = self.inbox.snapshot();
         const state = self.connection.current();
-        var subagents = state.subagents;
-        var hash = std.hash.Wyhash.init(0);
-        for (subagents.agents) |row| {
-            hash.update(std.mem.asBytes(&row.id));
-            hash.update(std.mem.asBytes(&row.revision));
-            hash.update(&.{@backingInt(row.phase)});
-            hash.update(std.mem.asBytes(&row.elapsed_ms));
-            hash.update(row.latestText());
-        }
-        const rows_hash = hash.final();
-        subagents.agents = &.{};
         return .{
             .sequence = self.next_seq -| 1,
             .revision = self.view_revision,
@@ -1408,9 +1372,6 @@ pub const SessionHost = struct {
             .codex = self.codexView(),
             .memory = state.memory,
             .background = state.background,
-            .subagents = subagents,
-            .subagent_rows_hash = rows_hash,
-            .subagents_supported = state.subagents_supported,
         };
     }
 
@@ -1418,12 +1379,6 @@ pub const SessionHost = struct {
     /// snapshot and baseline then describe the same display watermark. Each is
     /// independently bounded by max_response (not an oversized nested frame).
     pub fn watchSnapshot(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {
-        return (try self.watchSnapshotPage(a, id, epoch, 0, null)).frame;
-    }
-
-    pub const WatchSnapshotPage = struct { frame: []u8, next: u64, group: u64 };
-
-    pub fn watchSnapshotPage(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64, row_cursor: u64, row_group: ?u64) !WatchSnapshotPage {
         const control_id = try self.watchOwner(epoch);
         var out = protocol.Out.init(a);
         defer out.deinit();
@@ -1433,10 +1388,9 @@ pub const SessionHost = struct {
         try out.field("through", self.next_seq -| 1);
         const queue = self.inbox.snapshot();
         var previews: [protocol.max_previews]protocol.QueuePreview = undefined;
-        var snapshot = self.snapshotFor(control_id, &queue, &previews);
-        const page = pageSnapshot(&snapshot, row_cursor, row_group);
+        const snapshot = self.snapshotFor(control_id, &queue, &previews);
         try protocol.encodeSnapshot(&out, snapshot);
-        return .{ .frame = try replyFrame(&out), .next = page.next, .group = page.group };
+        return try replyFrame(&out);
     }
 
     pub fn watchBaseline(self: *SessionHost, a: std.mem.Allocator, id: u64, epoch: u64) ![]u8 {

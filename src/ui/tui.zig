@@ -82,12 +82,6 @@ const Kind = enum { user, assistant, reasoning, tool, notice };
 /// Conversation-only notice severity. Red/yellow never reach the footer.
 const NoticeLevel = enum { plain, success, warning, failure };
 
-/// 对话区中的一条显示记录。body 保存原始 UTF-8 文本；渲染结果缓存在 cache 的 arena 中。
-const AgentRow = struct {
-    view: @import("../core/subagent_status.zig").AgentView,
-    record_id: u64,
-};
-
 const Record = struct {
     id: u64 = 0,
     stream_generation: u64 = 0,
@@ -100,7 +94,7 @@ const Record = struct {
     /// Memory saved result) opt in; every other notice keeps paragraph
     /// rendering so no real failure text is ever cut away.
     single_row: bool = false,
-    /// Leading status marker bytes that keep their own colour (e.g. `M: ✓`).
+    /// Leading status marker bytes that keep their own colour.
     /// Zero colours the whole row with the notice severity.
     notice_marker_len: usize = 0,
     /// Measured task aggregate rendered as one separate muted notice row. Kept
@@ -111,8 +105,6 @@ const Record = struct {
     notice_files_edited: u32 = 0,
     /// Compact completion caption; explicit local output uses a separate plain record.
     command_row: bool = false,
-    agent_row: bool = false,
-    agent_open: bool = false,
     /// Measured wall-clock execution time of this row; null when unobserved.
     duration_ms: ?u64 = null,
     /// Raw failure detail rendered as one extra row below a failed command.
@@ -605,8 +597,6 @@ pub const Connection = struct {
         memory_auto: bool = true,
         memory: @import("../core/memory_status.zig").View = .{},
         background: background_status.View = .{},
-        subagents: @import("../core/subagent_status.zig").View = .{},
-        subagents_supported: bool = false,
         /// Owner-published proxy host/port availability; never inferred or guessed.
         proxy_configured: bool = false,
         /// Owner-published bare host (IPv6 without brackets); null means none.
@@ -1075,17 +1065,7 @@ const Ui = struct {
     fast_step: u64 = 0,
     fast_next_ms: u64 = 0,
     display: shared.State = .{},
-    active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64, display_key: ?p.ToolDisplayKey = null, grouped: bool = false } = null,
-    /// Group id of the rows below; the owner's group scalars are never copied
-    /// beyond what this display needs to order groups.
-    subagent_group: u64 = 0,
-    subagent_last_group: u64 = 0,
-    subagent_epoch: u64 = 0,
-    subagent_starting: bool = false,
-    /// One display row per real subagent id, in first-seen order. These are
-    /// Ui-owned value copies of the owner's borrowed AgentView entries; the
-    /// owner's slice is never retained past one observation.
-    subagent_rows: std.ArrayList(AgentRow) = .empty,
+    active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64, display_key: ?p.ToolDisplayKey = null } = null,
     applying_history: bool = false,
     /// This view published the restored-conversation transcript banner. Its
     /// byte-identical footer hint / settings notice stays suppressed even if
@@ -1198,7 +1178,6 @@ const Ui = struct {
         self.clearToolCaptions();
         self.tool_calls.deinit(self.allocator);
         self.tool_views.deinit(self.allocator);
-        self.subagent_rows.deinit(self.allocator);
         self.discardFrameRecords(self.frame_records);
         self.frame_records = &.{};
         if (self.frame_arena) |*arena| arena.deinit();
@@ -2193,11 +2172,6 @@ const Ui = struct {
         // Do not adopt the new epoch or destroy the old display until both
         // operations succeed.
         self.clearPermission();
-        self.clearSubagentRows();
-        self.subagent_group = 0;
-        self.subagent_last_group = if (snapshot.busy) 0 else snapshot.subagents.group_id;
-        self.subagent_epoch = snapshot.control_epoch;
-        self.subagent_starting = false;
         self.discardResizedFrame();
         self.frame_permission = null;
         self.frame_fresh = false;
@@ -2655,14 +2629,14 @@ const Ui = struct {
     }
 
     fn add(self: *Ui, kind: Kind, data: []const u8) !usize {
-        return self.addRecord(kind, data, false);
+        return self.addRecord(kind, data);
     }
 
-    fn addRecord(self: *Ui, kind: Kind, data: []const u8, is_agent_row: bool) !usize {
+    fn addRecord(self: *Ui, kind: Kind, data: []const u8) !usize {
         // Prepare every fallible part before publishing an id.
         // A failed body allocation owns no display row.
         try self.reserveRecord();
-        var prepared = Record{ .kind = kind, .agent_row = is_agent_row };
+        var prepared = Record{ .kind = kind };
         errdefer prepared.deinit(self.allocator);
         if (kind == .reasoning) try prepared.attachTail(self.allocator, @max(1, self.size.columns -| 1));
         try prepared.append(self.allocator, data);
@@ -2732,137 +2706,6 @@ const Ui = struct {
             }
         }
         return presentation.fromCall(self.allocator, call);
-    }
-
-    fn isSubagentTool(name: []const u8) bool {
-        return std.mem.eql(u8, name, "subagent") or std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "send_subagent_message") or std.mem.eql(u8, name, "cancel_subagent");
-    }
-
-    fn groupTools(self: *Ui) bool {
-        const state = self.connection.current();
-        // Individual per-agent rows are the only representation of children.
-        // Without that capability the ordinary tool rows stay authoritative.
-        return !self.applying_history and state.subagents_supported and (state.available or state.runtime != null);
-    }
-
-    fn subagentPhaseOutcome(agent: @import("../core/subagent_status.zig").AgentView) presentation.Outcome {
-        if (agent.active()) return .pending;
-        return switch (agent.phase) {
-            .completed => .success,
-            .failed => .failed,
-            .canceled, .paused => .canceled,
-            .starting, .running, .waiting => .pending,
-        };
-    }
-
-    /// `#<id> · <phase> · <latest text>`; the id is the real child id, so no
-    /// placeholder row can exist without one.
-    fn subagentAgentLabel(a: std.mem.Allocator, agent: @import("../core/subagent_status.zig").AgentView) ![]const u8 {
-        const phase = @tagName(agent.phase);
-        const detail = try presentation.singleLine(a, agent.latestText(), 256);
-        defer a.free(detail);
-        if (detail.len == 0) return std.fmt.allocPrint(a, "#{d} · {s}", .{ agent.id, phase });
-        return std.fmt.allocPrint(a, "#{d} · {s} · {s}", .{ agent.id, phase, detail });
-    }
-
-    fn subagentRowsVisible(self: *const Ui) bool {
-        return self.subagent_rows.items.len != 0 or self.subagent_starting;
-    }
-
-    fn subagentRowsPending(self: *const Ui) bool {
-        for (self.subagent_rows.items) |row| if (subagentPhaseOutcome(row.view) == .pending) return true;
-        return false;
-    }
-
-    fn clearSubagentRows(self: *Ui) void {
-        for (self.subagent_rows.items) |row| {
-            if (self.record_index.get(row.record_id)) |index| {
-                if (!self.records.items[index].output) self.removeRecord(index);
-            }
-        }
-        self.subagent_rows.clearRetainingCapacity();
-    }
-
-    fn updateSubagentRow(self: *Ui, agent: @import("../core/subagent_status.zig").AgentView) !bool {
-        for (self.subagent_rows.items) |*row| {
-            if (row.view.id != agent.id) continue;
-            if (agent.revision < row.view.revision or std.meta.eql(row.view, agent)) return false;
-            const index = self.record_index.get(row.record_id) orelse return false;
-            if (self.records.items[index].output) return false;
-            const label = try subagentAgentLabel(self.allocator, agent);
-            defer self.allocator.free(label);
-            var replacement = Record{ .kind = .tool, .id = row.record_id, .stream_generation = self.records.items[index].stream_generation +% 1, .agent_row = true, .agent_open = agent.active() };
-            errdefer replacement.deinit(self.allocator);
-            try replacement.setCommand(self.allocator, .{ .kind = .subagent, .label = label }, subagentPhaseOutcome(agent), agent.elapsed_ms);
-            self.records.items[index].deinit(self.allocator);
-            self.records.items[index] = replacement;
-            row.view = agent;
-            return true;
-        }
-        try self.subagent_rows.ensureUnusedCapacity(self.allocator, 1);
-        const index = try self.addRecord(.tool, "", true);
-        errdefer self.removeRecord(index);
-        const label = try subagentAgentLabel(self.allocator, agent);
-        defer self.allocator.free(label);
-        const record = &self.records.items[index];
-        try record.setCommand(self.allocator, .{ .kind = .subagent, .label = label }, subagentPhaseOutcome(agent), agent.elapsed_ms);
-        record.agent_open = agent.active();
-        self.subagent_rows.appendAssumeCapacity(.{ .view = agent, .record_id = record.id });
-        self.subagent_starting = false;
-        return true;
-    }
-
-    fn finishSubagentRows(self: *Ui) !void {
-        self.subagent_rows.clearRetainingCapacity();
-        self.subagent_last_group = @max(self.subagent_last_group, self.subagent_group);
-    }
-
-    fn observeSubagents(self: *Ui) !void {
-        const state = self.connection.current();
-        const view = state.subagents;
-        if (!state.subagents_supported or (!state.available and state.runtime == null)) {
-            const had_row = self.subagentRowsVisible();
-            self.clearSubagentRows();
-            self.subagent_group = 0;
-            self.subagent_starting = false;
-            if (had_row) self.requestDraw();
-            return;
-        }
-        var changed = false;
-        if (self.subagent_epoch != state.control_epoch) {
-            // Switching control does not settle the old root's mutable rows.
-            changed = self.subagentRowsVisible();
-            self.subagent_epoch = state.control_epoch;
-            self.subagent_last_group = if (state.busy) 0 else view.group_id;
-            self.clearSubagentRows();
-            self.subagent_group = 0;
-            self.subagent_starting = false;
-        }
-        if (view.group_id != 0 and view.group_id > self.subagent_last_group) {
-            if (view.group_id > self.subagent_group) {
-                // A different root owns the new ids; unsettled old rows are not
-                // ours to settle, and a finished group is never replayed.
-                changed = changed or self.subagentRowsVisible();
-                self.clearSubagentRows();
-                self.subagent_group = view.group_id;
-            }
-            // Borrowed for this observation only; each row keeps a value copy.
-            for (view.agents) |agent| {
-                if (agent.id == 0) continue;
-                if (try self.updateSubagentRow(agent)) changed = true;
-            }
-        }
-        if (!self.busy and !self.presentationWaiting() and !self.remote_terminal_wait) {
-            if (self.subagent_starting and self.subagent_rows.items.len == 0) {
-                self.subagent_starting = false;
-                changed = true;
-            }
-            if (self.subagent_rows.items.len != 0 and view.group_id == self.subagent_group and view.agents.len >= view.total and !self.subagentRowsPending()) {
-                try self.finishSubagentRows();
-                changed = true;
-            }
-        }
-        if (changed) self.requestDraw();
     }
 
     fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution, local: bool) !void {
@@ -3040,30 +2883,8 @@ const Ui = struct {
             }
         }
         if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; /exit and reconnect";
-        // Active/queued Memory has an independent persistent status. Its
-        // terminal results are conversation notices and never return here.
-        // The row is one braille frame plus, when waiting work exists, exactly
-        // the queued count (the active job is never counted twice). The frame
-        // comes from the shared 40 ms animation clock; nothing here schedules
-        // a refresh of its own.
-        if (self.permission == null and !self.stop_open and state.memory.enabled and
-            (state.memory.active != null or state.memory.queued_count != 0))
-        {
-            const spinner = activity.spinner(self.clock_ms);
-            const memory_text = if (state.memory.queued_count != 0)
-                try std.fmt.allocPrint(a, "M: {s} +{d}", .{ spinner, state.memory.queued_count })
-            else
-                try std.fmt.allocPrint(a, "M: {s}", .{spinner});
-            notice = if (notice.len == 0) memory_text else try std.fmt.allocPrint(a, "{s} | {s}", .{ notice, memory_text });
-        }
-        if (self.permission == null and !self.stop_open and state.background.active_count != 0) {
-            const spinner = activity.spinner(self.clock_ms);
-            const background_text = if (state.background.active_count > 1)
-                try std.fmt.allocPrint(a, "B: {s} {d}", .{ spinner, state.background.active_count })
-            else
-                try std.fmt.allocPrint(a, "B: {s}", .{spinner});
-            notice = if (notice.len == 0) background_text else try std.fmt.allocPrint(a, "{s} | {s}", .{ notice, background_text });
-        }
+        // Memory and background activity are rendered in the separate
+        // activity row below, not mixed into the actionable notice line.
         if (notice.len == 0) if (state.pending_default_effort) |effort| {
             notice = try std.fmt.allocPrint(a, "Default thinking: {s}; awaiting model capabilities", .{effort.name() orelse "unknown"});
         };
@@ -3079,6 +2900,47 @@ const Ui = struct {
             }
         }
         return notice;
+    }
+
+    /// Activity row: memory then background, immediately above the composer.
+    /// The spinner is a foreground cue; when the foreground is idle, only
+    /// static counts remain.
+    fn activityLine(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
+        if (self.permission != null or self.stop_open) return "";
+        const foreground = self.workingOnTask();
+        const spinner = activity.spinner(self.clock_ms);
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(a);
+        if (state.memory.enabled and (state.memory.active != null or state.memory.queued_count != 0)) {
+            if (foreground) {
+                const part = if (state.memory.queued_count != 0)
+                    try std.fmt.allocPrint(a, "memory: {s} +{d}", .{ spinner, state.memory.queued_count })
+                else
+                    try std.fmt.allocPrint(a, "memory: {s}", .{spinner});
+                try parts.append(a, part);
+            } else if (state.memory.active != null) {
+                const part = if (state.memory.queued_count != 0)
+                    try std.fmt.allocPrint(a, "memory: 1 +{d}", .{state.memory.queued_count})
+                else
+                    try a.dupe(u8, "memory: 1");
+                try parts.append(a, part);
+            } else {
+                try parts.append(a, try std.fmt.allocPrint(a, "memory: +{d}", .{state.memory.queued_count}));
+            }
+        }
+        if (state.background.active_count != 0) {
+            if (foreground) {
+                const part = if (state.background.active_count > 1)
+                    try std.fmt.allocPrint(a, "background: {s} {d}", .{ spinner, state.background.active_count })
+                else
+                    try std.fmt.allocPrint(a, "background: {s}", .{spinner});
+                try parts.append(a, part);
+            } else {
+                try parts.append(a, try std.fmt.allocPrint(a, "background: {d}", .{state.background.active_count}));
+            }
+        }
+        if (parts.items.len == 0) return "";
+        return std.mem.join(a, " · ", parts.items);
     }
 
     fn footerHint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
@@ -3370,9 +3232,7 @@ const Ui = struct {
             },
             .tool_started => |tool| {
                 self.clearActiveTool();
-                const grouped = self.groupTools() and isSubagentTool(tool.name);
-                if (grouped and std.mem.eql(u8, tool.name, "subagent")) self.subagent_starting = true;
-                self.active_tool = .{ .id = tool.id, .caption = try self.executionCaption(tool.name, tool.display_key), .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key, .grouped = grouped };
+                self.active_tool = .{ .id = tool.id, .caption = try self.executionCaption(tool.name, tool.display_key), .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key };
                 self.fast_step = 0;
                 self.fast_next_ms = self.clock_ms +| flow_interval_ms;
             },
@@ -3387,24 +3247,14 @@ const Ui = struct {
                     if (active.id == tool.id) {
                         // Both events may arrive in one UI tick; use the worker's
                         // measured result, never queue-drain time as execution time.
-                        if (!active.grouped) {
-                            try self.toolCompleted(active.caption, tool.result, local);
-                        } else if (self.subagent_starting and (tool.result.is_error or tool.result.canceled)) {
-                            self.subagent_starting = false;
-                            self.notice = "Subagent start failed";
-                        }
+                        try self.toolCompleted(active.caption, tool.result, local);
                         if (active.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                         self.clearActiveTool();
                     }
                 } else {
                     const caption = try self.executionCaption(tool.name, tool.display_key);
                     defer caption.deinit(self.allocator);
-                    if (!(self.groupTools() and isSubagentTool(tool.name))) {
-                        try self.toolCompleted(caption, tool.result, local);
-                    } else if (std.mem.eql(u8, tool.name, "subagent") and self.subagent_starting and (tool.result.is_error or tool.result.canceled)) {
-                        self.subagent_starting = false;
-                        self.notice = "Subagent start failed";
-                    }
+                    try self.toolCompleted(caption, tool.result, local);
                     if (tool.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                 }
                 if (local) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
@@ -3435,18 +3285,6 @@ const Ui = struct {
             .tool_preview => {},
             .tool_view => |view| {
                 try self.tool_views.upsert(self.allocator, view);
-                if (view.ready and view.subagent_progress != null) {
-                    if (self.active_tool) |*active| if (active.display_key) |identity| {
-                        if (identity.eql(view.key)) if (self.tool_views.get(view.key)) |entry| {
-                            if (entry.ready and (entry.caption.kind == .subagent or entry.caption.kind == .subagent_id)) {
-                                var replacement = entry.caption;
-                                replacement.label = try self.allocator.dupe(u8, entry.caption.label);
-                                active.caption.deinit(self.allocator);
-                                active.caption = replacement;
-                            }
-                        };
-                    };
-                }
             },
             .tool_views => |stream| switch (stream.phase) {
                 .begin => self.tool_views.begin(self.allocator, stream.generation),
@@ -5788,7 +5626,7 @@ const Ui = struct {
         return switch (result.status) {
             .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
-            .paused => if (result.model_failure == .output_limit or r.policyPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
+            .paused => if (result.model_failure == .output_limit or r.inputBudgetPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
             .failed => "Failed",
         };
     }
@@ -5797,7 +5635,7 @@ const Ui = struct {
     /// foreground `notice` field. Publication failure inserts no record and
     /// leaves every caller-owned receipt unchanged.
     fn appendNotice(self: *Ui, level: NoticeLevel, message: []const u8) !void {
-        const index = try self.addRecord(.notice, message, false);
+        const index = try self.addRecord(.notice, message);
         self.records.items[index].notice_level = level;
     }
 
@@ -5809,9 +5647,9 @@ const Ui = struct {
     fn formatMemoryTerminal(terminal: memory_status.Terminal, buffer: []u8) ?struct { level: NoticeLevel, text: []const u8, marker_len: usize } {
         if (terminal.result == .skipped) return null;
         const label: []const u8 = switch (terminal.result) {
-            .saved => "M: \u{2713}",
-            .failed, .uncertain => "M: \u{2717}",
-            .canceled => "M: canceled",
+            .saved => "memory: \u{2713}",
+            .failed, .uncertain => "memory: \u{2717}",
+            .canceled => "memory: canceled",
             .skipped => return null,
         };
         const level: NoticeLevel = switch (terminal.result) {
@@ -5844,7 +5682,7 @@ const Ui = struct {
     fn appendMemoryCompletion(self: *Ui, terminal: memory_status.Terminal) !void {
         var buffer: [640]u8 = undefined;
         const formatted = formatMemoryTerminal(terminal, &buffer) orelse return;
-        const index = try self.addRecord(.notice, formatted.text, false);
+        const index = try self.addRecord(.notice, formatted.text);
         self.records.items[index].notice_level = formatted.level;
         self.records.items[index].notice_marker_len = formatted.marker_len;
         // Only the saved confirmation is guaranteed one physical row. Failure,
@@ -5883,10 +5721,10 @@ const Ui = struct {
             status;
         const command = terminal.command.slice();
         const message = if (std.mem.eql(u8, command, "[command hidden]"))
-            try std.fmt.bufPrint(&buffer, "B: {s} {s} {s} · {d}ms", .{ detail, terminal.id.slice(), command, terminal.duration_ms })
+            try std.fmt.bufPrint(&buffer, "background: {s} {s} {s} · {d}ms", .{ detail, terminal.id.slice(), command, terminal.duration_ms })
         else
-            try std.fmt.bufPrint(&buffer, "B: {s} {s} · {d}ms", .{ detail, command, terminal.duration_ms });
-        const index = try self.addRecord(.notice, message, false);
+            try std.fmt.bufPrint(&buffer, "background: {s} {s} · {d}ms", .{ detail, command, terminal.duration_ms });
+        const index = try self.addRecord(.notice, message);
         self.records.items[index].notice_level = if (terminal.result == .success) .plain else if (terminal.result == .canceled and terminal.failure != .cleanup) .warning else .failure;
         self.records.items[index].single_row = true;
     }
@@ -5969,7 +5807,7 @@ const Ui = struct {
         if (result.status == .success and result.duration_ms == null) return true;
         // Ordinary round-limit pauses already have user-facing wording; do not
         // expose their internal error name. Policy and output pauses keep detail.
-        if (result.status == .paused and result.model_failure != .output_limit and !r.policyPause(result.detail)) {
+        if (result.status == .paused and result.model_failure != .output_limit and !r.inputBudgetPause(result.detail)) {
             var concise: std.Io.Writer.Allocating = .init(self.allocator);
             defer concise.deinit();
             concise.writer.writeAll(terminalNotice(result)) catch return false;
@@ -5999,7 +5837,7 @@ const Ui = struct {
     /// Embedding SGR bytes in the body would make the plain-text sanitizer
     /// render garbage.
     fn appendTerminalNotice(self: *Ui, level: NoticeLevel, message: []const u8, result: r.Terminal) bool {
-        const index = self.addRecord(.notice, message, false) catch return false;
+        const index = self.addRecord(.notice, message) catch return false;
         self.records.items[index].notice_level = level;
         self.records.items[index].notice_duration_ms = result.duration_ms;
         self.records.items[index].notice_tool_calls = result.tool_calls;
@@ -6334,7 +6172,7 @@ const Ui = struct {
     fn idlePolling(self: *const Ui) bool {
         return !self.dirty and !self.busy and self.future == null and !self.presentationWaiting() and
             !self.remoteSynchronizing() and self.mode == null and self.active_tool == null and
-            !self.memoryAnimating() and !self.backgroundAnimating() and self.deferred_submit == null and !self.resize_waiting;
+            self.deferred_submit == null and !self.resize_waiting;
     }
 
     /// Base wait before cadence/animation alignment. Idle sleeps are longer but
@@ -6368,28 +6206,12 @@ const Ui = struct {
             !self.busy and !self.presentationWaiting() and !self.remoteSynchronizing() and self.mode == null and self.active_tool == null;
     }
 
-    /// Active or queued Memory keeps its own neutral animated footer row even
-    /// while the main task is idle. Read-only owner snapshot; it neither polls
-    /// nor schedules anything, so the ordinary tick owns the cadence.
-    fn memoryAnimating(self: *const Ui) bool {
-        if (self.permission != null or self.stop_open or self.secret_mode or self.secret_quarantine or
-            self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible()) return false;
-        const memory = self.connection.current().memory;
-        return memory.enabled and (memory.active != null or memory.queued_count != 0);
-    }
-
-    fn backgroundAnimating(self: *const Ui) bool {
-        if (self.permission != null or self.stop_open or self.secret_mode or self.secret_quarantine or
-            self.settings_open or self.provider_open or self.model_picker != null or self.commandMenuVisible()) return false;
-        return self.connection.current().background.active_count != 0;
-    }
-
     /// The dedicated animation slot. The running tool band owns it first;
     /// otherwise the streaming model label does. Null means only the shared
     /// 40ms tick is animating. Both owners step the same frame-counted phase
     /// once per due frame, so a late loop slows the motion instead of skipping.
     fn fastInterval(self: *const Ui) ?u64 {
-        if (self.active_tool) |tool| if (!tool.grouped) return flow_interval_ms;
+        if (self.active_tool != null) return flow_interval_ms;
         if (!self.composerMounted() or !self.workingOnTask()) return null;
         const view = self.display.view(self.clock_ms);
         if (!view.streaming) return null;
@@ -6408,11 +6230,10 @@ const Ui = struct {
             !self.settings_open and !self.provider_open and self.model_picker == null;
     }
 
-    /// Any animation owner: working task, tool row or mode (the fast slot's
-    /// sources) plus memory/background progress. Memory rotates on the same
-    /// 40ms tick and dirty-draw path as a running task.
+    /// Only a foreground task animates. Background memory/background activity
+    /// is rendered as static counts while the composer is idle.
     fn animationActive(self: *const Ui) bool {
-        return self.workingOnTask() or self.memoryAnimating() or self.backgroundAnimating();
+        return self.workingOnTask();
     }
 
     fn animate(self: *Ui) void {
@@ -6439,7 +6260,7 @@ const Ui = struct {
         // A static pending preview needs no spinner-only repaint. Real events,
         // input and tool timing retain their normal independent draw requests.
         const queue = self.queueSnapshot();
-        if (self.permission == null and (queue.preview_count == 0 or self.active_tool != null or self.memoryAnimating() or self.backgroundAnimating())) self.dirty = true;
+        if (self.permission == null and (queue.preview_count == 0 or self.active_tool != null)) self.dirty = true;
     }
 
     /// 主事件循环：有界消费、处理按键，然后绘制最新状态；仅动画自身限频。
@@ -6479,7 +6300,6 @@ const Ui = struct {
 
             self.refreshStop();
             self.pollMetadata();
-            try self.observeSubagents();
             self.observeCodexLogin();
             const dimensions = self.terminal.size();
             self.resize(dimensions);
@@ -7278,18 +7098,10 @@ const Ui = struct {
         var canonical_output = false;
         var transcript_rows: usize = 0;
         var previous_kind: ?Kind = scan.previous_kind;
-        var hold_from: ?usize = null;
-        for (self.records.items[scan.start..], scan.start..) |record, index| {
-            if (record.agent_row and record.agent_open and !record.output) {
-                hold_from = index;
-                break;
-            }
-        }
         for (self.records.items[scan.start..], scan.start..) |*record, index| {
             if (@import("builtin").is_test) self.draw_record_visits += 1;
             if (record.kind == .reasoning) continue;
             const drafting = self.draft == index;
-            const held = if (hold_from) |first| index >= first else false;
             if (record.output and !drafting) {
                 previous_kind = record.kind;
                 continue;
@@ -7315,7 +7127,7 @@ const Ui = struct {
             if (!stream_record and record.flow_prefix != null) {
                 if (record.flowMatches(@max(1, cols))) {
                     prefix = record.flow_prefix.?.rowCount();
-                } else if (!held and self.permission == null and (!drafting or flow_allowed)) {
+                } else if (self.permission == null and (!drafting or flow_allowed)) {
                     // Do not clear/replay native history as Pi's regular renderer
                     // can do. A revised/reflowed preview is explicitly superseded.
                     try putToneLine(writer, a, 1, "Response revised — earlier stream preview above", cols, theme.muted);
@@ -7327,14 +7139,13 @@ const Ui = struct {
             // An approval is a reversible overlay, not a transcript advance.
             // Defer unseen canonical rows until it closes; otherwise opening a
             // full-height preview can scroll away the context it must restore.
-            const finalized = cols >= 8 and !record.output and !drafting and !held and self.permission == null;
-            if (held) prefix = 0;
+            const finalized = cols >= 8 and !record.output and !drafting and self.permission == null;
             var stop = prefix;
             if (stream_record) {
-                stop = if (finalized) record.stream.?.releaseLimit(record.stream.?.visibleRows().len) else if (drafting and flow_allowed and !held) record.stream.?.releaseLimit(record.lines.len -| mutable_rows) else 0;
+                stop = if (finalized) record.stream.?.releaseLimit(record.stream.?.visibleRows().len) else if (drafting and flow_allowed) record.stream.?.releaseLimit(record.lines.len -| mutable_rows) else 0;
                 record.pending_stream_rows = stop;
             } else {
-                if (drafting and flow_allowed and !held) {
+                if (drafting and flow_allowed) {
                     const wanted = @max(prefix, record.lines.len -| mutable_rows);
                     if (wanted > prefix and try record.stageFlow(self.allocator, wanted)) stop = wanted;
                 }
@@ -7378,7 +7189,7 @@ const Ui = struct {
             frame_record.tail_line_start = lines.items.len;
             if (stream_record and record.lines.len == 0 and flow_allowed and record.stream.?.hasMetadataProgress())
                 frame_record.metadata_staged = true;
-            if (drafting or held or (finalized and stream_record and record.stream.?.limit != .none)) {
+            if (drafting or (finalized and stream_record and record.stream.?.limit != .none)) {
                 const begin = prefix;
                 if (begin == 0 and !(stream_record and record.stream_written != 0)) {
                     if (previous_kind) |prior| if (prior != .tool or record.kind != .tool) try lines.append(a, "");
@@ -7393,7 +7204,7 @@ const Ui = struct {
                 try lines.appendSlice(a, record.lines[begin..]);
                 // A finalized limited stream's tail is only a diagnostic, not
                 // proof that its retained source was completely delivered.
-                frame_record.tail_rows = if (drafting or held) lines.items.len - frame_record.tail_line_start else 0;
+                frame_record.tail_rows = if (drafting) lines.items.len - frame_record.tail_line_start else 0;
                 if (begin != 0 or (stream_record and record.stream_written != 0)) flow_continuation = true;
             }
             // Display proof candidates, captured while this frame's render is
@@ -7440,11 +7251,10 @@ const Ui = struct {
                 };
                 const view_end = @min(self.tool_views.entries.items.len, view_start + view_limit);
                 for (self.tool_views.entries.items[view_start..view_end]) |entry| {
-                    if (self.groupTools() and (entry.caption.kind == .subagent or entry.caption.kind == .subagent_id)) continue;
                     const running = if (self.active_tool) |active| if (active.display_key) |identity| identity.eql(entry.key) else false else false;
                     try lines.append(a, if (running) try self.pendingCommand(a, @max(1, cols)) else try self.waitingCommand(a, entry, @max(1, cols)));
                 }
-                if (detached_active and !(self.active_tool.?.grouped)) try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
+                if (detached_active) try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
             }
         }
         const thinking = if (self.show_reasoning and self.draft == null and self.tool_views.entries.items.len == 0 and self.active_tool == null) self.reasoning else null;
@@ -7480,17 +7290,19 @@ const Ui = struct {
         // notices, but do not repeat the stop confirmation or queue summary.
         const modal_hint = if (modal_text != null) try self.hint(a, state) else "";
         const hint_line = if (modal_text == null) try self.footerHint(a, state) else if (std.mem.eql(u8, modal_hint, "Confirm stop")) "" else modal_hint;
+        const activity_line = if (modal_text == null) try self.activityLine(a, state) else "";
+        const status_rows: usize = @as(usize, @intFromBool(hint_line.len != 0)) + @as(usize, @intFromBool(activity_line.len != 0));
         // Normal output keeps its empty gap; acknowledged shell-like idle
         // lines instead keep a single-row composer without extra redraw scroll.
-        const hint_hash = std.hash.Wyhash.hash(0, hint_line);
+        const hint_hash = std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, hint_line), activity_line);
         // Idle release keeps the one-row composer only while the hint it would
         // hide is exactly the one already ACKed. A newly published diagnostic
         // therefore keeps its own row instead of being dismissed by this Enter.
-        const compact = (release_idle and !self.idle_notice_barrier and self.tail_hint_hash == hint_hash) or
+        const compact = activity_line.len == 0 and ((release_idle and !self.idle_notice_barrier and self.tail_hint_hash == hint_hash) or
             ((self.compact_composer and self.compact_hint_hash == hint_hash) and
                 !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
                 !self.provider_open and !self.codex_open and self.resume_picker == null and self.model_picker == null and !self.commandMenuVisible() and
-                !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1);
+                !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1));
         // The separator row is footprint, so it exists only while there is
         // something above it to separate: mutable body, an approval/secret
         // panel, pending reasoning, a candidate/menu popup, or canonical rows
@@ -7509,8 +7321,8 @@ const Ui = struct {
         const body_present = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or
             self.permission != null or self.secret_mode or thinking != null or popup_requested;
         const separator: usize = @intFromBool(!compact and body_present and modal_text == null);
-        const exit_separator = separator != 0 and hint_line.len == 0;
-        const footer_rows: usize = if (compact) 1 else composer_rows + separator + @as(usize, @intFromBool(hint_line.len != 0));
+        const exit_separator = separator != 0 and status_rows == 0;
+        const footer_rows: usize = if (compact) 1 else composer_rows + separator + status_rows;
         const body_limit = self.size.rows -| footer_rows;
         const candidate_limit = body_limit -| 1; // Separate candidates from conversation even in short windows.
         const model_state = state;
@@ -7558,7 +7370,7 @@ const Ui = struct {
         }
         // A genuine hint occupies one of the three rows immediately above the
         // question; never let it push the plain preview farther away.
-        const preview_limit = @as(usize, 3) - @intFromBool(hint_line.len != 0);
+        const preview_limit = @as(usize, 3) -| status_rows;
         const preview_count = if (modal_text != null and self.permission != null and !self.stop_open) @min(@min(preview_limit, candidate_limit), approval_lines.lines.len) else 0;
         const preview_start = @min(self.permission_scroll, approval_lines.lines.len -| preview_count);
         const preview = approval_lines.lines[preview_start .. preview_start + preview_count];
@@ -7632,7 +7444,7 @@ const Ui = struct {
             self.resume_picker != null or self.model_picker != null or (self.permission == null and queue_snapshot.preview_count != 0);
         const normal_body_present = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or
             self.permission != null or self.secret_mode or thinking != null or normal_popup;
-        const normal_footer = if (!root_menu) footer_rows else if (normal_compact) @as(usize, 1) else composer_rows + @as(usize, @intFromBool(normal_body_present)) + @as(usize, @intFromBool(hint_line.len != 0));
+        const normal_footer = if (!root_menu) footer_rows else if (normal_compact) @as(usize, 1) else composer_rows + @as(usize, @intFromBool(normal_body_present)) + status_rows;
         const normal_content = normal_footer + @min(self.size.rows -| normal_footer, borrowed.len + lines.items.len);
         const normal_baseline = @max(normal_content, @max(normal_footer, (old_normal -| transcript_rows) +| borrow_count));
         self.frame_menu_extra = if (self.natural_flow and root_menu) rows -| normal_baseline else 0;
@@ -7798,8 +7610,13 @@ const Ui = struct {
 
             // Keep the existing separator above the hint, never between the
             // hint and the first composer row. With no hint it remains the gap.
-            if (!compact and separator != 0) try putLine(writer, a, rows - composer_rows - @intFromBool(hint_line.len != 0), "", cols);
-            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - composer_rows, hint_line, cols, theme.muted);
+            if (!compact and separator != 0) try putLine(writer, a, rows - composer_rows - status_rows, "", cols);
+            if (!compact and hint_line.len != 0) try putToneLine(writer, a, rows - composer_rows - @intFromBool(activity_line.len != 0), hint_line, cols, theme.muted);
+            if (!compact and activity_line.len != 0) {
+                const spinner = activity.spinner(self.clock_ms);
+                const spinner_tone = theme.command_pulse[(self.clock_ms / 80) % theme.command_pulse.len];
+                try putActivityLine(writer, a, rows - composer_rows, activity_line, cols, spinner, spinner_tone);
+            }
 
             const cursor = try self.drawComposer(&tail_out, a, cols, rows, composer_rows, prepared, modal_text != null);
             cursor_offset = cursor.offset;
@@ -8088,6 +7905,37 @@ fn putInputLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, prefix: []
 
 fn putLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize) !void {
     try putToneLine(writer, a, row, line, columns, "");
+}
+
+/// Activity row keeps labels/counts muted and tints only the braille spinner.
+/// The plain line is clipped before SGR so styling never changes visible width.
+fn putActivityLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize, spinner: []const u8, spinner_tone: []const u8) !void {
+    const safe = try text.sanitize(a, line, 65536);
+    var pos: usize = 0;
+    var width: usize = 0;
+    while (pos < safe.len and safe[pos] != '\n') {
+        const cluster = text.nextCluster(safe, pos, width);
+        if (width + cluster.width > columns) break;
+        width += cluster.width;
+        pos = cluster.end;
+    }
+    var styled: std.ArrayList(u8) = .empty;
+    defer styled.deinit(a);
+    try styled.appendSlice(a, theme.muted);
+    var at: usize = 0;
+    while (at < pos) {
+        if (std.mem.startsWith(u8, safe[at..pos], spinner)) {
+            try styled.appendSlice(a, spinner_tone);
+            try styled.appendSlice(a, spinner);
+            try styled.appendSlice(a, theme.muted);
+            at += spinner.len;
+        } else {
+            try styled.append(a, safe[at]);
+            at += 1;
+        }
+    }
+    try styled.appendSlice(a, theme.reset);
+    try putStyled(writer, row, styled.items);
 }
 
 fn putToneLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize, tone: []const u8) !void {

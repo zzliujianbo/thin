@@ -110,74 +110,17 @@ pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     const kind = call.kind;
     if (call.display) |display| return withBackground(a, .{ .kind = kind, .label = "" }, display);
     if (kind == .other) return .{ .kind = kind, .label = try a.dupe(u8, "tool") };
-    // Child status is a bare tool-name row, not a new panel or message body.
-    if (kind == .parent_message) return .{ .kind = kind, .label = try a.dupe(u8, "message_parent") };
+    if (kind == .background) return .{ .kind = kind, .label = try a.dupe(u8, "background") };
     const unavailable = switch (kind) {
         .bash => "(command unavailable)",
         .read, .write, .edit => "(file unavailable)",
         .memory => "(operation unavailable)",
-        .subagent => "(task unavailable)",
-        .subagent_id => "(id unavailable)",
-        .parent_message => unreachable,
-        .other => unreachable,
+        .background, .other => unreachable,
     };
     const detail = call.detail orelse return .{ .kind = kind, .label = try a.dupe(u8, unavailable) };
     // Preserve bounded detail until frame-time width is known; no old 32/72
     // cell path/command cutoff before applying the actual full-width row limit.
     return .{ .kind = kind, .label = try singleLineImpl(a, detail, 512, call.truncated) };
-}
-
-/// Add display-only subagent progress without changing the borrowed caption.
-/// Strip terminal escape sequences before the common single-line sanitizer.
-pub fn subagentProgress(a: std.mem.Allocator, value: Caption, progress: []const u8) !Caption {
-    var result = value;
-    if (value.kind != .subagent and value.kind != .subagent_id) {
-        result.label = try a.dupe(u8, value.label);
-        return result;
-    }
-    var buf: [512]u8 = undefined;
-    var len: usize = 0;
-    var i: usize = 0;
-    while (i < progress.len and len < buf.len) {
-        if (progress[i] == 0x1b) {
-            i += 1;
-            if (i == progress.len) break;
-            const kind = progress[i];
-            i += 1;
-            if (kind == '[') {
-                while (i < progress.len) {
-                    const c = progress[i];
-                    i += 1;
-                    if (c >= 0x40 and c <= 0x7e) break;
-                }
-            } else if (kind == ']') {
-                while (i < progress.len) {
-                    if (progress[i] == 7) {
-                        i += 1;
-                        break;
-                    }
-                    if (progress[i] == 0x1b and i + 1 < progress.len and progress[i + 1] == '\\') {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        buf[len] = progress[i];
-        len += 1;
-        i += 1;
-    }
-    const note = std.mem.trim(u8, buf[0..len], " \t\r\n\x0b\x0c");
-    if (note.len == 0) {
-        result.label = try a.dupe(u8, value.label);
-        return result;
-    }
-    const joined = try std.mem.concat(a, u8, &.{ value.label, " · ", note });
-    defer a.free(joined);
-    result.label = try singleLineImpl(a, joined, 512, i < progress.len);
-    return result;
 }
 
 /// Numeric observations survive Bridge text clipping. Missing is ?, not zero.
@@ -255,7 +198,7 @@ pub fn statusGlyph(outcome: Outcome) []const u8 {
 /// Composer busy marker palette; executing tool rows pulse the same phase and
 /// colour at the status slot, then leave the command band to the row flow.
 fn activeIndicatorColor(now_ms: u64) []const u8 {
-    return theme.command_pulse[shared.activity.commandStep(now_ms)];
+    return theme.command_pulse[(now_ms / 80) % theme.command_pulse.len];
 }
 
 pub const CommandSpan = struct {
@@ -294,11 +237,10 @@ fn labelParts(name: []const u8, label: []const u8) LabelParts {
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indicator: []const u8) ![]const u8 {
     const name = activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
-    return std.fmt.allocPrint(a, "{s} {s}{s}{s}{s}", .{
+    return std.fmt.allocPrint(a, "{s} {s}{s}{s}", .{
         if (outcome == .pending) indicator else statusGlyph(outcome),
         name,
         parts.sep,
-        if (value.display != null) "B: " else "",
         parts.text,
     });
 }
@@ -344,7 +286,7 @@ pub fn commandPrefixLen(value: Caption, outcome: Outcome, indicator: []const u8)
     const name = activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
     const slot = if (outcome == .pending) indicator else statusGlyph(outcome);
-    return slot.len + 1 + name.len + parts.sep.len + @intFromBool(value.display != null) * "B: ".len;
+    return slot.len + 1 + name.len + parts.sep.len;
 }
 
 /// Caption bodies are already sanitized, and spans are renderer-owned offsets.

@@ -1,9 +1,9 @@
-fn schemasFor(image_on: bool, memory_on: bool, channel: usize, background_on: bool) []const p.ToolSchema {
-    return schemasWithTitle(image_on, memory_on, channel, background_on, false);
+fn schemasFor(image_on: bool, memory_on: bool, background_on: bool) []const p.ToolSchema {
+    return schemasWithTitle(image_on, memory_on, background_on, false);
 }
 
 fn schemasForServices(enabled: bool) []const p.ToolSchema {
-    return schemasFor(enabled, true, 0, false);
+    return schemasFor(enabled, true, false);
 }
 
 const FakeBackground = struct {
@@ -51,7 +51,3 @@ const FakeBackground = struct {
         return .{ .text = self.control_text };
     }
 };
-
-fn fakeParentMessage(_: *anyopaque, _: std.mem.Allocator, _: subagent.Message, _: *const p.Cancellation) anyerror!subagent.Result {
-    return .{ .text = "{}" };
-}

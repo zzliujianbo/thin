@@ -350,6 +350,9 @@ test "32KiB global layer does not omit project source" {
     try std.testing.expect(std.mem.indexOf(u8, snap.agents, "[truncated]") == null);
 }
 test "unreadable optional agents files are skipped and an override does not fall through" {
+    // Root can read mode-000 files, so this permission fixture cannot model
+    // an unreadable optional source in that environment.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

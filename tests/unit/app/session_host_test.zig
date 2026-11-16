@@ -1836,33 +1836,6 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     }
     try std.testing.expectEqual(@as(usize, 0), rendered);
 }
-test "per-agent status rows snapshot pages retain every row" {
-    const a = std.testing.allocator;
-    const Agent = @import("../core/subagent_status.zig").AgentView;
-    const rows = try a.alloc(Agent, 130);
-    defer a.free(rows);
-    for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i + 1), .phase = .running };
-    const source: protocol.Snapshot = .{ .session = @splat('a'), .project = "/tmp", .owner = .daemon, .subagents_supported = true, .subagents = .{ .group_id = 7, .revision = 1, .total = rows.len, .running = rows.len, .latest_id = rows.len, .agents = rows } };
-    var offset: u64 = 0;
-    var seen: usize = 0;
-    while (true) {
-        var snapshot = source;
-        const page = SessionHost.pageSnapshot(&snapshot, offset, 7);
-        try std.testing.expectEqual(offset, snapshot.subagents.page_offset.?);
-        try std.testing.expect(snapshot.subagents.agents.len <= 64);
-        for (snapshot.subagents.agents) |row| {
-            seen += 1;
-            try std.testing.expectEqual(@as(u64, @intCast(seen)), row.id);
-        }
-        if (page.next == 0) break;
-        offset = page.next;
-    }
-    try std.testing.expectEqual(rows.len, seen);
-    var replacement = source;
-    const restarted = SessionHost.pageSnapshot(&replacement, 64, 6);
-    try std.testing.expectEqual(@as(u64, 0), replacement.subagents.page_offset.?);
-    try std.testing.expectEqual(@as(u64, 64), restarted.next);
-}
 test "snapshot reply encodes caller-owned queued previews consistently" {
     const a = std.testing.allocator;
     const io = std.testing.io;

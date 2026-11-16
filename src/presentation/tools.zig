@@ -15,12 +15,7 @@ pub const Kind = enum {
     read,
     write,
     edit,
-    /// Child-job start; only its bounded task summary is displayable.
-    subagent,
-    /// get/send/cancel job control; the bounded id is the only detail.
-    subagent_id,
-    /// Child -> parent status; no separate panel and no message body.
-    parent_message,
+    background,
     other,
     pub fn fromName(name: []const u8) Kind {
         if (std.mem.eql(u8, name, "memory")) return .memory;
@@ -28,9 +23,7 @@ pub const Kind = enum {
         if (std.mem.eql(u8, name, "read_file")) return .read;
         if (std.mem.eql(u8, name, "write_file")) return .write;
         if (std.mem.eql(u8, name, "edit_file")) return .edit;
-        if (std.mem.eql(u8, name, "subagent")) return .subagent;
-        if (std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "send_subagent_message") or std.mem.eql(u8, name, "cancel_subagent")) return .subagent_id;
-        if (std.mem.eql(u8, name, "message_parent")) return .parent_message;
+        if (std.mem.eql(u8, name, "background")) return .background;
         return .other;
     }
 };
@@ -67,15 +60,10 @@ pub const Call = struct {
             defer a.free(raw);
             return fromDetail(a, kind, raw);
         }
-        // A child status row only needs the tool name; never its message body.
-        if (kind == .parent_message) return .{ .kind = kind };
+        // Background rows are described by the host-supplied display caption.
+        if (kind == .background) return .{ .kind = kind };
         const value = parsed.value.object.get(switch (kind) {
             .bash => "command",
-            // Only the delegation goal is a caption; context and every other
-            // argument stay out of the row entirely.
-            .subagent => "task",
-            // Job control exposes only the opaque bounded id.
-            .subagent_id => "id",
             else => "path",
         }) orelse return .{ .kind = kind };
         if (value != .string) return .{ .kind = kind };
@@ -87,11 +75,7 @@ pub const Call = struct {
     pub fn fromFields(a: std.mem.Allocator, name: []const u8, fields: tool_preview.Snapshot) !Call {
         const kind = Kind.fromName(name);
         if (kind == .other) return .{ .kind = kind };
-        // A delegation row shows only the bounded task summary. `context` is
-        // deliberately not extracted, so it can never reach a caption.
-        if (kind == .subagent) return fromField(a, kind, fields.task);
-        if (kind == .subagent_id) return fromField(a, kind, fields.id);
-        if (kind == .parent_message) return .{ .kind = kind };
+        if (kind == .background) return .{ .kind = kind };
         if (kind == .memory) {
             const action = fields.action orelse return .{ .kind = kind };
             if (action.truncated) return .{ .kind = kind };

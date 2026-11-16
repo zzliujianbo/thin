@@ -1,7 +1,7 @@
-test "terminal spinner advances on the shared 40ms frame clock" {
-    try std.testing.expect(!std.mem.eql(u8, spinner(0), spinner(40)));
-    try std.testing.expectEqualStrings(spinner(0), spinner(400));
-    try std.testing.expectEqualStrings("⠴", spinner(600));
+test "terminal spinner advances on the shared 80ms frame clock" {
+    try std.testing.expect(!std.mem.eql(u8, spinner(0), spinner(80)));
+    try std.testing.expectEqualStrings(spinner(0), spinner(800));
+    try std.testing.expectEqualStrings("⠴", spinner(1200));
     try std.testing.expect(labelInterval(1000) < labelInterval(100));
 }
 

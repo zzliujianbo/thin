@@ -14,15 +14,13 @@ pub fn toolName(kind: Tool) []const u8 {
         .read => "read_file",
         .write => "write_file",
         .edit => "edit_file",
-        .subagent => "subagent",
-        .subagent_id => "subagent",
-        .parent_message => "message_parent",
+        .background => "background",
         .other => "tool",
     };
 }
 
-/// 固定 40ms，与执行流光同一帧节拍；TPS 只改变正文标签的色流速度。
+/// 80ms per braille frame; tool-row flow keeps its own 40ms cadence.
 pub fn spinner(now_ms: u64) []const u8 {
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-    return frames[(now_ms / 40) % frames.len];
+    return frames[(now_ms / 80) % frames.len];
 }

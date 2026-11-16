@@ -211,105 +211,6 @@ fn valueU64(value: std.json.Value) ?u64 {
     };
 }
 
-fn decodeSubagentView(a: std.mem.Allocator, value: std.json.Value) !@import("../core/subagent_status.zig").View {
-    const obj = switch (value) {
-        .object => |v| v,
-        else => return error.ProtocolError,
-    };
-    if (obj.count() != 13 and obj.count() != 15) return error.ProtocolError;
-    const read = struct {
-        fn uint(map: std.json.ObjectMap, key: []const u8) !u64 {
-            return valueU64(map.get(key) orelse return error.ProtocolError) orelse error.ProtocolError;
-        }
-    };
-    var view: @import("../core/subagent_status.zig").View = .{
-        .group_id = try read.uint(obj, "group_id"),
-        .revision = try read.uint(obj, "revision"),
-        .total = try read.uint(obj, "total"),
-        .running = try read.uint(obj, "running"),
-        .waiting = try read.uint(obj, "waiting"),
-        .completed = try read.uint(obj, "completed"),
-        .failed = try read.uint(obj, "failed"),
-        .canceled = try read.uint(obj, "canceled"),
-        .paused = try read.uint(obj, "paused"),
-        .elapsed_ms = try read.uint(obj, "elapsed_ms"),
-        .latest_id = try read.uint(obj, "latest_id"),
-    };
-    const text = switch (obj.get("text") orelse return error.ProtocolError) {
-        .string => |s| s,
-        else => return error.ProtocolError,
-    };
-    if (text.len > view.text_buf.len or !std.unicode.utf8ValidateSlice(text)) return error.ProtocolError;
-    for (text, 0..) |b, i| {
-        if (b < 0x20 or b == 0x7f or (b == 0xc2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9f)) return error.ProtocolError;
-    }
-    var total: u64 = 0;
-    for ([_]u64{ view.running, view.waiting, view.completed, view.failed, view.canceled, view.paused }) |n| {
-        total = std.math.add(u64, total, n) catch return error.ProtocolError;
-    }
-    if (total != view.total or (view.group_id == 0 and (total != 0 or view.revision != 0 or view.latest_id != 0 or view.elapsed_ms != 0 or text.len != 0)) or (view.group_id != 0 and (total == 0 or view.latest_id == 0))) return error.ProtocolError;
-    view.text_len = @intCast(text.len);
-    @memcpy(view.text_buf[0..text.len], text);
-    {
-        const value_agents = obj.get("agents") orelse return error.ProtocolError;
-        const items = switch (value_agents) {
-            .array => |array| array.items,
-            else => return error.ProtocolError,
-        };
-        const Agent = @import("../core/subagent_status.zig").AgentView;
-        if (obj.count() == 15) {
-            const offset = try read.uint(obj, "page_offset");
-            const page_total = try read.uint(obj, "page_total");
-            const end = std.math.add(u64, offset, items.len) catch return error.ProtocolError;
-            if (items.len > 64 or page_total != view.total or offset > page_total or end > page_total or (end < page_total and items.len != 64) or (offset % 64 != 0)) return error.ProtocolError;
-            view.page_offset = offset;
-            view.page_total = page_total;
-        } else if (obj.count() != 13 or items.len != view.total) return error.ProtocolError;
-        const rows: []Agent = if (items.len == 0) &.{} else try a.alloc(Agent, items.len);
-        errdefer if (rows.len != 0) a.free(rows);
-        var counts: [6]u64 = @splat(0);
-        for (items, 0..) |item, i| {
-            const row = switch (item) {
-                .object => |map| map,
-                else => return error.ProtocolError,
-            };
-            if (row.count() != 5) return error.ProtocolError;
-            const id = try read.uint(row, "id");
-            if (id == 0) return error.ProtocolError;
-            for (rows[0..i]) |previous| if (previous.id == id) return error.ProtocolError;
-            const phase = switch (row.get("phase") orelse return error.ProtocolError) {
-                .string => |s| std.meta.stringToEnum(@import("../core/subagent_status.zig").Phase, s) orelse return error.ProtocolError,
-                else => return error.ProtocolError,
-            };
-            const row_text = switch (row.get("text") orelse return error.ProtocolError) {
-                .string => |s| s,
-                else => return error.ProtocolError,
-            };
-            if (row_text.len > 2048 or !std.unicode.utf8ValidateSlice(row_text)) return error.ProtocolError;
-            for (row_text, 0..) |b, j| if (b < 0x20 or b == 0x7f or (b == 0xc2 and j + 1 < row_text.len and row_text[j + 1] >= 0x80 and row_text[j + 1] <= 0x9f)) return error.ProtocolError;
-            const category: usize = switch (phase) {
-                .starting, .running => 0,
-                .waiting => 1,
-                .completed => 2,
-                .failed => 3,
-                .canceled => 4,
-                .paused => 5,
-            };
-            counts[category] += 1;
-            rows[i] = .{ .id = id, .revision = try read.uint(row, "revision"), .phase = phase, .elapsed_ms = try read.uint(row, "elapsed_ms"), .text_len = @intCast(row_text.len) };
-            @memcpy(rows[i].text_buf[0..row_text.len], row_text);
-        }
-        const expected = [_]u64{ view.running, view.waiting, view.completed, view.failed, view.canceled, view.paused };
-        if (view.page_offset == null) {
-            if (!std.mem.eql(u64, &counts, &expected)) return error.ProtocolError;
-        } else {
-            for (counts, expected) |count, max| if (count > max) return error.ProtocolError;
-        }
-        view.agents = rows;
-    }
-    return view;
-}
-
 fn decodeBackgroundView(value: std.json.Value) !@import("../core/background_status.zig").View {
     const obj = switch (value) {
         .object => |v| v,
@@ -446,8 +347,6 @@ const max_label_bytes = 64;
 const SnapshotCache = struct {
     background: @import("../core/background_status.zig").View = .{},
     memory: memory_status.View = .{},
-    subagents: @import("../core/subagent_status.zig").View = .{},
-    subagents_supported: bool = false,
     valid: bool = false,
     codex_login: codex_login.View = .{},
     busy: bool = false,
@@ -591,8 +490,6 @@ pub const Client = struct {
     arena_index: u1 = 0,
 
     cache: SnapshotCache = .{},
-    row_cursor: u64 = 0,
-    row_group: u64 = 0,
     pubcfg: Pub = .{},
     pending: std.ArrayList(session_client.Item) = .empty,
     /// Locators this launcher really published for workers it owns. Kept so a
@@ -661,7 +558,6 @@ pub const Client = struct {
         if (self.dir) |*dir| dir.deinit();
         self.dir = null;
         self.freePub();
-        self.cache.subagents.deinitOwned(self.a);
         self.arenas[0].deinit();
         self.arenas[1].deinit();
         self.pending.deinit(self.a);
@@ -832,8 +728,6 @@ pub const Client = struct {
         self.cursor = 0;
         self.need_history = false;
         self.cache.valid = false;
-        self.cache.subagents.deinitOwned(self.a);
-        self.cache.subagents_supported = false;
         self.rebuild();
     }
 
@@ -922,8 +816,6 @@ pub const Client = struct {
             .running_sessions = 0,
             .memory = cache.memory,
             .background = cache.background,
-            .subagents = try cache.subagents.clone(arena),
-            .subagents_supported = cache.subagents_supported,
         };
     }
 
@@ -936,8 +828,6 @@ pub const Client = struct {
         state.codex_login = cache.codex_login;
         state.memory = cache.memory;
         state.background = cache.background;
-        state.subagents = try cache.subagents.clone(arena);
-        state.subagents_supported = cache.subagents_supported;
         state.available = cfg.available and (self.conn != null or self.control != null);
         state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
         state.session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null;
@@ -1097,8 +987,6 @@ pub const Client = struct {
     fn refreshSnapshot(self: *Client) void {
         var req = self.request(.snapshot) catch return;
         defer req.deinit();
-        req.put("row_cursor", self.row_cursor) catch return;
-        req.put("row_group", self.row_group) catch return;
         var resp = req.exchange(quick_timeout_ms) catch |err| {
             self.poll_error = err;
             return;
@@ -1116,7 +1004,6 @@ pub const Client = struct {
         };
         var cache: SnapshotCache = .{};
         var adopted = false;
-        defer if (!adopted) cache.subagents.deinitOwned(self.a);
         const get = struct {
             fn field(map: std.json.ObjectMap, name: []const u8) ?std.json.Value {
                 return map.get(name);
@@ -1140,39 +1027,6 @@ pub const Client = struct {
         cache.valid = true;
         cache.memory = try decodeMemoryView(object.get("memory") orelse return error.ProtocolError);
         cache.background = try decodeBackgroundView(object.get("background") orelse return error.ProtocolError);
-        if (object.get("subagents")) |value| {
-            cache.subagents = try decodeSubagentView(self.a, value);
-            if (cache.subagents.page_offset != null and self.cache.subagents_supported and self.cache.subagents.group_id == cache.subagents.group_id) {
-                const previous = self.cache.subagents;
-                const page = cache.subagents;
-                const Agent = @import("../core/subagent_status.zig").AgentView;
-                var rows: std.ArrayList(Agent) = .empty;
-                defer rows.deinit(self.a);
-                try rows.appendSlice(self.a, previous.agents);
-                for (page.agents) |row| {
-                    var found = false;
-                    for (rows.items) |*old| if (old.id == row.id) {
-                        if (row.revision >= old.revision) old.* = row;
-                        found = true;
-                        break;
-                    };
-                    if (!found) try rows.append(self.a, row);
-                }
-                if (rows.items.len > @max(page.total, previous.total)) return error.ProtocolError;
-                const merged = try rows.toOwnedSlice(self.a);
-                cache.subagents.deinitOwned(self.a);
-                cache.subagents = page;
-                cache.subagents.agents = merged;
-                if (previous.revision > page.revision) {
-                    const merged_rows = cache.subagents.agents;
-                    cache.subagents = previous;
-                    cache.subagents.agents = merged_rows;
-                    cache.subagents.page_offset = page.page_offset;
-                    cache.subagents.page_total = page.page_total;
-                }
-            }
-            cache.subagents_supported = true;
-        }
         if (object.get("codex_login")) |value| {
             const login_view = switch (value) {
                 .object => |map| map,
@@ -1258,17 +1112,6 @@ pub const Client = struct {
             (self.cache.codex_login.status != .succeeded or self.cache.codex_login.generation != cache.codex_login.generation)) self.dirty = true;
         if (!std.meta.eql(self.cache.memory, cache.memory)) self.dirty = true;
         if (!std.meta.eql(self.cache.background, cache.background)) self.dirty = true;
-        if (cache.subagents.page_offset) |offset| {
-            self.row_group = cache.subagents.group_id;
-            // Merged rows can contain earlier pages; use the decoded page length.
-            const wire_agents = object.get("subagents").?.object.get("agents").?.array.items.len;
-            const page_end = offset + wire_agents;
-            self.row_cursor = if (page_end < cache.subagents.page_total) page_end else 0;
-        } else {
-            self.row_cursor = 0;
-            self.row_group = cache.subagents.group_id;
-        }
-        self.cache.subagents.deinitOwned(self.a);
         self.cache = cache;
         adopted = true;
         if (resp.uint("through")) |through| self.cache_floor = @max(self.cache_floor, through);
@@ -2171,7 +2014,6 @@ pub const Client = struct {
         self.need_history = true;
         self.dirty = true;
         // A different session identity invalidates every cached owner field.
-        self.cache.subagents.deinitOwned(self.a);
         self.cache = .{};
         self.rebuild();
     }
@@ -2551,7 +2393,6 @@ pub const Client = struct {
         self.a.free(self.launcher);
         self.launcher = try self.a.dupe(u8, resolved);
         self.session = null;
-        self.cache.subagents.deinitOwned(self.a);
         self.cache = .{};
         self.dirty = true;
         // The launcher readiness belongs to the new directory's setup owner, so

@@ -1,42 +1,3 @@
-test "subagent tool progress roundtrip and malformed wire" {
-    const a = std.testing.allocator;
-    const values = [_]?[]const u8{ null, "", "first\n第二行\t\x01" };
-    for (values) |value| {
-        const event: r.Event = .{ .tool_view = .{
-            .key = .{ .generation = std.math.maxInt(u64), .index = 3 },
-            .name = "subagent",
-            .fields = .{ .id = .{ .text = "job-7" } },
-            .subagent_progress = value,
-        } };
-        const bytes = try encodeEvent(a, event);
-        defer a.free(bytes);
-        var decoded = try decodeEvent(a, bytes);
-        defer decoded.deinit();
-        const view = decoded.event.tool_view;
-        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), view.key.generation);
-        try std.testing.expectEqual(@as(usize, 3), view.key.index);
-        try std.testing.expectEqualStrings("job-7", view.fields.id.?.text);
-        if (value) |expected| try std.testing.expectEqualStrings(expected, view.subagent_progress.?) else try std.testing.expect(view.subagent_progress == null);
-        try expectEventRoundTrip(a, event);
-    }
-    const long = try a.alloc(u8, 2050);
-    defer a.free(long);
-    @memset(long, 'x');
-    const complete = try encodeEvent(a, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "subagent", .subagent_progress = long } });
-    defer a.free(complete);
-    var decoded_long = try decodeEvent(a, complete);
-    defer decoded_long.deinit();
-    try std.testing.expect(!decoded_long.display_truncated);
-    try std.testing.expectEqualStrings(long, decoded_long.event.tool_view.subagent_progress.?);
-    for ([_][]const u8{
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"display\":null,\"sprog\":1}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"display\":null,\"sprog\":{}}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1.0,\"idx\":0,\"display\":null,\"sprog\":null}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0.0,\"display\":null,\"sprog\":null}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":null,\"sprog\":\"duplicate\"}",
-        "{\"t\":\"tool_view\",\"name\":\"x\",\"gen\":1,\"idx\":0,\"sprog\":null} trailing",
-    }) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
-}
 test "every runtime display event round-trips through the wire" {
     const a = std.testing.allocator;
     const high = std.math.maxInt(u64);
@@ -51,8 +12,6 @@ test "every runtime display event round-trips through the wire" {
         .command = .{ .text = "zig build" },
         .action = .{ .text = "run" },
         .topic = .{ .text = "build" },
-        .task = .{ .text = "inspect release paths" },
-        .id = .{ .text = "job-3" },
     };
     const events = [_]r.Event{
         .{ .state = .awaiting_permission },

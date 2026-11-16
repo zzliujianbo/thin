@@ -310,11 +310,6 @@ pub fn build(b: *std.Build) void {
     const run_memory_app = fixture(b, "node", "tests/product/memory_auto_mock.mjs", &.{exe}, &.{});
     b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
 
-    // Foreground subagent acceptance: real in-process child Runtime over owned
-    // loopback Chat/Responses/Anthropic wires plus denial cases.
-    const run_subagent = fixture(b, "node", "tests/product/subagent_mock.mjs", &.{exe}, &.{});
-    b.step("test-subagent", "Run owned-loopback interactive subagent Runtime acceptance").dependOn(&run_subagent.step);
-
     // Instance-owned background services: owned loopback plus a real PTY, so
     // cross-task keep-alive is proven in one App instance (--print exits must
     // clear every service, which is the correct headless semantic).
@@ -406,7 +401,6 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .linux) {
         full_prerequisites.dependOn(&run_subscription.step);
         full_prerequisites.dependOn(&run_ssh.step);
-        full_prerequisites.dependOn(&run_subagent.step);
         full_prerequisites.dependOn(&run.step);
     }
     full_prerequisites.dependOn(&run_presentation.step);

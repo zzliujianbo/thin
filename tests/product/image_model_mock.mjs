@@ -16,9 +16,8 @@ const DESCRIPTION = 'Owned one-pixel image inspected.';
 const REMOTE_SECRET = 'image-raw-remote-error-must-not-leak';
 const CALL = 'owned-read-image', FILE = 'owned-pixel.png';
 const FIRST_FOUR = ['read_file','write_file','bash','memory'];
-// Default root capability: the four parent job tools follow the base surface
-// (image, when selected, stays at index 4). No settings gate adds or removes them.
-const SUBAGENT_FOUR = ['subagent','get_subagent_result','send_subagent_message','cancel_subagent'];
+// Base capability: image, when selected, stays at index 4. No settings gate
+// adds or removes the optional tools.
 const defaults = {
   command_timeout_ms:300000, low_price_input:false,
   request_timeout_ms:10000, compaction_enabled:true,
@@ -130,7 +129,7 @@ export async function imageModelRegressions({app,pty,execute}) {
         }
         const names = body.tools.map(t=>t.function.name);
         assert.equal(names.filter(name=>name === 'set_session_title').length, isPty ? 1 : 0, 'title tool must be root-interactive only');
-        assert.deepEqual(names.filter(name=>name !== 'set_session_title'), [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),...SUBAGENT_FOUR,'background','edit_file']);
+        assert.deepEqual(names.filter(name=>name !== 'set_session_title'), [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),'background','edit_file']);
         assert.equal(names.filter(name=>name !== 'set_session_title').at(-1),'edit_file');
         assert.deepEqual(body.tools.slice(0,4),primaryTools,'Image changed an existing tool schema');
         if (isPty && mainPosts === 1) {

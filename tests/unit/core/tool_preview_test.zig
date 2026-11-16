@@ -50,30 +50,6 @@ test "content hook receives decoded scalars close and revocation without storing
     try std.testing.expect(!bad.finish());
     try std.testing.expect(hook.revoked);
 }
-test "task is previewed while context body is not" {
-    const json = "{\"task\":\"inspect release path\",\"context\":\"parent notes with \\\"quotes\\\"\"}";
-    for (0..json.len + 1) |split| {
-        var e: Extractor = .{};
-        e.feed(json[0..split]);
-        e.feed(json[split..]);
-        try std.testing.expect(e.finish());
-        const s = e.snapshot();
-        try std.testing.expectEqualStrings("inspect release path", s.task.?.text);
-        try std.testing.expect(s.path == null and s.command == null and s.action == null and s.topic == null and s.id == null);
-    }
-}
-test "job id is previewed while message and reply bodies are not" {
-    const json = "{\"id\":\"job-7\",\"message\":\"private-body\",\"wait\":true,\"wait_for_reply\":false}";
-    for (0..json.len + 1) |split| {
-        var e: Extractor = .{};
-        e.feed(json[0..split]);
-        e.feed(json[split..]);
-        try std.testing.expect(e.finish());
-        const s = e.snapshot();
-        try std.testing.expectEqualStrings("job-7", s.id.?.text);
-        try std.testing.expect(s.task == null and s.path == null);
-    }
-}
 test "unknown content and nested names never publish and long keys do not alias" {
     const json = "{\"content\":\"\\\"path\\\":\\\"fake\\\"\",\"expected_version\":\"path\",\"nested\":[{\"path\":\"wrong\",\"command\":\"wrong\"}],\"pathTOOLONG\":\"wrong\",\"commandx\":\"wrong\",\"unknown\":[0,-0,10,-10,1.2,1E2,1e-2,true,false,null,{},[]]}";
     for (0..json.len + 1) |split| {
@@ -101,7 +77,7 @@ test "closed path available during 100KiB content without storing it" {
     try std.testing.expect(e.finish());
     try std.testing.expectEqualStrings("safe", e.snapshot().path.?.text);
     try std.testing.expectEqual(@as(usize, 4), e.lengths[0]);
-    try std.testing.expectEqual(@as(usize, 6 * 1024), @sizeOf(@TypeOf(e.buffers)));
+    try std.testing.expectEqual(@as(usize, 4 * 1024), @sizeOf(@TypeOf(e.buffers)));
 }
 test "strict invalid cases revoke all fields at every split and stay invalid" {
     const cases = [_][]const u8{

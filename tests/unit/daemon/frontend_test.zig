@@ -31,43 +31,6 @@ test "identical and stale codex views do not wake" {
     try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
     try std.testing.expectEqualStrings("ABCD", frontend.view.state.codex_login.userCode());
 }
-test "per-agent status rows wake frontend once" {
-    const Agent = @import("../core/subagent_status.zig").AgentView;
-    const first_rows = [_]Agent{.{ .id = 1, .phase = .running, .elapsed_ms = 1 }};
-    const next_rows = [_]Agent{.{ .id = 1, .phase = .running, .elapsed_ms = 2 }};
-    var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
-    defer frontend.view.deinit();
-    defer if (frontend.retired) |retired| retired.deinit();
-    frontend.view.state.subagents = .{ .agents = &first_rows };
-    const changed = try testProjection(false, "model");
-    changed.state.subagents = .{ .agents = &next_rows };
-    frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = changed });
-    try std.testing.expect(Frontend.metadataOwned(&frontend, false));
-    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
-}
-test "grouped subagent progress publication wakes once" {
-    var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
-    defer frontend.view.deinit();
-    defer if (frontend.retired) |retired| retired.deinit();
-    const changed = try testProjection(false, "model");
-    changed.state.subagents_supported = true;
-    changed.state.subagents = .{ .group_id = 7, .revision = 1, .total = 1, .running = 1, .latest_id = 1 };
-    frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = changed });
-    try std.testing.expect(Frontend.metadataOwned(&frontend, false));
-    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
-    const same = try testProjection(false, "model");
-    same.state.subagents_supported = true;
-    same.state.subagents = frontend.view.state.subagents;
-    frontend.adopt(.{ .generation = 1, .revision = 12, .watermark = 0, .ordered = false, .projection = same });
-    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
-    const progress = try testProjection(false, "model");
-    progress.state.subagents_supported = true;
-    progress.state.subagents = frontend.view.state.subagents;
-    progress.state.subagents.revision += 1;
-    frontend.adopt(.{ .generation = 1, .revision = 13, .watermark = 0, .ordered = false, .projection = progress });
-    try std.testing.expect(Frontend.metadataOwned(&frontend, false));
-    try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
-}
 test "configuration-only publications notify the UI once without polling the owner" {
     var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "old"), .revision = 10 };
     defer frontend.view.deinit();

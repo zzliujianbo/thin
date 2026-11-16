@@ -195,32 +195,6 @@ test "owned events deep-copy text and drop local inbox pointers" {
     try std.testing.expectEqualStrings("desc", item.event.permission.description);
     try std.testing.expect(item.event.permission.interrupt == null);
 }
-test "subagent tool progress owns decoded text after document release" {
-    const a = std.testing.allocator;
-    var item: Item = undefined;
-    {
-        var frame = "\"进度\\n完成\"".*;
-        var doc = try std.json.parseFromSlice([]const u8, a, &frame, .{ .allocate = .alloc_always });
-        defer doc.deinit();
-        item = try ownEvent(a, 9, .{ .tool_view = .{
-            .key = .{ .generation = 42, .index = 3 },
-            .name = "subagent",
-            .fields = .{ .id = .{ .text = "job-7" } },
-            .subagent_progress = doc.value,
-        } });
-        @memset(&frame, 'x');
-        @memset(@constCast(doc.value), 'x');
-    }
-    defer item.deinit();
-    try std.testing.expectEqualStrings("进度\n完成", item.event.tool_view.subagent_progress.?);
-    try std.testing.expectEqualStrings("job-7", item.event.tool_view.fields.id.?.text);
-    try std.testing.expectEqual(@as(u64, 42), item.event.tool_view.key.generation);
-    try std.testing.expectEqual(@as(usize, 3), item.event.tool_view.key.index);
-
-    var empty = try ownEvent(a, 9, .{ .tool_view = .{ .key = .{ .generation = 1, .index = 0 }, .name = "subagent" } });
-    defer empty.deinit();
-    try std.testing.expect(empty.event.tool_view.subagent_progress == null);
-}
 test "user committed event owns complete large input" {
     const a = std.testing.allocator;
     const input = try a.alloc(u8, 65537);

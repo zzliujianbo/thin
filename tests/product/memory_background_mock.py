@@ -65,16 +65,15 @@ PROMPTS = (
 )
 ANSWERS = ('answer-one-proof', 'answer-two-proof', 'answer-three-proof')
 FACT = ('Prefers concise code reviews. 中文记忆😀详细内容 ' * 3).strip()
-SPINNERS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-PROGRESS = re.compile(r'^M: ([' + SPINNERS + r'])(?: \+([1-9][0-9]*))?$')
+PROGRESS = re.compile(r'^memory: (?:1(?: \+([1-9][0-9]*))?|\+([1-9][0-9]*))$')
 SAVED_PATH = '.thin/memory/preferences-review-style.md'
 RETIRED_PATHS = ('.thin/memory/jobs', '.thin/memory/jobs-owner', '.thin/mem-jobs', '.thin/mem-jobs-owner')
 CONTEXT_PREFIX = '[Context material'
-WARNING_MARKERS = ('Saved thinking level not applied', 'awaiting model capabilities')
+WARNING_MARKERS = ('Saved thinking level not applied', 'awaiting model capabilit')
 MEMORY_UI_LABELS = (
     'Memory: extracting', 'Memory: saving', 'Memory: queued', 'Memory: saved',
     'Memory: skipped', 'Memory: failed', 'Memory: canceled', 'Memory: request outcome uncertain',
-    'M: ✓',
+    'memory: ✓',
 )
 
 
@@ -89,7 +88,7 @@ def assert_no_ui_memory_notice(value, where):
             assert_no_ui_memory_notice(nested, where)
     elif isinstance(value, str):
         assert not any(label in value for label in MEMORY_UI_LABELS), f'Memory UI notice in {where}'
-        assert not re.search(r'M: [' + SPINNERS + r']', value), f'Memory progress in {where}'
+        assert not re.search(r'memory: (?:1|\+)', value), f'Memory progress in {where}'
 
 
 def load_idle_fixture():
@@ -349,6 +348,13 @@ def memory_progress(text):
     return PROGRESS.fullmatch(text.split('|')[0].rstrip()) is not None
 
 
+def memory_queued(label):
+    match = PROGRESS.fullmatch(label)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2) or 0)
+
+
 def footer_state(screen):
     """Settled progress footer, or None while unsettled.
 
@@ -361,7 +367,7 @@ def footer_state(screen):
     hint = rows[screen.row - 1]
     if not memory_progress(hint):
         return None
-    if rows[screen.row - 2] != '':
+    if memory_progress(rows[screen.row - 2]):
         return None
     if sum(memory_progress(text) for text in rows) != 1:
         return None
@@ -372,17 +378,17 @@ def memory_footer_absent(screen):
     if not 1 <= screen.row < len(screen.grid):
         return False
     hint = row_text(screen, screen.row - 1)
-    return not hint.startswith(('M: ', 'Memory: '))
+    return not hint.startswith(('memory: ', 'Memory: '))
 
 
 def saved_transcript_rows(screen):
     """Visible Memory rows outside the footer, with logical positions."""
     return [(len(screen.history) + i, row_text(screen, i)) for i in range(len(screen.grid))
-            if i != screen.row - 1 and row_text(screen, i).startswith('M: ✓')]
+            if i != screen.row - 1 and row_text(screen, i).startswith('memory: ✓')]
 
 
 def saved_visible(screen):
-    return any(i < len(screen.history) + screen.row - 1 and row.startswith('M: ✓ ')
+    return any(i < len(screen.history) + screen.row - 1 and row.startswith('memory: ✓ ')
                for i, row in saved_transcript_rows(screen))
 
 
@@ -395,11 +401,13 @@ def assert_saved_transcript(screen, expected=None):
         assert len(rows) == expected, f'Memory transcript rows {len(rows)} != {expected}: {rows!r}'
     for index, text in rows:
         assert index < len(screen.history) + screen.row - 1, 'Memory result is not above the footer'
-        assert text.startswith('M: ✓ ') and text.endswith('...'), f'unexpected saved row: {text!r}'
-        summary_prefix = text[len('M: ✓ '):-3]
+        assert text.startswith('memory: ✓ ') and text.endswith('...'), f'unexpected saved row: {text!r}'
+        summary_prefix = text[len('memory: ✓ '):-3]
         assert summary_prefix and FACT.startswith(summary_prefix) and len(summary_prefix) < len(FACT), \
             f'saved summary is not a clipped prefix: {text!r}'
-        assert '中文' in summary_prefix and '😀' in summary_prefix, f'wide characters missing: {text!r}'
+        assert '中文' in summary_prefix, f'wide characters missing: {text!r}'
+        if screen.columns >= 80:
+            assert '😀' in summary_prefix, f'wide emoji missing: {text!r}'
         assert IDLE.cells(text.encode('utf-8')) <= screen.columns, f'saved row exceeds physical width: {text!r}'
         physical = index - len(screen.history)
         if physical + 1 < len(screen.grid):
@@ -418,25 +426,23 @@ def assert_footer(screen, queued):
     assert screen.idle(), 'current cursor line is not the idle composer'
     assert all(text == '' for text in rows[row + 1:]), 'visible rows below composer are not blank'
     hint = rows[row - 1]
-    assert rows[row - 2] == '', f'blank separator above the Memory hint is missing: {rows[row - 2]!r}'
+    assert not memory_progress(rows[row - 2]), f'duplicate Memory hint above the activity row: {rows[row - 2]!r}'
     assert not any(text.startswith(('Memory: extracting', 'Memory: saving', 'Memory: queued'))
                    for text in rows), 'legacy Memory progress is visible'
     hints = [(i, text) for i, text in enumerate(rows) if memory_progress(text)]
     assert len(hints) == 1, f'Memory progress hint is not unique on the screen: {hints!r}'
     assert hints[0] == (row - 1, hint), 'the Memory hint is not the row directly above the composer'
     label = hint.split('|')[0].rstrip()
-    match = PROGRESS.fullmatch(label)
-    assert match and match.group(2) == (str(queued) if queued else None), \
+    assert memory_queued(label) == queued, \
         f'Memory footer {label!r} has incorrect queued count {queued}'
     assert 'S:' not in hint and 'F:' not in hint, \
         f'Memory status leaked primary steering/follow-up counters: {hint!r}'
-    return match.group(1)
+    return label
 
 
 def footer_has_queue(screen, queued):
     hint = footer_state(screen)
-    match = PROGRESS.fullmatch(hint) if hint else None
-    return bool(match and match.group(2) == (str(queued) if queued else None))
+    return memory_queued(hint) == queued if hint else False
 
 
 class ControllerInterrupted(Exception):
@@ -687,12 +693,6 @@ def run(app, columns, observe_saved=False):
             round1_deadline = time.monotonic() + 12
             pump_until(lambda: b'answer-one-proof' in capture and fresh() and footer_has_queue(screen, 0),
                        'round 1 idle primary with an active Memory footer',
-                       timeout=max(0, round1_deadline - time.monotonic()))
-            first_spinner = assert_footer(screen, 0)
-            before = len(capture)
-            pump_until(lambda: fresh(after=before) and footer_has_queue(screen, 0)
-                       and PROGRESS.fullmatch(footer_state(screen)).group(1) != first_spinner,
-                       'a second Memory-only idle animation frame',
                        timeout=max(0, round1_deadline - time.monotonic()))
             assert_footer(screen, 0)
             rows = [row_text(screen, i) for i in range(len(screen.grid))]

@@ -23,7 +23,6 @@ fn expectBackgroundSurface(app: *App) !void {
     // The App is the only owner; Tools only sees the service value.
     try std.testing.expect(app.background.deps != null);
     try std.testing.expect(app.executor.background != null);
-    try std.testing.expect(app.executor.parent_channel == null);
     const schemas = app.executor.executor().schemas;
     try std.testing.expect(hasSchema(schemas, "background"));
     try std.testing.expect(hasSchema(schemas, "bash"));

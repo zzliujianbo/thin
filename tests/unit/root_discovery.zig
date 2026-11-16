@@ -40,7 +40,6 @@ test {
     // These modules are otherwise reached only through transitive imports;
     // reference them explicitly so filtered test-unit groups always enumerate
     // every top-level test prefix.
-    _ = @import("core/subagent_status.zig");
     _ = @import("llm/image_codec.zig");
     _ = @import("platform/anonymous_input.zig");
     _ = @import("platform/filesystem_native.zig");
@@ -86,14 +85,9 @@ test {
     _ = @import("tests/selection_defaults_test.zig");
     _ = @import("tests/thinking_contract_test.zig");
     _ = @import("tests/context_usage_test.zig");
-    _ = @import("core/subagent.zig");
-    _ = @import("core/subagent_test.zig");
     _ = @import("core/background.zig");
     _ = @import("tests/background_service_test.zig");
     _ = @import("tests/app_background_test.zig");
-    _ = @import("tools/subagent_tool_test.zig");
-    _ = @import("tests/subagent_service_test.zig");
-    _ = @import("tests/subagent_app_test.zig");
     _ = @import("tests/output_budget_test.zig");
     _ = @import("tests/compaction_policy_test.zig");
     _ = @import("tests/input_budget_test.zig");

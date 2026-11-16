@@ -137,7 +137,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('break :gate &full_daemon.step;', full)
         dependencies = re.findall(r'full_prerequisites\.dependOn\(([^)]+)\);', full)
         # Original full inventory, except its daemon is now the downstream gate.
-        expected = {'workflow_tests', 'run_unit', 'run_memory', 'run_memory_app', 'run_background', 'run_subscription', 'run_ssh', 'run_subagent', 'run', 'run_presentation', 'run_http', 'run_anthropic', 'run_proxy', 'run_app', 'run_idle_enter', 'run_resume_menu', 'run_memory_background', 'run_resize', 'run_settings', 'run_command', 'run_approval_cancel', 'run_tool_preview', 'run_queued'}
+        expected = {'workflow_tests', 'run_unit', 'run_memory', 'run_memory_app', 'run_background', 'run_subscription', 'run_ssh', 'run', 'run_presentation', 'run_http', 'run_anthropic', 'run_proxy', 'run_app', 'run_idle_enter', 'run_resume_menu', 'run_memory_background', 'run_resize', 'run_settings', 'run_command', 'run_approval_cancel', 'run_tool_preview', 'run_queued'}
         self.assertEqual(set(dependencies), {f'&{name}.step' for name in expected} | {'viewport_step'})
         self.assertEqual(len(dependencies), len(expected) + 1)
         communication = source.split('const communication = ', 1)[1].split('// Root-level offline tooling', 1)[0]

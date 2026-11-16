@@ -43,28 +43,6 @@ test "unselected synchronizing prompt is not a ready marker" {
     try std.testing.expect(!std.mem.eql(u8, "> ", rendered.plain));
     try std.testing.expectEqual(@as(usize, 2), text.width(rendered.plain));
 }
-test "subagent tool progress sanitizes and bounds borrowed captions" {
-    const a = std.testing.allocator;
-    const base: Caption = .{ .kind = .subagent_id, .label = "subagent_1", .failure_reason = "reason" };
-    const value = try subagentProgress(a, base, " \x1b[2J中文\nnext\tline\x1b]0;secret\x07 ");
-    defer value.deinit(a);
-    try std.testing.expectEqualStrings("subagent_1 · 中文 next line", value.label);
-    try std.testing.expectEqualStrings("reason", value.failure_reason.?);
-    const empty = try subagentProgress(a, base, " \n\t");
-    defer empty.deinit(a);
-    try std.testing.expectEqualStrings(base.label, empty.label);
-    const other = try subagentProgress(a, .{ .kind = .read, .label = "file" }, "ignored");
-    defer other.deinit(a);
-    try std.testing.expectEqualStrings("file", other.label);
-    const long_input: [1200]u8 = @splat('x');
-    const long = try subagentProgress(a, base, &long_input);
-    defer long.deinit(a);
-    try std.testing.expect(long.label.len <= 512 and text.width(long.label) <= 512);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(long.label));
-    const tiny = try singleLine(a, long.label, 2);
-    defer a.free(tiny);
-    try std.testing.expect(text.width(tiny) <= 2);
-}
 test "normal preview captions show names until reliable typed fields arrive" {
     const a = std.testing.allocator;
     const early = try fromToolView(a, "write_file", .{});
@@ -223,8 +201,8 @@ test "percent prompt has default input colors and real spinner not loading text"
     try expectPromptStyle(idle.plain, idle.styled);
     const active = try prompt(a, "deepseek-flash", null, 79, .{ .busy = true, .streaming = true, .now_ms = 80, .phase = 2 });
     defer active.deinit(a);
-    try std.testing.expectEqualStrings("(deepseek-flash) ?%⠹ ", active.plain);
-    try expectPromptSuffix(active.styled, theme.reset ++ theme.command_pulse[0] ++ "⠹" ++ theme.reset ++ " ");
+    try std.testing.expectEqualStrings("(deepseek-flash) ?%⠙ ", active.plain);
+    try expectPromptSuffix(active.styled, theme.reset ++ theme.command_pulse[1] ++ "⠙" ++ theme.reset ++ " ");
     try std.testing.expect(std.mem.find(u8, active.styled, "loading") == null);
     const narrow = try prompt(a, "long model name", null, 7, .{});
     defer narrow.deinit(a);
@@ -351,7 +329,7 @@ test "context percent thresholds follow displayed rounding without animation or 
             for ([_]usize{ 0, 11 }) |phase| {
                 const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high });
                 defer value.deinit(a);
-                const suffix = try std.fmt.allocPrint(a, ") {s}{s}{s}{s}{s}{s} ", .{ case.color, case.label, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
+                const suffix = try std.fmt.allocPrint(a, ") {s}{s}{s}{s}{s}{s} ", .{ case.color, case.label, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
                 defer a.free(suffix);
                 try expectPromptSuffix(value.styled, suffix);
                 try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
@@ -374,7 +352,7 @@ test "low price marker shares the full static context color and optout removes i
     for (cases) |case| for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |busy| for ([_]usize{ 0, 11 }) |phase| {
         const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high, .low_price_input = enabled });
         defer value.deinit(a);
-        const suffix = try std.fmt.allocPrint(a, ") {s}{s}{s}{s}{s}{s}{s} ", .{ case.color, if (enabled) "L" else "", case.label, theme.reset, if (busy) theme.command_pulse[0] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
+        const suffix = try std.fmt.allocPrint(a, ") {s}{s}{s}{s}{s}{s}{s} ", .{ case.color, if (enabled) "L" else "", case.label, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
         defer a.free(suffix);
         try expectPromptSuffix(value.styled, suffix);
         const label = try std.mem.concat(a, u8, &.{ "L", case.label });
@@ -451,7 +429,7 @@ test "model keeps effort and TPS waves while context percent has static occupanc
                 for ("model", 0..) |byte, ordinal| {
                     try expected.writer.print("{s}{c}", .{ palette[(phase % palette.len + ordinal) % palette.len], byte });
                 }
-                try expected.writer.print("{s}) {s}2.3%{s}{s}{s}{s} ", .{ theme.reset, theme.success, theme.reset, theme.command_pulse[shared.activity.commandStep(now)], activity.spinner(now), theme.reset });
+                try expected.writer.print("{s}) {s}2.3%{s}{s}{s}{s} ", .{ theme.reset, theme.success, theme.reset, theme.command_pulse[(now / 80) % theme.command_pulse.len], activity.spinner(now), theme.reset });
                 for (efforts) |effort| {
                     const value = try prompt(a, "model", .{ .tokens = 22807, .limit = 1000000 }, 79, .{ .busy = true, .streaming = true, .now_ms = now, .phase = phase, .rate_band = band, .reasoning_effort = effort });
                     defer value.deinit(a);
@@ -482,9 +460,9 @@ test "model keeps effort and TPS waves while context percent has static occupanc
             for ([_]bool{ false, true }) |busy| {
                 const narrow = try prompt(a, "model", null, columns, .{ .busy = busy, .now_ms = 80, .reasoning_effort = effort });
                 defer narrow.deinit(a);
-                try std.testing.expectEqualStrings(if (busy) "⠹ " else "> ", narrow.plain);
+                try std.testing.expectEqualStrings(if (busy) "⠙ " else "> ", narrow.plain);
                 if (busy) {
-                    try expectPromptStyle(theme.command_pulse[0] ++ "⠹" ++ theme.reset ++ " ", narrow.styled);
+                    try expectPromptStyle(theme.command_pulse[1] ++ "⠙" ++ theme.reset ++ " ", narrow.styled);
                 } else try expectPromptStyle(narrow.plain, narrow.styled);
             }
         }
@@ -496,7 +474,7 @@ test "running tool status pulses with the composer while the band flows separate
     const output = @import("markdown_writer.zig");
     const value: Caption = .{ .kind = .bash, .label = "target" };
     for ([_]u64{ 0, 79, 80, 119, 120, 239, 960, std.math.maxInt(u64) }) |now| {
-        const color = theme.command_pulse[shared.activity.commandStep(now)];
+        const color = theme.command_pulse[(now / 80) % theme.command_pulse.len];
         const icon = activity.spinner(now);
         const ending = try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ color, icon, theme.reset });
         defer a.free(ending);
@@ -668,7 +646,7 @@ test "executing rows keep every column after the status slot while the band and 
     const a = std.testing.allocator;
     const times = [_]u64{ 0, 40, 80, 120, 160, 200, 240, 280, std.math.maxInt(u64) };
     const spinner = "⠋";
-    for ([_]activity.Tool{ .bash, .read, .write, .memory, .subagent, .other }) |kind| {
+    for ([_]activity.Tool{ .bash, .read, .write, .memory, .background, .other }) |kind| {
         const value: Caption = .{ .kind = kind, .label = "operation 中文 target" };
         const name = activity.toolName(kind);
         const active_body = try commandText(a, value, .pending, spinner);

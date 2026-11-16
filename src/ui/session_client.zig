@@ -237,9 +237,6 @@ const Copy = struct {
                 c.fields.command = self.field(v.fields.command);
                 c.fields.action = self.field(v.fields.action);
                 c.fields.topic = self.field(v.fields.topic);
-                c.fields.task = self.field(v.fields.task);
-                c.fields.id = self.field(v.fields.id);
-                c.subagent_progress = if (v.subagent_progress) |progress_text| self.text(progress_text) else null;
                 break :blk .{ .tool_view = c };
             },
             // Never carry a process-local Inbox pointer across the boundary.
@@ -290,8 +287,6 @@ pub const QueuePreview = struct {
 pub const Snapshot = struct {
     background: @import("../core/background_status.zig").View = .{},
     memory: @import("../core/memory_status.zig").View = .{},
-    subagents: @import("../core/subagent_status.zig").View = .{},
-    subagents_supported: bool = false,
     available: bool = false,
     attached: bool = false,
     busy: bool = false,

@@ -1,6 +1,5 @@
 test "memory view identity revision and clear change only once" {
     var session: Session = undefined;
-    session.last_subagent_view = .{};
     session.last_memory_view = .{};
     const first: @import("../core/memory_status.zig").View = .{ .enabled = true, .revision = 1, .active = .{ .id = 1, .phase = .extracting } };
     var next = first;
@@ -18,8 +17,6 @@ test "memory notice dirty survives busy metadata and cadence early returns" {
     // Minimal owner fixture: these paths must not touch App/Runtime or I/O.
     var session: Session = undefined;
     session.allocator = std.testing.allocator;
-    session.last_subagent_view = .{};
-    defer session.last_subagent_view.deinitOwned(session.allocator);
     session.app = null;
     session.owner_task_active = false;
     session.initial_default_pending = false;
