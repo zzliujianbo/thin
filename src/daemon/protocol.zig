@@ -622,6 +622,11 @@ pub const Out = struct {
         try self.buf.appendSlice(self.a, json);
     }
 
+    pub fn stringElement(self: *Out, text: []const u8) !void {
+        try self.separate();
+        try appendString(&self.buf, self.a, text);
+    }
+
     /// Finish the frame. Rejects unbalanced builders and oversized responses.
     pub fn finish(self: *Out) ![]u8 {
         if (self.depth != 0) return error.BadRequest;
@@ -1000,6 +1005,9 @@ pub const Snapshot = struct {
     background: background.View = .{},
     read_only: bool = false,
     truncated: bool = false,
+    /// Startup-visible user prompts, independent of the display-history window.
+    /// Bounded by the host; the frontend uses this once to seed input recall.
+    input_history: []const []const u8 = &.{},
 };
 
 pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
@@ -1053,6 +1061,9 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.endObject();
     try out.field("read_only", snapshot.read_only);
     try out.field("truncated", snapshot.truncated);
+    try out.beginArray("input_history");
+    for (snapshot.input_history) |text| try out.stringElement(text);
+    try out.endArray();
     try out.endObject();
 }
 

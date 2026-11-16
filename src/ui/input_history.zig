@@ -5,7 +5,13 @@ const Allocator = std.mem.Allocator;
 
 pub const History = struct {
     entries: std.ArrayList([]u8) = .empty,
+    bytes: usize = 0,
     index: ?usize = null,
+
+    /// Keep long-running sessions bounded without making the cap visible as a
+    /// navigation error. Oldest entries are evicted first.
+    const max_entries: usize = 256;
+    const max_bytes: usize = 2 * 1024 * 1024;
 
     pub fn deinit(self: *History, a: Allocator) void {
         for (self.entries.items) |entry| release(a, entry);
@@ -33,8 +39,14 @@ pub const History = struct {
     }
 
     /// Called only after the task successfully starts. Infallible ownership transfer.
-    pub fn commit(self: *History, _: Allocator, prepared: []u8) void {
+    pub fn commit(self: *History, a: Allocator, prepared: []u8) void {
         self.entries.appendAssumeCapacity(prepared);
+        self.bytes +|= prepared.len;
+        while (self.entries.items.len > max_entries or self.bytes > max_bytes) {
+            const oldest = self.entries.orderedRemove(0);
+            self.bytes -|= oldest.len;
+            release(a, oldest);
+        }
         self.index = null;
     }
 

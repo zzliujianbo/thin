@@ -9639,6 +9639,30 @@ test "remote history replay seeds input history without touching the editor" {
     try drainBridge(&ui);
     try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
 }
+test "remote snapshot seeds input history independently of display replay" {
+    try text.initLocale();
+    const a = std.testing.allocator;
+    const seeded = [_][]const u8{ "checkpoint one", "checkpoint two" };
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 5, .input_history = &seeded } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    try std.testing.expectEqualStrings("checkpoint one", ui.input_history.entries.items[0]);
+    // A replay of the same prompt must not duplicate the seeded entry.
+    fake.item = try session_client.ownEvent(a, 5, .{ .user_committed = .{ .id = 1, .text = "checkpoint two" } });
+    fake.item.?.history_replay = true;
+    fake.item.?.history_reset = true;
+    try ui.pumpRemote();
+    try drainBridge(&ui);
+    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
+    ui.editor.cursor = 0;
+    try Ui.key(&ui, .up);
+    try std.testing.expectEqualStrings("checkpoint two", ui.editor.bytes.items);
+}
+
 test "remote history reset while browsing returns the unsent draft to the editor" {
     try text.initLocale();
     const a = std.testing.allocator;

@@ -26,6 +26,20 @@ test "input history retains owned chronological entries and prepares transaction
     try std.testing.expectEqualStrings("input-0", h.entries.items[0]);
     try std.testing.expectEqualSlices(u8, big, h.entries.items[87]);
 }
+test "input history keeps the newest bounded window" {
+    const a = std.testing.allocator;
+    var h: History = .{};
+    defer h.deinit(a);
+    for (0..300) |i| {
+        var buf: [32]u8 = undefined;
+        h.commit(a, try h.prepare(a, try std.fmt.bufPrint(&buf, "bounded-{d}", .{i})));
+    }
+    try std.testing.expectEqual(History.max_entries, h.entries.items.len);
+    try std.testing.expectEqualStrings("bounded-44", h.entries.items[0]);
+    try std.testing.expectEqualStrings("bounded-299", h.entries.items[h.entries.items.len - 1]);
+    try std.testing.expect(h.bytes <= History.max_bytes);
+}
+
 test "input history allocation failure preserves existing entries" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }

@@ -294,6 +294,10 @@ pub const SessionHost = struct {
 
     events: LiveRing,
     history: Ring,
+    /// User prompts retained for input recall, independent of display replay.
+    /// Seeded from the restored checkpoint and appended on live submissions.
+    input_history: std.ArrayList([]u8) = .empty,
+    input_history_bytes: usize = 0,
     /// Tests only: lower the baseline byte budget; production uses the transport max.
     test_history_budget: ?usize = null,
     pending_event: ?struct { item: bridge_mod.Item, json: []u8 } = null,
@@ -558,6 +562,7 @@ pub const SessionHost = struct {
     /// Canonical history row for a queued/steering message actually committed by
     /// the Runtime (also delivered live, exactly once).
     fn noteQueuedUser(self: *SessionHost, id: u64, text: []const u8) void {
+        self.appendInputHistory(text);
         const meta = protocol.EventMeta{ .epoch = 0, .truncated = false, .canonical_complete = true };
         const event: r.Event = .{ .user_committed = .{ .id = id, .text = text } };
         const seq = self.takeSeq();
@@ -577,6 +582,7 @@ pub const SessionHost = struct {
     /// it is recorded in canonical history only: no event echo, no duplicate UI
     /// row. Runtime does not emit user_committed for the initial append.
     fn noteSubmittedUser(self: *SessionHost, text: []const u8) u64 {
+        self.appendInputHistory(text);
         self.next_user_id +%= 1;
         if (self.next_user_id == 0) self.next_user_id = 1;
         const meta = protocol.EventMeta{ .epoch = 0, .truncated = false, .canonical_complete = true };
@@ -814,6 +820,36 @@ pub const SessionHost = struct {
         self.reset_failed = null;
     }
 
+    const max_input_history_entries: usize = 256;
+    const max_input_history_bytes: usize = 1024 * 1024;
+
+    /// Keep a bounded user prompt list for input recall. This is deliberately
+    /// independent of the display-history byte window: a    /// resumed frontend must still be able to recall prompts whose tool rows
+    /// were too old to replay.
+    fn appendInputHistory(self: *SessionHost, text: []const u8) void {
+        if (text.len == 0 or text.len > max_input_history_bytes or
+            std.mem.findScalar(u8, text, 0) != null or !std.unicode.utf8ValidateSlice(text))
+            return;
+        const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] == '/') return;
+        if (self.input_history.items.len >= max_input_history_entries) {
+            const oldest = self.input_history.orderedRemove(0);
+            self.input_history_bytes -|= oldest.len;
+            self.allocator.free(oldest);
+        }
+        while (self.input_history.items.len != 0 and self.input_history_bytes + text.len > max_input_history_bytes) {
+            const oldest = self.input_history.orderedRemove(0);
+            self.input_history_bytes -|= oldest.len;
+            self.allocator.free(oldest);
+        }
+        const owned = self.allocator.dupe(u8, text) catch return;
+        self.input_history.append(self.allocator, owned) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.input_history_bytes += owned.len;
+    }
+
     /// Convert startup canonical messages into owned display rows. Native
     /// replay, configuration and credentials never cross this conversion.
     fn seedHistory(self: *SessionHost, messages: []const p.Message, stats: []const checkpoint.ToolStat) void {
@@ -844,6 +880,7 @@ pub const SessionHost = struct {
                     user_id +%= 1;
                     if (user_id == 0) user_id = 1;
                     if (!self.seedEvent(.{ .user_committed = .{ .id = user_id, .text = text_buf.items } })) return;
+                    self.appendInputHistory(text_buf.items);
                 },
                 .assistant => {
                     if (message.blocks.len == 0) continue;
@@ -1080,6 +1117,8 @@ pub const SessionHost = struct {
         self.draft_marks.deinit(self.allocator);
         self.events.deinit();
         self.history.deinit();
+        for (self.input_history.items) |text| a.free(text);
+        self.input_history.deinit(self.allocator);
         self.session.deinit();
         a.free(self.project);
         a.destroy(self);
@@ -1217,6 +1256,7 @@ pub const SessionHost = struct {
             .background = state.background,
             .read_only = self.session.read_only,
             .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
+            .input_history = self.input_history.items,
         };
     }
 

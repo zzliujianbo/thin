@@ -654,6 +654,13 @@ test "idle refresh publishes restored context after login without requests" {
         const attached = try dispatchJson(host, a, "{\"v\":5,\"id\":1,\"op\":\"attach\",\"write\":true}", 7);
         defer a.free(attached);
         try std.testing.expect(std.mem.indexOf(u8, attached, "\"epoch\":1") != null);
+        const recalled_frame = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"snapshot\"}", 7);
+        defer a.free(recalled_frame);
+        var recalled_doc = try parseJson(a, recalled_frame);
+        defer recalled_doc.deinit();
+        const recalled = recalled_doc.value.object.get("snapshot").?.object.get("input_history").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), recalled.len);
+        try std.testing.expectEqualStrings("saved question", recalled[0].string);
         const expected = r.ContextSnapshot{ .tokens = reported orelse 0, .limit = 131072, .known = reported != null };
         try Spy.expectSnapshot(host, expected);
         const history_count = host.history.items.items.len;
@@ -1449,6 +1456,17 @@ test "seeded tool results replay as tool_result rows, not assistant text" {
     try std.testing.expectEqual(@as(usize, 2), assistant_rows);
     try std.testing.expectEqual(@as(usize, 3), tool_rows);
     try std.testing.expect(saw_paired and saw_orphan and saw_local);
+
+    // Input recall is seeded from the same checkpoint rows even when display
+    // history is later windowed or skipped.
+    const snapshot_frame = try dispatchJson(host, a, "{\"v\":5,\"id\":32,\"op\":\"snapshot\"}", 1);
+    defer a.free(snapshot_frame);
+    var snapshot_doc = try parseJson(a, snapshot_frame);
+    defer snapshot_doc.deinit();
+    const recalled = snapshot_doc.value.object.get("snapshot").?.object.get("input_history").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), recalled.len);
+    try std.testing.expectEqualStrings("question", recalled[0].string);
+    try std.testing.expectEqualStrings("!printf hi", recalled[1].string);
 }
 
 test "history reply is valid JSON with truncated outside the entries array" {

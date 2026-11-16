@@ -483,6 +483,8 @@ pub const Client = struct {
 
     /// Published projections with a stable address for the VTable.
     snap: session_client.Snapshot = .{},
+    /// Owned startup user prompts, independent of the display-history ring.
+    input_history: std.ArrayList([]u8) = .empty,
     state: tui.Connection.State = baseState(),
     /// Ping-pong arenas: the published projection stays valid until the next
     /// rebuild, so the UI never reads freed wire memory.
@@ -561,6 +563,8 @@ pub const Client = struct {
         self.arenas[0].deinit();
         self.arenas[1].deinit();
         self.pending.deinit(self.a);
+        for (self.input_history.items) |text| self.a.free(text);
+        self.input_history.deinit(self.a);
         for (self.published.items) |entry| {
             self.a.free(entry.project);
             self.a.free(entry.endpoint);
@@ -787,6 +791,12 @@ pub const Client = struct {
                 };
             }
         }
+        var recalled: []const []const u8 = &.{};
+        if (self.input_history.items.len != 0) {
+            const copy = try arena.alloc([]const u8, self.input_history.items.len);
+            for (self.input_history.items, 0..) |text, index| copy[index] = try arena.dupe(u8, text);
+            recalled = copy;
+        }
         return .{
             // Serving readiness is backend capability, not the current view: a
             // worker transport, or a launcher that can still get one. A revoked
@@ -816,6 +826,7 @@ pub const Client = struct {
             .running_sessions = 0,
             .memory = cache.memory,
             .background = cache.background,
+            .input_history = recalled,
         };
     }
 
@@ -1097,6 +1108,21 @@ pub const Client = struct {
             else => {},
         };
         cache.preview_count = @intCast(preview_count);
+        for (self.input_history.items) |text| self.a.free(text);
+        self.input_history.clearRetainingCapacity();
+        if (object.get("input_history")) |value| switch (value) {
+            .array => |array| for (array.items) |entry| {
+                const text = switch (entry) {
+                    .string => |text| text,
+                    else => return error.ProtocolError,
+                };
+                if (text.len == 0 or text.len > 64 * 1024 or !std.unicode.utf8ValidateSlice(text)) continue;
+                const owned = try self.a.dupe(u8, text);
+                errdefer self.a.free(owned);
+                try self.input_history.append(self.a, owned);
+            },
+            else => return error.ProtocolError,
+        };
         // Control was revoked. The owner reports `epoch: 0` to a connection that
         // is no longer the controller (it never hands out another console's
         // epoch), so any epoch other than the one this view holds — including 0

@@ -712,7 +712,7 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     // the composer moves down with output until it reaches the bottom.
     // Remote attach may already own a running task; adopt its epoch before the
     // first frame so a stale approval or queue send cannot cross sessions.
-    if (connection.session_client) |client| ui.adoptRemoteSession(client);
+    if (connection.session_client) |client| ui.adoptRemoteSession(client) else ui.seedLocalInputHistory();
 
     // 事件循环出错时直接返回，资源释放交给上面的 defer。
     const result = ui.loop() catch |err| {
@@ -862,6 +862,9 @@ const Ui = struct {
     editor: input.Editor,
     editor_revision: u64 = 0,
     input_history: @import("input_history.zig").History = .{},
+    /// True when this session was seeded from the owner's checkpoint snapshot,
+    /// not from display replay. Reset on a session view replacement.
+    input_history_seeded: bool = false,
     history_draft: ?input.Editor = null,
     history_draft_pasted: bool = false,
     vertical_column: ?usize = null,
@@ -1579,6 +1582,7 @@ const Ui = struct {
         self.remote_epoch = snapshot.control_epoch;
         self.remote_observed_busy = snapshot.busy;
         self.remote_kind = snapshot.task_kind;
+        self.seedRemoteInputHistory(snapshot);
         if (snapshot.busy) {
             self.busy = true;
             self.mode = snapshot.mode orelse .calling_model;
@@ -2011,6 +2015,47 @@ const Ui = struct {
         return null;
     }
 
+    /// Seed once from the owner's checkpoint user prompts. This is independent
+    /// of the display-history window, which may start after these prompts.
+    fn seedRemoteInputHistory(self: *Ui, snapshot: *const session_client.Snapshot) void {
+        if (self.input_history_seeded or snapshot.input_history.len == 0) return;
+        if (self.input_history.index != null and self.history_draft != null) self.restoreHistoryDraft();
+        self.input_history.deinit(self.allocator);
+        for (snapshot.input_history) |prompt| {
+            const trimmed = std.mem.trimStart(u8, prompt, " \t\r\n");
+            if (trimmed.len == 0 or trimmed[0] == '/') continue;
+            const owned = self.input_history.prepare(self.allocator, prompt) catch continue;
+            self.input_history.commit(self.allocator, owned);
+        }
+        self.input_history_seeded = true;
+    }
+
+    /// Local foreground startup uses the same checkpoint contract without a
+    /// remote snapshot. The borrowed messages are consumed before any task.
+    fn seedLocalInputHistory(self: *Ui) void {
+        const history = self.connection.initial_history_fn orelse return;
+        var prompt_buf: std.ArrayList(u8) = .empty;
+        defer prompt_buf.deinit(self.allocator);
+        for (history(self.connection.context)) |message| {
+            if (message.role != .user) continue;
+            prompt_buf.clearRetainingCapacity();
+            for (message.blocks) |block| {
+                const prompt = switch (block) {
+                    .text => |value| value,
+                    else => continue,
+                };
+                if (prompt_buf.items.len != 0) prompt_buf.append(self.allocator, '\n') catch break;
+                prompt_buf.appendSlice(self.allocator, prompt) catch break;
+            }
+            if (prompt_buf.items.len == 0) continue;
+            const trimmed = std.mem.trimStart(u8, prompt_buf.items, " \t\r\n");
+            if (trimmed.len == 0 or trimmed[0] == '/') continue;
+            const owned = self.input_history.prepare(self.allocator, prompt_buf.items) catch continue;
+            self.input_history.commit(self.allocator, owned);
+        }
+        self.input_history_seeded = self.input_history.entries.items.len != 0;
+    }
+
     /// Poll returns only items whose epoch still matches the current controller,
     /// so a real history snapshot may reset and seed the session input history.
     /// Display replay never becomes execution: only complete, unreduced
@@ -2064,9 +2109,9 @@ const Ui = struct {
             if (self.input_history.index != null and self.history_draft != null) {
                 self.restoreHistoryDraft();
             } else self.dropHistoryDraft();
-            self.input_history.deinit(self.allocator);
+            if (!self.input_history_seeded) self.input_history.deinit(self.allocator);
         }
-        if (!item.history_replay or item.display_truncated or !item.canonical_complete) return;
+        if (self.input_history_seeded or !item.history_replay or item.display_truncated or !item.canonical_complete) return;
         const committed = switch (item.event) {
             .user_committed => |value| value.text,
             else => return,
@@ -2275,6 +2320,7 @@ const Ui = struct {
         self.secret_provider = null;
         self.parser.secretMode(false);
         self.input_history.deinit(self.allocator);
+        self.input_history_seeded = false;
         self.dropHistoryDraft();
         self.wipeEditor();
         self.discardResizedFrame();

@@ -304,6 +304,9 @@ pub const Snapshot = struct {
     newest_bytes: usize = 0,
     previews: []const QueuePreview = &.{},
     running_sessions: usize = 0,
+    /// Startup user prompts for input recall; bounded by the owner and valid
+    /// until the next snapshot rebuild.
+    input_history: []const []const u8 = &.{},
 };
 
 /// Session-management request. `id`, `cd` and `close` arguments are borrowed for
