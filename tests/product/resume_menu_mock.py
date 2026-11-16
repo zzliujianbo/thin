@@ -26,7 +26,7 @@ errors = []
 selected_ids = []
 continuation_sessions = []
 # Screen is an ASCII VT oracle; Unicode title validity is covered by core tests.
-MODEL_TITLE = 'Resume summary'
+FIRST_TITLE = 'seed-one-user'
 FALLBACK_TITLE = 'seed-two-user'
 
 
@@ -51,11 +51,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             messages = body['messages']
             tools = body['tools']
             names = [tool['function']['name'] for tool in tools]
-            assert names.count('set_session_title') == 1, 'root title tool schema missing or duplicated'
-            schema = next(tool['function'] for tool in tools if tool['function']['name'] == 'set_session_title')
-            assert schema['parameters']['type'] == 'object'
-            assert schema['parameters']['properties']['title']['type'] == 'string'
-            assert 'title' in schema['parameters']['required']
+            assert names.count('set_session_title') == 0, 'title tool must be removed'
             if n >= 4:
                 actual = self.headers.get('x-opencode-session')
                 continuation_sessions.append(actual)
@@ -67,15 +63,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assert 'resume-side-effect' in wire and 'seed-two-user' not in wire
                     assert any(m.get('role') == 'tool' for m in messages)
                     calls = [c for m in messages for c in m.get('tool_calls', [])]
-                    assert sum(c['function']['name'] == 'set_session_title' for c in calls) == 1
-                    assert sum(m.get('role') == 'tool' and m.get('tool_call_id') == 'resume-title' for m in messages) == 1
+                    assert sum(c['function']['name'] == 'bash' for c in calls) == 1
+                    assert sum(m.get('role') == 'tool' and m.get('tool_call_id') == 'resume-tool' for m in messages) == 1
                 else:
                     assert 'seed-two-user' in wire and 'seed-two-answer' in wire
                     assert 'probe-b-user' in wire and 'seed-one-user' not in wire
             if n == 1:
                 delta = {'role': 'assistant', 'tool_calls': [
                     {'index': 0, 'id': 'resume-tool', 'type': 'function', 'function': {'name': 'bash', 'arguments': json.dumps({'command': 'printf once >> resume-side-effect'})}},
-                    {'index': 1, 'id': 'resume-title', 'type': 'function', 'function': {'name': 'set_session_title', 'arguments': json.dumps({'title': MODEL_TITLE}, ensure_ascii=False)}},
                 ]}
                 finish = 'tool_calls'
             else:
@@ -230,7 +225,7 @@ def main(app):
                 ids.append(new.pop())
             assert len(requests) == 3
             selected_ids[:] = [ids[0], ids[1], ids[0]]
-            assert read_title(sessions, ids[0]) == MODEL_TITLE
+            assert read_title(sessions, ids[0]) == FIRST_TITLE
             assert read_title(sessions, ids[1]) == FALLBACK_TITLE
             titles_before = {i: (sessions / f'{i}.title').read_bytes() for i in ids}
             marker = project / 'resume-side-effect'
@@ -239,27 +234,27 @@ def main(app):
             try:
                 term.pump(term.idle, 'fresh launcher startup composer')
                 term.send(b'/resume\r')
-                term.pump(lambda: all(any(title in line for line in term.lines()) for title in (MODEL_TITLE, FALLBACK_TITLE)) and term.data.endswith(FRAME_END),
+                term.pump(lambda: all(any(title in line for line in term.lines()) for title in (FIRST_TITLE, FALLBACK_TITLE)) and term.data.endswith(FRAME_END),
                           'first resume menu contains both titles')
                 lines = term.lines()
-                assert next(i for i, line in enumerate(lines) if FALLBACK_TITLE in line) < next(i for i, line in enumerate(lines) if MODEL_TITLE in line)
+                assert next(i for i, line in enumerate(lines) if FALLBACK_TITLE in line) < next(i for i, line in enumerate(lines) if FIRST_TITLE in line)
                 assert not any(session_id in line for session_id in ids for line in lines)
                 mark = len(term.data)
                 term.send(b'\x1b')
                 term.pump(lambda: len(term.data) > mark and term.idle() and
-                          not any(MODEL_TITLE in ''.join(row) for row in term.screen.grid),
+                          not any(FIRST_TITLE in ''.join(row) for row in term.screen.grid),
                           'Escape returns to current composer')
                 assert len(requests) == 3
                 mark = len(term.data)
                 term.send(b'/resume\r')
-                term.pump(lambda: len(term.data) > mark and all(any(title in ''.join(row) for row in term.screen.grid) for title in (MODEL_TITLE, FALLBACK_TITLE)) and term.data.endswith(FRAME_END),
+                term.pump(lambda: len(term.data) > mark and all(any(title in ''.join(row) for row in term.screen.grid) for title in (FIRST_TITLE, FALLBACK_TITLE)) and term.data.endswith(FRAME_END),
                           'reopened resume menu contains both titles')
                 arrow_mark = len(term.data)
                 selection_deadline = time.monotonic() + 15
                 term.send(b'\x1b[B')
                 term.pump(lambda: len(term.data) > arrow_mark and term.data.endswith(FRAME_END) and
                           term.data.rfind(SYNC_BEGIN) >= arrow_mark and
-                          any(''.join(row).lstrip().startswith(f'> {MODEL_TITLE}') for row in term.screen.grid),
+                          any(''.join(row).lstrip().startswith(f'> {FIRST_TITLE}') for row in term.screen.grid),
                           'Down selects older checkpoint in a fresh complete frame', deadline=selection_deadline)
                 term.send(b'\r')
                 term.pump(lambda: any('seed-one-answer' in line for line in term.lines()) and term.idle(),
@@ -293,7 +288,7 @@ def main(app):
                               f'{phase} result and menu closed')
 
                 newest(ids[0])
-                default_resume(MODEL_TITLE, 'same-current no-op', 'Already attached')
+                default_resume(FIRST_TITLE, 'same-current no-op', 'Already attached')
                 assert len(requests) == 4 and marker.read_text() == 'once'
                 newest(ids[1])
                 default_resume(FALLBACK_TITLE, 'switch to B', 'Conversation restored; prior tools are NOT rerun')
@@ -303,7 +298,7 @@ def main(app):
                           'explicit B continuation')
                 assert len(requests) == 5 and marker.read_text() == 'once'
                 newest(ids[0])
-                default_resume(MODEL_TITLE, 'return to live A', 'Conversation restored; prior tools are NOT rerun')
+                default_resume(FIRST_TITLE, 'return to live A', 'Conversation restored; prior tools are NOT rerun')
                 assert len(requests) == 5 and marker.read_text() == 'once'
                 term.send(b'return-a-user\r')
                 term.pump(lambda: any('return-a-answer' in line for line in term.lines()) and term.idle(),
@@ -403,7 +398,7 @@ def trailing_home_connect(app, server):
                           term.idle() and not any(''.join(row).lstrip().startswith(f'> {title}') for row in term.screen.grid),
                           f'{phase} restored')
 
-            select(ids[0], MODEL_TITLE, 'trailing-HOME A')
+            select(ids[0], FIRST_TITLE, 'trailing-HOME A')
             assert len(requests) == 3 and marker.read_text() == 'once'
             term.send(b'continuation-user\r')
             term.pump(lambda: any('continuation-answer' in line for line in term.lines()) and term.idle(), 'trailing-HOME A continuation')
@@ -411,7 +406,7 @@ def trailing_home_connect(app, server):
             assert len(requests) == 4 and marker.read_text() == 'once'
             term.send(b'probe-b-user\r')
             term.pump(lambda: any('probe-b-answer' in line for line in term.lines()) and term.idle(), 'trailing-HOME B continuation')
-            select(ids[0], MODEL_TITLE, 'trailing-HOME live return to A')
+            select(ids[0], FIRST_TITLE, 'trailing-HOME live return to A')
             assert len(requests) == 5 and marker.read_text() == 'once'
             term.send(b'return-a-user\r')
             term.pump(lambda: any('return-a-answer' in line for line in term.lines()) and term.idle(), 'trailing-HOME return A continuation')

@@ -13,7 +13,6 @@ const Journal = @import("journal.zig").Journal;
 const reasoning_defaults = @import("reasoning_defaults.zig");
 const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
-const Title = @import("../core/session_metadata.zig").Title;
 const model_resolver = @import("model_resolver.zig");
 const image = @import("../core/image.zig");
 const ImageClient = @import("image_client.zig").Client;
@@ -87,16 +86,6 @@ pub const App = struct {
     /// Agent 运行时，最后初始化，依赖前面所有字段。
     runtime: r.Runtime,
     thinking_control: r.ThinkingControl = .{},
-
-    /// Enable only during Session initialization, before restoring a checkpoint.
-    /// Restore compares the actual schema fingerprint and resets native replay
-    /// when necessary; regular settings/connection rebinds retain this value.
-    pub fn enableSessionTitle(self: *App, initial: Title) void {
-        std.debug.assert(!self.runtime.busy.load(.acquire));
-        std.debug.assert(self.runtime.messages().len == 0);
-        self.executor.session_title = initial;
-        self.runtime.executor = self.executor.executor();
-    }
 
     /// Heap placement is intentional: Store, Tools, Client and Runtime refer to
     /// these fields, so returning a self-referential value would invalidate them.

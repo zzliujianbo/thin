@@ -62,7 +62,7 @@ test "session completions survive activation and every owner replacement" {
     }
     try std.testing.expect(session.takeMemoryCompletion() == null);
 }
-test "session title fallback model update and resume follow successful checkpoints" {
+test "session title fallback and resume follow successful checkpoints" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
     var id: ids.Id = undefined;
@@ -77,18 +77,14 @@ test "session title fallback model update and resume follow successful checkpoin
         try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .tool, .blocks = &.{.{ .tool_result = .{ .call_id = "old-title-tool", .text = "old result" } }} });
         try session.persistCheckpointInner(false);
         try std.testing.expectEqualStrings("首条 问题", session.saved_title.text());
-        app.executor.session_title = session_metadata.Title.fromText("概括标题");
-        try session.persistCheckpointInner(false);
-        try std.testing.expectEqualStrings("概括标题", session.saved_title.text());
         try std.testing.expect(try session.saveOnExit());
         id = session.session_id;
     }
     {
         var restored = try fixture.open(.{ .resume_session = id });
         defer restored.deinit();
-        try std.testing.expectEqualStrings("概括标题", restored.saved_title.text());
+        try std.testing.expectEqualStrings("首条 问题", restored.saved_title.text());
         try restored.connection().configure("fake-title-resume");
-        try std.testing.expectEqualStrings("概括标题", restored.app.?.executor.session_title.?.text());
         try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, "must-not-run.txt", .{}));
     }
 }
@@ -98,7 +94,6 @@ test "title is not created without conversation or a checkpoint" {
     var session = try fixture.open(.{});
     defer session.deinit();
     try session.connection().configure("fake-title-empty");
-    session.app.?.executor.session_title = session_metadata.Title.fromText("model title");
     session.publishCheckpoint();
     try std.testing.expect(!try session.saveOnExit());
     try std.testing.expect(session.resume_lease == null);
@@ -137,7 +132,6 @@ test "failed checkpoint does not create a title" {
     defer session.deinit();
     try session.connection().configure("fake-title-checkpoint-failure");
     try seedSessionTestHistory(&session);
-    session.app.?.executor.session_title = session_metadata.Title.fromText("model title");
     try session.ensureWritableLease();
     var checkpoint_buffer: [100]u8 = undefined;
     const checkpoint_path = try std.fmt.bufPrint(&checkpoint_buffer, ".thin/sessions/{s}.session", .{session.session_id});
@@ -954,7 +948,7 @@ test "Anthropic displayable session resume preserves signed replay and never exe
         try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "must-not-run.txt", .{}));
     }
 }
-test "Anthropic session resume invalidates null-hash replay when title tools are enabled" {
+test "Anthropic session resume invalidates null-hash replay when the schema is unknown" {
     const a = std.testing.allocator;
     const adapter = @import("../llm/anthropic.zig");
     const native = "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"private null-hash plan\",\"signature\":\"signed null-hash fixture\"},{\"type\":\"redacted_thinking\",\"data\":\"opaque null-hash fixture\"},{\"type\":\"tool_use\",\"id\":\"saved-call\",\"name\":\"write_file\",\"input\":{\"path\":\"must-not-run.txt\",\"content\":\"no\"}}]}";
@@ -1004,12 +998,6 @@ test "Anthropic session resume invalidates null-hash replay when title tools are
     try std.testing.expectEqual(id, restored.session_id);
     try std.testing.expect(restored.resume_lease.?.writable and !restored.read_only);
     try std.testing.expect(!restored.global_config.?.value.imageActive());
-    try std.testing.expect(app.executor.session_title != null);
-    var title_schemas: usize = 0;
-    for (app.runtime.executor.schemas) |schema| {
-        if (std.mem.eql(u8, schema.name, "set_session_title")) title_schemas += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), title_schemas);
     try std.testing.expectEqual(@as(?u64, 77), app.runtime.last_context_tokens);
     try std.testing.expect(restored.initial_context.?.known);
     try std.testing.expectEqual(@as(u64, 77), restored.initial_context.?.tokens);
@@ -1037,7 +1025,7 @@ test "Anthropic session resume invalidates null-hash replay when title tools are
     defer encoded.deinit();
     const wire_tools = encoded.value.object.get("tools").?.array.items;
     try std.testing.expectEqual(app.runtime.executor.schemas.len, wire_tools.len);
-    try std.testing.expectEqualStrings("set_session_title", wire_tools[wire_tools.len - 2].object.get("name").?.string);
+    try std.testing.expectEqualStrings("background", wire_tools[wire_tools.len - 2].object.get("name").?.string);
     try std.testing.expectEqualStrings("edit_file", wire_tools[wire_tools.len - 1].object.get("name").?.string);
     const messages = encoded.value.object.get("messages").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), messages.len);

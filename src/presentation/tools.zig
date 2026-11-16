@@ -62,6 +62,14 @@ pub const Call = struct {
         }
         // Background rows are described by the host-supplied display caption.
         if (kind == .background) return .{ .kind = kind };
+        if (kind == .bash) {
+            if (parsed.value.object.get("commands")) |commands| {
+                if (commands != .array or commands.array.items.len == 0) return .{ .kind = kind };
+                const count = try std.fmt.allocPrint(a, "{d} command{s}", .{ commands.array.items.len, if (commands.array.items.len == 1) "" else "s" });
+                defer a.free(count);
+                return fromDetail(a, kind, count);
+            }
+        }
         const value = parsed.value.object.get(switch (kind) {
             .bash => "command",
             else => "path",

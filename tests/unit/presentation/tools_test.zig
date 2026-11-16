@@ -79,6 +79,17 @@ test "memory descriptions include known action and topic without bodies versions
     defer long.deinit(a);
     try std.testing.expect(long.truncated and long.detail.?.len <= 512);
 }
+test "bash batch captions count commands without exposing their bodies" {
+    const a = std.testing.allocator;
+    const two = try Call.init(a, "bash", "{\"commands\":[{\"command\":\"printf one\"},{\"command\":\"printf two\"}]}");
+    defer two.deinit(a);
+    try std.testing.expect(two.kind == .bash);
+    try std.testing.expectEqualStrings("2 commands", two.detail.?);
+    const one = try Call.init(a, "bash", "{\"commands\":[{\"command\":\"printf one\"}]}");
+    defer one.deinit(a);
+    try std.testing.expectEqualStrings("1 command", one.detail.?);
+}
+
 test "shared tools expose structured safe detail observations and bounded FIFO without styles" {
     const a = std.testing.allocator;
     var queue: Queue = .{};

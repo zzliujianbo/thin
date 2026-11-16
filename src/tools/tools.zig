@@ -21,24 +21,23 @@ const image = @import("../core/image.zig");
 const image_file = @import("image_file.zig");
 const text_edit = @import("text_edit.zig");
 const background = @import("../core/background.zig");
-const Title = @import("../core/session_metadata.zig").Title;
 
 /// Foreground bash description. The background variant appends its own sentence
 /// so a child Tools without a service never advertises background capability.
-const bash_description = "Run bash in the startup project; cwd changes do not persist. Ordinary commands run without approval prompts; classified high-risk commands require explicit approval each time. Denial means no execution. timeout_ms defaults to 5 minutes. stdout and stderr are captured in full.";
+const bash_description = "Run bash in the startup project; cwd changes do not persist. Use command, or commands (1-20) for independent concurrent jobs; batches share cwd/env, return results in input order, and reject high-risk commands. High-risk single commands need explicit approval. timeout_ms defaults to 5 minutes per command; item timeout_ms overrides. Single-command output is complete; batch output is bounded and marks truncation.";
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
     .{
         .name = "read_file",
-        .description = "Read a local UTF-8 file. Relative paths start in the startup project; absolute paths and ../ may read outside it. Protected credentials and symlinks remain denied. offset is a zero-based BYTE offset; limit is a BYTE count, not lines. Mid-character starts round back at most 3 bytes; returned offset is the actual start. When truncated, use returned next_offset as the next call's offset.",
+        .description = "Read a UTF-8 file. Relative paths start at the startup project; absolute and ../ paths may read outside it; credentials and symlinks are denied. offset is a zero-based BYTE offset; limit is a BYTE count. When truncated, continue with next_offset.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}
         ,
     },
     .{
         .name = "write_file",
-        .description = "Atomically write UTF-8 inside the startup project after host validation. Read relevant content before replacing it. Parent directory must exist; overwrite=true is required to replace a file. Denied writes make no change.",
+        .description = "Atomically write a UTF-8 file inside the startup project. Parent directory must exist; overwrite=true is required to replace. Read before editing.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"],"additionalProperties":false}
         ,
@@ -46,9 +45,7 @@ pub const schemas = [_]p.ToolSchema{
     .{
         .name = "bash",
         .description = bash_description,
-        .parameters_json =
-        \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}
-        ,
+        .parameters_json = bash_parameters_json,
     },
     .{
         .name = "memory",
@@ -62,16 +59,20 @@ pub const schemas = [_]p.ToolSchema{
 /// Background variants only appear when the host supplied a background service
 /// to a root Tools. They state that the bounded timeout covers startup only,
 /// so the command timeout is not mistaken for the lifetime of a handed-off service.
-const background_bash_description = bash_description ++ " background=true starts a managed service in this Thin instance: the call returns after a bounded startup wait with an id; timeout_ms bounds only that startup wait, not how long the service keeps running. For long output needing later inspection, use background=true and read background.logs by offset. Manage it with the background tool.";
+const background_bash_description = bash_description ++ " background=true starts a managed service and bounds only startup, not how long the service keeps running; use the background tool for logs/status/stop. Batch commands are foreground only.";
+
+const bash_parameters_json =
+    \\{"type":"object","properties":{"command":{"type":"string","minLength":1},"commands":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"command":{"type":"string","minLength":1},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}},"timeout_ms":{"type":"integer","minimum":1}},"anyOf":[{"required":["command"]},{"required":["commands"]}],"additionalProperties":false}
+;
 const bash_background_parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"background":{"type":"boolean"}},"required":["command"],"additionalProperties":false}
+    \\{"type":"object","properties":{"command":{"type":"string","minLength":1},"commands":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"command":{"type":"string","minLength":1},"timeout_ms":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}},"timeout_ms":{"type":"integer","minimum":1},"background":{"type":"boolean"}},"anyOf":[{"required":["command"]},{"required":["commands"]}],"additionalProperties":false}
 ;
 
 /// One management tool, appended after every other root tool. It exists only
 /// when a background service is available.
 const background_schema: p.ToolSchema = .{
     .name = "background",
-    .description = "Manage background commands started with bash background=true in this Thin instance. list pages services by launch order (default 20); status returns state, exit code/signal, startup time and cleanup errors; logs reads incremental stdout/stderr with absolute raw byte offsets and a page budget (default 4096); stop cancels and joins exactly one service and returns its final state. Unknown or foreign ids are rejected. The model can obtain results only through this control tool; the UI may passively show completion without triggering inference. Status and exit are only returned here: nothing is appended to the conversation automatically and no inference runs because a process changed state.",
+    .description = "Manage background commands started with bash background=true: list (default 20), status, logs (absolute byte offsets and limit), or stop one service. Results are returned only here; completion does not add a conversation turn.",
     .parameters_json =
     \\{"type":"object","properties":{"action":{"type":"string","enum":["list","status","logs","stop"]},"id":{"type":"string","minLength":1,"maxLength":64},"after":{"type":"integer","minimum":0},"stdout_offset":{"type":"integer","minimum":0},"stderr_offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
     ,
@@ -83,9 +84,9 @@ const image_schema: p.ToolSchema = .{
     \\{"type":"object","properties":{"path":{"type":"string"},"question":{"type":"string","minLength":1,"maxLength":4096}},"required":["path"],"additionalProperties":false}
     ,
 };
-/// Largest schema set: read/write/bash/memory + image + background management,
-/// optional title and edit_file.
-const max_schemas = 8;
+/// Largest schema set: read/write/bash/memory + image + background management
+/// and edit_file.
+const max_schemas = 7;
 const edit_schema: p.ToolSchema = .{
     .name = "edit_file",
     .description = "Atomically replace exact unique text in an existing project file. All edits match the original text, must be non-overlapping, and are applied together. Read the file first.",
@@ -93,16 +94,9 @@ const edit_schema: p.ToolSchema = .{
     \\{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}
     ,
 };
-const title_schema: p.ToolSchema = .{
-    .name = "set_session_title",
-    .description = "After first understanding the user's intent, set a short descriptive session title. Update it only when the main topic clearly changes.",
-    .parameters_json =
-    \\{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}
-    ,
-};
 const schema_choices = 2;
 
-fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime background_on: bool, comptime title_on: bool) [max_schemas]p.ToolSchema {
+fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime background_on: bool) [max_schemas]p.ToolSchema {
     var result: [max_schemas]p.ToolSchema = undefined;
     var count: usize = 0;
     for (&schemas, 0..) |schema, i| {
@@ -129,10 +123,6 @@ fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime back
         result[count] = background_schema;
         count += 1;
     }
-    if (title_on) {
-        result[count] = title_schema;
-        count += 1;
-    }
     result[count] = edit_schema;
     return result;
 }
@@ -141,9 +131,9 @@ fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime back
 // a rebind never invalidates a previously handed-out schema slice.
 const schema_table = blk: {
     @setEvalBranchQuota(160000);
-    var table: [schema_choices][schema_choices][schema_choices][schema_choices][max_schemas]p.ToolSchema = undefined;
-    for (0..schema_choices) |title_on| for (0..schema_choices) |background_on| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| {
-        table[title_on][background_on][image_on][memory_on] = buildSchemas(image_on == 1, memory_on == 1, background_on == 1, title_on == 1);
+    var table: [schema_choices][schema_choices][schema_choices][max_schemas]p.ToolSchema = undefined;
+    for (0..schema_choices) |background_on| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| {
+        table[background_on][image_on][memory_on] = buildSchemas(image_on == 1, memory_on == 1, background_on == 1);
     };
     break :blk table;
 };
@@ -152,9 +142,9 @@ fn schemaCount(image_on: bool, memory_on: bool, background_on: bool) usize {
     return 5 + @as(usize, @intFromBool(image_on)) + @as(usize, @intFromBool(background_on)) - @as(usize, @intFromBool(!memory_on));
 }
 
-fn schemasWithTitle(image_on: bool, memory_on: bool, background_on: bool, title_on: bool) []const p.ToolSchema {
-    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(title_on)][@intFromBool(background_on)][@intFromBool(image_on)][@intFromBool(memory_on)];
-    return set[0 .. schemaCount(image_on, memory_on, background_on) + @as(usize, @intFromBool(title_on))];
+fn schemasWith(image_on: bool, memory_on: bool, background_on: bool) []const p.ToolSchema {
+    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(background_on)][@intFromBool(image_on)][@intFromBool(memory_on)];
+    return set[0..schemaCount(image_on, memory_on, background_on)];
 }
 
 pub const ReadImage = struct { path: []const u8, question: []const u8 = image.default_question };
@@ -169,9 +159,20 @@ pub const Read = struct { path: []const u8, offset: u64 = 0, limit: ?usize = nul
 /// write_file 的解析结果；覆盖已有文件必须显式设置 overwrite。
 pub const Write = struct { path: []const u8, content: []const u8, overwrite: bool = false };
 pub const EditFile = struct { path: []const u8, edits: []const text_edit.Edit };
-/// bash 的解析结果；timeout_ms 为空时使用配置的默认超时。background=true
-/// 只改变本次调用的执行方式：异步启动一个实例内托管服务。
-pub const Bash = struct { command: []const u8, timeout_ms: ?u32 = null, background: bool = false };
+const max_batch_commands = 20;
+const batch_concurrency = 5;
+const batch_command_output_bytes = 10 * 1024;
+const batch_total_output_bytes = 200 * 1024;
+
+pub const BashCommand = struct { command: []const u8, timeout_ms: ?u32 = null };
+/// bash 的解析结果。单命令用 command；批量用 commands。二者互斥，background
+/// 只适用于单命令，批量命令始终前台执行并 join。
+pub const Bash = struct {
+    command: []const u8 = "",
+    commands: []const BashCommand = &.{},
+    timeout_ms: ?u32 = null,
+    background: bool = false,
+};
 
 /// memory 工具的解析结果；topic 为 core 或 ASCII slug，list 时不得携带其他字段。
 pub const Memory = struct {
@@ -195,7 +196,6 @@ pub const Action = union(enum) {
     bash: Bash,
     background: background.Query,
     memory: Memory,
-    set_session_title: Title,
 
     /// 生成展示给用户的授权描述；写入 memory 时附带完整内容，便于用户审阅后再批准。
     pub fn description(self: Action, a: std.mem.Allocator) ![]const u8 {
@@ -206,7 +206,10 @@ pub const Action = union(enum) {
                 if (w.overwrite) "Write/replace" else "Create", w.path, w.content.len,
             }),
             .edit_file => |e| try std.fmt.allocPrint(a, "Edit {s} ({d} edits)", .{ e.path, e.edits.len }),
-            .bash => |b| try std.fmt.allocPrint(a, "Run bash{s}: {s}", .{ if (b.background) " (background service)" else "", b.command }),
+            .bash => |b| if (b.commands.len != 0)
+                try std.fmt.allocPrint(a, "Run bash batch ({d} commands)", .{b.commands.len})
+            else
+                try std.fmt.allocPrint(a, "Run bash{s}: {s}", .{ if (b.background) " (background service)" else "", b.command }),
             .background => |q| if (q.id) |id|
                 try std.fmt.allocPrint(a, "Background {s} {s}", .{ q.action.name(), id })
             else
@@ -215,7 +218,6 @@ pub const Action = union(enum) {
                 try std.fmt.allocPrint(a, "Memory write: {s} ({d} bytes)\n{s}", .{ m.topic.?, m.content.?.len, m.content.? })
             else
                 try std.fmt.allocPrint(a, "Memory {s}: {s}", .{ @tagName(m.action), m.topic orelse "index" }),
-            .set_session_title => |title| try std.fmt.allocPrint(a, "Set session title: {s}", .{title.text()}),
         };
     }
 };
@@ -225,12 +227,6 @@ pub const Action = union(enum) {
 pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limits: cfg.Limits) !Action {
     // 严格模式：拒绝未知字段（如伪造的 trust），并让字符串复制进 arena，不借用输入缓冲。
     const opts: std.json.ParseOptions = .{ .allocate = .alloc_always, .ignore_unknown_fields = false };
-    if (std.mem.eql(u8, name, "set_session_title")) {
-        const args = try std.json.parseFromSliceLeaky(struct { title: []const u8 }, a, arguments, opts);
-        const title = Title.fromText(args.title);
-        if (title.text().len == 0) return error.InvalidSessionTitle;
-        return .{ .set_session_title = title };
-    }
     if (std.mem.eql(u8, name, "read_image")) {
         const args = try std.json.parseFromSliceLeaky(ReadImage, a, arguments, opts);
         try validateReadImage(args);
@@ -267,13 +263,30 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     }
 
     if (std.mem.eql(u8, name, "bash")) {
-        const args = try std.json.parseFromSliceLeaky(Bash, a, arguments, opts);
-        // 命令长度限制为 32KB 且不允许 NUL；超时必须在 (0, 配置上限] 之内。
-        if (args.command.len == 0 or std.mem.findScalar(u8, args.command, 0) != null)
-            return error.InvalidCommand;
+        const BashArgs = struct {
+            command: ?[]const u8 = null,
+            commands: ?[]const BashCommand = null,
+            timeout_ms: ?u32 = null,
+            background: bool = false,
+        };
+        const args = try std.json.parseFromSliceLeaky(BashArgs, a, arguments, opts);
+        if (args.commands) |commands| {
+            if (args.command != null or args.background or commands.len == 0 or commands.len > max_batch_commands)
+                return error.InvalidCommand;
+            for (commands) |item| {
+                if (item.command.len == 0 or std.mem.findScalar(u8, item.command, 0) != null) return error.InvalidCommand;
+                if (item.timeout_ms != null and item.timeout_ms.? == 0) return error.InvalidCommandTimeout;
+            }
+            const timeout = args.timeout_ms orelse limits.command_timeout_ms;
+            if (timeout == 0) return error.InvalidCommandTimeout;
+            return .{ .bash = .{ .commands = commands, .timeout_ms = args.timeout_ms } };
+        }
+        const command = args.command orelse return error.InvalidCommand;
+        // 命令必须非空且不允许 NUL；超时必须在 (0, 配置上限] 之内。
+        if (command.len == 0 or std.mem.findScalar(u8, command, 0) != null) return error.InvalidCommand;
         const timeout = args.timeout_ms orelse limits.command_timeout_ms;
         if (timeout == 0) return error.InvalidCommandTimeout;
-        return .{ .bash = args };
+        return .{ .bash = .{ .command = command, .timeout_ms = args.timeout_ms, .background = args.background } };
     }
 
     if (std.mem.eql(u8, name, "background")) {
@@ -348,9 +361,6 @@ pub const Tools = struct {
     background: ?background.Service = null,
     /// False hides the memory schema and rejects forged memory calls (child Tools).
     allow_memory: bool = true,
-    /// Only a Session-owned root App enables the title capability.
-    session_title: ?Title = null,
-
     fn backgroundActive(self: *Tools) bool {
         return self.background != null;
     }
@@ -361,13 +371,25 @@ pub const Tools = struct {
 
     fn checkAvailableActions(self: *Tools, action: Action) !void {
         switch (action) {
-            .bash => |b| if (b.background and !self.backgroundActive()) return error.BackgroundDisabled,
+            .bash => |b| {
+                if (b.timeout_ms != null and b.timeout_ms.? == 0) return error.InvalidCommandTimeout;
+                if (b.commands.len != 0) {
+                    if (b.background or b.commands.len > max_batch_commands) return error.InvalidCommand;
+                    for (b.commands) |item| {
+                        if (item.command.len == 0 or std.mem.findScalar(u8, item.command, 0) != null or
+                            !std.unicode.utf8ValidateSlice(item.command)) return error.InvalidCommand;
+                        if (item.timeout_ms != null and item.timeout_ms.? == 0) return error.InvalidCommandTimeout;
+                        if (command_risk.classify(item.command) != null) return error.HighRiskBatch;
+                    }
+                } else if (b.command.len == 0 or std.mem.findScalar(u8, b.command, 0) != null or
+                    !std.unicode.utf8ValidateSlice(b.command))
+                {
+                    return error.InvalidCommand;
+                }
+                if (b.background and !self.backgroundActive()) return error.BackgroundDisabled;
+            },
             .background => if (!self.backgroundActive()) return error.BackgroundDisabled,
             .memory => if (!self.allow_memory) return error.MemoryDisabled,
-            .set_session_title => |title| {
-                if (self.session_title == null) return error.SessionTitleDisabled;
-                if (title.text().len == 0) return error.InvalidSessionTitle;
-            },
             else => {},
         }
     }
@@ -480,7 +502,7 @@ pub const Tools = struct {
     pub fn executor(self: *Tools) runtime.Executor {
         return .{
             .context = self,
-            .schemas = schemasWithTitle(self.image != null, self.allow_memory, self.backgroundActive(), self.session_title != null),
+            .schemas = schemasWith(self.image != null, self.allow_memory, self.backgroundActive()),
             .prepare_fn = prepare,
             .execute_fn = executePrepared,
             .preview_write_fn = previewWrite,
@@ -512,12 +534,180 @@ pub const Tools = struct {
         return @import("../core/write_preview.zig").Baseline.fromBytes(a, bytes);
     }
 
+    const BatchJob = struct {
+        command: []const u8,
+        timeout_ms: u32,
+        output_bytes: usize,
+        cancel: *const p.Cancellation,
+        root: *fs.Root,
+        environment: *const std.process.Environ.Map,
+        arena: std.heap.ArenaAllocator,
+        result: ?process.Result = null,
+        failure: ?anyerror = null,
+        skipped: bool = false,
+        duration_ms: u64 = 0,
+
+        fn init(root: *fs.Root, environment: *const std.process.Environ.Map, command: []const u8, timeout_ms: u32, output_bytes: usize, cancel: *const p.Cancellation) BatchJob {
+            return .{
+                .command = command,
+                .timeout_ms = timeout_ms,
+                .output_bytes = output_bytes,
+                .cancel = cancel,
+                .root = root,
+                .environment = environment,
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            };
+        }
+
+        fn run(self: *BatchJob) void {
+            if (self.cancel.isRequested()) {
+                self.skipped = true;
+                return;
+            }
+            const began = std.Io.Clock.awake.now(self.root.io);
+            self.result = process.run(self.arena.allocator(), self.root.io, self.root.path, self.command, self.environment, .{
+                .timeout_ms = self.timeout_ms,
+                .output_bytes = self.output_bytes,
+                .term_grace_ms = cfg.Policy.cleanup_grace_ms,
+                .cleanup_timeout_ms = cfg.Policy.cleanup_timeout_ms,
+                .cwd_dir = self.root.dir,
+            }, self.cancel) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.duration_ms = @intCast(@max(0, began.untilNow(self.root.io, .awake).toMilliseconds()));
+        }
+
+        fn deinit(self: *BatchJob) void {
+            self.arena.deinit();
+        }
+    };
+
+    fn executeBashBatch(self: *Tools, a: std.mem.Allocator, b: Bash, cancel: *const p.Cancellation) !Execution {
+        var results = j.array(a);
+        var failed = false;
+        var timed_out = false;
+        var canceled = false;
+        var truncated = false;
+        var cleanup_failed = false;
+        var next: usize = 0;
+        const output_bytes = @max(1, @min(batch_command_output_bytes, batch_total_output_bytes / b.commands.len));
+        while (next < b.commands.len) {
+            var jobs: [batch_concurrency]BatchJob = undefined;
+            const count = @min(batch_concurrency, b.commands.len - next);
+            for (0..count) |i| {
+                const item = b.commands[next + i];
+                const timeout = item.timeout_ms orelse b.timeout_ms orelse self.config.limits.command_timeout_ms;
+                jobs[i] = BatchJob.init(self.root, self.environment, item.command, timeout, output_bytes, cancel);
+            }
+            defer for (jobs[0..count]) |*job| job.deinit();
+            var group: std.Io.Group = .init;
+            for (jobs[0..count]) |*job| {
+                group.concurrent(self.root.io, BatchJob.run, .{job}) catch |err| {
+                    group.cancel(self.root.io);
+                    return err;
+                };
+            }
+            group.await(self.root.io) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+            for (jobs[0..count], 0..) |*job, i| {
+                const index = next + i + 1;
+                var item = j.object(a);
+                try j.put(a, &item, "index", try j.number(index));
+                try j.put(a, &item, "command", j.str(job.command));
+                if (job.skipped) {
+                    try j.put(a, &item, "canceled", .{ .bool = true });
+                    try j.put(a, &item, "failed", .{ .bool = true });
+                    try j.put(a, &item, "error", j.str("not started: batch canceled"));
+                    failed = true;
+                    canceled = true;
+                } else if (job.failure) |err| {
+                    try j.put(a, &item, "error", j.str(@errorName(err)));
+                    try j.put(a, &item, "failed", .{ .bool = true });
+                    if (err == error.Canceled) {
+                        try j.put(a, &item, "canceled", .{ .bool = true });
+                        canceled = true;
+                    }
+                    if (err == error.CleanupFailed) {
+                        try j.put(a, &item, "cleanup_failed", .{ .bool = true });
+                        cleanup_failed = true;
+                    }
+                    failed = true;
+                } else if (job.result) |result| {
+                    try j.put(a, &item, "stdout", j.str(try a.dupe(u8, result.stdout)));
+                    try j.put(a, &item, "stderr", j.str(try a.dupe(u8, result.stderr)));
+                    try j.put(a, &item, "stdout_bytes", try j.number(result.stdout_bytes));
+                    try j.put(a, &item, "stderr_bytes", try j.number(result.stderr_bytes));
+                    try j.put(a, &item, "truncated", .{ .bool = result.truncated });
+                    try j.put(a, &item, "timed_out", .{ .bool = result.timed_out });
+                    try j.put(a, &item, "canceled", .{ .bool = result.canceled });
+                    try j.put(a, &item, "cleanup_failed", .{ .bool = result.cleanup_failed });
+                    try j.put(a, &item, "duration_ms", try j.number(job.duration_ms));
+                    var command_failed = result.timed_out or result.canceled or result.cleanup_failed;
+                    if (result.term) |term| switch (term) {
+                        .exited => |code| {
+                            try j.put(a, &item, "exit_code", try j.number(code));
+                            command_failed = command_failed or code != 0;
+                        },
+                        .signal => |signal| {
+                            try j.put(a, &item, "signal", try j.number(@backingInt(signal)));
+                            command_failed = true;
+                        },
+                        else => command_failed = true,
+                    } else command_failed = true;
+                    try j.put(a, &item, "failed", .{ .bool = command_failed });
+                    failed = failed or command_failed;
+                    timed_out = timed_out or result.timed_out;
+                    canceled = canceled or result.canceled;
+                    truncated = truncated or result.truncated;
+                    cleanup_failed = cleanup_failed or result.cleanup_failed;
+                } else {
+                    try j.put(a, &item, "canceled", .{ .bool = true });
+                    try j.put(a, &item, "failed", .{ .bool = true });
+                    try j.put(a, &item, "error", j.str("not started: batch canceled"));
+                    failed = true;
+                    canceled = true;
+                }
+                try j.append(&results, item);
+            }
+            next += count;
+            if (canceled or cleanup_failed) break;
+        }
+        while (next < b.commands.len) : (next += 1) {
+            var item = j.object(a);
+            try j.put(a, &item, "index", try j.number(next + 1));
+            try j.put(a, &item, "command", j.str(b.commands[next].command));
+            try j.put(a, &item, "canceled", .{ .bool = true });
+            try j.put(a, &item, "failed", .{ .bool = true });
+            try j.put(a, &item, "error", j.str("not started: batch canceled"));
+            try j.append(&results, item);
+            failed = true;
+            canceled = true;
+        }
+        var value = j.object(a);
+        try j.put(a, &value, "output_encoding", j.str("utf8; unsafe bytes escaped as \\xHH; literal backslashes doubled"));
+        try j.put(a, &value, "commands", results);
+        try j.put(a, &value, "failed", .{ .bool = failed });
+        try j.put(a, &value, "timed_out", .{ .bool = timed_out });
+        try j.put(a, &value, "canceled", .{ .bool = canceled });
+        try j.put(a, &value, "truncated", .{ .bool = truncated });
+        try j.put(a, &value, "cleanup_failed", .{ .bool = cleanup_failed });
+        return .{
+            .text = try j.encode(a, value),
+            .is_error = failed or canceled or cleanup_failed,
+            .canceled = canceled and !cleanup_failed,
+            .truncated = truncated,
+            .cleanup_failed = cleanup_failed,
+            .memory_evidence = false,
+        };
+    }
+
     /// 解析并做路径校验，生成待授权的 Prepared；此阶段不产生任何副作用。
     fn prepare(context_: *anyopaque, a: std.mem.Allocator, call: p.ToolCall) !runtime.Prepared {
         const self: *Tools = @ptrCast(@alignCast(context_));
         // Names the model was never offered must not become executable actions.
         // Reject before parsing or allocating anything.
-        if (std.mem.eql(u8, call.name, "set_session_title") and self.session_title == null) return error.SessionTitleDisabled;
         if (!self.allow_memory and std.mem.eql(u8, call.name, "memory")) return error.MemoryDisabled;
         // Pure availability boundary: a child Tools (parent channel) and any
         // Tools without a registry must reject the management tool before parse.
@@ -587,12 +777,6 @@ pub const Tools = struct {
 
         var value = j.object(a);
         switch (action) {
-            .set_session_title => |title| {
-                try j.put(a, &value, "title", j.str(title.text()));
-                const encoded = try j.encode(a, value);
-                self.session_title = title;
-                return .{ .text = encoded };
-            },
             .read_image => |r| {
                 if (cancel.isRequested()) return error.Canceled;
                 const picture = try image_file.load(a, self.root, r.path);
@@ -661,6 +845,7 @@ pub const Tools = struct {
             },
 
             .bash => |b| {
+                if (b.commands.len != 0) return try self.executeBashBatch(a, b, cancel);
                 if (b.background) {
                     // Background start: keep the same risk classification and
                     // approval path (prepare already attached them). Only the

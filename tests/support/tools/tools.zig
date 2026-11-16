@@ -1,5 +1,5 @@
 fn schemasFor(image_on: bool, memory_on: bool, background_on: bool) []const p.ToolSchema {
-    return schemasWithTitle(image_on, memory_on, background_on, false);
+    return schemasWith(image_on, memory_on, background_on);
 }
 
 fn schemasForServices(enabled: bool) []const p.ToolSchema {

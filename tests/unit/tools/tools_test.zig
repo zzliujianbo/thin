@@ -1,3 +1,96 @@
+test "bash batch parses independent commands and rejects mixed modes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const batch = try parse(a, "bash", "{\"commands\":[{\"command\":\"printf one\"},{\"command\":\"printf two\",\"timeout_ms\":5000}]}", .{});
+    try std.testing.expect(batch.bash.command.len == 0);
+    try std.testing.expectEqual(@as(usize, 2), batch.bash.commands.len);
+    try std.testing.expectEqualStrings("printf two", batch.bash.commands[1].command);
+    try std.testing.expectEqual(@as(?u32, 5000), batch.bash.commands[1].timeout_ms);
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", "{\"command\":\"true\",\"commands\":[{\"command\":\"true\"}]}", .{}));
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", "{}", .{}));
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", "{\"commands\":[{\"command\":\"true\"}],\"background\":true}", .{}));
+    try std.testing.expectError(error.InvalidCommandTimeout, parse(a, "bash", "{\"commands\":[{\"command\":\"true\",\"timeout_ms\":0}]}", .{}));
+    const entry = "{\"command\":\"true\"}";
+    var max_entries: [20][]const u8 = undefined;
+    for (&max_entries) |*item| item.* = entry;
+    const max_joined = try std.mem.join(a, ",", &max_entries);
+    const max_batch = try std.fmt.allocPrint(a, "{{\"commands\":[{s}]}}", .{max_joined});
+    try std.testing.expectEqual(@as(usize, 20), (try parse(a, "bash", max_batch, .{})).bash.commands.len);
+    var entries: [21][]const u8 = undefined;
+    for (&entries) |*item| item.* = entry;
+    const joined = try std.mem.join(a, ",", &entries);
+    const too_many = try std.fmt.allocPrint(a, "{{\"commands\":[{s}]}}", .{joined});
+    try std.testing.expectError(error.InvalidCommand, parse(a, "bash", too_many, .{}));
+}
+
+test "bash batch returns ordered bounded results and rejects high-risk batches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+    const commands = [_]BashCommand{
+        .{ .command = "printf one" },
+        .{ .command = "printf two" },
+        .{ .command = "sh -c 'exit 3'" },
+        .{ .command = "printf four" },
+        .{ .command = "printf five" },
+        .{ .command = "printf six" },
+    };
+    const result = try tools.execute(a, .{ .bash = .{ .commands = &commands } }, &cancel);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(!result.canceled);
+    try std.testing.expect(!result.memory_evidence);
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, a, result.text, .{});
+    const rows = json.object.get("commands").?.array.items;
+    try std.testing.expectEqual(@as(usize, 6), rows.len);
+    try std.testing.expectEqualStrings("one", rows[0].object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("two", rows[1].object.get("stdout").?.string);
+    try std.testing.expectEqual(@as(i64, 3), rows[2].object.get("exit_code").?.integer);
+    try std.testing.expect(rows[2].object.get("failed").?.bool);
+    try std.testing.expectEqualStrings("four", rows[3].object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("five", rows[4].object.get("stdout").?.string);
+    try std.testing.expectEqualStrings("six", rows[5].object.get("stdout").?.string);
+    try std.testing.expectError(error.HighRiskBatch, Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"commands\":[{\"command\":\"rm -rf /\"}]}" }));
+}
+
+test "bash batch starts independent commands concurrently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+    const first_cmd = try std.fmt.allocPrint(a, "/usr/bin/touch {s}/first; while [ ! -f {s}/second ]; do /bin/sleep 0.01; done", .{ root.path, root.path });
+    const second_cmd = try std.fmt.allocPrint(a, "while [ ! -f {s}/first ]; do /bin/sleep 0.01; done; /usr/bin/touch {s}/second", .{ root.path, root.path });
+    const commands = [_]BashCommand{
+        .{ .command = first_cmd },
+        .{ .command = second_cmd },
+    };
+    const result = try tools.execute(a, .{ .bash = .{ .commands = &commands, .timeout_ms = 2000 } }, &cancel);
+    try std.testing.expect(!result.is_error);
+    _ = try root.dir.statFile(std.testing.io, "first", .{});
+    _ = try root.dir.statFile(std.testing.io, "second", .{});
+}
+
 test "tool schemas have stable order and valid JSON" {
     try std.testing.expectEqualStrings("read_file", schemas[0].name);
     try std.testing.expectEqualStrings("memory", schemas[3].name);
@@ -285,53 +378,6 @@ test "image tool strict arguments schemas guards and bounded text output" {
     tools.auth_path = try std.fs.path.join(a, &.{ root.path, "fixture.bin" });
     try std.testing.expectError(error.ProtectedAuthFile, tools.execute(a, parsed, &cancel));
     try std.testing.expectError(error.ProtectedSettingsFile, tools.execute(a, .{ .read_image = .{ .path = ".thin/settings.json" } }, &cancel));
-}
-test "session title schema is appended across the static matrix" {
-    for ([_]bool{ false, true }) |image_on| for ([_]bool{ false, true }) |memory_on| for ([_]bool{ false, true }) |background_on| {
-        const old = schemasFor(image_on, memory_on, background_on);
-        try std.testing.expectEqualStrings("edit_file", old[old.len - 1].name);
-        const with_title = schemasWithTitle(image_on, memory_on, background_on, true);
-        try std.testing.expectEqual(old.len + 1, with_title.len);
-        for (old[0 .. old.len - 1], with_title[0 .. old.len - 1]) |before, after| try std.testing.expectEqualStrings(before.name, after.name);
-        try std.testing.expectEqualStrings("set_session_title", with_title[old.len - 1].name);
-        try std.testing.expectEqualStrings("edit_file", with_title[old.len].name);
-    };
-    try std.testing.expectEqual(@as(usize, 8), schemasWithTitle(true, true, true, true).len);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, title_schema.parameters_json, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .object);
-    const edit_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, edit_schema.parameters_json, .{});
-    defer edit_parsed.deinit();
-    try std.testing.expect(edit_parsed.value == .object);
-    try std.testing.expect(edit_parsed.value.object.get("properties").?.object.get("edits").?.object.get("maxItems") == null);
-}
-test "session title prepare execution and capability boundaries" {
-    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tools: Tools = .{ .root = undefined, .memory = undefined, .config = &config, .environment = &env };
-    var cancel: p.Cancellation = .{};
-    const call: p.ToolCall = .{ .id = "t", .name = "set_session_title", .arguments = "{\"title\":\"中文标题\"}" };
-    try std.testing.expectError(error.SessionTitleDisabled, Tools.prepare(&tools, a, call));
-    try std.testing.expectError(error.SessionTitleDisabled, tools.execute(a, .{ .set_session_title = Title.fromText("标题") }, &cancel));
-    tools.session_title = Title.fromText("原题");
-    try std.testing.expectEqualStrings("set_session_title", tools.executor().schemas[tools.executor().schemas.len - 2].name);
-    try std.testing.expectError(error.InvalidSessionTitle, Tools.prepare(&tools, a, .{ .id = "t", .name = "set_session_title", .arguments = "{\"title\":\"\"}" }));
-    const prepared = try Tools.prepare(&tools, a, call);
-    try std.testing.expect(prepared.explicit_denial == null);
-    try std.testing.expectEqualStrings("原题", tools.session_title.?.text());
-    cancel.cancel();
-    const canceled = try Tools.executePrepared(&tools, a, prepared, &cancel);
-    try std.testing.expect(canceled.canceled);
-    try std.testing.expectEqualStrings("原题", tools.session_title.?.text());
-    cancel = .{};
-    const result = try Tools.executePrepared(&tools, a, prepared, &cancel);
-    try std.testing.expectEqualStrings("中文标题", tools.session_title.?.text());
-    const json = try std.json.parseFromSlice(std.json.Value, a, result.text, .{});
-    try std.testing.expectEqualStrings("中文标题", json.value.object.get("title").?.string);
 }
 test "background schema is appended last and old schemas keep indexes" {
     {

@@ -18,7 +18,7 @@
     {
       "virtual": "src/app/app.zig",
       "production": "src/app/app.zig",
-      "support": "tests/support/app/app.zig",
+      "support": null,
       "fragments": [
         {
           "path": "tests/unit/app/app_test.zig",

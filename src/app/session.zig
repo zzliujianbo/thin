@@ -519,12 +519,11 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         // A missing schema hash cannot prove the saved tool prefix. Current
-        // tool declarations must not replay old signed thinking under changed tools.
-        // Normalize display data before restore, even for a poisoned archive;
-        // loading history itself must not require permission to run a task.
-        if (state.tool_schema_hash == null and
-            (self.global_config.?.value.imageActive() or candidate.executor.session_title != null))
-        {
+        // tool declarations may differ (including removed optional tools), so
+        // never replay old signed thinking without a verified prefix. Normalize
+        // display data before restore, even for a poisoned archive; loading
+        // history itself must not require permission to run a task.
+        if (state.tool_schema_hash == null) {
             const messages = try scratch.allocator().alloc(@import("../core/protocol.zig").Message, state.messages.len);
             for (state.messages, 0..) |message, i|
                 messages[i] = try @import("../core/context.zig").cloneAfterPrefixRewrite(scratch.allocator(), message);
@@ -559,10 +558,6 @@ pub const Session = struct {
         // Pin while the fresh journal still has zero counters. Imported sequence
         // numbers belong to the archive, not to a second pin operation.
         try candidate.pinSessionID(self.session_id);
-        if (!self.read_only) {
-            const title = if (self.app) |app| app.executor.session_title orelse self.saved_title else self.saved_title;
-            candidate.enableSessionTitle(title);
-        }
         try self.prepareLoadedHistory(candidate);
         return candidate;
     }
@@ -777,7 +772,7 @@ pub const Session = struct {
     fn persistTitleBestEffort(self: *Session) void {
         const lease = if (self.resume_lease) |*value| value else return;
         if (!lease.writable or lease.expected == null) return;
-        var title = if (self.app) |app| app.executor.session_title orelse self.saved_title else self.saved_title;
+        var title = self.saved_title;
         if (title.text().len == 0) {
             for (initialHistory(self)) |message| {
                 if (message.role != .user) continue;
@@ -790,9 +785,6 @@ pub const Session = struct {
                 };
                 break;
             }
-            if (self.app) |app| if (app.executor.session_title != null) {
-                app.executor.session_title = title;
-            };
         }
         if (title.text().len == 0 or session_metadata.Title.eql(title, self.saved_title)) return;
         lease.saveTitle(&self.project_root, title) catch |err| {
