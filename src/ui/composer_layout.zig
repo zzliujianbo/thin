@@ -10,27 +10,34 @@ const Segment = struct { start: usize, end: usize, cells: usize, stop: Stop };
 const Iterator = struct {
     bytes: []const u8,
     width: usize,
+    first_width: usize,
     pos: usize = 0,
+    first: bool = true,
     finished: bool = false,
 
     fn next(self: *Iterator) ?Segment {
         if (self.finished) return null;
         const start = self.pos;
+        const segment_width = if (self.first) self.first_width else self.width;
         var cells: usize = 0;
         while (self.pos < self.bytes.len) {
             if (self.bytes[self.pos] == '\n') {
                 const end = self.pos;
                 self.pos += 1;
+                self.first = false;
                 return .{ .start = start, .end = end, .cells = cells, .stop = .hard };
             }
             const cluster = text.nextCluster(self.bytes, self.pos, cells);
-            const width = if (cluster.width > self.width) 1 else cluster.width;
-            if (width > 0 and cells + width > self.width)
+            const cluster_width = if (cluster.width > segment_width) 1 else cluster.width;
+            if (cluster_width > 0 and cells + cluster_width > segment_width) {
+                self.first = false;
                 return .{ .start = start, .end = self.pos, .cells = cells, .stop = .soft };
-            cells += width;
+            }
+            cells += cluster_width;
             self.pos = cluster.end;
         }
-        self.finished = cells < self.width;
+        self.finished = cells < segment_width;
+        self.first = false;
         return .{ .start = start, .end = self.pos, .cells = cells, .stop = if (self.finished) .end else .soft };
     }
 };
@@ -40,6 +47,7 @@ pub const Layout = struct {
     cursor_row: usize,
     cursor_column: usize,
     total_rows: usize,
+    first_row: usize,
 
     pub fn deinit(self: Layout, a: std.mem.Allocator) void {
         for (self.lines) |line| a.free(line);
@@ -81,19 +89,20 @@ fn render(a: std.mem.Allocator, bytes: []const u8, segment: Segment, width: usiz
 
 const Position = struct { row: usize, column: usize, total: usize };
 
-fn locate(bytes: []const u8, cursor: usize, width: usize) Position {
-    var scan: Iterator = .{ .bytes = bytes, .width = width };
+fn locate(bytes: []const u8, cursor: usize, width: usize, first_width: usize) Position {
+    var scan: Iterator = .{ .bytes = bytes, .width = width, .first_width = first_width };
     var total: usize = 0;
     var caret_row: ?usize = null;
     var caret_column: usize = 0;
     while (scan.next()) |segment| {
         if (caret_row == null) {
+            const segment_width = if (total == 0) first_width else width;
             if (cursor >= segment.start and (cursor < segment.end or
-                (cursor == segment.end and (segment.stop == .end or (segment.stop == .hard and segment.cells < width)))))
+                (cursor == segment.end and (segment.stop == .end or (segment.stop == .hard and segment.cells < segment_width)))))
             {
                 caret_row = total;
-                caret_column = column(bytes, segment.start, cursor, width);
-            } else if (cursor == segment.end and segment.stop == .hard and segment.cells == width) {
+                caret_column = column(bytes, segment.start, cursor, segment_width);
+            } else if (cursor == segment.end and segment.stop == .hard and segment.cells == segment_width) {
                 caret_row = total + 1;
                 caret_column = 0;
             }
@@ -105,9 +114,16 @@ fn locate(bytes: []const u8, cursor: usize, width: usize) Position {
 
 /// Two bounded scans, but allocations only for the visible (at most eight) rows.
 /// Exact-width ends get an empty next row so the caret never occupies autowrap.
+/// `first_columns` lets the first visual row reserve a prompt prefix while every
+/// wrapped row uses the full width and starts at column zero.
 pub fn layout(a: std.mem.Allocator, bytes: []const u8, raw_cursor: usize, columns: usize, limit: usize) !Layout {
+    return layoutWithFirst(a, bytes, raw_cursor, columns, columns, limit);
+}
+
+pub fn layoutWithFirst(a: std.mem.Allocator, bytes: []const u8, raw_cursor: usize, columns: usize, first_columns: usize, limit: usize) !Layout {
     const width = @max(1, columns);
-    const position = locate(bytes, @min(raw_cursor, bytes.len), width);
+    const first_width = @min(width, @max(1, first_columns));
+    const position = locate(bytes, @min(raw_cursor, bytes.len), width, first_width);
     const row = position.row;
     const total = position.total;
     const count = @min(total, @min(max_rows, @max(1, limit)));
@@ -118,16 +134,16 @@ pub fn layout(a: std.mem.Allocator, bytes: []const u8, raw_cursor: usize, column
         for (lines[0..made]) |line| a.free(line);
         a.free(lines);
     }
-    var scan: Iterator = .{ .bytes = bytes, .width = width };
+    var scan: Iterator = .{ .bytes = bytes, .width = width, .first_width = first_width };
     var index: usize = 0;
     while (scan.next()) |segment| : (index += 1) {
         if (index < first) continue;
         if (made == count) break;
-        lines[made] = try render(a, bytes, segment, width);
+        lines[made] = try render(a, bytes, segment, if (index == 0) first_width else width);
         made += 1;
     }
     std.debug.assert(made == count);
-    return .{ .lines = lines, .cursor_row = row - first, .cursor_column = position.column, .total_rows = total };
+    return .{ .lines = lines, .cursor_row = row - first, .cursor_column = position.column, .total_rows = total, .first_row = first };
 }
 
 pub const Movement = struct { cursor: usize, preferred_column: usize };
@@ -135,6 +151,10 @@ pub const Movement = struct { cursor: usize, preferred_column: usize };
 /// Build the same sanitized/tab-expanded display as the composer, with stops
 /// only at original grapheme boundaries. Never move into a tab/emoji/UTF8 byte.
 pub fn moveVertical(a: std.mem.Allocator, raw: []const u8, cursor: usize, columns: usize, forward: bool, preferred: ?usize) !Movement {
+    return moveVerticalWithFirst(a, raw, cursor, columns, columns, forward, preferred);
+}
+
+pub fn moveVerticalWithFirst(a: std.mem.Allocator, raw: []const u8, cursor: usize, columns: usize, first_columns: usize, forward: bool, preferred: ?usize) !Movement {
     const Offset = struct { raw: usize, display: usize };
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(a);
@@ -163,28 +183,30 @@ pub fn moveVertical(a: std.mem.Allocator, raw: []const u8, cursor: usize, column
     try stops.append(a, .{ .raw = raw.len, .display = bytes.items.len });
     if (cursor >= raw.len) display_cursor = bytes.items.len;
     const width = @max(1, columns);
-    const position = locate(bytes.items, display_cursor, width);
+    const first_width = @min(width, @max(1, first_columns));
+    const position = locate(bytes.items, display_cursor, width, first_width);
     const goal = preferred orelse position.column;
     const target = if (forward) @min(position.row + 1, position.total - 1) else position.row -| 1;
     if (target == position.row) return .{ .cursor = cursor, .preferred_column = goal };
-    var scan: Iterator = .{ .bytes = bytes.items, .width = width };
+    var scan: Iterator = .{ .bytes = bytes.items, .width = width, .first_width = first_width };
     var index: usize = 0;
     const segment = while (scan.next()) |candidate| : (index += 1) {
         if (index == target) break candidate;
     } else unreachable;
+    const segment_width = if (target == 0) first_width else width;
     var best: ?usize = null;
     var stop: usize = 0;
     at = segment.start;
     var cells: usize = 0;
     while (true) {
         while (stop < stops.items.len and stops.items[stop].display < at) stop += 1;
-        const fits = at < segment.end or (at == segment.end and (segment.stop == .end or (segment.stop == .hard and cells < width)));
+        const fits = at < segment.end or (at == segment.end and (segment.stop == .end or (segment.stop == .hard and cells < segment_width)));
         if (fits and cells <= goal) {
             while (stop < stops.items.len and stops.items[stop].display == at) : (stop += 1) best = stops.items[stop].raw;
         }
         if (at == segment.end) break;
         const cluster = text.nextCluster(bytes.items, at, cells);
-        cells += if (cluster.width > width) 1 else cluster.width;
+        cells += if (cluster.width > segment_width) 1 else cluster.width;
         at = cluster.end;
     }
     // A tab can occupy an entire narrow intermediate row, but the raw cursor

@@ -105,6 +105,9 @@ test "memory footer stays adjacent to wrapped composer after ACK" {
     try ui.draw();
     try screen.replay(ui.frame);
     try std.testing.expect(ui.frame_composer_rows > 1);
+    const composer_top = screen.rows - ui.frame_composer_rows;
+    try std.testing.expect(composer_top + 1 < screen.rows);
+    try std.testing.expect(screen.grid[composer_top + 1][0] != ' ');
     const status_row = screen.rows - ui.frame_composer_rows - 1;
     // The screen fixture maps each non-ASCII code point to one '~' cell.
     try std.testing.expectEqualStrings("memory: 1", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
@@ -264,7 +267,11 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
         try std.testing.expectEqual(@as(usize, 1), ui.frame_height);
         try screen.replay(ui.frame);
         try std.testing.expectEqual(history_start + 3, screen.history_len);
-        try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
+        var prompt_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer prompt_arena.deinit();
+        const prompt_layout = try ui.prepareComposer(prompt_arena.allocator(), ui.connection.current(), ui.size.columns -| 1);
+        const expected_prompts: usize = 3 + @as(usize, @intFromBool(prompt_layout.layout.first_row == 0));
+        try std.testing.expectEqual(expected_prompts, screen.count("?%>"));
         testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
         try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
@@ -1459,22 +1466,22 @@ test "composer arrows move visual rows and only exact origin browses history wit
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const prepared = try ui.prepareComposer(arena.allocator(), ui.connection.current(), 29);
-    const width = 29 - text.width(prepared.decoration.plain);
-    const draft = try a.alloc(u8, width * 3 + 3);
+    const first_width = 29 - text.width(prepared.decoration.plain);
+    const draft = try a.alloc(u8, first_width * 3 + 3);
     defer a.free(draft);
     @memset(draft, 'x');
     _ = try ui.editor.insert(draft);
     ui.editor_pasted = true;
-    ui.editor.cursor = width * 2 + 2;
+    ui.editor.cursor = first_width + 2;
     try Ui.key(&ui, .up);
-    try std.testing.expectEqual(width + 2, ui.editor.cursor);
+    try std.testing.expectEqual(@as(usize, 2), ui.editor.cursor);
     try Ui.key(&ui, .up);
     try std.testing.expectEqual(@as(usize, 2), ui.editor.cursor);
     try Ui.key(&ui, .up); // Top row, nonzero column: never browse history.
     try std.testing.expectEqual(@as(usize, 2), ui.editor.cursor);
     try std.testing.expect(ui.input_history.index == null);
     try Ui.key(&ui, .down);
-    try std.testing.expectEqual(width + 2, ui.editor.cursor);
+    try std.testing.expectEqual(first_width + 2, ui.editor.cursor);
     try std.testing.expectEqualStrings(draft, ui.editor.bytes.items);
     try Ui.key(&ui, .home);
     try Ui.key(&ui, .up);
@@ -4949,7 +4956,8 @@ test "flow model prefix wraps long editor suffix without changing raw cursor byt
     try std.testing.expectEqual(screen.rows - 1 - ui.frame_cursor_rows_up, screen.row);
     const first_row = screen.row - first_composer.layout.cursor_row;
     try std.testing.expect(std.mem.startsWith(u8, &screen.grid[first_row], "(fixture) ?%~ x"));
-    try std.testing.expectEqual(text.width(first_composer.decoration.plain) + first_composer.layout.cursor_column, screen.col);
+    const first_absolute_row = first_composer.layout.first_row + first_composer.layout.cursor_row;
+    try std.testing.expectEqual((if (first_absolute_row == 0) text.width(first_composer.decoration.plain) else 0) + first_composer.layout.cursor_column, screen.col);
     // With no body above it, the composer is preceded only by the fixture's real
     // notice: no reserved blank row and no second composer.
     if (first_row > 0) {
@@ -4966,7 +4974,8 @@ test "flow model prefix wraps long editor suffix without changing raw cursor byt
     try screen.replay(ui.frame);
     // The composer is the frame's last block: its final row is the frame row.
     try std.testing.expectEqual(screen.rows - 1 - (last_composer.layout.lines.len - 1 - last_composer.layout.cursor_row), screen.row);
-    try std.testing.expectEqual(text.width(last_composer.decoration.plain) + last_composer.layout.cursor_column, screen.col);
+    const last_absolute_row = last_composer.layout.first_row + last_composer.layout.cursor_row;
+    try std.testing.expectEqual((if (last_absolute_row == 0) text.width(last_composer.decoration.plain) else 0) + last_composer.layout.cursor_column, screen.col);
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     testAcknowledgeFullFrame(&ui);
 }
@@ -5664,7 +5673,8 @@ test "editor tabs expand before clipping and cursor placement but submit unchang
         // The configured fixture has no notice, so the composer is the whole tail.
         try std.testing.expectEqual(prepared.layout.lines.len, ui.frame_height);
         try std.testing.expectEqual(screen.rows - prepared.layout.lines.len + prepared.layout.cursor_row, screen.row);
-        try std.testing.expectEqual(text.width(prepared.decoration.plain) + prepared.layout.cursor_column, screen.col);
+        const absolute_row = prepared.layout.first_row + prepared.layout.cursor_row;
+        try std.testing.expectEqual((if (absolute_row == 0) text.width(prepared.decoration.plain) else 0) + prepared.layout.cursor_column, screen.col);
         try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
         discardFixtureFrame(&ui);
     }
@@ -7424,7 +7434,8 @@ test "closing approval reuses its footprint without erasing a multiline composer
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(std.testing.allocator);
     for (prepared.layout.lines, 0..) |line, index| {
-        const visible = std.mem.trimEnd(u8, screen.grid[first_row + index][decoration_width..], " ");
+        const start = if (index == 0) decoration_width else 0;
+        const visible = std.mem.trimEnd(u8, screen.grid[first_row + index][start..], " ");
         try std.testing.expectEqualStrings(line, visible);
         try joined.appendSlice(std.testing.allocator, visible);
     }

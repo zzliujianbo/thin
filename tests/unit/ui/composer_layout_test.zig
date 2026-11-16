@@ -1,3 +1,43 @@
+test "composer first row reserves prompt width and continuation uses full width" {
+    const a = std.testing.allocator;
+    const value = try layoutWithFirst(a, "abcdefgh", 8, 4, 2, 8);
+    defer value.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), value.lines.len);
+    try std.testing.expectEqualStrings("ab", value.lines[0]);
+    try std.testing.expectEqualStrings("cdef", value.lines[1]);
+    try std.testing.expectEqualStrings("gh", value.lines[2]);
+    try std.testing.expectEqual(@as(usize, 2), value.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), value.cursor_column);
+    try std.testing.expectEqual(@as(usize, 0), value.first_row);
+
+    const hard = try layoutWithFirst(a, "a\nbcdef", "a\nbcdef".len, 4, 2, 8);
+    defer hard.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), hard.lines.len);
+    try std.testing.expectEqualStrings("a", hard.lines[0]);
+    try std.testing.expectEqualStrings("bcde", hard.lines[1]);
+    try std.testing.expectEqualStrings("f", hard.lines[2]);
+
+    const exact = try layoutWithFirst(a, "ab", 2, 4, 2, 8);
+    defer exact.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), exact.lines.len);
+    try std.testing.expectEqualStrings("", exact.lines[1]);
+    try std.testing.expectEqual(@as(usize, 1), exact.cursor_row);
+    try std.testing.expectEqual(@as(usize, 0), exact.cursor_column);
+
+    const hard_exact = try layoutWithFirst(a, "ab\ncd", 2, 4, 2, 8);
+    defer hard_exact.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), hard_exact.lines.len);
+    try std.testing.expectEqualStrings("ab", hard_exact.lines[0]);
+    try std.testing.expectEqualStrings("cd", hard_exact.lines[1]);
+    try std.testing.expectEqual(@as(usize, 1), hard_exact.cursor_row);
+    try std.testing.expectEqual(@as(usize, 0), hard_exact.cursor_column);
+
+    const up = try moveVerticalWithFirst(a, "abcdefgh", 8, 4, 2, false, null);
+    try std.testing.expectEqual(@as(usize, 4), up.cursor);
+    const down = try moveVerticalWithFirst(a, "abcdefgh", up.cursor, 4, 2, true, up.preferred_column);
+    try std.testing.expectEqual(@as(usize, 8), down.cursor);
+}
+
 test "composer vertical mapping cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, verticalAllocationScenario, .{});
 }

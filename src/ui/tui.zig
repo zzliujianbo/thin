@@ -4837,7 +4837,7 @@ const Ui = struct {
             const a = arena.allocator();
             const cols = self.size.columns -| 1;
             const prepared = try self.prepareComposer(a, self.connection.current(), cols);
-            const moved = try composer_layout.moveVertical(a, self.editor.bytes.items, self.editor.cursor, cols -| text.width(prepared.decoration.plain), forward, self.vertical_column);
+            const moved = try composer_layout.moveVerticalWithFirst(a, self.editor.bytes.items, self.editor.cursor, cols, cols -| text.width(prepared.decoration.plain), forward, self.vertical_column);
             self.editor.cursor = moved.cursor;
             self.vertical_column = moved.preferred_column;
             return;
@@ -6828,7 +6828,7 @@ const Ui = struct {
         // Modal authorization/secret layouts stay fixed. Idle LF debt first
         // obtains a single-row composer ACK even if a newer long draft arrived.
         const limit: usize = if (self.permission != null or self.stop_open or self.idle_breaks != 0) 1 else @min(composer_layout.max_rows, @max(1, self.size.rows -| 5));
-        return .{ .decoration = decoration, .layout = try composer_layout.layout(a, display_bytes, prefix.len, cols -| text.width(decoration.plain), limit) };
+        return .{ .decoration = decoration, .layout = try composer_layout.layoutWithFirst(a, display_bytes, prefix.len, cols, cols -| text.width(decoration.plain), limit) };
     }
 
     /// Restore borrowed ACKed rows at their original owned coordinates, ahead
@@ -6956,10 +6956,11 @@ const Ui = struct {
         } else {
             const composer = prepared.?;
             const decoration_width = text.width(composer.decoration.plain);
-            const indent = try a.alloc(u8, decoration_width);
-            @memset(indent, ' ');
             for (composer.layout.lines, 0..) |line, index| {
-                const input_line = try std.fmt.allocPrint(a, "{s}{s}", .{ if (index == 0) composer.decoration.styled else indent, line });
+                const input_line = if (composer.layout.first_row + index == 0)
+                    try std.fmt.allocPrint(a, "{s}{s}", .{ composer.decoration.styled, line })
+                else
+                    line;
                 try putStyled(writer, rows - composer_rows + 1 + index, input_line);
             }
             rendered_composer_rows = composer_rows;
@@ -6967,7 +6968,8 @@ const Ui = struct {
             cursor_offset = tail_out.written().len;
             try writer.writeAll("\r");
             if (cursor_rows_up != 0) try writer.print("\x1b[{d}A", .{cursor_rows_up});
-            const cursor_column = @min(cols - 1, decoration_width + composer.layout.cursor_column);
+            const absolute_cursor_row = composer.layout.first_row + composer.layout.cursor_row;
+            const cursor_column = @min(cols - 1, (if (absolute_cursor_row == 0) decoration_width else 0) + composer.layout.cursor_column);
             if (cursor_column != 0) try writer.print("\x1b[{d}C", .{cursor_column});
         }
         return .{ .offset = cursor_offset, .rows_up = cursor_rows_up, .rows = rendered_composer_rows };
