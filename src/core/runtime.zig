@@ -1042,9 +1042,9 @@ pub const Runtime = struct {
         self.protected_index = self.history.items.len;
         self.history.appendAssumeCapacity(user);
         self.history.appendAssumeCapacity(assistant);
-        // New canonical context invalidates only the display usage, not the
-        // estimator's learned calibration. executeBatch owns pairing on ALL exits.
-        self.last_context_tokens = null;
+        // A local command is not a model request. Keep the last reported model
+        // context visible until the next normal request updates it; the
+        // estimator remains the source for safety/compaction checks.
         try self.executeBatch(assistant.blocks, cancel, task, .local);
     }
 

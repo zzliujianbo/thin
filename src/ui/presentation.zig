@@ -449,6 +449,9 @@ pub const PromptActivity = struct {
     /// Owner says tiered-price protection is active for the selected model;
     /// not merely the global toggle, and never inferred from latest usage.
     low_price_input: bool = false,
+    /// The composer is in explicit local-command mode. The `!` marker replaces
+    /// the ordinary `>` and is rendered with its own color.
+    command: bool = false,
 };
 
 /// The model keeps idle effort/busy TPS styling; context occupancy has a static
@@ -478,8 +481,11 @@ pub fn prompt(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Context
 
 fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.ContextSnapshot, columns: usize, motion: PromptActivity) !Prompt {
     if (model.len == 0) {
-        const plain = try std.fmt.allocPrint(a, "{s} ", .{if (motion.busy) activity.spinner(motion.now_ms) else ">"});
+        const marker = if (motion.busy) activity.spinner(motion.now_ms) else if (motion.command) "!" else ">";
+        const plain = try std.fmt.allocPrint(a, "{s} ", .{marker});
         errdefer a.free(plain);
+        if (motion.command and !motion.busy)
+            return .{ .plain = plain, .styled = try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ theme.accent, marker, theme.reset }) };
         return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     }
     const value = if (motion.effort_flash) |level|
@@ -489,7 +495,7 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     defer a.free(value);
     const percentage = try std.fmt.allocPrint(a, "{s}{s}", .{ if (motion.low_price_input) "L" else "", value });
     defer a.free(percentage);
-    const marker = if (motion.busy) activity.spinner(motion.now_ms) else ">";
+    const marker = if (motion.busy) activity.spinner(motion.now_ms) else if (motion.command) "!" else ">";
     const reserve: usize = @min(@as(usize, 24), columns / 3);
     const room: usize = columns -| (reserve + 5 + text.width(percentage));
     const label = try singleLine(a, model, if (columns < 12) 0 else room);
@@ -508,7 +514,7 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     const slot_color = if (motion.effort_flash != null) idle_color else context_color;
     const styled_model = label.len != 0 and (motion.streaming or !std.mem.eql(u8, idle_color, theme.reset));
     const styled_slot = slot_flow or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
-    if (!motion.busy and ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
+    if (!motion.busy and !motion.command and ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     const palette = theme.modelPalette(motion.rate_band);
@@ -538,6 +544,8 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     }
     if (motion.busy) {
         try out.writer.print("{s}{s}{s} ", .{ activeIndicatorColor(motion.now_ms), marker, theme.reset });
+    } else if (motion.command) {
+        try out.writer.print("{s}{s}{s} ", .{ theme.accent, marker, theme.reset });
     } else try out.writer.print("{s} ", .{marker});
     return .{ .plain = plain, .styled = try a.dupe(u8, out.written()) };
 }

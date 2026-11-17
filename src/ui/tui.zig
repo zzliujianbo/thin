@@ -873,10 +873,13 @@ const Ui = struct {
     input_history_seeded: bool = false,
     history_draft: ?input.Editor = null,
     history_draft_pasted: bool = false,
+    history_draft_command_mode: bool = false,
     vertical_column: ?usize = null,
     /// 终端输入解析器，处理转义序列与粘贴边界。
     parser: input.Parser = .{},
     editor_pasted: bool = false,
+    /// The leading `!` is represented by the composer marker, not editor text.
+    command_mode: bool = false,
     model_picker: ?picker_module.Picker = null,
     provider_picker: provider_picker_module.Picker = .{},
     provider_open: bool = false,
@@ -1124,7 +1127,7 @@ const Ui = struct {
     /// A normal Enter behind display-only breaks waits for their ACK, never
     /// until the next task completes. Move the editor (no allocation) so typing
     /// in the following read batch belongs to the next draft, not this submit.
-    deferred_submit: ?struct { editor: input.Editor, pasted: bool } = null,
+    deferred_submit: ?struct { editor: input.Editor, pasted: bool, command_mode: bool = false } = null,
     /// 待输出的完整帧；可能分多次 write，由 frame_offset 记录进度。
     frame: []const u8 = "",
     frame_offset: usize = 0,
@@ -1331,6 +1334,8 @@ const Ui = struct {
         self.editor.deinit();
         self.editor = .{ .allocator = self.allocator, .bytes = .{ .items = bytes, .capacity = bytes.len, .pointer_stability = .{} }, .cursor = bytes.len };
         self.editor_pasted = false;
+        self.command_mode = false;
+        self.history_draft_command_mode = false;
         self.input_history.index = null;
         self.vertical_column = null;
     }
@@ -3502,7 +3507,7 @@ const Ui = struct {
         if (self.deferred_submit != null or self.presentationWaiting() or !self.settingsIdle() or self.editor_pasted or self.parser.batch_paste or
             self.parser.escape_len != 0 or self.parser.utf8_len != 0 or self.stop_open or
             self.settings_open or self.provider_open or self.model_picker != null or
-            self.mode != null or self.active_tool != null or self.draft != null or
+            self.command_mode or self.mode != null or self.active_tool != null or self.draft != null or
             self.size.columns < 9 or self.size.rows < 7 or
             std.mem.trim(u8, self.editor.bytes.items, " \t\r\n").len != 0) return false;
         const queue = self.inbox.snapshot();
@@ -3522,7 +3527,7 @@ const Ui = struct {
     /// Refresh the slash menu from the current editor bytes. The menu is only
     /// meaningful on an idle, non-pasted session with no modal surface open.
     fn refreshCommandMenu(self: *Ui) void {
-        const active = self.settingsIdle() and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !self.editor_pasted;
+        const active = self.settingsIdle() and !self.command_mode and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !self.editor_pasted;
         if (!active) {
             self.command_matches = .{};
             return;
@@ -3549,7 +3554,7 @@ const Ui = struct {
         self.command_matches = matches;
     }
     fn commandMenuVisible(self: *const Ui) bool {
-        return self.settingsIdle() and !self.editor_pasted and self.command_matches.len != 0 and !self.command_menu.dismissed and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open;
+        return self.settingsIdle() and !self.command_mode and !self.editor_pasted and self.command_matches.len != 0 and !self.command_menu.dismissed and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open;
     }
     fn closeCommandMenu(self: *Ui) void {
         self.command_matches = .{};
@@ -4612,20 +4617,38 @@ const Ui = struct {
             self.notice = "Operation pending; input kept";
             return;
         }
-        const command = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        const typed = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
+        var synthetic: ?[]u8 = null;
+        defer if (synthetic) |value| self.allocator.free(value);
+        const command = if (self.command_mode) blk: {
+            synthetic = try std.fmt.allocPrint(self.allocator, "!{s}", .{self.editor.bytes.items});
+            break :blk synthetic.?;
+        } else typed;
         // Session management resolves before steering: /ls, /cd, /attach,
         // /detach, /exit and /close work while a task is busy and never enter
-        // the model, Steering or FollowUp.
-        if (self.runManageText(command)) return;
+        // the model, Steering or FollowUp. Command mode is already a bash task.
+        if (!self.command_mode and self.runManageText(command)) return;
         if (self.terminal_notice_pending != null) return;
-        if (self.busy) return self.enqueueDraft(.steering);
+        if (self.busy) {
+            if (self.command_mode) {
+                self.notice = "Commands require an idle session";
+                return;
+            }
+            return self.enqueueDraft(.steering);
+        }
+        if (self.command_mode and typed.len == 0) {
+            self.notice = "Usage: !command";
+            self.wipeEditor();
+            return;
+        }
         // Slash commands keep their original modal/secret and stop-feed
         // boundary. Inference/local execution alone needs the display barrier.
         if (self.idle_breaks != 0 and command.len != 0 and (command[0] != '/' or compactCommand(command))) {
             if (self.deferred_submit == null) {
-                self.deferred_submit = .{ .editor = self.editor, .pasted = self.editor_pasted };
+                self.deferred_submit = .{ .editor = self.editor, .pasted = self.editor_pasted, .command_mode = self.command_mode };
                 self.editor = .{ .allocator = self.allocator };
                 self.editor_pasted = false;
+                self.command_mode = false;
                 self.input_history.index = null;
                 self.dropHistoryDraft();
                 self.requestDraw();
@@ -4740,9 +4763,10 @@ const Ui = struct {
             return;
         }
 
-        if (std.mem.trim(u8, self.editor.bytes.items, " \t\r\n").len == 0) return;
+        if (!self.command_mode and typed.len == 0) return;
 
-        const local_command = command[0] == '!';
+        const local_command = self.command_mode or command[0] == '!';
+        const submitted = if (self.command_mode) command else self.editor.bytes.items;
         if (local_command and (!self.settingsIdle() or self.editor_pasted or self.parser.pasted or self.parser.escape_len != 0 or self.parser.utf8_len != 0)) {
             self.notice = "Commands require an idle, non-pasted fresh Enter";
             return;
@@ -4753,7 +4777,7 @@ const Ui = struct {
         }
         const state = self.connection.current();
         if (self.remote()) |client| {
-            if (try self.remoteStart(client, if (local_command) .command else .prompt, self.editor.bytes.items)) self.wipeEditor();
+            if (try self.remoteStart(client, if (local_command) .command else .prompt, submitted)) self.wipeEditor();
             return;
         }
         const runtime = state.runtime orelse {
@@ -4762,7 +4786,7 @@ const Ui = struct {
             return;
         };
 
-        self.startPrompt(runtime, self.editor.bytes.items, if (local_command) .command else .prompt) catch |err| {
+        self.startPrompt(runtime, submitted, if (local_command) .command else .prompt) catch |err| {
             if (err != error.QueueOwnerChanged) return err;
             self.notice = "Queue belongs to another session; Ctrl-C to confirm clearing it";
             self.parser.stop_feed = true;
@@ -4967,12 +4991,15 @@ const Ui = struct {
     fn restoreHistoryDraft(self: *Ui) void {
         const draft = self.history_draft orelse return;
         const pasted = self.history_draft_pasted;
+        const command_mode = self.history_draft_command_mode;
         self.history_draft = null;
         self.wipeEditor();
         self.editor.deinit();
         self.editor = draft;
         self.editor_pasted = pasted;
+        self.command_mode = command_mode;
         self.history_draft_pasted = false;
+        self.history_draft_command_mode = false;
         self.vertical_column = null;
     }
 
@@ -4984,6 +5011,7 @@ const Ui = struct {
         }
         self.history_draft = null;
         self.history_draft_pasted = false;
+        self.history_draft_command_mode = false;
     }
 
     fn navigateInput(self: *Ui, forward: bool) !void {
@@ -5005,25 +5033,30 @@ const Ui = struct {
         if (selected.index == null) {
             const saved = self.history_draft;
             const pasted = self.history_draft_pasted;
+            const command_mode = self.history_draft_command_mode;
             const allocator = self.editor.allocator;
             self.history_draft = null;
             self.wipeEditor();
             self.editor.deinit();
             self.editor = saved orelse .{ .allocator = allocator };
             self.editor_pasted = pasted;
+            self.command_mode = command_mode;
             self.history_draft_pasted = false;
+            self.history_draft_command_mode = false;
             return;
         }
         // Allocate a replacement before moving either owner; OOM preserves the
         // selected entry, draft, original cursor and paste provenance.
         var replacement: input.Editor = .{ .allocator = self.editor.allocator };
         errdefer replacement.deinit();
-        if (!try replacement.insert(selected.text)) return error.InputLimit;
+        const selected_command = selected.text.len != 0 and selected.text[0] == '!';
+        if (!try replacement.insert(if (selected_command) selected.text[1..] else selected.text)) return error.InputLimit;
         replacement.cursor = 0; // Repeated history keys still satisfy the rule.
         if (self.input_history.index == null) {
             self.dropHistoryDraft();
             self.history_draft = self.editor;
             self.history_draft_pasted = self.editor_pasted;
+            self.history_draft_command_mode = self.command_mode;
         } else {
             self.editor.clear();
             std.crypto.secureZero(u8, self.editor.bytes.allocatedSlice());
@@ -5033,6 +5066,7 @@ const Ui = struct {
         self.editor_revision +%= 1;
         self.input_history.index = selected.index;
         self.editor_pasted = false;
+        self.command_mode = selected_command;
     }
 
     fn detachInbox(self: *Ui) void {
@@ -5060,6 +5094,10 @@ const Ui = struct {
     }
 
     fn enqueueDraft(self: *Ui, kind: inbox_module.Kind) !void {
+        if (self.command_mode) {
+            self.notice = "Commands require an idle session";
+            return;
+        }
         const value = std.mem.trim(u8, self.editor.bytes.items, " \t\r\n");
         if (value.len == 0) return;
         if (value[0] == '/' or value[0] == '!') {
@@ -5401,7 +5439,17 @@ const Ui = struct {
         // clear 在 Debug 模式会 poison 原 items；最后再擦除，确保整个保留缓冲区为零。
         self.editor.clear();
         self.editor_pasted = false;
+        self.command_mode = false;
         std.crypto.secureZero(u8, self.editor.bytes.allocatedSlice());
+    }
+
+    fn beginCommandMode(self: *Ui) void {
+        self.command_mode = true;
+        self.editor_revision +%= 1;
+        self.input_history.index = null;
+        self.dropHistoryDraft();
+        self.closeCommandMenu();
+        self.requestDraw();
     }
 
     fn endSecret(self: *Ui) void {
@@ -5649,6 +5697,15 @@ const Ui = struct {
             try self.escapeQueue();
             return;
         }
+        if (self.command_mode and self.settingsIdle() and !self.stop_open and !self.settings_open and !self.provider_open and self.model_picker == null and self.resume_picker == null) {
+            if (event_ == .escape or ((event_ == .backspace or event_ == .delete) and self.editor.bytes.items.len == 0)) {
+                self.wipeEditor();
+                self.notice = "Ready";
+                self.parser.stop_feed = true;
+                self.requestDraw();
+                return;
+            }
+        }
         if (self.settings_open and self.permission == null) return self.settingsKey(event_);
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
@@ -5703,6 +5760,12 @@ const Ui = struct {
                 self.blockPastedApproval();
             },
             .text => |v| {
+                if (!v.pasted and !self.command_mode and self.editor.bytes.items.len == 0 and self.editor.cursor == 0 and
+                    self.settingsIdle() and !self.editor_pasted and v.value.len == 1 and v.value[0] == '!')
+                {
+                    self.beginCommandMode();
+                    return;
+                }
                 if (try self.editor.insert(v.value)) {
                     self.input_history.index = null;
                     self.dropHistoryDraft();
@@ -6239,14 +6302,17 @@ const Ui = struct {
         const pending = self.deferred_submit orelse return;
         const draft = self.editor;
         const pasted = self.editor_pasted;
+        const command_mode = self.command_mode;
         self.deferred_submit = null;
         self.editor = pending.editor;
         self.editor_pasted = pending.pasted;
+        self.command_mode = pending.command_mode;
         defer {
             self.wipeEditor();
             self.editor.deinit();
             self.editor = draft;
             self.editor_pasted = pasted;
+            self.command_mode = command_mode;
         }
         try self.submit();
         self.requestDraw();
@@ -6991,7 +7057,7 @@ const Ui = struct {
         // is owned by the fast animation slot, one step per painted frame.
         const streaming = view.streaming and working;
         const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
+        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .command = self.command_mode });
         // Modal authorization/secret layouts stay fixed. Idle LF debt first
         // obtains a single-row composer ACK even if a newer long draft arrived.
         const limit: usize = if (self.permission != null or self.stop_open or self.idle_breaks != 0) 1 else @min(composer_layout.max_rows, @max(1, self.size.rows -| 5));
@@ -7225,7 +7291,7 @@ const Ui = struct {
             // Only the prompt, never that now-deleted draft, becomes history.
             const view = self.display.view(self.clock_ms);
             const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input });
+            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .command = self.command_mode });
             idle_prompt = try std.fmt.allocPrint(a, "{s}{s}\x1b[K", .{ decoration.styled, theme.reset });
             try writer.writeAll(idle_prompt);
             // Entry is the ACKed composer's bottom row, not the tail's top.

@@ -13952,3 +13952,60 @@ test "compaction status and result are visible in the conversation" {
     }
     try std.testing.expect(skipped);
 }
+
+test "command composer hides the leading bang and restores it on cancel" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+
+    try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
+    try std.testing.expect(ui.command_mode);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try Ui.key(&ui, .{ .text = .{ .value = "ls", .pasted = false } });
+    try std.testing.expectEqualStrings("ls", ui.editor.bytes.items);
+    try std.testing.expect(ui.command_mode);
+
+    try Ui.key(&ui, .escape);
+    try std.testing.expect(!ui.command_mode);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+
+    try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
+    try Ui.key(&ui, .backspace);
+    try std.testing.expect(!ui.command_mode);
+
+    try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
+    try Ui.key(&ui, .delete);
+    try std.testing.expect(!ui.command_mode);
+
+    try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
+    try Ui.key(&ui, .enter);
+    try std.testing.expect(!ui.command_mode);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "Usage: !command") != null);
+}
+
+test "command composer submits the hidden bang as a command task" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+
+    try Ui.key(&ui, .{ .text = .{ .value = "!", .pasted = false } });
+    try Ui.key(&ui, .{ .text = .{ .value = "printf hi", .pasted = false } });
+    try Ui.key(&ui, .enter);
+    try std.testing.expectEqual(@as(usize, 1), fake.submits);
+    try std.testing.expectEqual(session_client.TaskKind.command, fake.last_submit_kind);
+    try std.testing.expectEqualStrings("!printf hi", fake.text[0..fake.text_len]);
+    try std.testing.expect(!ui.command_mode);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+}
+
+test "command prompt uses the bang marker and accent color" {
+    const rendered = try presentation.prompt(std.testing.allocator, "fixture", null, 79, .{ .command = true });
+    defer rendered.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("(fixture) ?%! ", rendered.plain);
+    try std.testing.expect(std.mem.find(u8, rendered.styled, theme.accent ++ "!") != null);
+}

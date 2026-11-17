@@ -8,7 +8,8 @@ test "local command unknown price keeps output, pairs checkpoint and next normal
     const terminal = try runtime.executeCommand("!printf hello", &cancel);
     try std.testing.expectEqual(r.Status.success, terminal.status);
     try std.testing.expectEqual(@as(u32, 0), terminal.usage.normal_calls + terminal.usage.summary_calls);
-    try std.testing.expect(!terminal.context_snapshot.?.known);
+    try std.testing.expect(terminal.context_snapshot.?.known);
+    try std.testing.expectEqual(@as(u64, 0), terminal.context_snapshot.?.tokens);
     try std.testing.expectEqualStrings(&output, runtime.messages()[2].blocks[0].tool_result.text);
     try std.testing.expect(!runtime.messages()[2].blocks[0].tool_result.truncated);
     try paired(&runtime);
@@ -243,4 +244,19 @@ test "local command preserves complete UTF8 across former byte boundaries and re
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(error.InvalidToolOutput, (try runtime.executeCommand("!bad-prefix", &cancel)).detail.?);
     try paired(&runtime);
+}
+
+test "local command preserves the last reported context snapshot" {
+    var fake: Fake = .{ .approve = .allow_once };
+    const config = configuration();
+    var runtime = try fake.init(&config, false);
+    defer runtime.deinit();
+    fake.runtime = &runtime;
+    runtime.last_context_tokens = 1000;
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.executeCommand("!printf context", &cancel);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    try std.testing.expect(terminal.context_snapshot.?.known);
+    try std.testing.expectEqual(@as(u64, 1000), terminal.context_snapshot.?.tokens);
+    try std.testing.expectEqual(@as(?u64, 1000), runtime.contextSnapshot().tokens);
 }
