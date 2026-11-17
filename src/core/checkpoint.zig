@@ -194,6 +194,20 @@ pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
         // Display-only metadata added later: an older checkpoint simply has no
         // such rows, and must still resume.
         if (!tree.value.object.contains("tool_stats")) try tree.value.object.put(tree.arena.allocator(), "tool_stats", .null);
+        // The estimator's calibration window was added later. Older files only
+        // carry `per_mille`; resume with an empty window and keep that
+        // coefficient until new samples recalibrate it.
+        if (tree.value.object.getPtr("estimator")) |estimator| if (estimator.* == .object) {
+            const arena = tree.arena.allocator();
+            if (!estimator.object.contains("recent")) {
+                var recent = j.array(arena);
+                for (0..@typeInfo(@FieldType(context.Estimator, "recent")).array.len) |_|
+                    try j.append(&recent, .{ .number_string = "0" });
+                try j.put(arena, estimator, "recent", recent);
+            }
+            if (!estimator.object.contains("recent_count")) try j.put(arena, estimator, "recent_count", .{ .number_string = "0" });
+            if (!estimator.object.contains("recent_next")) try j.put(arena, estimator, "recent_next", .{ .number_string = "0" });
+        };
     }
     try shape(State, tree.value);
     const parsed = try std.json.parseFromValue(State, a, tree.value, .{});

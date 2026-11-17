@@ -71,6 +71,21 @@ test "checkpoint keeps display-only tool counters and reads old files without th
     defer a.free(bad);
     try std.testing.expectError(error.InvalidHistory, decode(a, bad));
 }
+test "checkpoint resumes files saved before estimator calibration" {
+    const a = std.testing.allocator;
+    const bytes = try encode(a, fixture(.chat));
+    defer a.free(bytes);
+    // The exact old DTO: only `per_mille` in the estimator.
+    const legacy = try std.mem.replaceOwned(u8, a, bytes, ",\"recent\":[0,0,0,0,0,0,0,0],\"recent_count\":0,\"recent_next\":0", "");
+    defer a.free(legacy);
+    try std.testing.expect(legacy.len < bytes.len);
+    var decoded = try decode(a, legacy);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 1234), decoded.value.estimator.per_mille);
+    try std.testing.expectEqual(@as(u8, 0), decoded.value.estimator.recent_count);
+    try std.testing.expectEqual(@as(u8, 0), decoded.value.estimator.recent_next);
+    for (decoded.value.estimator.recent) |value| try std.testing.expectEqual(@as(u32, 0), value);
+}
 test "checkpoint preserves more than 1024 canonical messages" {
     const a = std.testing.allocator;
     const messages = try a.alloc(p.Message, 1026);
@@ -148,7 +163,7 @@ test "checkpoint requires every emitted field recursively including nullable def
     // Each removal starts with the current encoder's complete valid DTO.
     const removals = [_][]const u8{
         "\"version\":2,",              "\"context_tokens\":null,", "\"context_official\":false,",
-        ",\"initial_attempted\":true", "\"per_mille\":1234,",       ",\"replay\":null",
+        ",\"initial_attempted\":true", "\"per_mille\":1234,",      ",\"replay\":null",
         ",\"item_id\":null",           "\"canceled\":true,",       ",\"retain_turn\":true",
     };
     for (removals) |field| {
