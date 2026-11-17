@@ -29,6 +29,9 @@ test "context estimate counts Unicode and calibrates from reported usage" {
     // Samples below the noise floor never move the factor.
     estimate.observe(100, 200);
     try std.testing.expectEqual(@as(u64, 1000), estimate.per_mille);
+    // A zero report (output-only usage) is not a ratio sample.
+    estimate.observe(10_000, 0);
+    try std.testing.expectEqual(@as(u64, 1000), estimate.per_mille);
     // An under-estimating heuristic raises it.
     estimate.observe(10_000, 20_000);
     try std.testing.expectEqual(@as(u64, 2200), estimate.per_mille);

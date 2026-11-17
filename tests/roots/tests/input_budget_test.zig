@@ -32,6 +32,8 @@ const Fake = struct {
     summary_text: ?[]const u8 = null,
     summary_fault: enum { none, server, transport, invalid } = .none,
     output: [8192]u8 = @splat('x'),
+    /// A provider that reports no input usage for one call.
+    zero_input: bool = false,
     fn model(self: *Fake) p.Model {
         return .{ .context = self, .call_fn = call };
     }
@@ -54,7 +56,7 @@ const Fake = struct {
             self.normal += 1;
             if (self.tool_mode and self.normal == 1) return .{ .success = .{ .finish = .tool_calls, .message = .{ .role = .assistant, .blocks = &.{.{ .tool_call = .{ .id = "one", .name = "fixture", .arguments = "{}" } }} } } };
         }
-        return .{ .success = .{ .finish = .stop, .message = try p.textMessage(alloc, .assistant, if (req.purpose == .summary) self.summary_text orelse "Earlier work completed." else "Earlier work completed."), .usage = .{ .input_tokens = estimate, .output_tokens = 8 } } };
+        return .{ .success = .{ .finish = .stop, .message = try p.textMessage(alloc, .assistant, if (req.purpose == .summary) self.summary_text orelse "Earlier work completed." else "Earlier work completed."), .usage = .{ .input_tokens = if (self.zero_input) 0 else estimate, .output_tokens = 8 } } };
     }
     fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !r.Prepared {
         return .{ .payload = raw, .description = "fixture" };
@@ -201,4 +203,19 @@ test "reported usage decides sendability, not the conservative raw estimate" {
     // No summary and no rejection: the anchored measurement still fits.
     try std.testing.expectEqual(@as(usize, 1), fake.normal);
     try std.testing.expectEqual(@as(usize, 0), fake.summaries);
+}
+
+test "a zero input report never becomes the anchoring baseline" {
+    var config = configuration();
+    config.model.context_tokens = 30000;
+    var fake = Fake{ .config = &config, .zero_input = true };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, "small old work");
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("first step", &cancel);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    // Without a trustworthy count the measurement falls back to the estimate.
+    try std.testing.expectEqual(@as(?u64, null), runtime.last_normal_input_tokens);
+    try std.testing.expectEqual(@as(usize, 0), runtime.last_normal_estimated_tokens);
 }

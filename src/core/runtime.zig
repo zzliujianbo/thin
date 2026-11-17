@@ -1652,8 +1652,10 @@ pub const Runtime = struct {
             // 供下一次自动压缩判断使用。摘要请求不会覆盖这个基线。
             self.estimator.observe(raw, usage.input_tokens);
             if (purpose == .normal) {
-                self.last_normal_input_tokens = usage.input_tokens;
-                self.last_normal_estimated_tokens = if (usage.input_tokens != null) self.estimator.tokens(raw) else 0;
+                // A zero count cannot anchor the next measurement: keeping it
+                // would let the gate believe the prompt is nearly empty.
+                self.last_normal_input_tokens = if (usage.input_tokens) |value| if (value == 0) null else value else null;
+                self.last_normal_estimated_tokens = if (self.last_normal_input_tokens != null) self.estimator.tokens(raw) else 0;
             }
         }
 
@@ -1711,7 +1713,9 @@ pub const Runtime = struct {
                 try checkCanceled(cancel);
                 return error.InputBudgetSummaryFailed;
             }
-            const current = self.estimatedTokens();
+            // Same anchored measure as preflight: a failed summary may continue
+            // only when the real prompt still fits the hard budget.
+            const current = self.anchoredTokens(self.estimatedTokens());
             if (err == error.NoCompactionCandidate and current <= budget) {
                 // Surface the condition once per task instead of retrying a
                 // summary that has no safe prefix on every model round.

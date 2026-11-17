@@ -21,8 +21,8 @@ pub const per_mille_ceiling: u64 = 4000;
 pub const Estimator = struct {
     /// 千分比系数，1000 表示 1.0 倍。
     per_mille: u64 = 1000,
-    /// 最近的校准比例（千分比）。只在进程内参与窗口计算，不写入 checkpoint：
-    /// 恢复的会话先沿用存档系数，再按新的实测逐步修正。
+    /// 最近的校准比例（千分比）。随 checkpoint 一起保存，恢复后继续使用，
+    /// 避免每次恢复都退回未经校准的 1.0 系数。
     recent: [estimate_window]u32 = @splat(0),
     recent_count: u8 = 0,
     recent_next: u8 = 0,
@@ -36,9 +36,10 @@ pub const Estimator = struct {
     /// 用提供方报告的真实输入用量校准估算值：保留 10% 余量，取最近窗口内的
     /// 最大值。窗口同时允许向下修正，避免字符估算偏高时一直用不到整窗。
     pub fn observe(self: *Estimator, raw: usize, reported: ?u64) void {
-        // 没有真实用量或样本太小都无法校准，直接忽略。
+        // 没有真实用量、用量为 0 或样本太小都无法校准，直接忽略。上报 0 通常
+        // 意味着这一轮只有输出用量，把它当成比例会把系数一路拉到下限。
         const actual = reported orelse return;
-        if (raw < min_sample_raw) return;
+        if (actual == 0 or raw < min_sample_raw) return;
         // 计算 actual * 1.1 / raw（向上取整）得到本次的千分比。
         const n = (@as(u128, actual) * 1100 + raw - 1) / raw;
         const sample = std.math.cast(u32, n) orelse std.math.maxInt(u32);
