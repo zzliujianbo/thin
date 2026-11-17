@@ -6,12 +6,26 @@ const p = @import("protocol.zig");
 const cfg = @import("config.zig");
 
 /// Deliberately an estimate, not a claim to implement every model's tokenizer.
-/// Provider input usage can increase the safety multiplier for later requests.
-/// 中文：这只是估算，不是实现各模型的真实 tokenizer。
-/// 提供方报告的输入用量只会把 per_mille 调大（偏安全），后续请求据此估算。
+/// 中文：这只是估算，不是实现各模型的真实 tokenizer。提供方报告的输入用量
+/// 通过最近窗口内的比例修正 per_mille，两个方向都允许，但都受上下限约束。
+/// 校准窗口：取最近若干次比例的最大值。一次异常样本不会永久抬高系数，
+/// 字符估算系统性偏高时，旧样本淘汰后系数也会回落。
+const estimate_window = 8;
+/// 低于这个原始规模的样本噪声太大，不参与校准。
+pub const min_sample_raw = 2048;
+/// 系数下限：允许向下修正到 0.7 倍，再低就不再信任字符估算的偏差。
+pub const per_mille_floor: u64 = 700;
+/// 系数上限：防止一次病态样本让预算彻底失去意义。
+pub const per_mille_ceiling: u64 = 4000;
+
 pub const Estimator = struct {
-    /// 千分比系数，1000 表示 1.0 倍；只增不减，初始为 1.0。
+    /// 千分比系数，1000 表示 1.0 倍。
     per_mille: u64 = 1000,
+    /// 最近的校准比例（千分比）。只在进程内参与窗口计算，不写入 checkpoint：
+    /// 恢复的会话先沿用存档系数，再按新的实测逐步修正。
+    recent: [estimate_window]u32 = @splat(0),
+    recent_count: u8 = 0,
+    recent_next: u8 = 0,
     /// 按系数把原始字符估算值换算为 token 数，向上取整。
     pub fn tokens(self: Estimator, raw: usize) usize {
         // 使用 u128 做乘法，避免 raw 很大时溢出；+999 实现向上取整。
@@ -19,14 +33,21 @@ pub const Estimator = struct {
         return @intCast(@min(n, std.math.maxInt(usize)));
     }
 
-    /// 用提供方报告的真实输入用量校准估算值；只会向上调整，并保留 10% 余量。
+    /// 用提供方报告的真实输入用量校准估算值：保留 10% 余量，取最近窗口内的
+    /// 最大值。窗口同时允许向下修正，避免字符估算偏高时一直用不到整窗。
     pub fn observe(self: *Estimator, raw: usize, reported: ?u64) void {
-        // 没有真实用量或原始估算为 0 时无法校准，直接忽略。
+        // 没有真实用量或样本太小都无法校准，直接忽略。
         const actual = reported orelse return;
-        if (raw == 0) return;
-        // 计算 actual * 1.1 / raw（向上取整）得到新的千分比。
+        if (raw < min_sample_raw) return;
+        // 计算 actual * 1.1 / raw（向上取整）得到本次的千分比。
         const n = (@as(u128, actual) * 1100 + raw - 1) / raw;
-        self.per_mille = @max(self.per_mille, @as(u64, @intCast(@min(n, std.math.maxInt(u64)))));
+        const sample = std.math.cast(u32, n) orelse std.math.maxInt(u32);
+        self.recent[self.recent_next] = @max(sample, 1);
+        self.recent_next = if (self.recent_next + 1 == estimate_window) 0 else self.recent_next + 1;
+        if (self.recent_count < estimate_window) self.recent_count += 1;
+        var highest: u64 = per_mille_floor;
+        for (self.recent[0..self.recent_count]) |value| highest = @max(highest, @as(u64, value));
+        self.per_mille = @min(highest, per_mille_ceiling);
     }
 };
 

@@ -21,15 +21,31 @@ test "summary prompt distinguishes verified work and preserves closed-context co
         "actual user request is group 0",
     }) |boundary| try std.testing.expect(std.mem.indexOf(u8, text, boundary) != null);
 }
-test "context estimate counts Unicode and learns only upward from reported usage" {
+test "context estimate counts Unicode and calibrates from reported usage" {
     try std.testing.expect(textTokens("中文") > 0);
     var estimate = Estimator{};
     estimate.observe(100, null);
     try std.testing.expectEqual(@as(usize, 100), estimate.tokens(100));
+    // Samples below the noise floor never move the factor.
     estimate.observe(100, 200);
-    try std.testing.expect(estimate.tokens(100) >= 200);
-    estimate.observe(100, 1);
-    try std.testing.expect(estimate.tokens(100) >= 200);
+    try std.testing.expectEqual(@as(u64, 1000), estimate.per_mille);
+    // An under-estimating heuristic raises it.
+    estimate.observe(10_000, 20_000);
+    try std.testing.expectEqual(@as(u64, 2200), estimate.per_mille);
+    try std.testing.expect(estimate.tokens(10_000) >= 20_000);
+}
+
+test "estimator corrects over-estimates within bounds and forgets old samples" {
+    // An over-estimating heuristic lowers the factor, but never past the floor.
+    var low = Estimator{};
+    low.observe(10_000, 5_000);
+    try std.testing.expectEqual(per_mille_floor, low.per_mille);
+    // One swollen sample leaves the window instead of pinning the factor.
+    var window = Estimator{};
+    window.observe(10_000, 20_000);
+    try std.testing.expectEqual(@as(u64, 2200), window.per_mille);
+    for (0..8) |_| window.observe(10_000, 10_000);
+    try std.testing.expectEqual(@as(u64, 1100), window.per_mille);
 }
 test "compaction boundaries never split calls/results or opaque user turns" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

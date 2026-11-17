@@ -148,7 +148,7 @@ test "checkpoint requires every emitted field recursively including nullable def
     // Each removal starts with the current encoder's complete valid DTO.
     const removals = [_][]const u8{
         "\"version\":2,",              "\"context_tokens\":null,", "\"context_official\":false,",
-        ",\"initial_attempted\":true", "\"per_mille\":1234",       ",\"replay\":null",
+        ",\"initial_attempted\":true", "\"per_mille\":1234,",       ",\"replay\":null",
         ",\"item_id\":null",           "\"canceled\":true,",       ",\"retain_turn\":true",
     };
     for (removals) |field| {

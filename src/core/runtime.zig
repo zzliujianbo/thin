@@ -760,7 +760,9 @@ pub const Runtime = struct {
             }
             self.selector.initial_attempted = true;
         }
-        self.estimator = if (state.estimator.per_mille < 1000) .{} else state.estimator;
+        // 存档系数允许低于 1.0（向下校准），但必须落在可信区间内。
+        self.estimator = if (state.estimator.per_mille < context.per_mille_floor or
+            state.estimator.per_mille > context.per_mille_ceiling) .{} else state.estimator;
         // The last server-confirmed display statistic is independent of whether
         // native replay remains valid for the rewritten tool prefix.
         self.last_context_tokens = state.last_context_tokens;
@@ -791,11 +793,12 @@ pub const Runtime = struct {
         self.last_normal_estimated_tokens = 0;
     }
 
-    /// Use the last normal request's actual input count plus the estimated
-    /// growth since that request. The estimator remains the hard-budget guard;
-    /// this only avoids triggering an unnecessary paid summary when it is
-    /// systematically high.
-    fn automaticCompactionTokens(self: *const Runtime, estimated: usize) usize {
+    /// The provider's last reported input plus the estimated growth since that
+    /// request. Both the compaction decision and the send gate use this one
+    /// measure: comparing an anchored value against an unanchored estimate let
+    /// a conservative estimate reject a request the trigger still considered
+    /// comfortable, so a long turn failed without ever trying to compact.
+    fn anchoredTokens(self: *const Runtime, estimated: usize) usize {
         const actual = self.last_normal_input_tokens orelse return estimated;
         if (self.last_normal_estimated_tokens == 0) return estimated;
         const growth = estimated -| self.last_normal_estimated_tokens;
@@ -1511,7 +1514,10 @@ pub const Runtime = struct {
         send_req.wire = wire;
         defer a.free(wire);
         const estimated = self.estimator.tokens(context.rawTokens(req.system, req.tools, req.messages));
-        try context.checkInputFor(self.config.*, req.purpose, estimated);
+        // A normal request is measured from the last real prompt plus its
+        // growth; the pure estimate stays as the fallback when no usage is known.
+        const measured = if (req.purpose == .normal) self.anchoredTokens(estimated) else estimated;
+        try context.checkInputFor(self.config.*, req.purpose, measured);
         // Display-only work must not alter Selector observation/fallback/accounting.
         if (req.purpose != .normal) return self.callModel(a, send_req, sink);
         var uncanceled: p.Cancellation = .{};
@@ -1661,19 +1667,18 @@ pub const Runtime = struct {
         try context.validateInputPolicy(self.config.*);
         const budget = context.inputBudget(self.config.*);
         const estimated = self.estimatedTokens();
+        const measured = self.anchoredTokens(estimated);
         if (!self.config.limits.compaction_enabled) {
-            if (estimated > budget) return context.inputBudgetError(self.config.*);
+            if (measured > budget) return context.inputBudgetError(self.config.*);
             return;
         }
-        const trigger = self.automaticCompactionTokens(estimated);
-        if (trigger < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) {
-            // Actual usage can justify a lower trigger, but it never relaxes
-            // the hard physical/price limit enforced by the estimator.
-            if (estimated > budget) return context.inputBudgetError(self.config.*);
-            return;
-        }
+        // Below the soft trigger and inside the hard budget: nothing to do.
+        // Over the hard budget the run always tries a summary first, even when
+        // the growth proxy still looks comfortable; refusing here is what made
+        // a 72%-full session fail without compacting.
+        if (measured <= budget and measured < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) return;
         const cap_reached = task.auto_compactions >= max_auto_compactions;
-        if (cap_reached and estimated <= budget) {
+        if (cap_reached and measured <= budget) {
             if (!task.auto_skip_notified) {
                 task.auto_skip_notified = true;
                 try self.emit(.{ .compaction_skipped = .{ .reason = .limit } }, cancel);
@@ -1683,8 +1688,8 @@ pub const Runtime = struct {
         // Beyond the soft cap, an input already over the hard budget still
         // needs an emergency summary. Refusing here would fail a long task
         // that is otherwise still making progress.
-        if (task.auto_compactions != 0 and estimated <= budget and
-            estimated < task.auto_after_tokens +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
+        if (task.auto_compactions != 0 and measured <= budget and
+            measured < task.auto_after_tokens +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
         {
             if (!task.auto_skip_notified) {
                 task.auto_skip_notified = true;

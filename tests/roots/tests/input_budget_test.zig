@@ -19,6 +19,10 @@ fn configuration() cfg.Config {
 
 const Fake = struct {
     config: *const cfg.Config,
+    /// The send gate may legitimately admit a request whose raw estimate is
+    /// over budget when the provider-reported prompt is smaller; the anchored
+    /// test below opts out of this raw-only assertion.
+    check_raw_budget: bool = true,
     normal: usize = 0,
     summaries: usize = 0,
     last_summary_input: usize = 0,
@@ -34,7 +38,7 @@ const Fake = struct {
     fn call(raw: *anyopaque, alloc: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
         const estimate = c.rawTokens(req.system, req.tools, req.messages);
-        try std.testing.expect(estimate <= c.inputBudgetFor(self.config.*, req.purpose));
+        if (self.check_raw_budget) try std.testing.expect(estimate <= c.inputBudgetFor(self.config.*, req.purpose));
         if (req.purpose == .summary) {
             self.summaries += 1;
             self.last_summary_input = estimate;
@@ -171,4 +175,30 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.summaries + fake.tools);
     try std.testing.expectEqual(@as(usize, 0), capture.compacting + capture.committed + capture.usages);
     try std.testing.expectEqualDeep(r.UsageTotals{}, terminal.usage);
+}
+
+test "reported usage decides sendability, not the conservative raw estimate" {
+    var config = configuration();
+    config.model.context_tokens = 30000;
+    const budget = c.inputBudget(config);
+    try std.testing.expectEqual(@as(usize, 26249), budget);
+    var fake = Fake{ .config = &config, .check_raw_budget = false };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    // A prompt around 72% of the window that the character heuristic calls
+    // larger than the whole budget: exactly the shape that used to fail.
+    const long: [90000]u8 = @splat('x');
+    try seed(&runtime, &long);
+    const estimated = runtime.estimatedTokens();
+    try std.testing.expect(estimated > budget);
+    const reported: u64 = 18600; // ~72% of 30000, as the provider counted it
+    try std.testing.expect(reported <= budget);
+    runtime.last_normal_input_tokens = reported;
+    runtime.last_normal_estimated_tokens = estimated;
+    var cancel: p.Cancellation = .{};
+    const terminal = try runtime.run("next step", &cancel);
+    try std.testing.expectEqual(r.Status.success, terminal.status);
+    // No summary and no rejection: the anchored measurement still fits.
+    try std.testing.expectEqual(@as(usize, 1), fake.normal);
+    try std.testing.expectEqual(@as(usize, 0), fake.summaries);
 }
