@@ -2720,3 +2720,16 @@ test "resume selects launcher project when attached to another project's same id
     a_pending = false;
     try a_result;
 }
+
+test "an unmapped rejection keeps the raw name for the notice" {
+    var pair = try pairOf(std.testing.allocator);
+    defer pair.deinit();
+    try pair.replyErrorNamed(pair.nextId(), "internal", "ContextTooLarge");
+    try std.testing.expectError(error.RemoteFailure, Client.cycleEffortFn(@ptrCast(pair.client)));
+    // The frontend can name the cause instead of the placeholder class.
+    try std.testing.expectEqualStrings("ContextTooLarge", pair.client.errorName());
+    // A later rejection without a name clears it instead of leaving a stale one.
+    try pair.replyError(pair.nextId(), "busy");
+    try std.testing.expectError(error.Busy, Client.cycleEffortFn(@ptrCast(pair.client)));
+    try std.testing.expectEqualStrings("", pair.client.errorName());
+}

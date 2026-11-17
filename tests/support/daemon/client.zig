@@ -54,6 +54,15 @@ const Pair = struct {
         defer a.free(bytes);
         try self.server.writeFrame(bytes, .{ .io = std.testing.io, .timeout_ms = 5_000 });
     }
+
+    /// Same rejection plus the raw local error name the wire carries beside the
+    /// closed code.
+    fn replyErrorNamed(self: *Pair, id: u64, code: []const u8, name: []const u8) !void {
+        const a = self.client.a;
+        const bytes = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":false,\"err\":\"{s}\",\"name\":\"{s}\"}}", .{ protocol.version, id, code, name });
+        defer a.free(bytes);
+        try self.server.writeFrame(bytes, .{ .io = std.testing.io, .timeout_ms = 5_000 });
+    }
 };
 
 fn pairOf(a: std.mem.Allocator) !Pair {

@@ -275,8 +275,8 @@ const Fake = struct {
                 }
             },
             // 压缩失败后 token 数应与压缩前一致，说明历史未被破坏。
-            .compaction_failed => |err| {
-                self.compaction_error = err;
+            .compaction_failed => |failure| {
+                self.compaction_error = failure.err;
                 self.failed_summary_preserved = self.before_summary_tokens == self.current_runtime.?.estimatedTokens();
                 // Stop the fixture before another normal call can overwrite
                 // the summary's display result; don't change production logic.

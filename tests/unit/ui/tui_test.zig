@@ -13975,7 +13975,7 @@ test "compaction status and result are visible in the conversation" {
     try std.testing.expect(compacted);
 
     try ui.applyEvent(.{ .state = .compacting }, false, true);
-    try ui.applyEvent(.{ .compaction_failed = error.InsufficientCompaction }, false, true);
+    try ui.applyEvent(.{ .compaction_failed = .{ .err = error.InsufficientCompaction } }, false, true);
     try std.testing.expect(!ui.compaction_active);
     var failed = false;
     for (ui.records.items) |record| {

@@ -381,6 +381,9 @@ pub const VTable = struct {
     /// Release this view/control without canceling the task. Called once when
     /// the TUI exits or the connection ends; must not fail or block forever.
     detach_fn: *const fn (*anyopaque) void,
+    /// Raw name of the last rejected call, or empty. Optional so adapters that
+    /// never report a name keep compiling; the notice fallback stays generic.
+    error_name_fn: ?*const fn (*anyopaque) []const u8 = null,
 };
 
 pub const Client = struct {
@@ -440,11 +443,29 @@ pub const Client = struct {
     pub fn detach(self: Client) void {
         self.vtable.detach_fn(self.context);
     }
+    /// Raw local error name from the last rejected call; empty when unknown.
+    pub fn errorName(self: Client) []const u8 {
+        const name = self.vtable.error_name_fn orelse return "";
+        return name(self.context);
+    }
 };
 
-/// User-facing notice for a failed client call. Static strings only.
+/// Notice text plus whether it borrows the caller's raw-name buffer. The UI
+/// copies borrowed text: a later failure reuses that buffer.
+pub const Notice = struct {
+    text: []const u8,
+    raw: bool,
+};
+
+/// User-facing notice for a failed client call that carried no raw name.
 pub fn describe(err: anyerror) []const u8 {
-    return switch (err) {
+    return describeNotice(err, "").text;
+}
+
+/// Same notices, but an unmapped error shows the raw name the owner reported.
+/// A known error keeps its actionable wording: there the class is the cause.
+pub fn describeNotice(err: anyerror, name: []const u8) Notice {
+    const known: ?[]const u8 = switch (err) {
         error.StaleControl => "Connection is no longer the controller; /attach --takeover or reconnect",
         error.SessionNotFound => "Session not found",
         error.InvalidPath => "Directory is not accessible; launcher unchanged",
@@ -458,6 +479,13 @@ pub fn describe(err: anyerror) []const u8 {
         error.Transport, error.ConnectionLost => "Connection lost; the task was not canceled",
         error.ProtocolMismatch => "Session worker speaks an incompatible Thin protocol version; restart Thin to start a compatible worker",
         error.OutOfMemory => "Out of memory",
-        else => "Remote session request failed",
+        else => null,
     };
+    if (known) |text| return .{ .text = text, .raw = false };
+    if (name.len != 0) return .{ .text = name, .raw = true };
+    return .{ .text = "Remote session request failed", .raw = false };
+}
+
+pub fn describeName(err: anyerror, name: []const u8) []const u8 {
+    return describeNotice(err, name).text;
 }

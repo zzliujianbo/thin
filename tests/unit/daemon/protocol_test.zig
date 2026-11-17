@@ -59,7 +59,7 @@ test "every runtime display event round-trips through the wire" {
         } },
         .{ .fallback = .responses },
         .{ .compacted = .{ .before = 100, .after = 10 } },
-        .{ .compaction_failed = error.InputBudgetSummaryFailed },
+        .{ .compaction_failed = .{ .err = error.InputBudgetSummaryFailed } },
         .{ .compaction_skipped = .{ .reason = .recent } },
         .{ .compaction_skipped = .{ .reason = .limit } },
         .{ .finished = .{
@@ -762,4 +762,36 @@ test "wire error codes classify configuration rejections as invalid input" {
     // Reclassification never widens the neighbors it sits between.
     try std.testing.expectEqual(.unsupported, errorCode(error.Unsupported));
     try std.testing.expectEqual(.internal, errorCode(error.CleanupFailed));
+}
+
+test "a local failure name replaces the placeholder class on the wire" {
+    const a = std.testing.allocator;
+    const terminal: r.Terminal = .{
+        .status = .failed,
+        .detail = error.ContextTooLarge,
+        .duration_ms = 7,
+    };
+    // Byte-identical re-encode: the raw name is the only carrier of a cause the
+    // closed wire class cannot express.
+    try expectEventRoundTrip(a, .{ .finished = terminal });
+    const encoded = try encodeEvent(a, .{ .finished = terminal });
+    defer a.free(encoded);
+    var decoded = try decodeEvent(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(error.RemoteFailure, decoded.event.finished.detail.?);
+    try std.testing.expectEqualStrings("ContextTooLarge", decoded.event.finished.failureText());
+    try std.testing.expect(std.mem.find(u8, encoded, "\"failure\":\"other\"") != null);
+}
+
+test "an unmapped compaction failure keeps its raw name" {
+    const a = std.testing.allocator;
+    const event: r.Event = .{ .compaction_failed = .{ .err = error.ContextTooLarge } };
+    const encoded = try encodeEvent(a, event);
+    defer a.free(encoded);
+    var decoded = try decodeEvent(a, encoded);
+    defer decoded.deinit();
+    // The closed class degrades to "other"; the raw name is what a reader needs.
+    try std.testing.expectEqual(error.RemoteFailure, decoded.event.compaction_failed.err);
+    try std.testing.expectEqualStrings("ContextTooLarge", decoded.event.compaction_failed.name);
+    try expectEventRoundTrip(a, event);
 }

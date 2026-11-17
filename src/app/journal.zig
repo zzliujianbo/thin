@@ -585,7 +585,7 @@ pub const Journal = struct {
                 .usage => |v| try self.record(a, "usage", v),
                 .fallback => |v| try self.record(a, "fallback", .{ .protocol = v }),
                 .compacted => |v| try self.record(a, "compacted", v),
-                .compaction_failed => |v| try self.record(a, "compaction_failed", .{ .error_name = @errorName(v) }),
+                .compaction_failed => |v| try self.record(a, "compaction_failed", .{ .error_name = @errorName(v.err) }),
                 .compaction_skipped => |v| try self.record(a, "compaction_skipped", .{ .reason = @tagName(v.reason) }),
                 .finished => |v| try self.record(a, "finished", .{
                     .dropped_total = self.diagnostic_dropped.load(.monotonic),

@@ -105,6 +105,22 @@ pub fn codeFromName(name: []const u8) ErrorCode {
     return std.meta.stringToEnum(ErrorCode, name) orelse .internal;
 }
 
+/// Bound for a raw local error name carried beside a wire code. The name is a
+/// Zig error identifier, never provider text: it exists so a frontend can show
+/// the cause the owner actually hit instead of a placeholder class.
+pub const max_error_name = 64;
+
+/// Identifiers only, so a name can never smuggle prose, quotes or control bytes
+/// into a frame the decoder treats as closed.
+pub fn errorNameValid(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_error_name) return false;
+    for (name) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// Closed startup exit-code handshake for an owner-managed worker process.
 ///
 /// A worker that fails before publishing its `hello` has no wire channel yet,
@@ -499,6 +515,13 @@ pub const Out = struct {
     }
 
     pub fn fail(self: *Out, id: u64, code: ErrorCode) !void {
+        return self.failNamed(id, code, "");
+    }
+
+    /// Same rejection plus the raw local error name beside the closed code. The
+    /// code stays the actionable class; the name is the cause the owner hit, so
+    /// an unmapped error never reaches the frontend as a placeholder.
+    pub fn failNamed(self: *Out, id: u64, code: ErrorCode, name: []const u8) !void {
         try self.buf.appendSlice(self.a, "{\"v\":");
         try appendInt(&self.buf, self.a, version);
         try self.buf.appendSlice(self.a, ",\"id\":");
@@ -509,6 +532,11 @@ pub const Out = struct {
         // fields; only `finish` closes it. Closing here produced a frame with a
         // trailing stray brace once the caller finished normally.
         try self.buf.append(self.a, '"');
+        if (errorNameValid(name)) {
+            try self.buf.appendSlice(self.a, ",\"name\":\"");
+            try self.buf.appendSlice(self.a, name);
+            try self.buf.append(self.a, '"');
+        }
         try self.comma.append(self.a, true);
     }
 
@@ -892,9 +920,11 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("before", value.before);
             try out.field("after", value.after);
         },
-        .compaction_failed => |err| {
+        .compaction_failed => |failure| {
             try out.field("t", "compaction_failed");
-            try out.field("code", failureCode(err));
+            try out.field("code", failureCode(failure.err));
+            const name = if (failure.name.len != 0) failure.name else @errorName(failure.err);
+            if (errorNameValid(name)) try out.field("name", name);
         },
         .compaction_skipped => |value| {
             try out.field("t", "compaction_skipped");
@@ -917,7 +947,13 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("duration_ms", terminal.duration_ms);
             try out.field("tool_calls", terminal.tool_calls);
             try out.field("files_edited", terminal.files_edited);
-            if (terminal.failureText().len != 0) try out.field("failure_message", terminal.failureText());
+            const failure_text = terminal.failureText();
+            // A local pre-send rejection has no provider prose; send its raw name
+            // so the row shows the real cause instead of a placeholder class.
+            if (failure_text.len != 0)
+                try out.field("failure_message", failure_text)
+            else if (terminal.detail) |detail|
+                try out.field("failure_message", @errorName(detail));
             try out.beginObject("usage");
             try out.field("normal_calls", terminal.usage.normal_calls);
             try out.field("summary_calls", terminal.usage.summary_calls);
@@ -1576,7 +1612,11 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
         } };
     } else if (std.mem.eql(u8, kind, "compaction_failed")) {
         const failure = failureFromName(try requireText(object, "code"));
-        event = .{ .compaction_failed = Failure.toError(failure) orelse error.RemoteFailure };
+        const name = try optionalText(object, "name") orelse "";
+        event = .{ .compaction_failed = .{
+            .err = Failure.toError(failure) orelse error.RemoteFailure,
+            .name = if (errorNameValid(name)) name else "",
+        } };
     } else if (std.mem.eql(u8, kind, "compaction_skipped")) {
         event = .{ .compaction_skipped = .{ .reason = try requireEnum(r.CompactionSkipReason, object, "reason") } };
     } else if (std.mem.eql(u8, kind, "assistant")) {

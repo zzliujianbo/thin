@@ -398,7 +398,7 @@ fn serveWatchInput(host: *SessionHost, a: std.mem.Allocator, io: Io, active: *Ac
     defer out.deinit();
     // A refused range is reported to the viewer, never silently retired.
     const outcome = host.watchAcknowledgeRange(epoch, first orelse 0, sequence) catch |err| {
-        out.fail(request.id, protocol.errorCode(err)) catch {
+        out.failNamed(request.id, protocol.errorCode(err), @errorName(err)) catch {
             dropSlot(host, slot, active);
             return;
         };

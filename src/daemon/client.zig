@@ -464,6 +464,10 @@ pub const Client = struct {
     receipt: ?Receipt = null,
     /// Suppress the owner echo of the prompt this UI already rendered.
     suppress: ?struct { digest: [32]u8, armed: bool } = null,
+    /// Raw local error name from the most recent rejected reply, empty when the
+    /// reply carried none. Display only: never authority, never a retry policy.
+    last_error_name: [protocol.max_error_name]u8 = @splat(0),
+    last_error_name_len: u8 = 0,
 
     reg: ?Registry = null,
     workers: ?Workers = null,
@@ -666,9 +670,28 @@ pub const Client = struct {
             return err;
         };
         return switch (verdict) {
-            .ok => {},
-            .rejected => |code| wireError(code),
+            .ok => self.last_error_name_len = 0,
+            .rejected => |code| blk: {
+                self.noteErrorName(resp);
+                break :blk wireError(code);
+            },
         };
+    }
+
+    /// Keep the raw name a rejection carried, so the frontend can name an error
+    /// this build has no closed code for instead of showing a placeholder.
+    fn noteErrorName(self: *Client, resp: *const Response) void {
+        const name = resp.text("name") orelse "";
+        if (!protocol.errorNameValid(name)) {
+            self.last_error_name_len = 0;
+            return;
+        }
+        @memcpy(self.last_error_name[0..name.len], name);
+        self.last_error_name_len = @intCast(name.len);
+    }
+
+    fn errorName(self: *const Client) []const u8 {
+        return self.last_error_name[0..self.last_error_name_len];
     }
 
     /// Read exactly one reply. Timeouts retry within the caller's budget because
@@ -1546,6 +1569,10 @@ pub const Client = struct {
         return &fromContext(context).snap;
     }
 
+    fn errorNameFn(context: *anyopaque) []const u8 {
+        return fromContext(context).errorName();
+    }
+
     fn bufferedFn(context: *anyopaque) bool {
         const self = fromContext(context);
         return self.pending.items.len != 0 or if (self.stream) |stream| stream.buffered() else false;
@@ -2313,7 +2340,13 @@ pub const Client = struct {
             const id = resp.uint("id") orelse return error.ProtocolError;
             if (id != req.id) return error.ProtocolError;
             const ok = resp.flag("ok", false);
-            if (!ok) return wireError(protocol.codeFromName(resp.text("err") orelse "internal"));
+            if (!ok) {
+                self.noteErrorName(&resp);
+                return wireError(protocol.codeFromName(resp.text("err") orelse "internal"));
+            }
+            // A success clears the name: an unrelated later failure must never
+            // borrow a raw name from an earlier, already-reported rejection.
+            self.last_error_name_len = 0;
             return resp;
         }
     }
@@ -2936,6 +2969,7 @@ const table = session_client.VTable{
     .withdraw_fn = Client.withdrawFn,
     .manage_fn = Client.manageFn,
     .detach_fn = Client.detachFn,
+    .error_name_fn = Client.errorNameFn,
 };
 
 fn kindName(kind: session_client.TaskKind) []const u8 {

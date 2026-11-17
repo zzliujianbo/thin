@@ -1188,7 +1188,7 @@ pub const SessionHost = struct {
     fn errorReply(a: std.mem.Allocator, id: u64, err: anyerror) ![]u8 {
         var out = protocol.Out.init(a);
         defer out.deinit();
-        try out.fail(id, protocol.errorCode(err));
+        try out.failNamed(id, protocol.errorCode(err), @errorName(err));
         return out.finish();
     }
 

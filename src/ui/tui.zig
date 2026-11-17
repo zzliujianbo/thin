@@ -1254,6 +1254,19 @@ const Ui = struct {
         return self.connection.session_client;
     }
 
+    /// Notice for a failed client call. An unmapped error shows the raw name the
+    /// owner reported; borrowed text is copied so a later failure cannot rewrite
+    /// a notice the user is still reading.
+    fn describeError(self: *Ui, err: anyerror) []const u8 {
+        const name = if (self.remote()) |client| client.errorName() else "";
+        const notice = session_client.describeNotice(err, name);
+        if (!notice.raw) return notice.text;
+        const copy = self.allocator.dupe(u8, notice.text) catch return session_client.describeName(err, "");
+        if (self.notice_owned) |old| self.allocator.free(old);
+        self.notice_owned = copy;
+        return copy;
+    }
+
     fn hasAsync(self: *const Ui, purpose: AsyncPurpose) bool {
         for (self.async_pending) |pending| if (pending) |value| {
             if (value.purpose == purpose) return true;
@@ -1324,7 +1337,7 @@ const Ui = struct {
         const epoch = if (purpose == .approve) (if (self.permission) |permission| permission.epoch else self.remote_epoch) else self.remote_epoch;
         const ticket = channel.start(epoch, action) catch |err| {
             self.allocator.free(original);
-            self.notice = session_client.describe(err);
+            self.notice = self.describeError(err);
             self.publishNoticeAlias(self.asyncFailureLevel(purpose));
             return null;
         };
@@ -1479,7 +1492,7 @@ const Ui = struct {
                     .configure => "Could not save configuration; use /login to retry",
                     .model => "Could not switch; selection is unchanged",
                     .preference, .setting, .image, .proxy, .proxy_address => "Could not save setting; previous value kept",
-                    else => session_client.describe(err),
+                    else => self.describeError(err),
                 };
                 self.publishNoticeAlias(self.asyncFailureLevel(pending.purpose));
                 if (pending.purpose == .configure and self.secret_mode) self.endSecret();
@@ -1689,7 +1702,7 @@ const Ui = struct {
         if (self.terminal_delivery != null) return;
         if (self.bridgeEmpty()) {
             const delivered = pollRemote(client, self.allocator) catch |err| blk: {
-                self.notice = session_client.describe(err);
+                self.notice = self.describeError(err);
                 self.requestDraw();
                 break :blk null;
             };
@@ -2679,7 +2692,7 @@ const Ui = struct {
         var outcome = client.manage(self.allocator, request) catch |err| {
             if (request == .saved_sessions) self.clearResumePending();
             if (request == .new_session) self.restoreNewPrompt();
-            self.notice = session_client.describe(err);
+            self.notice = self.describeError(err);
             self.requestDraw();
             return;
         };
@@ -2738,7 +2751,7 @@ const Ui = struct {
             self.notice = "Ready";
         }
         self.submitNewPrompt() catch |err| {
-            self.notice = session_client.describe(err);
+            self.notice = self.describeError(err);
         };
         if (leaving) self.requestQuit();
         self.requestDraw();
@@ -3352,14 +3365,15 @@ const Ui = struct {
         _ = try self.add(.notice, message);
     }
 
-    fn compactionFailureNotice(err: anyerror) []const u8 {
+    fn compactionFailureNotice(err: anyerror, name: []const u8) []const u8 {
         return switch (err) {
             error.NoCompactionCandidate => "No history can be safely compacted yet; context was not changed.",
             error.InsufficientCompaction => "Compaction did not reduce context enough; context was not changed.",
             error.InvalidSummary => "Summary was empty or invalid; context was not changed.",
             error.SummaryRequestedTool => "Summary requested tools; context was not changed.",
             error.SummaryFailed => "Summary request failed; context was not changed.",
-            else => @errorName(err),
+            // An unclassified failure shows the name the owner reported.
+            else => if (name.len != 0) name else @errorName(err),
         };
     }
 
@@ -3476,9 +3490,9 @@ const Ui = struct {
                 defer self.allocator.free(message);
                 try self.finishCompactionStatus(message);
             },
-            .compaction_failed => |err| {
+            .compaction_failed => |failure| {
                 self.compaction_active = false;
-                try self.finishCompactionStatus(compactionFailureNotice(err));
+                try self.finishCompactionStatus(compactionFailureNotice(failure.err, failure.name));
             },
             .compaction_skipped => |value| {
                 self.compaction_active = false;
@@ -4974,7 +4988,7 @@ const Ui = struct {
             return false;
         }
         client.submit(self.remote_epoch, kind, value) catch |err| {
-            self.notice = session_client.describe(err);
+            self.notice = self.describeError(err);
             return false;
         };
         self.acceptRemote(kind, &record, &history_entry);
@@ -5161,7 +5175,7 @@ const Ui = struct {
                 return;
             }
             client.enqueue(self.remote_epoch, kind, self.editor.bytes.items) catch |err| {
-                self.notice = session_client.describe(err);
+                self.notice = self.describeError(err);
                 return;
             };
             self.wipeEditor();
@@ -5330,7 +5344,7 @@ const Ui = struct {
                         return;
                     }
                     client.cancelClear(self.remote_epoch, identity.revision) catch |err| {
-                        self.notice = session_client.describe(err);
+                        self.notice = self.describeError(err);
                         self.closeStop();
                         return;
                     };
@@ -5374,7 +5388,7 @@ const Ui = struct {
                 return;
             }
             client.setConfirming(self.remote_epoch, true) catch |err| {
-                self.notice = session_client.describe(err);
+                self.notice = self.describeError(err);
                 self.requestDraw();
                 self.parser.stop_feed = true;
                 return;
@@ -5414,7 +5428,7 @@ const Ui = struct {
                     return;
                 }
                 const withdrawn = client.withdraw(self.allocator, self.remote_epoch, id) catch |err| {
-                    self.notice = session_client.describe(err);
+                    self.notice = self.describeError(err);
                     return;
                 };
                 const draft = withdrawn orelse {
@@ -5458,7 +5472,7 @@ const Ui = struct {
                 return;
             }
             client.cancel(self.remote_epoch) catch |err| {
-                self.notice = session_client.describe(err);
+                self.notice = self.describeError(err);
                 return;
             };
             self.notice = "Cancellation requested; cleaning up, not rolling back effects";
@@ -5611,7 +5625,7 @@ const Ui = struct {
                 return;
             }
             client.approve(permission.epoch, permission.id, decision) catch |err| {
-                self.notice = session_client.describe(err);
+                self.notice = self.describeError(err);
                 self.clearPermission();
                 self.parser.stop_feed = true;
                 return;

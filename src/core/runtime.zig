@@ -211,8 +211,9 @@ pub const Event = union(enum) {
     fallback: p.Protocol,
     /// 压缩成功，before/after 为估算 token 数。
     compacted: struct { before: usize, after: usize },
-    /// 压缩失败；旧历史保持不变。
-    compaction_failed: anyerror,
+    /// 压缩失败；旧历史保持不变。原始错误名随事件一起下发，因为封闭的线上
+    /// 分类单独使用时只能给前端一个占位名。
+    compaction_failed: struct { err: anyerror, name: []const u8 = "" },
     /// 自动压缩被增长保护或每任务上限跳过；旧历史保持不变。
     compaction_skipped: struct { reason: CompactionSkipReason },
     /// Session-owned auxiliary completion, display only. Never a Runtime
@@ -1055,13 +1056,13 @@ pub const Runtime = struct {
                 const budget = if (normal_budget != 0) normal_budget else context.inputBudgetFor(self.config.*, .summary);
                 if (self.estimatedTokens() > budget) {
                     const exceeded = context.inputBudgetError(self.config.*);
-                    try self.emit(.{ .compaction_failed = exceeded }, cancel);
+                    try self.emit(.{ .compaction_failed = .{ .err = exceeded } }, cancel);
                     return exceeded;
                 }
-                try self.emit(.{ .compaction_failed = err }, cancel);
+                try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 return;
             }
-            try self.emit(.{ .compaction_failed = err }, cancel);
+            try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
             return err;
         };
     }
@@ -1701,7 +1702,7 @@ pub const Runtime = struct {
             if (task.summary_attempts != attempts) {
                 // A failed paid compaction under the opt-in cost policy must not
                 // fall through to normal inference or another automatic summary.
-                try self.emit(.{ .compaction_failed = err }, cancel);
+                try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 try checkCanceled(cancel);
                 return error.InputBudgetSummaryFailed;
             }
@@ -1711,11 +1712,11 @@ pub const Runtime = struct {
                 // summary that has no safe prefix on every model round.
                 if (!task.compaction_skipped_notified) {
                     task.compaction_skipped_notified = true;
-                    try self.emit(.{ .compaction_failed = err }, cancel);
+                    try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 }
                 return;
             }
-            try self.emit(.{ .compaction_failed = err }, cancel);
+            try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
             // Failed compaction never mutates the old history. It may continue
             // only if that old input still fits the hard input budget.
             if (current > budget) return context.inputBudgetError(self.config.*);

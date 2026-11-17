@@ -336,7 +336,7 @@ const Supervisor = struct {
         const reply = self.route(&request, active) catch |err| blk: {
             var out = protocol.Out.init(self.allocator);
             defer out.deinit();
-            out.fail(request.id, localErrorCode(err)) catch {
+            out.failNamed(request.id, localErrorCode(err), @errorName(err)) catch {
                 self.closeSlot(slot);
                 return;
             };
@@ -412,7 +412,7 @@ const Supervisor = struct {
     fn failFrame(self: *Supervisor, id: u64, err: anyerror) ![]u8 {
         var out = protocol.Out.init(self.allocator);
         defer out.deinit();
-        try out.fail(id, localErrorCode(err));
+        try out.failNamed(id, localErrorCode(err), @errorName(err));
         return out.finish();
     }
 

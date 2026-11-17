@@ -89,9 +89,9 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
         fn emit(raw: ?*anyopaque, event: r.Event, _: *const p.Cancellation) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             switch (event) {
-                .compaction_failed => |err| {
+                .compaction_failed => |failure| {
                     self.failures += 1;
-                    self.cause = err;
+                    self.cause = failure.err;
                     self.protected_index = self.runtime.protected_index;
                     for (self.runtime.messages()) |message|
                         try self.history.append(self.allocator, try p.cloneMessage(self.allocator, message));
