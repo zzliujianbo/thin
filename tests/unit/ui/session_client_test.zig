@@ -256,7 +256,7 @@ test "an unmapped error notice shows the raw name the owner reported" {
     const notice = describeNotice(error.RemoteFailure, "ContextTooLarge");
     try std.testing.expect(notice.raw);
     try std.testing.expectEqualStrings("ContextTooLarge", notice.text);
-    // Known errors keep their actionable wording; a missing name stays generic.
-    try std.testing.expectEqualStrings("Session is busy", describeNotice(error.Busy, "Busy").text);
-    try std.testing.expectEqualStrings("Remote session request failed", describe(error.RemoteFailure));
+    // A locally known error shows its own name; nothing is rewritten.
+    try std.testing.expectEqualStrings("Busy", describeNotice(error.Busy, "").text);
+    try std.testing.expectEqualStrings("RemoteFailure", describe(error.RemoteFailure));
 }

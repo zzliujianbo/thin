@@ -7666,7 +7666,7 @@ test "provider auth requires a visible full label and save failure wipes the key
     try ui.parser.feed("fake-ui-key\r", sink);
     try std.testing.expect(!ui.secret_mode and ui.secret.len == 0 and ui.secret_provider == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
+    try std.testing.expectEqualStrings("TestSelectionFailure", ui.notice);
 }
 test "first DeepSeek login initializes default and Shift Tab preserves budgets and atomic saves" {
     const Session = @import("../app/session.zig").Session;
@@ -7711,7 +7711,7 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     testAcknowledgeFullFrame(&ui);
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\x1b[Z", sink);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "are loading") != null);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "ThinkingCapabilitiesLoading") != null);
     try std.testing.expect(session.app.?.config.value.model.reasoning == null);
     try std.testing.expect(session.metadata_job == null); // Shortcut itself never fetches.
     try std.testing.expect(session.connection().poll_models_fn.?(session.connection().context, true));
@@ -7735,7 +7735,7 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\x1b[Z", sink);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "Could not save") != null);
+    try std.testing.expectEqualStrings("AuthVersionConflict", ui.notice);
     try std.testing.expect(session.app.?.config.value.model.reasoning != null);
     try std.testing.expectEqual(shared.ReasoningEffort.off, session.connection().current().reasoning_effort);
     try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data = saved_settings });
@@ -9257,7 +9257,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 3), fixture.proxy_saves);
     try std.testing.expectEqual(@as(usize, 2), fixture.proxy_len);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "previous value kept") != null);
+    try std.testing.expectEqualStrings("TestSelectionFailure", ui.notice);
     try std.testing.expect(ui.proxy_open);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 3), fixture.proxy_saves);
@@ -9593,7 +9593,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
     try std.testing.expectEqualStrings("10.0.0.1", fixture.proxy_address.?);
     try std.testing.expectEqual(@as(u16, 8080), fixture.proxy_port);
-    try std.testing.expect(std.mem.find(u8, ui.notice, "previous value kept") != null);
+    try std.testing.expect(std.mem.find(u8, ui.notice, "TestSelectionFailure") != null);
     try std.testing.expect(ui.proxy_address_open);
     try ui.settingsKey(.enter);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_address_saves);
@@ -9771,7 +9771,7 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
-    try std.testing.expectEqualStrings("Could not save configuration; use /login to retry", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("FixtureSaveFailed", ui.records.items[0].body.items);
     for ([_][]const u8{ "sk-fixture-secret", "secret-error-tail", "pasted", "trailing-key", "more-tail" }) |sensitive| {
         try std.testing.expect(std.mem.find(u8, ui.records.items[0].body.items, sensitive) == null);
         try std.testing.expect(std.mem.find(u8, ui.frame, sensitive) == null);
@@ -10365,7 +10365,7 @@ test "new prompt survives async admission failure" {
     try std.testing.expect(ui.new_prompt == null);
     try std.testing.expectEqualStrings("queued prompt", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), fake.manages);
-    try std.testing.expectEqualStrings("Queue is full; draft kept", ui.notice);
+    try std.testing.expectEqualStrings("QueueFull", ui.notice);
 }
 test "new prompt keeps internal newlines" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
@@ -10410,7 +10410,7 @@ test "new prompt is restored when starting the session fails" {
     try std.testing.expectEqual(@as(usize, 1), fake.manages);
     try std.testing.expectEqual(@as(usize, 0), fake.submits);
     try std.testing.expectEqualStrings("keep this prompt", ui.editor.bytes.items);
-    try std.testing.expectEqualStrings("Session is busy", ui.notice);
+    try std.testing.expectEqualStrings("Busy", ui.notice);
 }
 test "asynchronous new submits the supplied prompt after switching" {
     var actions: FakeAsync = .{};
@@ -12504,7 +12504,7 @@ test "remote submit is sent once and a rejected submit keeps the draft and start
     try std.testing.expect(!ui.busy and ui.future == null);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try std.testing.expectEqualStrings("hello", ui.editor.bytes.items);
-    try std.testing.expectEqualStrings("Connection lost; the task was not canceled", ui.notice);
+    try std.testing.expectEqualStrings("Transport", ui.notice);
 
     fake.submit_failure = null;
     try ui.submit();
@@ -12659,7 +12659,7 @@ test "failed or obsolete configure leaves the seeded context unchanged" {
             ui.endSecret();
         } else {
             try std.testing.expect(!ui.secret_mode);
-            try std.testing.expectEqualStrings("Could not save configuration; use /login to retry", ui.notice);
+            try std.testing.expectEqualStrings("FixtureSaveFailed", ui.notice);
         }
         try expectConfigureContextDraw(&ui, &screen, old, "25.0%");
     }
@@ -12856,7 +12856,7 @@ test "async submit queues behind an effort probe without dropping Enter" {
         .notice => {
             warnings += 1;
             try std.testing.expectEqual(NoticeLevel.warning, record.notice_level);
-            try std.testing.expect(std.mem.find(u8, record.body.items, "capabilities unknown") != null);
+            try std.testing.expect(std.mem.find(u8, record.body.items, "ThinkingCapabilitiesUnknown") != null);
         },
         else => return error.TestUnexpectedResult,
     };
@@ -12898,11 +12898,11 @@ test "async metadata errors retain the actionable synchronous notice" {
     try std.testing.expect(ui.beginAsync(.refresh_models, .refresh) != null);
     actions.complete(.none, error.NoOfficialProvider, false);
     ui.pumpAsync();
-    try std.testing.expectEqualStrings("No official provider configured; use /login first", ui.notice);
+    try std.testing.expectEqualStrings("NoOfficialProvider", ui.notice);
     try std.testing.expect(ui.beginAsync(.cycle_effort, .effort) != null);
     actions.complete(.none, error.ThinkingCapabilitiesLoading, false);
     ui.pumpAsync();
-    try std.testing.expectEqualStrings("Thinking capabilities are loading; try Shift+Tab again shortly", ui.notice);
+    try std.testing.expectEqualStrings("ThinkingCapabilitiesLoading", ui.notice);
 }
 test "async submit commits once after receipt and preserves newer draft" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
@@ -12964,14 +12964,14 @@ test "async refresh failure survives urgent approve success after notice OOM" {
     actions.complete(.none, null, false);
     ui.pumpAsync();
     try std.testing.expectEqual(failure_hash, ui.notice_alias_pending.?.hash);
-    try std.testing.expectEqualStrings("No official provider configured; use /login first", ui.notice);
+    try std.testing.expectEqualStrings("NoOfficialProvider", ui.notice);
     try std.testing.expect(!ui.hasAsync(.refresh) and !ui.hasAsync(.approve));
     ui.observeAdvisories();
     try std.testing.expect(ui.notice_alias_pending == null);
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
     try std.testing.expectEqualStrings("Request denied", ui.records.items[0].body.items);
     try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[1].notice_level);
-    try std.testing.expectEqualStrings("No official provider configured; use /login first", ui.records.items[1].body.items);
+    try std.testing.expectEqualStrings("NoOfficialProvider", ui.records.items[1].body.items);
     ui.observeAdvisories();
     try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
 }
@@ -13799,7 +13799,7 @@ test "remote codex login opens only after the owner receipt and cancels its exac
     actions.complete(.none, error.Transport, false);
     ui.pumpAsync();
     try std.testing.expect(ui.codex_open and ui.codex_generation == 5);
-    try std.testing.expectEqualStrings("Could not cancel OpenAI Codex login", ui.notice);
+    try std.testing.expectEqualStrings("Transport", ui.notice);
 
     // Cancel admission is not closure either: only the receipt for THIS
     // generation closes the panel, and it never publishes a success.
@@ -13819,7 +13819,7 @@ test "remote codex login opens only after the owner receipt and cancels its exac
     actions.complete(.none, error.PublicationUnavailable, false);
     ui.pumpAsync();
     try std.testing.expect(!ui.codex_opening and !ui.codex_open and ui.codex_generation == null);
-    try std.testing.expectEqualStrings("OpenAI Codex device login unavailable", ui.notice);
+    try std.testing.expectEqualStrings("PublicationUnavailable", ui.notice);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 
     // A superseded receipt retires the placeholder without a stale success.

@@ -556,10 +556,7 @@ test "a v1 worker handshake is refused, while an exact v4 worker is adopted" {
         try testing.expect(client.conn == null and client.session == null);
         try testing.expectEqual(@as(u64, 0), client.epoch);
         try testing.expect(client.stream == null);
-        try testing.expectEqualStrings(
-            "Session worker speaks an incompatible Thin protocol version; restart Thin to start a compatible worker",
-            session_client.describe(error.ProtocolMismatch),
-        );
+        try testing.expectEqualStrings("ProtocolMismatch", session_client.describe(error.ProtocolMismatch));
         // A v1 worker that simply rejects and closes the v4 frame is the same
         // fail-closed class: no adoption and no automatic restart or kill.
         try testing.expectEqual(AttachStage.outdated, try client.attachEndpoint(&record, id, false));
@@ -1921,7 +1918,7 @@ test "wire error codes keep the classification describe already knows" {
     try std.testing.expectEqual(error.SessionNotFound, wireError(.not_found));
     try std.testing.expectEqual(error.InputTooLarge, wireError(.input_too_large));
     try std.testing.expectEqual(error.ProtocolError, wireError(.bad_request));
-    try std.testing.expect(std.mem.find(u8, session_client.describe(error.StaleControl), "takeover") != null);
+    try std.testing.expectEqualStrings("StaleControl", session_client.describe(error.StaleControl));
 }
 test "refresh wire codes survive a real failing frame without collapsing" {
     const a = testing.allocator;

@@ -1261,7 +1261,7 @@ const Ui = struct {
         const name = if (self.remote()) |client| client.errorName() else "";
         const notice = session_client.describeNotice(err, name);
         if (!notice.raw) return notice.text;
-        const copy = self.allocator.dupe(u8, notice.text) catch return session_client.describeName(err, "");
+        const copy = self.allocator.dupe(u8, notice.text) catch return session_client.describe(err);
         if (self.notice_owned) |old| self.allocator.free(old);
         self.notice_owned = copy;
         return copy;
@@ -1477,23 +1477,13 @@ const Ui = struct {
                         // was bound to this request either.
                         self.codex_open = false;
                         self.codex_generation = null;
-                        self.notice = "OpenAI Codex device login unavailable";
-                    } else self.notice = "Could not cancel OpenAI Codex login";
+                        self.notice = self.describeError(err);
+                    } else self.notice = self.describeError(err);
                     self.requestDraw();
                     continue;
                 }
-                self.notice = if (err == error.PublicationUnavailable) "Operation result unavailable; verify before retrying" else switch (pending.purpose) {
-                    .refresh => if (err == error.NoOfficialProvider) "No official provider configured; use /login first" else if (err == error.MetadataRefreshBusy) "Official metadata refresh already running" else "Could not start metadata refresh; previous cache kept",
-                    .effort => switch (err) {
-                        error.ThinkingCapabilitiesLoading => "Thinking capabilities are loading; try Shift+Tab again shortly",
-                        error.ThinkingCapabilitiesUnknown => "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration",
-                        else => "Could not save thinking option; previous option kept",
-                    },
-                    .configure => "Could not save configuration; use /login to retry",
-                    .model => "Could not switch; selection is unchanged",
-                    .preference, .setting, .image, .proxy, .proxy_address => "Could not save setting; previous value kept",
-                    else => self.describeError(err),
-                };
+                // 失败提示只给原始错误名，不按操作类型改写。
+                self.notice = self.describeError(err);
                 self.publishNoticeAlias(self.asyncFailureLevel(pending.purpose));
                 if (pending.purpose == .configure and self.secret_mode) self.endSecret();
                 self.requestDraw();
@@ -2289,8 +2279,8 @@ const Ui = struct {
         self.remote_idle_ticks = 0;
         if (self.draft) |index| {
             self.records.items[index].interrupted = true;
-            if (self.records.items[index].stream) |stream| stream.finish() catch {
-                self.notice = "Could not finalize interrupted display";
+            if (self.records.items[index].stream) |stream| stream.finish() catch |err| {
+                self.notice = self.describeError(err);
             };
         }
         self.discardReasoning();
@@ -3838,8 +3828,8 @@ const Ui = struct {
             _ = self.beginAsync(.{ .preference = .{ .key = key_, .value = value } }, .preference);
             return false;
         }
-        save(self.connection.context, key_, value) catch {
-            self.notice = "Could not save setting; previous value kept";
+        save(self.connection.context, key_, value) catch |err| {
+            self.notice = self.describeError(err);
             return false;
         };
         self.display.context = self.connection.current().initial_context;
@@ -4005,8 +3995,8 @@ const Ui = struct {
             _ = self.beginAsync(.{ .proxy_address = value }, .proxy_address);
             return;
         }
-        save(self.connection.context, value) catch {
-            self.notice = "Could not save setting; previous value kept";
+        save(self.connection.context, value) catch |err| {
+            self.notice = self.describeError(err);
             return;
         };
         // The owner publishes; then the submenu shows the saved endpoint.
@@ -4143,8 +4133,8 @@ const Ui = struct {
             _ = self.beginAsync(.{ .proxy = .{ .model = name, .enabled = !proxy_picker_module.isSelected(state.proxy_models, name) } }, .proxy);
             return;
         }
-        save(self.connection.context, name, !proxy_picker_module.isSelected(state.proxy_models, name)) catch {
-            self.notice = "Could not save setting; previous value kept";
+        save(self.connection.context, name, !proxy_picker_module.isSelected(state.proxy_models, name)) catch |err| {
+            self.notice = self.describeError(err);
             return;
         };
         // The owner publishes; the UI never rewrites its own selected copy.
@@ -4274,8 +4264,8 @@ const Ui = struct {
                         _ = self.beginAsync(.{ .image = selected }, .image);
                         return;
                     }
-                    save(self.connection.context, selected) catch {
-                        self.notice = "Could not save setting; previous value kept";
+                    save(self.connection.context, selected) catch |err| {
+                        self.notice = self.describeError(err);
                         return;
                     };
                     self.backToSettings();
@@ -4288,8 +4278,8 @@ const Ui = struct {
                         _ = self.beginAsync(.{ .setting = .{ .key = .low_price_input, .value = !state.low_price_input_enabled } }, .setting);
                         return;
                     }
-                    save(self.connection.context, .low_price_input, !state.low_price_input_enabled) catch {
-                        self.notice = "Could not save setting; previous value kept";
+                    save(self.connection.context, .low_price_input, !state.low_price_input_enabled) catch |err| {
+                        self.notice = self.describeError(err);
                         return;
                     };
                 }
@@ -4370,8 +4360,8 @@ const Ui = struct {
                 self.requestDraw();
                 return;
             }
-            self.connection.codexLogin(.cancel, generation) catch {
-                self.notice = "Could not cancel OpenAI Codex login";
+            self.connection.codexLogin(.cancel, generation) catch |err| {
+                self.notice = self.describeError(err);
                 return;
             };
             self.codex_open = false;
@@ -4562,11 +4552,7 @@ const Ui = struct {
         }
         const next = if (self.connection.cycle_effort_fn) |cycle|
             cycle(self.connection.context) catch |err| {
-                self.notice = switch (err) {
-                    error.ThinkingCapabilitiesLoading => "Thinking capabilities are loading; try Shift+Tab again shortly",
-                    error.ThinkingCapabilitiesUnknown => "Thinking capabilities unknown: refresh /model or declare reasoning levels in configuration",
-                    else => "Could not save thinking option; previous option kept",
-                };
+                self.notice = self.describeError(err);
                 return;
             }
         else blk: {
@@ -4574,8 +4560,8 @@ const Ui = struct {
                 self.notice = "Thinking capabilities unknown: declare model reasoning levels in configuration";
                 return;
             };
-            if (selected != state.reasoning_effort) self.connection.setEffort(selected) catch {
-                self.notice = "Could not save thinking option; previous option kept";
+            if (selected != state.reasoning_effort) self.connection.setEffort(selected) catch |err| {
+                self.notice = self.describeError(err);
                 return;
             };
             break :blk selected;
@@ -4656,7 +4642,7 @@ const Ui = struct {
                     defer self.allocator.free(name);
                     if (!picker.modelShown(name)) return;
                     self.selectModel(name) catch |err| {
-                        if (err != error.AsyncPending) self.notice = "Could not switch; selection is unchanged";
+                        if (err != error.AsyncPending) self.notice = self.describeError(err);
                     };
                 } else picker.move(event_ == .down, choices.len);
             },
@@ -4725,7 +4711,7 @@ const Ui = struct {
                 return;
             }
             refresh(self.connection.context) catch |err| {
-                self.notice = if (err == error.NoOfficialProvider) "No official provider configured; use /login first" else if (err == error.MetadataRefreshBusy) "Official metadata refresh already running" else "Could not start metadata refresh; previous cache kept";
+                self.notice = self.describeError(err);
                 return;
             };
             self.notice = "Refreshing official model metadata...";
@@ -4787,7 +4773,7 @@ const Ui = struct {
                 self.selectModel(name) catch |err| {
                     if (err == error.AsyncPending) return;
                     self.wipeEditor();
-                    self.notice = "Could not switch; selection is unchanged";
+                    self.notice = self.describeError(err);
                     return;
                 };
                 self.wipeEditor();
@@ -5187,8 +5173,8 @@ const Ui = struct {
             self.notice = "Queue unavailable for this task/session";
             return;
         }
-        _ = self.inbox.enqueue(self.allocator, kind, self.editor.bytes.items) catch {
-            self.notice = "Could not queue message; draft kept (queue/input limit)";
+        _ = self.inbox.enqueue(self.allocator, kind, self.editor.bytes.items) catch |err| {
+            self.notice = self.describeError(err);
             return;
         };
         self.wipeEditor();
@@ -5445,8 +5431,8 @@ const Ui = struct {
                 self.publishNotice("Pending message withdrawn as plain draft");
                 return;
             }
-            self.editor.bytes.ensureTotalCapacity(self.editor.allocator, snapshot.newest_bytes) catch {
-                self.notice = "Could not prepare editor; pending message kept";
+            self.editor.bytes.ensureTotalCapacity(self.editor.allocator, snapshot.newest_bytes) catch |err| {
+                self.notice = self.describeError(err);
                 return;
             };
             if (self.inbox.withdraw(id)) |value| {
@@ -5563,9 +5549,9 @@ const Ui = struct {
                     return;
                 }
                 const saved = if (self.secret_provider) |id| self.connection.configureProvider(id, key_bytes) else self.connection.configure(key_bytes);
-                saved catch {
+                saved catch |err| {
                     self.endSecret();
-                    self.notice = "Could not save configuration; use /login to retry";
+                    self.notice = self.describeError(err);
                     self.publishNoticeAlias(self.asyncFailureLevel(.configure));
                     return;
                 };
@@ -6332,8 +6318,8 @@ const Ui = struct {
         // A truncated or canceled stream still has to drain its final window.
         if (self.draft) |i| {
             self.records.items[i].interrupted = true;
-            if (self.records.items[i].stream) |stream| stream.finish() catch {
-                self.notice = "Could not finalize interrupted display";
+            if (self.records.items[i].stream) |stream| stream.finish() catch |err| {
+                self.notice = self.describeError(err);
             };
         }
         self.discardReasoning();

@@ -457,35 +457,14 @@ pub const Notice = struct {
     raw: bool,
 };
 
-/// User-facing notice for a failed client call that carried no raw name.
+/// Failure text for a client call: the raw name the owner reported, else this
+/// build's own error name. No category wording and no next-step hint.
+pub fn describeNotice(err: anyerror, name: []const u8) Notice {
+    if (name.len != 0) return .{ .text = name, .raw = true };
+    return .{ .text = @errorName(err), .raw = false };
+}
+
+/// Convenience for callers without a raw name from the peer.
 pub fn describe(err: anyerror) []const u8 {
     return describeNotice(err, "").text;
-}
-
-/// Same notices, but an unmapped error shows the raw name the owner reported.
-/// A known error keeps its actionable wording: there the class is the cause.
-pub fn describeNotice(err: anyerror, name: []const u8) Notice {
-    const known: ?[]const u8 = switch (err) {
-        error.StaleControl => "Connection is no longer the controller; /attach --takeover or reconnect",
-        error.SessionNotFound => "Session not found",
-        error.InvalidPath => "Directory is not accessible; launcher unchanged",
-        error.Busy => "Session is busy",
-        error.QueueFull => "Queue is full; draft kept",
-        error.QueueEmpty => "Message already consumed; nothing withdrawn",
-        error.QueueChanged => "Queue changed; try again",
-        error.PermissionExpired => "Permission expired",
-        error.InvalidInput => "Input rejected",
-        error.Unavailable => "Session unavailable; /exit and reconnect",
-        error.Transport, error.ConnectionLost => "Connection lost; the task was not canceled",
-        error.ProtocolMismatch => "Session worker speaks an incompatible Thin protocol version; restart Thin to start a compatible worker",
-        error.OutOfMemory => "Out of memory",
-        else => null,
-    };
-    if (known) |text| return .{ .text = text, .raw = false };
-    if (name.len != 0) return .{ .text = name, .raw = true };
-    return .{ .text = "Remote session request failed", .raw = false };
-}
-
-pub fn describeName(err: anyerror, name: []const u8) []const u8 {
-    return describeNotice(err, name).text;
 }
