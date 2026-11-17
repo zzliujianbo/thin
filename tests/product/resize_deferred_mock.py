@@ -277,7 +277,7 @@ def run(app):
                 # Stable post-finish frames end with the idle marker (SGR allowed).
                 start = len(capture)
                 wait(lambda: b'%>' in CSI.sub(b'', bytes(capture[start:])) and ACK in capture[start:], label='completed idle frame')
-                os.write(master, b'\x04')
+                os.write(master, b'\x04\x04')
                 child.wait(timeout=5)
                 pump(.05)
                 assert child.returncode == 0

@@ -49,7 +49,7 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "memory",
-        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns one page of the core/index; use offset and limit to page. read returns content. write creates or replaces the topic; delete removes it. Writes/deletes remain subject to host validation and limits. topic core is startup core memory; other topics are ASCII slugs.",
+        .description = "Store explicit durable project facts or reusable preferences, not transcripts or temporary progress. list returns one page of the core/index; use offset and limit to page. read returns content. write creates or replaces the topic; delete removes it. Writes/deletes remain subject to host validation and limits. topic names match the `.md` files listed by list; the suffix is optional on input and included in results. core is startup core memory; other topics are ASCII slugs.",
         .parameters_json =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["list","read","write","delete"]},"topic":{"type":"string"},"content":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}},"required":["action"],"additionalProperties":false}
         ,
@@ -208,8 +208,10 @@ pub const Action = union(enum) {
             .edit_file => |e| try std.fmt.allocPrint(a, "Edit {s} ({d} edits)", .{ e.path, e.edits.len }),
             .bash => |b| if (b.commands.len != 0)
                 try std.fmt.allocPrint(a, "Run bash batch ({d} commands)", .{b.commands.len})
+            else if (b.background)
+                try std.fmt.allocPrint(a, "$ {s}\n(background service)", .{b.command})
             else
-                try std.fmt.allocPrint(a, "Run bash{s}: {s}", .{ if (b.background) " (background service)" else "", b.command }),
+                try std.fmt.allocPrint(a, "$ {s}", .{b.command}),
             .background => |q| if (q.id) |id|
                 try std.fmt.allocPrint(a, "Background {s} {s}", .{ q.action.name(), id })
             else
@@ -301,7 +303,7 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
     }
 
     if (std.mem.eql(u8, name, "memory")) {
-        const args = try std.json.parseFromSliceLeaky(Memory, a, arguments, opts);
+        var args = try std.json.parseFromSliceLeaky(Memory, a, arguments, opts);
         // list 不接受 topic/content/版本号，保持调用形状严格。
         if (args.action == .list) {
             if (args.topic != null or args.content != null)
@@ -310,8 +312,11 @@ pub fn parse(a: std.mem.Allocator, name: []const u8, arguments: []const u8, limi
         } else {
             if (args.offset != 0 or args.limit != null) return error.InvalidMemoryArguments;
             // 非 list 操作都必须带合法 topic（core 或 ASCII slug）。
-            const topic = args.topic orelse return error.MissingMemoryTopic;
+            // list 显示的是文件名（`topic.md`），输入允许带同样的 `.md` 后缀。
+            const raw_topic = args.topic orelse return error.MissingMemoryTopic;
+            const topic = if (std.mem.endsWith(u8, raw_topic, ".md")) raw_topic[0 .. raw_topic.len - 3] else raw_topic;
             mem.validTopic(topic) catch return error.InvalidMemoryTopic;
+            args.topic = topic;
             // 写入：按 core 或分片分别限制大小，并校验 UTF-8 与 NUL。
             if (args.action == .write) {
                 const content = args.content orelse return error.MissingMemoryContent;
@@ -719,12 +724,13 @@ pub const Tools = struct {
         try self.checkImageAction(action.*);
         try self.checkFileAction(a, action.*);
         // 危险 bash 在授权前打标。Runtime 看到 explicit_denial 后逐次询问。
-        var description = try action.description(a);
+        // 审批弹框只展示命令；风险标签只留在给模型的拒绝文案里。
+        const description = try action.description(a);
         const risk = if (action.* == .bash) command_risk.classify(action.bash.command) else null;
-        const denial: ?[]const u8 = if (risk) |finding| blk: {
-            description = try std.fmt.allocPrint(a, "DANGEROUS bash ({s}). Explicit approval is required each time; choose Allow once or Deny in the confirmation popup.\n{s}", .{ finding.label, description });
-            break :blk try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label});
-        } else null;
+        const denial: ?[]const u8 = if (risk) |finding|
+            try std.fmt.allocPrint(a, "Dangerous bash command was not executed ({s}). High-risk bash needs an explicit user allow each time.", .{finding.label})
+        else
+            null;
         const status = @import("../core/background_status.zig");
         const display: ?status.Caption = switch (action.*) {
             .bash => |b| if (b.background) .{ .action = .start, .command = self.background.?.caption(b.command) } else null,
@@ -954,14 +960,18 @@ pub const Tools = struct {
                     var repository = knowledge_store.Repository.init(self.memory);
                     const content = try repository.readContent(a, m.topic.?);
                     defer a.free(content);
-                    try j.put(a, &value, "topic", j.str(m.topic.?));
+                    const topic_file = try std.fmt.allocPrint(a, "{s}.md", .{m.topic.?});
+                    defer a.free(topic_file);
+                    try j.put(a, &value, "topic", j.str(topic_file));
                     try j.put(a, &value, "content", j.str(content));
                     const encoded = try j.encode(a, value);
                     return .{ .text = encoded };
                 },
 
                 .write => {
-                    try j.put(a, &value, "topic", j.str(m.topic.?));
+                    const topic_file = try std.fmt.allocPrint(a, "{s}.md", .{m.topic.?});
+                    defer a.free(topic_file);
+                    try j.put(a, &value, "topic", j.str(topic_file));
                     try j.put(a, &value, "operation", j.str("written"));
                     const encoded = try j.encode(a, value);
                     errdefer a.free(encoded);
@@ -972,7 +982,9 @@ pub const Tools = struct {
 
                 .delete => {
                     // 删除同样先构造结果；成功 unlink 后不再进行可能失败的分配。
-                    try j.put(a, &value, "topic", j.str(m.topic.?));
+                    const topic_file = try std.fmt.allocPrint(a, "{s}.md", .{m.topic.?});
+                    defer a.free(topic_file);
+                    try j.put(a, &value, "topic", j.str(topic_file));
                     try j.put(a, &value, "operation", j.str("deleted"));
                     const encoded = try j.encode(a, value);
                     errdefer a.free(encoded);

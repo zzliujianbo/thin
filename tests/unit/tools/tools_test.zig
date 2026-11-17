@@ -134,16 +134,18 @@ test "memory prepare carries its parsed payload and no review input" {
         "{\"action\":\"write\",\"topic\":\"notes\",\"content\":\"durable fact\"}",
         "{\"action\":\"read\",\"topic\":\"notes\"}",
         "{\"action\":\"delete\",\"topic\":\"notes\"}",
+        "{\"action\":\"write\",\"topic\":\"notes.md\",\"content\":\"durable fact\"}",
+        "{\"action\":\"read\",\"topic\":\"notes.md\"}",
+        "{\"action\":\"delete\",\"topic\":\"notes.md\"}",
         "{\"action\":\"list\"}",
     };
     for (calls) |arguments| {
         const prepared = try Tools.prepare(&tools, a, .{ .id = "m", .name = "memory", .arguments = arguments });
         const action: *const Action = @ptrCast(@alignCast(prepared.payload));
         try std.testing.expect(action.* == .memory);
-        if (action.memory.action == .write) {
-            try std.testing.expectEqualStrings("notes", action.memory.topic.?);
-            try std.testing.expectEqualStrings("durable fact", action.memory.content.?);
-        }
+        // The on-disk `.md` suffix is accepted and normalized for the store.
+        if (action.memory.action != .list) try std.testing.expectEqualStrings("notes", action.memory.topic.?);
+        if (action.memory.action == .write) try std.testing.expectEqualStrings("durable fact", action.memory.content.?);
     }
 }
 test "prepare reports the one file a write or edit will change" {
@@ -287,7 +289,8 @@ test "dangerous bash is marked for explicit approval and ordinary bash is not" {
     try std.testing.expect(dangerous.explicit_denial != null);
     try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "sensitive") != null);
     try std.testing.expect(std.mem.indexOf(u8, dangerous.explicit_denial.?, "explicit user allow each time") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dangerous.description, "DANGEROUS bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.description, "$ rm -f .ssh/fixture-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dangerous.description, "DANGEROUS") == null);
 
     const safe = try Tools.prepare(&tools, a, .{ .id = "s", .name = "bash", .arguments = "{\"command\":\"rm -rf build\"}" });
     try std.testing.expect(safe.explicit_denial == null);
@@ -472,7 +475,8 @@ test "background capability is root-only approved and never re-encoded" {
     tools.background = fake.service();
     const prepared = try Tools.prepare(&tools, a, .{ .id = "b", .name = "bash", .arguments = "{\"command\":\"rm -f .ssh/fixture-marker\",\"background\":true}" });
     try std.testing.expect(prepared.explicit_denial != null);
-    try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.description, "$ rm -f .ssh/fixture-marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS") == null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.description, "background service") != null);
     try std.testing.expectEqual(@as(usize, 0), fake.checks);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);

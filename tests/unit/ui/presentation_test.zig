@@ -584,7 +584,7 @@ test "tool details survive old cutoffs and rows clip at full width with complete
     try std.testing.expect(commandColumns(std.math.maxInt(usize)) <= std.math.maxInt(usize));
     const memory = try caption(a, "memory", "{\"action\":\"write\",\"topic\":\"core\",\"content\":\"hidden-body\"}");
     defer memory.deinit(a);
-    try std.testing.expectEqualStrings("write core", memory.label);
+    try std.testing.expectEqualStrings("write core.md", memory.label);
     const missing = try caption(a, "memory", "{\"action\":\"invented\"}");
     defer missing.deinit(a);
     try std.testing.expectEqualStrings("(operation unavailable)", missing.label);

@@ -236,7 +236,7 @@ const common_help =
     \\Context percentage shows the latest provider-reported request total, not cumulative use.
     \\A fresh session starts at 0.0%; unreported usage shows ?. Safety budgets still use estimates.
     \\Startup shows three lines: Thin version, directory, local time with UTC offset.
-    \\Enter sends; Ctrl+J adds newline; Esc or Ctrl+C cancels the current task; Ctrl+D exits.
+    \\Enter sends; Ctrl+J adds newline; Esc or Ctrl+C cancels the current task; Ctrl+D twice exits.
     \\Input: Ctrl+A/E line edges; Ctrl+B/F cursor; Ctrl+K/U kill to end/start; Ctrl+W or Alt+Backspace deletes word; Alt+B/F or Ctrl+Left/Right moves by word.
     \\Up/Down browse this session's submitted inputs only from an empty composer.
     \\Manual edits stop browsing; navigation never submits. Keyboard recall is session-local.
@@ -277,7 +277,8 @@ const common_help =
     \\Bash risk checks include sensitive-target deletion or writes, device destruction,
     \\sensitive chmod/chown, remote script execution, and fork bombs.
     \\Static risk matches require explicit approval for that call.
-    \\The confirmation popup uses arrows, Enter and Esc; on denial nothing runs.
+    \\The confirmation shows Y allow once / N deny; arrows choose, Enter confirms, Esc denies.
+    \\Typed or pasted text never authorizes; on denial nothing runs.
     \\--print cannot approve a command, so calls requiring approval are denied.
     \\--print returns the final committed visible answer with the same tool policy.
     \\

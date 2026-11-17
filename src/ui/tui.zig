@@ -489,6 +489,13 @@ const Record = struct {
 /// 当前等待用户审批的工具调用。description 由 Ui 的 allocator 持有，由 clearPermission 释放。
 /// clipped 表示预览被截断；pasted 表示审批期间出现过粘贴。两者任一为真时只能拒绝。
 const ApprovalChoice = enum { allow_once, deny };
+/// Fixed-width approval choices. The surrounding spaces belong to the inverse
+/// block, so switching the selection never shifts either label.
+const approval_allow_label = " Y allow once ";
+const approval_deny_label = " N deny ";
+/// Ctrl+D arms exit for this window; a second press within it confirms.
+const ctrl_d_window_ms: u64 = 2000;
+const ctrl_d_notice = "Press Ctrl+D again to exit";
 const Permission = struct {
     id: u64,
     description: []const u8,
@@ -1026,6 +1033,11 @@ const Ui = struct {
 
     /// An explicit quit owns exit authority; local tasks are joined first.
     ctrl_d_exit: bool = false,
+    /// Ctrl+D arms exit until this deadline; any other key cancels the intent.
+    ctrl_d_pending: bool = false,
+    ctrl_d_deadline_ms: u64 = 0,
+    /// Read batch that carried the arming Ctrl+D; its remainder is discarded.
+    ctrl_d_feed: u64 = 0,
     /// 清理未确认（CleanupFailed 等），禁止再次提交，只允许退出并检查。
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
@@ -2639,7 +2651,7 @@ const Ui = struct {
                 self.parser.stop_feed = true;
                 self.closeResumePicker();
             },
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .up, .down => {
                 self.resume_serial +%= 1;
                 picker.move(event_ == .down);
@@ -2994,10 +3006,17 @@ const Ui = struct {
     }
 
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
+        if (self.ctrl_d_pending) return ctrl_d_notice;
         self.syncNoticeAlias();
         const persistent = !self.noticePublished() and !omitNotice(self.notice) and self.persistentNotice(self.notice);
         if (self.secret_quarantine) return "Esc closes";
         if (self.secret_mode) return if (persistent) self.notice else "";
+        if (!self.stop_open) {
+            if (self.permission) |permission| {
+                if (permission.pasted) return "Paste detected; this request can only be denied";
+                if (permission.clipped) return "Preview clipped; this request can only be denied";
+            }
+        }
         if (self.settings_open) {
             if (self.settings_value_picker) |picker| {
                 const title = settingsValueTitle(picker.key);
@@ -3490,10 +3509,25 @@ const Ui = struct {
         // A quit gesture or accepted session-leave action grants authority;
         // captured signals are checked separately by exitAuthorized.
         self.ctrl_d_exit = true;
+        self.ctrl_d_pending = false;
         self.parser.stop_feed = true;
         // A remote frontend leaves without canceling the daemon-owned task;
         // deinit reports the detach. Explicit Ctrl-C still cancels it.
         if (self.busy and self.remote() == null) self.cancel.cancel();
+    }
+    /// A single Ctrl+D only arms exit and shows a prompt; a second press within
+    /// the window confirms. Any other input cancels the intent.
+    fn confirmCtrlD(self: *Ui) void {
+        if (self.parser.pasted or self.parser.batch_paste) return;
+        const now = self.clock_ms;
+        if (self.ctrl_d_pending and now <= self.ctrl_d_deadline_ms) {
+            self.requestQuit();
+            return;
+        }
+        self.ctrl_d_pending = true;
+        self.ctrl_d_deadline_ms = now +| ctrl_d_window_ms;
+        self.ctrl_d_feed = self.parser.feed_id;
+        self.requestDraw();
     }
     fn exitAuthorized(self: *const Ui) bool {
         return self.ctrl_d_exit or interrupt.signal() != 0;
@@ -3814,7 +3848,7 @@ const Ui = struct {
             return;
         }
         switch (event_) {
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .paste_start => self.settings_menu.markPaste(),
             .text => |value| {
                 if (value.pasted) self.settings_menu.markPaste() else if (picker.editing) {
@@ -3969,7 +4003,7 @@ const Ui = struct {
     }
     fn proxySubKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .escape, .cancel, .left => self.backToSettings(),
             .up, .down => self.settings_menu.move(event_ == .down, settings_menu_module.proxy_labels.len),
             .paste_start => self.settings_menu.markPaste(),
@@ -3998,7 +4032,7 @@ const Ui = struct {
     }
     fn proxyAddressKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .escape, .cancel => self.backToProxySubmenu(0),
             // Left is a cursor move while text remains; at the raw origin it
             // cancels without writing, matching the Custom value editor.
@@ -4121,7 +4155,7 @@ const Ui = struct {
         }
         switch (event_) {
             .escape, .cancel => self.closeSettingsMenu(),
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .left => try self.backToCommands(.settings),
             .paste_start => self.settings_menu.markPaste(),
             .text => |value| {
@@ -4407,7 +4441,7 @@ const Ui = struct {
                 self.closeProviderPicker();
                 self.notice = "Ready";
             },
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .paste_start => self.provider_picker.markPaste(),
             .text => |value| if (value.pasted) {
                 self.provider_picker.markPaste();
@@ -4552,6 +4586,12 @@ const Ui = struct {
             }
         }
     }
+    fn expireCtrlD(self: *Ui) void {
+        if (self.ctrl_d_pending and self.clock_ms > self.ctrl_d_deadline_ms) {
+            self.ctrl_d_pending = false;
+            self.requestDraw();
+        }
+    }
     fn modelKey(self: *Ui, event_: input.Event) !void {
         if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .quit) return;
         const picker = &self.model_picker.?;
@@ -4560,7 +4600,7 @@ const Ui = struct {
                 self.closeModelPicker();
                 self.notice = "Ready";
             },
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .paste_start => {
                 picker.pasted = true;
                 picker.generation +%= 1;
@@ -5249,7 +5289,7 @@ const Ui = struct {
         self.refreshStop();
         if (!self.stop_open) return;
         switch (event_) {
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .escape => self.closeStop(),
             .left, .right, .up, .down, .tab => {
                 self.stop_danger = switch (event_) {
@@ -5496,7 +5536,7 @@ const Ui = struct {
             },
             .quit => {
                 self.endSecret();
-                self.requestQuit();
+                self.confirmCtrlD();
             },
             .enter => {
                 const key_bytes = self.secret.value() orelse {
@@ -5551,7 +5591,7 @@ const Ui = struct {
     fn decidePermission(self: *Ui, decision: r.Decision, require_choice_ack: bool) void {
         const permission = self.permission orelse return;
         if (require_choice_ack and (self.displayed_permission != permission.id or self.displayed_permission_choice != permission.choice)) return;
-        if (decision != .deny and ((permission.clipped or permission.pasted) or !self.approvalFits(permission.id, .allow_once))) {
+        if (decision != .deny and ((permission.clipped or permission.pasted) or !self.approvalFits())) {
             self.notice = if (permission.pasted) "Paste detected: deny this request and ask again" else "Preview unavailable: deny and request a smaller operation";
             return;
         }
@@ -5634,7 +5674,7 @@ const Ui = struct {
                 self.frame_permission = null;
                 self.frame_permission_choice = null;
             },
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             else => {},
         }
     }
@@ -5643,6 +5683,12 @@ const Ui = struct {
     fn key(ctx: *anyopaque, event_: input.Event) !void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         if (self.exitAuthorized()) return;
+        if (self.ctrl_d_pending and event_ != .quit) {
+            // The read that armed exit owns its remainder; any later read with
+            // another key cancels the intent instead of exiting.
+            if (self.parser.feed_id == self.ctrl_d_feed) return;
+            self.ctrl_d_pending = false;
+        }
         // Keyboard input must reach the next fresh draw without waiting for the
         // ordinary cadence; it still never interrupts an already-started frame.
         self.urgent_draw = true;
@@ -5663,14 +5709,14 @@ const Ui = struct {
                     self.secret_quarantine = false;
                     self.parser.secretMode(false);
                 },
-                .quit => self.requestQuit(),
+                .quit => self.confirmCtrlD(),
                 else => {},
             }
             return;
         }
 
         if (self.codex_open or self.codex_opening) {
-            if (event_ == .quit) self.requestQuit() else if (event_ == .escape and !self.parser.pasted and !self.parser.batch_paste) self.cancelCodexLogin();
+            if (event_ == .quit) self.confirmCtrlD() else if (event_ == .escape and !self.parser.pasted and !self.parser.batch_paste) self.cancelCodexLogin();
             return;
         }
         if (self.stop_open) {
@@ -5793,7 +5839,7 @@ const Ui = struct {
             // first refusal. Ordinary idle Ctrl-C must not erase the composer.
             .cancel => {},
             // 退出：若任务仍在运行则先取消，等 loop 中 complete 完成后才真正退出。
-            .quit => self.requestQuit(),
+            .quit => self.confirmCtrlD(),
             .toggle_reasoning => self.show_reasoning = !self.show_reasoning,
             .cycle_effort => self.cycleEffort(),
             .escape => {},
@@ -6507,6 +6553,7 @@ const Ui = struct {
             // 档位确认到期后自动恢复为上下文百分比，不必等下一次按键。
             // 空闲等待由 baseWaitMs 的档位 deadline 收紧，到期后无需额外唤醒。
             self.expireEffortFlash();
+            self.expireCtrlD();
             self.pumpAsync();
             // Both local and remote output share the bounded event budget;
             // buffered remote deltas must not wait one terminal tick apiece.
@@ -7016,13 +7063,9 @@ const Ui = struct {
         }
     }
 
-    /// 除正文行外，还必须完整显示审批编号；不能用被截断的标题确认当前请求。
-    fn approvalFits(self: *const Ui, id: u64, choice: ApprovalChoice) bool {
-        var buffer: [40]u8 = undefined;
-        const identity = std.fmt.bufPrint(&buffer, "Approval #{d}", .{id}) catch return false;
-        const cols = self.size.columns -| 1;
-        const authority_width: usize = if (choice == .allow_once) "> Allow once".len else 0;
-        return self.size.rows >= 7 and cols >= @max(text.width(identity), authority_width);
+    /// 审批选项必须完整可见才授予确认权限；Allow once 是较宽的一项。
+    fn approvalFits(self: *const Ui) bool {
+        return self.size.rows >= 7 and self.size.columns -| 1 >= approval_allow_label.len;
     }
 
     /// 构建一整帧输出到帧 arena（不直接写终端），帧由 loop 分段写出。
@@ -7189,12 +7232,17 @@ const Ui = struct {
         } else {
             const composer = prepared.?;
             const decoration_width = text.width(composer.decoration.plain);
+            const approval = self.permission != null and !self.stop_open;
             for (composer.layout.lines, 0..) |line, index| {
                 const input_line = if (composer.layout.first_row + index == 0)
                     try std.fmt.allocPrint(a, "{s}{s}", .{ composer.decoration.styled, line })
                 else
                     line;
-                try putStyled(writer, rows - composer_rows + 1 + index, input_line);
+                const drawn = if (approval)
+                    try styledApprovalChoice(a, line, index, composer.layout.lines.len, self.permission.?.choice)
+                else
+                    input_line;
+                try putStyled(writer, rows - composer_rows + 1 + index, drawn);
             }
             rendered_composer_rows = composer_rows;
             cursor_rows_up = composer_rows - 1 - composer.layout.cursor_row;
@@ -7245,10 +7293,17 @@ const Ui = struct {
             const safe = if (closing) (if (self.stop_danger) "Cancel" else "> Cancel") else (if (self.stop_danger) "Continue" else "> Continue");
             const danger = if (closing) (if (self.stop_danger) "> Close session" else "Close session") else (if (self.stop_danger) "> Stop and clear" else "Stop and clear");
             break :blk try std.fmt.allocPrint(a, "{s}: [{s} / {s}]", .{ title, safe, danger });
-        } else if (self.permission) |permission|
-            try std.fmt.allocPrint(a, "Approval #{d}: [{s}] {s}", .{ permission.id, if (permission.clipped or permission.pasted) "> Deny" else if (permission.choice == .allow_once) "> Allow once / Deny" else "Allow once / > Deny", if (permission.pasted) "(paste detected; deny only)" else if (permission.clipped) "(preview clipped; deny only)" else "" })
-        else
-            null;
+        } else if (self.permission) |permission| blk: {
+            // One line when both choices fit; otherwise one choice per row.
+            // Labels carry their own padding so the inverse block never moves
+            // the measured text.
+            break :blk if (permission.clipped or permission.pasted)
+                try a.dupe(u8, approval_deny_label)
+            else if (approval_allow_label.len + 2 + approval_deny_label.len <= cols)
+                try std.fmt.allocPrint(a, "{s}  {s}", .{ approval_allow_label, approval_deny_label })
+            else
+                try std.fmt.allocPrint(a, "{s}\n{s}", .{ approval_allow_label, approval_deny_label });
+        } else null;
         var modal_fits = false;
         const prepared: ?PreparedComposer = if (modal_text) |value| blk: {
             const layout = try composer_layout.layout(a, value, value.len, cols, 3);
@@ -7782,9 +7837,9 @@ const Ui = struct {
         // it was cropped (or replaced by a modal) and is never claimed visible.
         var visible_from: usize = std.math.maxInt(usize);
         // 终端太小时只显示提示，避免布局越界。
-        // 审批标题之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
-        const hides_approval_id = if (self.permission) |permission| !self.approvalFits(permission.id, permission.choice) else false;
-        if (self.size.rows < 7 or cols < 8 or hides_approval_id) {
+        // 审批选项之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
+        const hides_approval_choice = if (self.permission != null) !self.approvalFits() else false;
+        if (self.size.rows < 7 or cols < 8 or hides_approval_choice) {
             for (0..rows) |row| try putLine(writer, a, row + 1, if (row == 0) "Resize terminal" else "", cols);
             cursor_offset = tail_out.written().len;
             try writer.writeAll("\r");
@@ -7933,7 +7988,7 @@ const Ui = struct {
         self.frame_height = rows;
         self.frame_cursor_rows_up = cursor_rows_up;
         self.frame_composer_rows = rendered_composer_rows;
-        self.frame_exit_separator = exit_separator and self.size.rows >= 7 and cols >= 8 and !hides_approval_id;
+        self.frame_exit_separator = exit_separator and self.size.rows >= 7 and cols >= 8 and !hides_approval_choice;
         self.frame_size = self.size;
         if (self.natural_flow) {
             const last_row = self.size.rows -| 1;
@@ -8170,6 +8225,29 @@ fn putActivityLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: [
     }
     try styled.appendSlice(a, theme.reset);
     try putStyled(writer, row, styled.items);
+}
+
+/// Apply terminal inverse to the selected approval choice after layout, so the
+/// block never changes measured width. The one-row form selects a fixed-width
+/// segment; the narrow two-row form blocks the whole selected row.
+fn styledApprovalChoice(a: std.mem.Allocator, line: []const u8, index: usize, line_count: usize, choice: ApprovalChoice) ![]const u8 {
+    const allow_selected = choice == .allow_once;
+    var start: usize = 0;
+    var end: usize = line.len;
+    if (line_count == 1) {
+        if (allow_selected) {
+            if (!std.mem.startsWith(u8, line, approval_allow_label)) return line;
+            end = @min(line.len, approval_allow_label.len);
+        } else {
+            if (!std.mem.endsWith(u8, line, approval_deny_label)) return line;
+            start = line.len -| approval_deny_label.len;
+        }
+    } else if (line_count == 2) {
+        if ((allow_selected and index != 0) or (!allow_selected and index != 1)) return line;
+        if (!std.mem.eql(u8, line, if (allow_selected) approval_allow_label else approval_deny_label)) return line;
+    } else return line;
+    if (start >= end) return line;
+    return std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ line[0..start], theme.reverse, line[start..end], theme.reset, line[end..] });
 }
 
 fn putToneLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize, tone: []const u8) !void {

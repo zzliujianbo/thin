@@ -73,6 +73,9 @@ pub const Parser = struct {
     /// Secret parsing rejects bytes that the normal editor would silently discard.
     secret: bool = false,
     stop_feed: bool = false,
+    /// Monotonic read-batch id; the UI can discard the rest of a read without
+    /// stopping future input.
+    feed_id: u64 = 0,
     secret_paste: bool = false,
     secret_batch_paste: bool = false,
     /// A terminator cannot smuggle a submit in the remainder of the same read.
@@ -114,6 +117,7 @@ pub const Parser = struct {
 
     /// 逐字节解析输入。
     pub fn feed(self: *Parser, bytes: []const u8, sink: Sink) !void {
+        self.feed_id +%= 1;
         self.stop_feed = false;
         self.secret_batch_paste = self.secret and self.pasted;
         self.batch_paste = self.pasted;

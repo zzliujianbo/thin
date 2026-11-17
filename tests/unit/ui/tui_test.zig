@@ -3375,7 +3375,7 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(screen.visible("Approval #1"));
+    try std.testing.expect(screen.visible("Y allow once"));
     try std.testing.expect(ui.tail_snapshot == null);
     // The actual loop can answer and receive results before its next draw slot.
     ui.clearPermission();
@@ -3386,7 +3386,7 @@ test "one-pass transcript separators erase acknowledged approval preview before 
     try std.testing.expect(!ui.frame_sparse and ui.frame_tail_snapshot != null);
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expectEqual(@as(usize, 0), screen.count("Approval #1"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("Y allow once"));
     try std.testing.expectEqual(@as(usize, 0), screen.count("GHOST-preview"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("completed-tool-result"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("next-user-record"));
@@ -3449,7 +3449,7 @@ test "long approval Escape restores acknowledged conversation without blank scre
             }
             testAcknowledgeFullFrame(&ui);
         }
-        try std.testing.expect(screen.visible("Approval #14"));
+        try std.testing.expect(screen.visible("Y allow once"));
         const record_count = ui.records.items.len;
         if (pending_canonical) try std.testing.expect(!ui.records.items[pending_index].output);
         if (!cancel_during_frame) ui.requestCancel(); // Empty-draft/no-queue Esc.
@@ -3466,7 +3466,7 @@ test "long approval Escape restores acknowledged conversation without blank scre
             const value = try std.fmt.bufPrint(&marker, "PRIOR-RESPONSE-{d:0>2}", .{i});
             try std.testing.expectEqual(@as(usize, 1), screen.count(value));
         }
-        try std.testing.expectEqual(@as(usize, 0), screen.count("Approval #14"));
+        try std.testing.expectEqual(@as(usize, 0), screen.count("Y allow once"));
         try std.testing.expectEqual(@as(usize, 0), screen.count("CANCEL-GHOST-PREVIEW"));
         try std.testing.expectEqual(record_count, ui.records.items.len);
         if (pending_canonical) {
@@ -3548,7 +3548,7 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     const history_before = screen.history_len;
-    try std.testing.expect(screen.visible("Approval #14"));
+    try std.testing.expect(screen.visible("Y allow once"));
     ui.dirty = false;
     for (2..66) |tick| {
         ui.clock_ms = tick * 80;
@@ -3559,7 +3559,7 @@ test "approval waiting pulse never adds repeated prompts to native scrollback" {
         try screen.replay(ui.frame);
         testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(history_before, screen.history_len);
-        try std.testing.expectEqual(@as(usize, 1), screen.count("Approval #14"));
+        try std.testing.expectEqual(@as(usize, 1), screen.count("Y allow once"));
         try std.testing.expectEqual(@as(usize, 23), screen.row);
         try std.testing.expectEqual(@as(?u64, 14), ui.displayed_permission);
     }
@@ -5038,6 +5038,8 @@ test "exit blank cleanup drains and restores completed transcript on owned PTY" 
     ui.notice = "pty-footer";
     ui.observeAdvisories();
     try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
     try ui.drainExit();
     try std.testing.expect(ui.frame.len == 0 and !ui.dirty);
@@ -5267,10 +5269,10 @@ test "upstream truncated permission preview is deny-only" {
 
     try ui.draw();
     try std.testing.expect(ui.permission.?.clipped);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "deny only") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "can only be denied") != null);
     ui.displayed_permission = 1;
     ui.displayed_permission_choice = .deny;
-    try Ui.key(&ui, .left); // Clipped previews cannot select Allow once.
+    try Ui.key(&ui, .left); // Clipped previews cannot select Y allow once.
     try std.testing.expectEqual(ApprovalChoice.deny, ui.permission.?.choice);
     try Ui.key(&ui, .{ .text = .{ .value = "y", .pasted = false } });
     try std.testing.expect(bridge.answer == null);
@@ -5326,7 +5328,8 @@ test "inline approval preserves conversation and pages its plain preview" {
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("visible prior conversation"));
-    try std.testing.expect(std.mem.indexOf(u8, &screen.grid[screen.row], "Approval #12: [Allow once / > Deny]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, &screen.grid[screen.row], "Y allow once") != null);
+    try std.testing.expect(std.mem.indexOf(u8, &screen.grid[screen.row], "N deny") != null);
     try std.testing.expect(screen.row >= 3);
     try std.testing.expect(std.mem.indexOf(u8, &screen.grid[screen.row - 3], "PREVIEW-1") != null);
     try std.testing.expect(screen.visible("PREVIEW-1"));
@@ -5419,9 +5422,9 @@ test "inline approval shows deny-only reason after clipping or paste" {
         try ui.draw();
         try screen.replay(ui.frame);
         try std.testing.expect(screen.visible("plain preview"));
-        try std.testing.expect(screen.visible(if (pasted) "paste detected; deny only" else "preview clipped; deny only"));
-        try std.testing.expect(screen.visible("> Deny"));
-        try std.testing.expect(!screen.visible("Allow once"));
+        try std.testing.expect(screen.visible(if (pasted) "Paste detected; this request can only be denied" else "Preview clipped; this request can only be denied"));
+        try std.testing.expect(screen.visible("N deny"));
+        try std.testing.expect(!screen.visible("Y allow once"));
         try std.testing.expectEqual(@as(?ApprovalChoice, .deny), ui.frame_permission_choice);
         testAcknowledgeFullFrame(&ui);
         try Ui.key(&ui, .left);
@@ -5442,8 +5445,10 @@ test "approval popup offers only one-shot allow or deny and text grants no autho
         try ui.event(item);
         item.deinit();
         try ui.draw();
-        try std.testing.expect(std.mem.find(u8, ui.frame, "Allow once") != null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, "> Deny") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "Y allow once") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "N deny") != null);
+        // Deny is the default, so its fixed-width segment owns the block.
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[7m N deny \x1b[0m") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "TRUST") == null);
         ui.displayed_permission = ui.frame_permission;
         ui.displayed_permission_choice = ui.frame_permission_choice;
@@ -5475,7 +5480,7 @@ test "approval allow requires the complete selected authority row" {
     item.deinit();
     try Ui.key(&ui, .left);
     try std.testing.expectEqual(ApprovalChoice.allow_once, ui.permission.?.choice);
-    try std.testing.expect(!ui.approvalFits(1, .allow_once));
+    try std.testing.expect(!ui.approvalFits());
     try ui.draw();
     try std.testing.expect(ui.frame_permission == null);
     ui.displayed_permission = null;
@@ -5484,7 +5489,7 @@ test "approval allow requires the complete selected authority row" {
     try std.testing.expect(bridge.answer == null);
     discardFixtureFrame(&ui);
 
-    ui.size.columns = 17; // The complete identity and choices now fit within three rows.
+    ui.size.columns = 17; // The complete choices now fit within three rows.
     try ui.draw();
     try std.testing.expectEqual(@as(?u64, 1), ui.frame_permission);
     try std.testing.expectEqual(@as(?ApprovalChoice, .allow_once), ui.frame_permission_choice);
@@ -5596,48 +5601,46 @@ test "six-row approval cannot authorize and recovers after a complete visible fr
         }
     }
 }
-test "approval identity must fit in full before narrow windows can authorize" {
+test "approval choices must fit in full before narrow windows can authorize" {
     try text.initLocale();
-    for ([_]u64{ 1, std.math.maxInt(u64) }) |id| {
-        var cancel = p.Cancellation{};
-        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-        defer bridge.deinit();
-        var ui = fixtureUi(&bridge, &cancel);
-        defer ui.deinit();
-        var buffer: [40]u8 = undefined;
-        const identity = try std.fmt.bufPrint(&buffer, "Approval #{d}", .{id});
-        ui.size = .{ .columns = identity.len, .rows = 7 };
-        const host = bridge.host();
-        try host.emit_fn(host.context, .{ .permission = .{ .id = id, .tool_name = "bash", .description = "OPERATION" } }, &cancel);
-        var item = bridge.pop().?;
-        try ui.event(item);
-        item.deinit();
-        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-        try ui.draw();
-        try std.testing.expect(ui.frame_permission == null);
-        try std.testing.expect(!ui.permission.?.clipped);
-        // 即使还残留较宽窗口的旧帧确认，也不得在编号放不下时批准。
-        ui.displayed_permission = id;
-        ui.displayed_permission_choice = .allow_once;
-        try ui.parser.feed("yt", sink);
-        try std.testing.expect(bridge.answer == null);
-        ui.displayed_permission = null;
-        discardFixtureFrame(&ui);
+    const allow_width: usize = " Y allow once ".len;
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const id: u64 = 1;
+    ui.size = .{ .columns = allow_width, .rows = 7 }; // drawable cols = allow_width - 1
+    const host = bridge.host();
+    try host.emit_fn(host.context, .{ .permission = .{ .id = id, .tool_name = "bash", .description = "OPERATION" } }, &cancel);
+    var item = bridge.pop().?;
+    try ui.event(item);
+    item.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.draw();
+    try std.testing.expect(ui.frame_permission == null);
+    try std.testing.expect(!ui.permission.?.clipped);
+    // 即使还残留较宽窗口的旧帧确认，也不得在选项放不下时批准。
+    ui.displayed_permission = id;
+    ui.displayed_permission_choice = .allow_once;
+    try ui.parser.feed("yt", sink);
+    try std.testing.expect(bridge.answer == null);
+    ui.displayed_permission = null;
+    discardFixtureFrame(&ui);
 
-        // The drawable width must contain both the identity and the selected
-        // authority-bearing row; the last physical column remains unused.
-        ui.size.columns = @max(identity.len, 16) + 1;
-        try ui.draw();
-        try std.testing.expect(std.mem.find(u8, ui.frame, identity) != null);
-        try std.testing.expectEqual(@as(?u64, id), ui.frame_permission);
-        try Ui.key(&ui, .left);
-        try Ui.key(&ui, .enter);
-        try std.testing.expect(bridge.answer == null);
-        ui.displayed_permission = ui.frame_permission;
-        ui.displayed_permission_choice = .allow_once;
-        try Ui.key(&ui, .enter);
-        try std.testing.expectEqual(@as(?r.Decision, .allow_once), bridge.answer);
-    }
+    // The drawable width must contain the complete Allow once block; the last
+    // physical column remains unused.
+    ui.size.columns = allow_width + 1;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Y allow once") != null);
+    try std.testing.expectEqual(@as(?u64, id), ui.frame_permission);
+    try Ui.key(&ui, .left);
+    try Ui.key(&ui, .enter);
+    try std.testing.expect(bridge.answer == null);
+    ui.displayed_permission = ui.frame_permission;
+    ui.displayed_permission_choice = .allow_once;
+    try Ui.key(&ui, .enter);
+    try std.testing.expectEqual(@as(?r.Decision, .allow_once), bridge.answer);
 }
 test "editor tabs expand before clipping and cursor placement but submit unchanged" {
     try text.initLocale();
@@ -7407,7 +7410,7 @@ test "closing approval reuses its footprint without erasing a multiline composer
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     const before = ui.tail_height;
-    try std.testing.expect(before > 4);
+    try std.testing.expect(before >= 4); // three preview rows plus the choice row
     ui.clearPermission();
     try ui.draw();
     const after = ui.frame_height;
@@ -8853,6 +8856,8 @@ test "cancellation alone cannot authorize exit but a parsed quit can" {
     try std.testing.expect(cancel.isRequested() and !ui.ctrl_d_exit and !ui.exitAuthorized());
     try std.testing.expect(ui.settingsIdle());
     try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
     try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
     try std.testing.expect(!ui.settingsIdle());
 }
@@ -8865,12 +8870,16 @@ test "CtrlD discards the remainder and all subsequent input before submission" {
     const previous_notice = ui.notice;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\x04hello\r", sink);
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
-    try std.testing.expectEqualStrings(previous_notice, ui.notice);
-    try ui.parser.feed("another\r", sink);
+    // The first Ctrl+D only arms; the rest of its read is discarded.
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
     try std.testing.expectEqualStrings(previous_notice, ui.notice);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try std.testing.expect(ui.future == null and !ui.busy and ui.records.items.len == 0);
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
+    try ui.parser.feed("another\r", sink);
+    try std.testing.expectEqualStrings(previous_notice, ui.notice);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
 test "CtrlD exit reason survives secret quarantine picker and busy cancellation" {
     for (0..5) |mode_| {
@@ -8892,6 +8901,10 @@ test "CtrlD exit reason survives secret quarantine picker and busy cancellation"
         }
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         try ui.parser.feed("\x04", sink);
+        try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
+        // A secret-mode first press also leaves the secret prompt, so the
+        // confirming press must be a separate read.
+        try ui.parser.feed("\x04", sink);
         try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
         if (mode_ == 4) try std.testing.expect(cancel.requested.load(.acquire));
         if (mode_ == 1) {
@@ -8899,6 +8912,28 @@ test "CtrlD exit reason survives secret quarantine picker and busy cancellation"
             for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
         }
     }
+}
+test "CtrlD intent expires and any other key cancels the exit" {
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit);
+    // A later read with any other key cancels the intent and is processed.
+    try ui.parser.feed("x", sink);
+    try std.testing.expect(!ui.ctrl_d_pending and !ui.ctrl_d_exit);
+    try std.testing.expectEqualStrings("x", ui.editor.bytes.items);
+    // A press after the window re-arms instead of exiting.
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit);
+    ui.clock_ms = ui.ctrl_d_deadline_ms + 1;
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit);
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
 }
 test "compact slash menu requires acknowledged choice then joins a summary-only job" {
     const cfg = @import("../core/config.zig");
@@ -9748,8 +9783,11 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     try std.testing.expect(!ui.secret_quarantine);
     try ui.parser.feed("/login\r", sink);
     try ui.parser.feed("key\x04exit-tail", sink);
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized() and !ui.secret_mode and ui.secret.len == 0);
+    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try std.testing.expect(!ui.secret_mode and ui.secret.len == 0);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
 }
 test "regression paste-tail Escape timeout cannot withdraw queued FollowUp" {
     try pasteTailEscapeRegression(&.{"\x1b[200~\x1b[201~\x1b"}, false);
@@ -9957,7 +9995,7 @@ test "higher priority input owners hide confirmations and frame authority" {
             try ui.draw();
             try screen.replay(ui.frame);
             try std.testing.expect(ui.frame_permission == null and ui.frame_stop == null);
-            try std.testing.expect(!screen.visible("Approval #") and !screen.visible("Task running"));
+            try std.testing.expect(!screen.visible("Y allow once") and !screen.visible("Task running"));
             if (owner == 2) try std.testing.expect(screen.visible("Waiting for device code..."));
         }
     }
@@ -9988,7 +10026,7 @@ test "wrapped confirmation requires every row and narrow fallback never grants a
         for (screen.row + 1 - ui.frame_composer_rows..screen.row + 1) |row| {
             try joined.appendSlice(std.testing.allocator, std.mem.trimEnd(u8, screen.grid[row][0 .. screen.columns - 1], " "));
         }
-        const expected = if (approval) "Approval #12: [Allow once / > Deny]" else "Task running | Steering 0 FollowUp 0: [> Continue / Stop and clear]";
+        const expected = if (approval) " Y allow once  N deny " else "Task running | Steering 0 FollowUp 0: [> Continue / Stop and clear]";
         // Wrapping can split at spaces, so compare after removing spaces from both.
         var actual_compact: std.ArrayList(u8) = .empty;
         defer actual_compact.deinit(std.testing.allocator);

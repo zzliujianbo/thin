@@ -27,6 +27,13 @@ pub const Kind = enum {
         return .other;
     }
 };
+/// Memory topics are files (`<topic>.md`). Show the suffix once on the tool row;
+/// a truncated topic is shown as-is because appending would misstate a cut name.
+fn memoryLabel(a: std.mem.Allocator, topic: []const u8, truncated: bool) ![]const u8 {
+    if (truncated or std.mem.endsWith(u8, topic, ".md")) return a.dupe(u8, topic);
+    return std.fmt.allocPrint(a, "{s}.md", .{topic});
+}
+
 pub const Outcome = enum { pending, success, failed, canceled };
 
 /// 字段可直接用于 Web view/DTO。detail 是有界安全文本(非HTML)，没有终端cell裁剪；
@@ -52,8 +59,16 @@ pub const Call = struct {
             if (action_value != .string) return .{ .kind = kind };
             const action = action_value.string;
             if (!std.mem.eql(u8, action, "list") and !std.mem.eql(u8, action, "read") and !std.mem.eql(u8, action, "write") and !std.mem.eql(u8, action, "delete")) return .{ .kind = kind };
+            const list = std.mem.eql(u8, action, "list");
             const topic = parsed.value.object.get("topic");
-            const target = if (std.mem.eql(u8, action, "list")) "core/index" else if (topic != null and topic.? == .string) topic.?.string else "(topic unavailable)";
+            const topic_text: ?[]const u8 = if (!list and topic != null and topic.? == .string) topic.?.string else null;
+            const target = if (list)
+                try a.dupe(u8, "core/index")
+            else if (topic_text) |value|
+                try memoryLabel(a, value, false)
+            else
+                try a.dupe(u8, "(topic unavailable)");
+            defer a.free(target);
             // Only known action and target metadata, never content or versions.
             // This description is not argument validation or permission policy.
             const raw = try std.fmt.allocPrint(a, "{s} {s}", .{ action, target });
@@ -88,11 +103,19 @@ pub const Call = struct {
             const action = fields.action orelse return .{ .kind = kind };
             if (action.truncated) return .{ .kind = kind };
             if (!std.mem.eql(u8, action.text, "list") and !std.mem.eql(u8, action.text, "read") and !std.mem.eql(u8, action.text, "write") and !std.mem.eql(u8, action.text, "delete")) return .{ .kind = kind };
-            const target: ?tool_preview.Field = if (std.mem.eql(u8, action.text, "list")) .{ .text = "core/index" } else fields.topic;
-            const raw = if (target) |value| try std.fmt.allocPrint(a, "{s} {s}", .{ action.text, value.text }) else try a.dupe(u8, action.text);
+            const list = std.mem.eql(u8, action.text, "list");
+            const source: ?tool_preview.Field = if (list) null else fields.topic;
+            const target: ?[]const u8 = if (list)
+                try a.dupe(u8, "core/index")
+            else if (source) |value|
+                try memoryLabel(a, value.text, value.truncated)
+            else
+                null;
+            defer if (target) |value| a.free(value);
+            const raw = if (target) |value| try std.fmt.allocPrint(a, "{s} {s}", .{ action.text, value }) else try a.dupe(u8, action.text);
             defer a.free(raw);
             var call = try fromDetail(a, kind, raw);
-            call.truncated = call.truncated or (if (target) |value| value.truncated else false);
+            call.truncated = call.truncated or (if (source) |value| value.truncated else false);
             return call;
         }
         const field = (if (kind == .bash) fields.command else fields.path) orelse return .{ .kind = kind };

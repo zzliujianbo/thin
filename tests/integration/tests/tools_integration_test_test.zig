@@ -605,11 +605,13 @@ test "mutating file and Memory tool allocation failures precede commits" {
                 try std.testing.expectEqualStrings("new", current.data);
                 try std.testing.expectEqual(@as(?u64, 3), j.uint(j.get(value, "written_bytes")));
             } else if (operation == .memory_delete) {
+                try std.testing.expectEqualStrings("core.md", j.string(j.get(value, "topic")).?);
                 try std.testing.expectEqualStrings("deleted", j.string(j.get(value, "operation")).?);
                 try std.testing.expectError(error.FileNotFound, store.read(attempt.allocator(), "core"));
             } else {
                 const current = try store.read(attempt.allocator(), "core");
                 try std.testing.expectEqualStrings("new", current.content);
+                try std.testing.expectEqualStrings("core.md", j.string(j.get(value, "topic")).?);
                 try std.testing.expectEqualStrings("written", j.string(j.get(value, "operation")).?);
             }
             reached_success = true;
@@ -664,8 +666,8 @@ test "tools classify high-risk commands without side effects and use ordinary co
         const bash_action: *const t.Action = @ptrCast(@alignCast(prepared.payload));
         try std.testing.expect(bash_action.* == .bash);
         if (case.label) |label| {
-            try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS bash") != null);
-            try std.testing.expect(std.mem.indexOf(u8, prepared.description, label) != null);
+            try std.testing.expect(std.mem.startsWith(u8, prepared.description, "$ "));
+            try std.testing.expect(std.mem.indexOf(u8, prepared.description, "DANGEROUS") == null);
             try std.testing.expect(std.mem.indexOf(u8, prepared.explicit_denial.?, label) != null);
         } else {
             try std.testing.expect(prepared.explicit_denial == null);

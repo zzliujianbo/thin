@@ -214,7 +214,7 @@ def main(app):
                     answer = f'seed-{("one", "two")[number - 1]}-answer'
                     term.pump(lambda: answer in '\n'.join(term.lines()) and term.idle(),
                               f'seed-{number} complete answer')
-                    term.send(b'\x04')
+                    term.send(b'\x04\x04')
                     term.pump(lambda: term.child.poll() is not None, f'seed-{number} clean exit')
                     assert term.child.wait() == 0
                 finally:
@@ -308,7 +308,7 @@ def main(app):
                 assert len(requests) == 6 and continuation_sessions == selected_ids
                 assert marker.read_text() == 'once'
                 assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
-                term.send(b'\x04')
+                term.send(b'\x04\x04')
                 term.pump(lambda: term.child.poll() is not None, 'restored launcher clean exit')
                 assert term.child.wait() == 0
                 assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
@@ -349,7 +349,7 @@ def trailing_home_connect(app, server):
                 term.send(f'seed-{word}-user\r'.encode())
                 term.pump(lambda: any(f'seed-{word}-answer' in line for line in term.lines()) and term.idle(),
                           f'connect seed-{number} answer')
-                term.send(b'\x04')
+                term.send(b'\x04\x04')
                 term.pump(lambda: term.child.poll() is not None, f'connect seed-{number} exit')
                 assert term.child.wait() == 0
             finally:
@@ -413,7 +413,7 @@ def trailing_home_connect(app, server):
             assert len(requests) == 6 and continuation_sessions == selected_ids
             assert marker.read_text() == 'once'
             assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
-            term.send(b'\x04')
+            term.send(b'\x04\x04')
             term.pump(lambda: term.child.poll() is not None, 'trailing-HOME connect exit')
             assert term.child.wait() == 0
         finally:

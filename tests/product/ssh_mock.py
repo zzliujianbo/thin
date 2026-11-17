@@ -148,7 +148,7 @@ def main():
             return c
 
         def normal_exit(c):
-            c.send(b'\x04')
+            c.send(b'\x04\x04')
             c.pump_until(lambda: c.proc.poll() is not None, 'normal SSH exit', 15)
             assert c.proc.returncode == 0, 'normal SSH exit must be zero (label=%s returncode=%r)' % (c.label, c.proc.returncode)
 

@@ -666,7 +666,7 @@ def assert_screen_idle_contract():
     assert not state(['Address> '], 0).idle(), 'proxy address line'
     assert not state(['Provider> '], 0).idle(), 'provider line'
     assert not state(['API key> '], 0).idle(), 'secret line'
-    assert not state(['> Allow once                Deny'], 0).idle(), 'approval choice row'
+    assert not state([' Y allow once   N deny '], 0).idle(), 'approval choice row'
     assert not state(['rm -rf protected-owned-dir >'], 0).idle(), 'body row ending in >'
     assert not state(['(fixture-model) 0.0%> draft'], 0).idle(), 'filled composer'
 
@@ -1396,7 +1396,7 @@ def case_no_service(app, base):
         default = case.client([], case.workspace.project_a, 'default-foreground')
         default.pump_until(lambda: default.idle_after(0), 'default interactive idle', 30,
                            guard=case.model.check)
-        default.send(b'\x04')
+        default.send(b'\x04\x04')
         code = default.wait_exit('default exit', 25)
         default.drain()
         assert code == 0, 'ordinary thin exit status %r' % (code,)
@@ -1446,7 +1446,7 @@ def case_detach_continues(app, base):
             'attached completed answer', 40, guard=case.model.check)
         assert case.model.count() == 1, 'attach caused new inference'
         assert DETACH_ANSWER in attached.screen_text(), 'completed answer missing after attach'
-        attached.send(b'\x04')
+        attached.send(b'\x04\x04')
         assert attached.wait_exit('attached exit', 25) == 0
         assert session_files(project)[0].name == ident + '.session'
         return {'case': 'detach', 'id': ident, 'requests': case.model.count()}
@@ -1478,7 +1478,7 @@ def ls_view(case, cwd, running=False, at_least=1, timeout=30):
                               'ls listing', timeout, guard=case.model.check)
             client.pump(0.6)
         ids = set(HEX32.findall(client.screen_text()))
-        client.send(b'\x04')
+        client.send(b'\x04\x04')
         code = client.wait_exit('ls client exit', 20)
         assert code == 0, 'launcher /ls exit status %r' % (code,)
         return ids
@@ -1553,14 +1553,14 @@ def case_parallel(app, base):
             reconnect = case.client(['--connect'], project_a, 'reconnect-%d' % index)
             reconnect.pump_until(lambda: reconnect.idle_after(0), 'reconnect idle', 30,
                                  guard=case.model.check)
-            reconnect.send(b'\x04')
+            reconnect.send(b'\x04\x04')
             assert reconnect.wait_exit('reconnect exit', 25) == 0
         after = (len(session_files(project_a)), len(session_files(project_b)))
         assert before == after, 'reconnects created empty sessions: %r -> %r' % (before, after)
         assert case.model.count() == 4, 'reconnects inferred: %d' % case.model.count()
 
-        client_a.send(b'\x04')
-        client_b.send(b'\x04')
+        client_a.send(b'\x04\x04')
+        client_b.send(b'\x04\x04')
         assert client_a.wait_exit('A exit', 25) == 0
         assert client_b.wait_exit('B exit', 25) == 0
         return {'case': 'parallel', 'ids': sorted(ids_a | ids_b),
@@ -1630,7 +1630,7 @@ def case_controller(app, base):
                          'takeover completion', 40, guard=case.model.check)
         assert case.model.count() == 1, 'takeover completion repeated inference'
         wait_checkpoint(project, CONTROLLER_ANSWER)
-        third.send(b'\x04')
+        third.send(b'\x04\x04')
         assert third.wait_exit('takeover exit', 25) == 0
         return {'case': 'controller', 'id': ident, 'requests': case.model.count()}
     finally:
@@ -1666,7 +1666,7 @@ def case_ownership(app, base):
         assert case.model.count() == 2, 'foreground attach caused inference'
 
         # Source owner closes: the view dies with it, nothing is promoted.
-        foreground.send(b'\x04')
+        foreground.send(b'\x04\x04')
         foreground.wait_exit('foreground owner exit', 30)
         deadline = time.monotonic() + 10
         while viewer.proc.poll() is None and time.monotonic() < deadline:
@@ -1677,7 +1677,7 @@ def case_ownership(app, base):
             'foreground tool re-executed after owner exit'
         assert lock_is_free(project_a, fg_id), 'foreground writer lock was not released'
         if viewer.proc.poll() is None:
-            viewer.send(b'\x04')
+            viewer.send(b'\x04\x04')
             viewer.wait_exit('viewer exit', 20)
 
         # Foreground --resume shows history without new inference or tools.
@@ -1686,7 +1686,7 @@ def case_ownership(app, base):
                              'foreground resume history', 40, guard=case.model.check)
         assert case.model.count() == 2, 'foreground resume inferred'
         assert (project_a / 'fg-tool-marker').read_text() == 'fg-once'
-        resume_fg.send(b'\x04')
+        resume_fg.send(b'\x04\x04')
         assert resume_fg.wait_exit('foreground resume exit', 25) == 0
 
         # -- daemon creates a session; another client may view it only by an
@@ -1711,9 +1711,9 @@ def case_ownership(app, base):
         plain_attach.pump_until(lambda: plain_attach.idle_after(0, DB_ANSWER.encode()),
                                 'takeover attach to daemon session', 30, guard=case.model.check)
         assert case.model.count() == before, 'takeover attach inferred'
-        daemon_client.send(b'\x04')
+        daemon_client.send(b'\x04\x04')
         assert daemon_client.wait_exit('daemon client exit', 25) == 0
-        plain_attach.send(b'\x04')
+        plain_attach.send(b'\x04\x04')
         assert plain_attach.wait_exit('plain attach exit', 25) == 0
 
         # Source owner (daemon) closes: resume must not replay anything.
@@ -1734,7 +1734,7 @@ def case_ownership(app, base):
             'second writer silently stole the checkpoint lock'
         assert case.model.count() == before, 'refused resume inferred'
         assert (project_b / 'db-tool-marker').read_text() == 'db-once'
-        resume_one.send(b'\x04')
+        resume_one.send(b'\x04\x04')
         assert resume_one.wait_exit('daemon resume exit', 25) == 0
         return {'case': 'ownership', 'foreground': fg_id, 'daemon': db_id,
                 'requests': case.model.count()}
@@ -1765,7 +1765,7 @@ def case_offline_approval(app, base):
         client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'approval cd completed', 20,
                           guard=case.model.check)
         client.send_line(APPROVAL_PROMPT)
-        client.pump_until(lambda: client.frame_after(0, b'Approval #'), 'approval popup', 40,
+        client.pump_until(lambda: client.frame_after(0, b'Y allow once'), 'approval popup', 40,
                           guard=case.model.check)
         assert victim.exists(), 'dangerous command ran before any approval'
         ident = session_id(project)
@@ -1787,25 +1787,20 @@ def case_offline_approval(app, base):
             assert case.model.count(APPROVAL_PROMPT) == 1, 'popup caused inference'
 
         attached.pump_until(
-            lambda: attached.frame_after(0, b'Approval #') and
-            b'Allow once' in attached.capture and b'Deny' in attached.capture,
+            lambda: attached.frame_after(0, b'Y allow once') and
+            b'Y allow once' in attached.capture and b'N deny' in attached.capture,
             'full approval popup frame', max(0, deadline - time.monotonic()), guard=approval_guard)
-        approval_id = None
         tokens = set()
         for page in range(9):  # Initial frame plus at most eight PageDown ACKs.
             approval_guard()
             rows = [''.join(row) for row in attached.screen.grid]
-            questions = [(i, re.search(r'Approval #(\d+): \[Allow once / > Deny\]', row))
-                         for i, row in enumerate(rows)]
-            questions = [(i, match) for i, match in questions if match]
+            questions = [i for i, row in enumerate(rows)
+                         if 'Y allow once' in row and 'N deny' in row]
             assert len(questions) == 1, 'missing or changed default-deny approval'
-            row, question = questions[0]
-            if approval_id is None:
-                approval_id = question.group(1)
-            assert question.group(1) == approval_id, 'approval id changed while paging'
+            row = questions[0]
             assert row >= 3, 'approval preview outside screen'
-            # This fixture's risk header and command fill the compact preview;
-            # these three adjacent rows contain only preview and any modal hint.
+            # This fixture's command fills the compact preview; these three
+            # adjacent rows contain only preview and any modal hint.
             preview = '\n'.join(rows[row - 3:row])
             tokens.update(token for token in ('rm -f ', '.ssh/fixture-marker') if token in preview)
             if len(tokens) == 2:
@@ -1814,7 +1809,7 @@ def case_offline_approval(app, base):
                 break
             before = attached.mark()
             attached.send(b'\x1b[6~')
-            attached.pump_until(lambda: attached.frame_after(before, b'Approval #'),
+            attached.pump_until(lambda: attached.frame_after(before, b'Y allow once'),
                                 'approval preview page acknowledged',
                                 max(0, deadline - time.monotonic()), guard=approval_guard)
         assert len(tokens) == 2, 'approval preview lost the command'
@@ -1824,7 +1819,7 @@ def case_offline_approval(app, base):
         attached.send(b'\x1b[A')
         attached.pump_until(
             lambda: attached.frame_after(before) and
-            b'> Allow once' in attached.capture[before:],
+            b'\x1b[7m Y allow once ' in attached.capture[before:],
             'allow-once selection acknowledged', 25, guard=case.model.check)
         attached.send(b'\r')
         attached.pump_until(lambda: attached.idle_after(0, APPROVAL_ANSWER.encode()),
@@ -1835,7 +1830,7 @@ def case_offline_approval(app, base):
         calls, results = tool_history(body)
         assert len(calls) == 1 and calls[0]['id'] == 'approval-tool-1', 'duplicate execution'
         assert results.get('approval-tool-1') is not None
-        attached.send(b'\x04')
+        attached.send(b'\x04\x04')
         assert attached.wait_exit('approval exit', 25) == 0
         return {'case': 'approval', 'id': ident, 'requests': case.model.count()}
     finally:
@@ -1870,7 +1865,7 @@ def case_daemon_reclaim(app, base):
                           'service start answer', 40, guard=case.model.check)
         service_pid, service_port = wait_service_ready(project)
         assert case.model.count(SERVICE_PROMPT) == 2
-        client.send(b'\x04')
+        client.send(b'\x04\x04')
         assert client.wait_exit('reclaim client exit', 25) == 0
 
         workers = children_of(daemon.proc.pid)
@@ -1999,7 +1994,7 @@ def case_streaming(app, base, daemon=False):
         client.pump_until(lambda: client.idle_after(mark, b'K1599'), 'stream final idle', 20,
                           guard=case.model.check)
         assert case.model.count() == 1, 'stream recovery repeated inference'
-        client.send(b'\x04')
+        client.send(b'\x04\x04')
         assert client.wait_exit('stream frontend exit', 20) == 0
         return {'case': 'stream-daemon' if daemon else 'stream-foreground',
                 'requests': 1, 'chunks': len(sent), 'visible_updates': updates,

@@ -731,7 +731,7 @@ def run(app, columns, observe_saved=False):
                 for retired in RETIRED_PATHS:
                     assert not (project / retired).exists(), 'retired Memory jobs path recreated'
                 assert config_path.read_bytes() == config_bytes
-                send(b'\x04')
+                send(b'\x04\x04')
                 pump_until(lambda: child.poll() is not None, 'saved-case Ctrl-D exit', timeout=10)
                 assert child.wait(timeout=5) == 0
                 assert_terminal_restored(slave, original, original_flags)
@@ -793,7 +793,7 @@ def run(app, columns, observe_saved=False):
             assert_saved_transcript(screen)  # The prior saved result may have scrolled away.
             assert not control.release3.is_set() and not control.helper3_responded
 
-            send(b'\x04')
+            send(b'\x04\x04')
             pump_until(lambda: child.poll() is not None, 'Ctrl-D exit while Memory is active', timeout=10)
             assert child.wait(timeout=5) == 0, 'owned child did not exit cleanly from an idle Ctrl-D'
             assert control.helper3_canceled.wait(3), 'owned server did not observe the canceled Memory socket'

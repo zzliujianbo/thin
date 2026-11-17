@@ -1228,7 +1228,7 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.send("values-task-private-marker\r");
     try d.waitFrame(start, "values-tool-result-verified");
     try d.waitIdle(start);
-    try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+    try check(std.mem.indexOf(u8, d.output[start..d.used], "Y allow once") == null);
     try settingsScreen(d, a, &.{"fixture-main"}, &.{});
 }
 
@@ -1242,7 +1242,7 @@ fn approvalCancelScreen(d: *Driver, view: *regular.Screen) !void {
 }
 
 // Confirmation controls are transient composer content, not transcript rows.
-// These fixtures use a normal-width PTY, so both choices fit on the question row.
+// These fixtures use a normal-width PTY, so both choices fit on the choice row.
 fn checkConfirmationRow(view: *const regular.Screen, question: []const u8, selected: []const u8, other: []const u8) !void {
     try Driver.checkComposerTail(view);
     const row = &view.grid[view.row];
@@ -1255,6 +1255,28 @@ fn checkConfirmationRow(view: *const regular.Screen, question: []const u8, selec
     }
 }
 
+/// Exit is a two-press gesture: the first full frame proves the arm, then the
+/// confirming press arrives in a separate read.
+fn quitTwice(d: *Driver) !void {
+    const start = d.used;
+    try d.send("\x04");
+    try d.waitText(start, "Press Ctrl+D again to exit");
+    try d.send("\x04");
+}
+
+// Approval choices own the composer row; both Y/N labels must fit there and
+// never be committed to native scrollback.
+fn checkApprovalRow(view: *const regular.Screen) !void {
+    try Driver.checkComposerTail(view);
+    const row = &view.grid[view.row];
+    try check(std.mem.indexOf(u8, row, "Y allow once") != null);
+    try check(std.mem.indexOf(u8, row, "N deny") != null);
+    try check(view.count("Y allow once") == 1);
+    for (view.history[0..view.history_len]) |line| {
+        try check(std.mem.indexOf(u8, &line, "Y allow once") == null);
+    }
+}
+
 // Opening and every PageDown share the original one-shot 15s screen budget.
 // Only a fresh, fully acknowledged frame may advance the three-line preview;
 // PageDown moves its window by two rows without selecting or allowing a call.
@@ -1262,19 +1284,12 @@ fn approvalCancelPreview(d: *Driver, view: *regular.Screen, start: usize) !void 
     const until = now() + 15000;
     var since = start;
     var pages: usize = 0;
-    var approval_id: ?u64 = null;
     std.debug.print("APPROVAL_CANCEL_CHECKPOINT=preview-await\n", .{});
     while (now() < until) {
         try d.drain(20);
         if (try d.acknowledgedScreen(since)) |current| {
-            if (current.visible("Approval #")) {
-                try checkConfirmationRow(current, "Approval #", "> Deny", "Allow once");
-                const row = &current.grid[current.row];
-                const id_start = std.mem.indexOf(u8, row, "Approval #").? + "Approval #".len;
-                var id_end = id_start;
-                while (id_end < row.len and std.ascii.isDigit(row[id_end])) : (id_end += 1) {}
-                const id = try std.fmt.parseInt(u64, row[id_start..id_end], 10);
-                if (approval_id) |expected| try check(id == expected) else approval_id = id;
+            if (current.visible("Y allow once")) {
+                try checkApprovalRow(current);
                 const ghost_visible = current.visible("GHOST-CANCEL-ONLY");
                 std.debug.print("APPROVAL_CANCEL_PREVIEW page={d} ghost_visible={any}\n", .{ pages, ghost_visible });
                 if (ghost_visible) {
@@ -1303,7 +1318,7 @@ fn checkApprovalCancelRestored(view: *const regular.Screen) !void {
         try check(view.count(text) == 1);
         if (view.visible(text)) visible_prior += 1;
     }
-    try check(view.count("Approval #") == 0 and view.count("GHOST-CANCEL-ONLY") == 0);
+    try check(view.count("Y allow once") == 0 and view.count("GHOST-CANCEL-ONLY") == 0);
     // The closed panel must not leave stale rows below the composer.
     try Driver.checkComposerTail(view);
     const composer = &view.grid[view.row];
@@ -1355,11 +1370,11 @@ fn approvalCancel(d: *Driver) !void {
     const waiting = d.used;
     try d.quiet(2400);
     try check(d.owned);
-    const titles = std.mem.count(u8, d.output[waiting..d.used], "Approval #");
+    const titles = std.mem.count(u8, d.output[waiting..d.used], "Y allow once");
     try approvalCancelScreen(d, view);
     try check(titles == 0 and view.history_len == history_before);
-    try check(view.count("Approval #") == 1 and view.visible("GHOST-CANCEL-ONLY"));
-    try checkConfirmationRow(view, "Approval #", "> Deny", "Allow once");
+    try check(view.count("Y allow once") == 1 and view.visible("GHOST-CANCEL-ONLY"));
+    try checkApprovalRow(view);
     var visible_prior: usize = 0;
     for (0..18) |i| {
         var marker: [32]u8 = undefined;
@@ -1435,29 +1450,29 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try source.writer.writeByte('\r');
         const submitted = d.used;
         try d.send(source.written());
-        try d.waitFrame(submitted, "Approval #");
+        try d.waitFrame(submitted, "Y allow once");
         const view = try std.heap.page_allocator.create(regular.Screen);
         defer std.heap.page_allocator.destroy(view);
         const ack_before = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
         view.* = .{ .columns = d.columns };
         try view.replay(d.output[0..ack_before]);
         const history_before = view.history_len;
-        try check(view.visible("Approval #"));
+        try check(view.visible("Y allow once"));
         const waiting = d.used;
         try d.quiet(2400);
         try check(d.owned);
-        const titles = std.mem.count(u8, d.output[waiting..d.used], "Approval #");
+        const titles = std.mem.count(u8, d.output[waiting..d.used], "Y allow once");
         const ack_after = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
         view.* = .{ .columns = d.columns };
         try view.replay(d.output[0..ack_after]);
-        std.debug.print("APPROVAL_WAIT repeated_titles={d} history_delta={d} visible_titles={d}\n", .{ titles, view.history_len -| history_before, view.count("Approval #") });
-        try check(titles == 0 and view.history_len == history_before and view.count("Approval #") == 1);
-        try checkConfirmationRow(view, "Approval #", "> Deny", "Allow once");
+        std.debug.print("APPROVAL_WAIT repeated_titles={d} history_delta={d} visible_titles={d}\n", .{ titles, view.history_len -| history_before, view.count("Y allow once") });
+        try check(titles == 0 and view.history_len == history_before and view.count("Y allow once") == 1);
+        try checkApprovalRow(view);
         // An actual scroll still redraws and needs a fresh completed frame;
         // freezing idle animation must not freeze input or approval controls.
         const scrolled = d.used;
         try d.send("\x1b[6~");
-        try d.waitFrame(scrolled, "Approval #");
+        try d.waitFrame(scrolled, "Y allow once");
         const denied = d.used;
         try d.send("\r");
         try d.waitIdle(denied);
@@ -1472,7 +1487,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         start = d.used;
         try d.send("\x1b[200~!touch pasted\n\x1b[201~");
         try d.quiet(150);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Y allow once") == null);
         try d.send("\x15");
         try d.quiet(100);
     }
@@ -1485,13 +1500,13 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
     try d.send(try std.fmt.bufPrint(&line, "  !{s}\r", .{command}));
     // Both command preview and approval must belong to a completed new frame.
     try d.waitFrame(start, command);
-    try d.waitFrame(start, "Approval #");
+    try d.waitFrame(start, "Y allow once");
     // Approval is a modal selector. Deny is the safe default; allowing once
     // requires a visible arrow-selected frame before Enter can authorize it.
     if (!deny) {
         const selected = d.used;
         try d.send("\x1b[D");
-        try d.waitFrame(selected, "> Allow once");
+        try d.waitFrame(selected, "\x1b[7m Y allow once ");
     }
     const answered = d.used;
     try d.send("\r");
@@ -1532,12 +1547,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try checkApprovalMarker(init, project);
         const batch = d.used;
         try d.send("!rm -f .ssh/fixture-marker; touch batch-first\r!touch batch-tail\r");
-        try d.waitFrame(batch, "Approval #");
-        const title = "Approval #";
-        const number_start = batch + (std.mem.lastIndexOf(u8, d.output[batch..d.used], title) orelse return error.AcceptanceFailed) + title.len;
-        var number_end = number_start;
-        while (number_end < d.used and std.ascii.isDigit(d.output[number_end])) : (number_end += 1) {}
-        const denied_id = try std.fmt.parseInt(u64, d.output[number_start..number_end], 10);
+        try d.waitFrame(batch, "Y allow once");
         const rejected = d.used;
         try d.send("\r");
         try d.waitIdle(rejected);
@@ -1545,17 +1555,9 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         // The asynchronous denial may redraw the SAME permission while its
         // receipt is pending. It must never create another permission or run
         // the second command in the read batch (also checked by the Node owner).
-        var from = rejected;
-        while (std.mem.indexOfPos(u8, d.output[0..d.used], from, title)) |at| {
-            const begin = at + title.len;
-            var end = begin;
-            while (end < d.used and std.ascii.isDigit(d.output[end])) : (end += 1) {}
-            try check(try std.fmt.parseInt(u64, d.output[begin..end], 10) == denied_id);
-            from = end;
-        }
         const settled = (try d.acknowledgedScreen(rejected)) orelse return error.AcceptanceFailed;
-        if (settled.visible(title)) std.debug.print("denial title still visible\n", .{});
-        try check(!settled.visible(title));
+        if (settled.visible("Y allow once")) std.debug.print("denial title still visible\n", .{});
+        try check(!settled.visible("Y allow once") and !settled.visible("batch-tail"));
         try checkApprovalMarker(init, project);
     }
 }
@@ -1953,7 +1955,7 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         try queuedIdle(d, a, probe_start);
         try queuedGate(d, a, project, "done");
     }
-    try d.send("\x04");
+    try quitTwice(d);
     try d.finish(0);
 }
 
@@ -2790,7 +2792,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // 默认直接运行真实 date，不发送 y/n/t；无响应会由驱动截止时间判失败。
         try d.waitText(start, "date-completed");
         try d.waitIdle(start);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "Y allow once") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "Completed") == null);
     } else if (std.mem.eql(u8, mode, "regular-two")) {
         // Same owned PTY, two loopback-only turns. Force the first reply into
@@ -3030,12 +3032,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, "memory-summary-final-answer");
         try d.waitIdle(start);
         const final = try d.screen();
-        for ([_][]const u8{ "~ memory write caption-note", "~ memory read caption-note", "~ memory list core/index", "~ memory delete caption-note" }) |caption| {
+        for ([_][]const u8{ "~ memory write caption-note.md", "~ memory read caption-note.md", "~ memory list core/index", "~ memory delete caption-note.md" }) |caption| {
             try check(final.count(caption) == 1);
         }
         try check(std.mem.indexOf(u8, d.output[start..d.used], "memory-summary-hidden-body") == null);
         try check(std.mem.indexOf(u8, d.output[start..d.used], "expected_version") == null);
-        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m✓\x1b[38;5;75m memory \x1b[38;5;245mread caption-note") != null);
+        try check(std.mem.indexOf(u8, d.output[start..d.used], "\x1b[0m\x1b[38;5;114m✓\x1b[38;5;75m memory \x1b[38;5;245mread caption-note.md") != null);
         try check(final.count("memory-summary-final-answer") == 1);
         try Driver.checkComposerTail(final);
     } else if (std.mem.eql(u8, mode, "file-stats")) {
@@ -3323,7 +3325,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, "REC FAILED");
         try d.waitText(start, "log-fixture-answer");
         try d.waitIdle(start);
-        try d.send("\x04");
+        try quitTwice(&d);
         try d.finish(0);
         const final = try d.screen();
         try check(final.count(regular.prior) == 1 and final.count("log-fixture-answer") == 1);
@@ -3337,7 +3339,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             try d.send("\r");
             try d.waitText(start, "fixture-answer");
             try d.waitIdle(start);
-            try check(std.mem.indexOf(u8, d.output[start..d.used], "Approval #") == null);
+            try check(std.mem.indexOf(u8, d.output[start..d.used], "Y allow once") == null);
         }
     } else if (std.mem.eql(u8, mode, "keyboard-history")) {
         for ([_][]const u8{ "history-one", "history-two" }, 1..) |message, number| {
@@ -3461,7 +3463,12 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     }
     // Remainder of the SAME read after Ctrl+D must not submit anything.
     const exit_start = d.used;
-    try d.send(if (std.mem.eql(u8, mode, "exit-batched")) "\x04post-quit-must-not-submit\r" else "\x04");
+    if (std.mem.eql(u8, mode, "exit-batched")) {
+        // The first press owns the rest of its read; the second read confirms.
+        try d.send("\x04post-quit-must-not-submit\r");
+        try d.waitText(exit_start, "Press Ctrl+D again to exit");
+        try d.send("\x04");
+    } else try quitTwice(&d);
     try d.finish(0);
     if (full_resume or std.mem.eql(u8, mode, "resume-create")) {
         const prefix = "thin --resume ";

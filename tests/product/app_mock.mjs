@@ -840,7 +840,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
 
     // 默认执行不进入审批；文件、shell 与 Memory 的真实结果仍正确回填。
     if (kind === 'auto' || kind === 'ordinary-tools' || kind === 'auto-tools') {
-      assert(!result.output.includes('Approval #'), 'default tool execution requested approval');
+      assert(!result.output.includes('Y allow once'), 'default tool execution requested approval');
       assert(!result.output.includes('privileged tools denied'), 'default tool execution denied');
       if (kind === 'auto-tools') {
         assert.equal(await readFile(join(project,'auto-one.txt'),'utf8'),'executed');

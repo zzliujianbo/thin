@@ -32,7 +32,13 @@ test "typed tool fields keep unknown targets safe and preserve clipping provenan
     try std.testing.expectEqualStrings("write", action.detail.?);
     const topic = try Call.fromFields(a, "memory", .{ .action = .{ .text = "read" }, .topic = .{ .text = "core" } });
     defer topic.deinit(a);
-    try std.testing.expectEqualStrings("read core", topic.detail.?);
+    try std.testing.expectEqualStrings("read core.md", topic.detail.?);
+    const suffixed = try Call.fromFields(a, "memory", .{ .action = .{ .text = "write" }, .topic = .{ .text = "core.md" } });
+    defer suffixed.deinit(a);
+    try std.testing.expectEqualStrings("write core.md", suffixed.detail.?);
+    const cut = try Call.fromFields(a, "memory", .{ .action = .{ .text = "read" }, .topic = .{ .text = "cut", .truncated = true } });
+    defer cut.deinit(a);
+    try std.testing.expect(cut.truncated and std.mem.eql(u8, cut.detail.?, "read cut"));
     const invalid = try Call.fromFields(a, "memory", .{ .action = .{ .text = "write", .truncated = true }, .topic = .{ .text = "hidden" } });
     defer invalid.deinit(a);
     try std.testing.expect(invalid.detail == null);
@@ -55,7 +61,7 @@ test "memory descriptions include known action and topic without bodies versions
         defer a.free(args);
         const call = try Call.init(a, "memory", args);
         defer call.deinit(a);
-        const expected = try std.fmt.allocPrint(a, "{s} core", .{action});
+        const expected = try std.fmt.allocPrint(a, "{s} core.md", .{action});
         defer a.free(expected);
         try std.testing.expectEqualStrings(expected, call.detail.?);
         try std.testing.expect(!call.truncated);

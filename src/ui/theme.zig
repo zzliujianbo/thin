@@ -2,11 +2,16 @@
 //! Use the 256-color cube for vivid yellow/green and a cooler violet, avoiding
 //! the gray/red cast of theme-defined bright slots. Blue stays at slot 12.
 //! No truecolor escapes, added bold, backgrounds or palette probing.
-//! Only our renderer emits SGR;
+//! The approval choice is the one exception: it uses terminal inverse for the
+//! selected option, which swaps the terminal's own colors instead of setting a
+//! background. Only our renderer emits SGR;
 //! model/user bytes are sanitized separately, never interpreted as escapes.
 const activity = @import("../presentation/activity.zig");
 
 pub const reset = "\x1b[0m";
+/// Terminal inverse for the selected approval choice: a block with the
+/// terminal's own foreground/background, so it follows light and dark themes.
+pub const reverse = "\x1b[7m";
 pub const accent = "\x1b[38;5;208m";
 pub const heading = "\x1b[1m\x1b[38;5;220m";
 /// Bold terminal-default foreground, readable on light and dark themes.

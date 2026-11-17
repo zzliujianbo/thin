@@ -324,20 +324,25 @@ def run(app, wrap=False, local_command=False):
                     draft_row = caret()[0]
                     assert (composer(80, 24) or '').endswith('-WRAP-END'), 'visual arrows replaced or clipped the draft'
 
-                    def at_start():
+                    def at_start(marker):
                         lines = tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()
-                        rows = [i for i, line in enumerate(lines) if '%>' in line]
+                        rows = [i for i, line in enumerate(lines) if marker in line]
                         if len(rows) != 1:
                             return False
                         cursor = tm('display-message', '-p', '-t', 'owned:0.0', '#{cursor_y} #{cursor_x}').split()
-                        return cursor == [str(rows[0]), str(lines[rows[0]].index('%>') + 3)]
+                        return cursor == [str(rows[0]), str(lines[rows[0]].index(marker) + 3)]
 
                     tm('send-keys', '-t', 'owned:0.0', 'Home')
-                    wait(at_start, 'wrapped input Home caret misplaced')
+                    wait(lambda: at_start('%>'), 'wrapped input Home caret misplaced')
                     tm('send-keys', '-t', 'owned:0.0', 'Up')
-                    wait(lambda: at_start() and any('%>' in line and history_seed in line for line in tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()), 'origin Up did not recall the submitted input')
+                    # Recalling a local `!command` switches the composer to command
+                    # mode, where the marker is `%!` and the leading `!` is not part
+                    # of the editor text.
+                    recalled_marker = '%!' if local_command else '%>'
+                    recalled_text = 'true' if local_command else history_seed
+                    wait(lambda: at_start(recalled_marker) and any(recalled_marker in line and recalled_text in line for line in tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()), 'origin Up did not recall the submitted input')
                     tm('send-keys', '-t', 'owned:0.0', 'Down')
-                    wait(lambda: at_start() and any('%>' in line and 'wrap-A-' in line for line in tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()), 'origin Down did not restore the original multiline draft')
+                    wait(lambda: at_start('%>') and any('%>' in line and 'wrap-A-' in line for line in tm('capture-pane', '-p', '-t', 'owned:0.0').splitlines()), 'origin Down did not restore the original multiline draft')
                     start = caret()
                     tm('send-keys', '-t', 'owned:0.0', 'Right')
                     start_right = (start[0], start[1] + 1)
@@ -358,7 +363,7 @@ def run(app, wrap=False, local_command=False):
                     if prompt_rows:
                         assert 0 <= caret()[0] - prompt_rows[0] <= 7, 'composer exceeded eight-row viewport'
                     tm('send-keys', '-t', 'owned:0.0', 'Home')
-                    wait(at_start, 'bounded viewport did not follow Home')
+                    wait(lambda: at_start('%>'), 'bounded viewport did not follow Home')
                     tm('send-keys', '-t', 'owned:0.0', 'End')
                     wait(lambda: visible(80, 24, '-UNICODE-END', True), 'bounded viewport did not follow End')
                     print(f'PASS composer-wrap: seed={"local-command" if local_command else "loopback"}, visible multiline input, visual rows, exact-origin history/draft restore, bounded Unicode viewport')
@@ -378,7 +383,7 @@ def run(app, wrap=False, local_command=False):
                 assert OwnedService.requests == expected_requests, 'unexpected resize/draft/helper HTTP'
                 assert OwnedService.failed is None, f'owned loopback assertion failed: {OwnedService.failed}'
                 assert cfg.read_text() == json.dumps(config), 'resize changed settings'
-                tm('send-keys', '-t', 'owned:0.0', 'C-u', 'C-d')
+                tm('send-keys', '-t', 'owned:0.0', 'C-u', 'C-d', 'C-d')
 
                 def exited_cleanly():
                     dead, status, signal, pid = tm('display-message', '-p', '-t', 'owned:0.0', '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_pid}').strip().split('|')

@@ -905,7 +905,7 @@ def run_pty(app, workspace, url, start_server=None):
         os.write(master, PTY_MANAGE_PROMPT.encode() + b'\r')
         pump_until(lambda: settled(PTY_FINAL_ANSWER.encode()), 'final answer settled frame')
         owned.wait_stopped('pty')
-        os.write(master, b'\x04')
+        os.write(master, b'\x04\x04')
         pump_until(lambda: child.poll() is not None, 'exit after Ctrl-D')
         assert child.wait(timeout=10) == 0, 'interactive app exit status'
         restored = termios.tcgetattr(slave)
