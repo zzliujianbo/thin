@@ -399,7 +399,7 @@ test "probe reads the nested snapshot object a real reply carries" {
         try testing.expectEqual(case.pending != null, probe.pending_permission);
         try testing.expect(probe.attached);
         try testing.expectEqual(case.state, probe.state);
-        // This is what `/ls --running` renders: only real work stays listed.
+        // Only real work stays listed when probing live sessions.
         try testing.expectEqual(case.state != .idle, probeVisible(probe.state, true));
     }
 }

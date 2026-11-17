@@ -51,7 +51,6 @@ pub const Action = union(enum) {
             } },
             .manage => |v| .{ .manage = switch (v) {
                 .@"resume" => |id| .{ .@"resume" = try text(a, id) },
-                .cd => |path| .{ .cd = try text(a, path) },
                 .attach => |value| .{ .attach = .{ .id = try text(a, value.id), .takeover = value.takeover } },
                 .close => |value| .{ .close = .{ .id = try text(a, value.id), .force = value.force } },
                 else => v,

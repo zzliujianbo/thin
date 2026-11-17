@@ -31,7 +31,7 @@ pub fn validateArgs(args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, arg, "--internal-worker")) {
             i += @min(@as(usize, 3), args.len - i - 1);
         } else {
-            for ([_][]const u8{ "--print", "-p", "--resume", "--restore-selection", "--worker-restore-selection" }) |takes_value| {
+            for ([_][]const u8{ "--print", "-p", "--restore-selection", "--worker-restore-selection" }) |takes_value| {
                 if (std.mem.eql(u8, arg, takes_value)) {
                     if (i + 1 < args.len) i += 1;
                     break;

@@ -9,7 +9,6 @@ test "interactive tty gate excludes print daemon and worker modes" {
     const socket = "/run/user/1000/thin/workers/session.sock";
 
     try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{"thin"})));
-    try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{ "thin", "--resume", id })));
     try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{ "thin", "--connect" })));
     try std.testing.expect(requiresInteractiveTty(try cli.parse(&.{ "thin", "--attach", id })));
 

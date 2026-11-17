@@ -9142,17 +9142,11 @@ test "slash composer keeps supported management arguments visible without submit
     const cases = [_]struct { raw: []const u8, shown: []const u8, hidden: ?[]const u8 = null }{
         .{ .raw = "/attach 0123456789abcdef0123456789abcdef", .shown = "/attach 0123456789abcdef0123456789abcdef" },
         .{ .raw = "/attach --takeover 0123456789abcdef0123456789abcdef", .shown = "/attach --takeover 0123456789abcdef0123456789abcdef" },
-        .{ .raw = "/attch 0123456789abcdef0123456789abcdef", .shown = "/attch 0123456789abcdef0123456789abcdef" },
         .{ .raw = "/close 0123456789abcdef0123456789abcdef --force", .shown = "/close 0123456789abcdef0123456789abcdef --force" },
-        .{ .raw = "/cd /srv/work dir", .shown = "/cd /srv/work dir" },
-        .{ .raw = "/ls --running --page 2", .shown = "/ls --running --page 2" },
-        .{ .raw = "/ls 2", .shown = "/ls 2" },
-        .{ .raw = "/ls ", .shown = "/ls " },
         .{ .raw = "/detach   ", .shown = "/detach   " },
         .{ .raw = "/login ", .shown = "/login " },
         .{ .raw = "/compact\t", .shown = "/compact    " },
         .{ .raw = "/attach bad!id extra", .shown = "/ [command arguments hidden]", .hidden = "bad!id" },
-        .{ .raw = "/ls --page", .shown = "/ [command arguments hidden]", .hidden = "--page" },
         .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
         .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
         .{ .raw = "/model one two", .shown = "/model [arguments hidden; use one model ID]", .hidden = "one two" },
@@ -10288,7 +10282,7 @@ test "configure enables same-process submit without sending secrets or commands"
     }
     try std.testing.expectEqual(@as(usize, 1), user_count);
 }
-test "resume root Tab completion and help show the remote command" {
+test "resume root Tab completion completes the remote command" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -10301,11 +10295,6 @@ test "resume root Tab completion and help show the remote command" {
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\t", sink);
     try std.testing.expectEqualStrings("/resume", ui.editor.bytes.items);
-    ui.wipeEditor();
-    try typeDraft(&ui, "/help");
-    try ui.submit();
-    try std.testing.expect(publishedNotice(&ui, "/resume [id]"));
-    try std.testing.expect(publishedNotice(&ui, "/new [prompt]  Start a new session"));
 }
 test "new starts a fresh session and resets the previous view" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
@@ -13128,10 +13117,10 @@ test "remote management commands run while busy instead of entering steering" {
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
     ui.remote_kind = .prompt;
-    try typeDraft(&ui, "/ls --running");
+    try typeDraft(&ui, "/detach");
     try ui.submit();
     try std.testing.expectEqual(@as(usize, 1), fake.manages);
-    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .list), fake.last_manage);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .detach), fake.last_manage);
     try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
     try std.testing.expectEqual(@as(usize, 0), fake.submits);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);

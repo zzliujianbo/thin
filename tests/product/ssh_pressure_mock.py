@@ -71,8 +71,6 @@ def check(app):
         client=SshChild('/usr/bin/ssh',argv,ws.home,env,'task-client',ws.logs,True,100,30)
         case.children.append(client)
         client.pump_until(lambda:settled(client),'SSH ready',20)
-        mark=client.mark();client.send_line('/cd '+str(ws.project_a))
-        client.pump_until(lambda:settled(client, mark, b'Launcher directory:'),'select project',20)
         client.send_line(prompt)
         case.wait_prompt(prompt)
         assert case.model.count()==1
@@ -100,7 +98,7 @@ def check(app):
         for s in sockets: s.close()
         sockets.clear()
         gate.set()
-        checkpoint=wait_checkpoint(ws.project_a,answer,timeout=35)
+        checkpoint=wait_checkpoint(ws.home,answer,timeout=35)
         assert checkpoint.is_file() and case.model.count()==1
         # Resource refusal must recover, not merely keep a broken listener alive.
         recovered=SshChild('/usr/bin/ssh',argv,ws.home,env,'recovered-client',ws.logs,True,100,30)

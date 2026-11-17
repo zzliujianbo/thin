@@ -11,7 +11,7 @@
 # 不能靠在 SSH 会话里 nohup/后台启动代替这个授权。
 #
 # 只以显式参数 `--daemon` 启动。默认 `thin` 仍是前台模式；
-# 本服务不会被普通 thin、`--connect`、`--attach` 或 `--resume` 隐式拉起。
+# 本服务不会被普通 thin、`--connect` 或 `--attach` 隐式拉起。
 
 [Unit]
 Description=Thin per-user daemon (explicit --daemon)
@@ -23,7 +23,7 @@ Type=simple
 # THIN:REPLACE 若安装目录不是 /usr/local/bin，必须与 install.sh 的 INSTALL_DIR 一致。
 ExecStart=/usr/local/bin/thin --daemon
 
-# 会话默认目录取该账户 HOME；会话实际根目录由 /cd 选择，不由本单元指定。
+# 会话默认目录取该账户 HOME；不由本单元切换目录。
 WorkingDirectory=%h
 
 # THIN:REPLACE 凭据等环境变量从 0600 的环境文件读取（见 daemon.env.example）。

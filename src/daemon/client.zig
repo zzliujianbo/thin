@@ -93,7 +93,6 @@ const finish_timeout_ms: u32 = 60_000;
 /// One page of display events per fetch; the UI drains one item per tick.
 const max_events: u16 = protocol.max_events;
 /// Bounded local item queue: never buffer more than this between UI ticks.
-const max_listing_bytes: usize = 8 * 1024;
 const control_socket = "daemon.sock";
 /// A pending receipt whose owner state cannot be queried is never blindly
 /// resubmitted; the user must attach the original session first.
@@ -428,8 +427,8 @@ pub const Client = struct {
     environ: ?*const std.process.Environ.Map,
     mode: cli.Mode,
 
-    /// Launcher root (HOME) and the current launcher directory. `/cd` changes
-    /// only the latter; the next explicit submission creates a session there.
+    /// Launcher root (HOME) and the initial launcher directory. The next
+    /// explicit submission creates a session there.
     root: []u8,
     launcher: []u8,
 
@@ -844,7 +843,6 @@ pub const Client = struct {
             .newest_id = if (cache.valid) cache.newest_id else null,
             .newest_bytes = if (cache.valid) cache.newest_bytes else 0,
             .previews = previews,
-            .running_sessions = 0,
             .memory = cache.memory,
             .background = cache.background,
             .input_history = recalled,
@@ -2240,7 +2238,7 @@ pub const Client = struct {
             try self.joinWorker(endpoint, id, true, self.launcher);
             return;
         }
-        // The foreground owner publishes its endpoint so `/ls`, SSH and
+        // The foreground owner publishes its endpoint so SSH and
         // `--attach` can discover it; a failed publication closes it again.
         const record = try self.startOwnedWorker(self.launcher, null, null);
         self.joinWorker(record.endpoint, record.id, true, record.project) catch |err| {
@@ -2359,8 +2357,6 @@ pub const Client = struct {
             .saved_sessions => self.manageSavedSessions(a),
             .new_session => self.manageNew(),
             .@"resume" => |id| self.manageResume(a, id),
-            .list => |args| self.manageList(a, args.running_only, args.page),
-            .cd => |path| self.manageCd(path),
             .attach => |args| self.manageAttach(args.id, args.takeover),
             .detach => self.manageDetach(),
             .exit => .{ .exit = true },
@@ -2405,78 +2401,6 @@ pub const Client = struct {
         if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
         try self.resumeSession(self.launcher, id);
         return .{ .switched = true, .notice = notice };
-    }
-
-    fn manageList(self: *Client, a: std.mem.Allocator, running_only: bool, page: usize) !session_client.Outcome {
-        const reg = try self.ensureRegistry();
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(a);
-        const records = reg.list(a, running_only, page) catch |err| switch (err) {
-            error.FileNotFound => &.{},
-            error.TooManySessions => return error.Unavailable,
-            else => return err,
-        };
-        defer if (records.len != 0) registry.freeRecords(a, records);
-        self.snap.running_sessions = records.len;
-
-        if (records.len == 0) {
-            try out.appendSlice(a, "no sessions");
-        } else {
-            const header = if (page == 0)
-                try std.fmt.allocPrint(a, "{d} session(s)\n", .{records.len})
-            else
-                try std.fmt.allocPrint(a, "{d} session(s), page {d}\n", .{ records.len, page + 1 });
-            defer a.free(header);
-            try out.appendSlice(a, header);
-        }
-        for (records, 0..) |record, index| {
-            if (out.items.len >= max_listing_bytes) break;
-            const project = record.project[0..@min(record.project.len, 64)];
-            const line = if (index + 1 == records.len)
-                try std.fmt.allocPrint(a, "{s}  {s}  {s}  {s}", .{ record.id, @tagName(record.owner), record.state, project })
-            else
-                try std.fmt.allocPrint(a, "{s}  {s}  {s}  {s}\n", .{ record.id, @tagName(record.owner), record.state, project });
-            defer a.free(line);
-            const room = max_listing_bytes - out.items.len;
-            try out.appendSlice(a, line[0..@min(line.len, room)]);
-        }
-        return .{ .listing = try out.toOwnedSlice(a) };
-    }
-
-    /// `/cd` only changes the launcher after the canonical directory is proven
-    /// usable; the current view is released (never canceled) afterwards.
-    fn manageCd(self: *Client, path: []const u8) !session_client.Outcome {
-        if (path.len == 0 or path.len > 4096) return error.InvalidPath;
-        if (std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
-        const resolved = try self.resolveDirectory(path);
-        defer self.a.free(resolved);
-        // Prove the canonical directory is accessible before changing anything.
-        var dir = std.Io.Dir.openDirAbsolute(self.io, resolved, .{}) catch return error.InvalidPath;
-        dir.close(self.io);
-        Client.detachFn(@ptrCast(self));
-        self.a.free(self.launcher);
-        self.launcher = try self.a.dupe(u8, resolved);
-        self.session = null;
-        self.cache = .{};
-        self.dirty = true;
-        // The launcher readiness belongs to the new directory's setup owner, so
-        // `/cd` in --connect must not fall back to the old project's state.
-        if (self.worksFromDaemon()) self.refreshSettings();
-        self.rebuild();
-        return .{ .notice = try std.fmt.allocPrint(self.a, "Launcher directory: {s}", .{resolved}) };
-    }
-
-    fn resolveDirectory(self: *Client, path: []const u8) ![]u8 {
-        const absolute = if (std.fs.path.isAbsolute(path))
-            try self.a.dupe(u8, path)
-        else
-            try std.fs.path.join(self.a, &.{ self.launcher, path });
-        defer self.a.free(absolute);
-        // Canonicalise below the launcher root, allowing anything absolute: the
-        // worker gets the real path, never a shell string.
-        const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.io, absolute, self.a) catch return error.InvalidPath;
-        defer self.a.free(canonical);
-        return self.a.dupe(u8, canonical);
     }
 
     /// `/attach` and `--attach`: prefer the launcher project, then the unique
@@ -2554,8 +2478,7 @@ pub const Client = struct {
             try self.joinWorker(endpoint, id, false, project);
             return;
         }
-        // Local mode keeps the same ownership rule as `--resume`: this launcher
-        // owns the restored worker and publishes its locator.
+        // Local mode owns the restored worker and publishes its locator.
         const record = try self.startOwnedWorker(project, id, null);
         self.joinWorker(record.endpoint, record.id, false, record.project) catch |err| {
             if (self.workers) |*workers| {
@@ -2894,53 +2817,9 @@ pub const Client = struct {
 
     // -- foreground ownership ---------------------------------------------
 
-    /// Ask the worker this launcher owns to cancel, join and save, then stop all
-    /// created workers. Returns the saved session id when the owner confirmed a
-    /// successful save; otherwise null (no resume line is printed).
-    /// Owner-only final shutdown on an explicitly supplied connection: greet,
-    /// verify this socket serves the very worker whose id we own, then accept
-    /// only a truthful `saved` carrying that same identity. Never guesses.
-    fn shutdownOwnedOn(self: *Client, conn: *unix.Connection, id: ids.Id) ?ids.Id {
-        var hello = self.request(.hello) catch return null;
-        defer hello.deinit();
-        var greeting = self.exchangeOn(conn, &hello, join_timeout_ms) catch return null;
-        defer greeting.deinit();
-        const peer_pid: ?u64 = @intCast(conn.peer.pid);
-        if (greeting.uint("pid") != peer_pid) return null;
-        if (greeting.uint("protocol") != protocol.version) return null;
-        const announced = greeting.text("session") orelse return null;
-        if (!std.mem.eql(u8, announced, &id)) return null;
-        var req = self.request(.shutdown) catch return null;
-        defer req.deinit();
-        var resp = self.exchangeOn(conn, &req, finish_timeout_ms) catch return null;
-        defer resp.deinit();
-        if (!resp.flag("saved", false)) return null;
-        const saved_id = resp.text("session") orelse return null;
-        if (!std.mem.eql(u8, saved_id, &id)) return null;
-        return id;
-    }
-
-    fn finishForeground(self: *Client) ?ids.Id {
-        var saved: ?ids.Id = null;
-        // `shutdown` is owner-only, so it is only sent to a session this launcher
-        // really created; an attached daemon session is never asked to exit.
-        // A detached view has already released the socket, so its own published
-        // locator is dialed once for the final ack and never adopted as a view.
-        if (self.session) |id| {
-            if (self.ownsSession(id)) {
-                if (self.conn) |*conn| {
-                    saved = self.shutdownOwnedOn(conn, id);
-                } else {
-                    for (self.published.items) |entry| {
-                        if (!std.mem.eql(u8, &entry.id, &id)) continue;
-                        var conn = unix.connect(self.a, entry.endpoint, self.uid, self.waitFor(join_timeout_ms)) catch break;
-                        defer conn.close();
-                        saved = self.shutdownOwnedOn(&conn, id);
-                        break;
-                    }
-                }
-            }
-        }
+    fn finishForeground(self: *Client) void {
+        // Stop every worker this launcher created. Each worker's shutdown path
+        // owns cancel/join/save; an attached daemon session is never touched.
         self.loseView();
         if (self.workers) |*workers| {
             workers.shutdown() catch {};
@@ -2949,7 +2828,6 @@ pub const Client = struct {
         // empty session's entry is removed only while it still points at this
         // launcher's own endpoint.
         self.retireAllPublished();
-        return saved;
     }
 };
 
@@ -3262,7 +3140,7 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     // `deinit` runs: `deinit` only fails the owner stop, it never cancels a
     // live daemon-owned worker. LIFO keeps this cleanup ahead of `deinit`.
     errdefer {
-        if (client.ownsAnyWorker()) _ = client.finishForeground();
+        if (client.ownsAnyWorker()) client.finishForeground();
     }
     client.auto_refresh = options.auto_refresh_models;
 
@@ -3270,7 +3148,7 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
         .foreground => {
             // One foreground-owned worker, published before the TUI can block on
             // it. A failed publication closes the worker again.
-            const record = client.startOwnedWorker(client.launcher, options.resume_session, options.restore_selection) catch |err| {
+            const record = client.startOwnedWorker(client.launcher, null, options.restore_selection) catch |err| {
                 report(io, "thin: could not start the session worker", err);
                 return err;
             };
@@ -3315,16 +3193,8 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
 
     if (client.ownsAnyWorker()) {
         // Foreground or a locally restored history: cancel/join/save and stop
-        // every worker this frontend owns, then print the resume line.
-        if (client.finishForeground()) |saved| {
-            if (code == 0) {
-                const line = @import("../app/resume_command.zig").format(a, saved) catch null;
-                if (line) |text| {
-                    defer a.free(text);
-                    writeOut(io, text);
-                }
-            }
-        }
+        // every worker this frontend owns.
+        client.finishForeground();
     } else {
         // Pure view (daemon-owned session): release control only.
         Client.detachFn(@ptrCast(client));
@@ -3336,13 +3206,6 @@ fn report(io: std.Io, message: []const u8, err: anyerror) void {
     var buffer: [512]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, "{s}: {s}\n", .{ message, @errorName(err) }) catch return;
     writeErr(io, text);
-}
-
-fn writeOut(io: std.Io, bytes: []const u8) void {
-    var buffer: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buffer);
-    writer.interface.writeAll(bytes) catch return;
-    writer.interface.flush() catch {};
 }
 
 fn writeErr(io: std.Io, bytes: []const u8) void {

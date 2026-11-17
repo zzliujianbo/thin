@@ -427,19 +427,6 @@
       "unit": true
     },
     {
-      "virtual": "src/app/resume_command.zig",
-      "production": "src/app/resume_command.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/app/resume_command_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
       "virtual": "src/app/resume_store.zig",
       "production": "src/app/resume_store.zig",
       "support": "tests/support/app/resume_store.zig",

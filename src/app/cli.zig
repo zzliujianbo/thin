@@ -29,7 +29,6 @@ pub const WorkerOwner = enum { foreground, daemon };
 pub const Options = struct {
     prompt: ?[]const u8 = null,
     restore_selection: ?ids.Id = null,
-    resume_session: ?ids.Id = null,
     auto_refresh_models: bool = true,
     help: bool = false,
     version: bool = false,
@@ -49,7 +48,7 @@ pub const Options = struct {
     worker_session: ?ids.Id = null,
     /// 内部 worker 的会话 owner；只由 --internal-worker 设置。
     worker_owner: WorkerOwner = .daemon,
-    /// 仅内部允许：worker 从既有 checkpoint 恢复，不得与公开 --resume/--restore-selection 混用。
+    /// 仅内部允许：worker 从既有 checkpoint 恢复，不得与公开 --restore-selection 混用。
     worker_resume: bool = false,
     /// 仅内部允许：worker 按原 --restore-selection 语义只读入旧选择（新空会话），不得与公开 flag 混用。
     worker_restore_selection: ?ids.Id = null,
@@ -71,11 +70,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
             if (result.prompt != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
             result.prompt = args[i];
-        } else if (std.mem.eql(u8, arg, "--restore-selection") or std.mem.eql(u8, arg, "--resume")) {
-            if (result.restore_selection != null or result.resume_session != null or i + 1 >= args.len) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--restore-selection")) {
+            if (result.restore_selection != null or i + 1 >= args.len) return error.InvalidArguments;
             i += 1;
-            const id = try parseId(args[i]);
-            if (std.mem.eql(u8, arg, "--resume")) result.resume_session = id else result.restore_selection = id;
+            result.restore_selection = try parseId(args[i]);
         } else if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "--connect")) {
             // 显式守护服务模式；--connect 只连接已运行的同类服务，永不自动拉起。
             const mode: Mode = if (std.mem.eql(u8, arg, "--daemon")) .daemon else .connect;
@@ -133,16 +131,16 @@ pub fn parse(args: []const [:0]const u8) !Options {
     }
 
     if (result.ssh_listen != null and result.mode != .daemon) return error.InvalidArguments;
-    if ((result.restore_selection != null or result.resume_session != null) and result.prompt != null) return error.InvalidArguments;
-    // 显式运行模式与 --print/--resume/--restore-selection 互斥；--resume 仍属于普通前台模式。
-    if (selected != null and (result.prompt != null or result.resume_session != null or result.restore_selection != null)) return error.InvalidArguments;
+    if (result.restore_selection != null and result.prompt != null) return error.InvalidArguments;
+    // 显式运行模式与 --print/--restore-selection 互斥。
+    if (selected != null and (result.prompt != null or result.restore_selection != null)) return error.InvalidArguments;
     // 只有 --attach 可以带 --takeover：替换已有的可写控制台，而不是新起服务。
     if (result.takeover and result.mode != .attach) return error.InvalidArguments;
-    // 内部 worker 的恢复标记只能在 worker 模式使用，且不得与公开 --resume/--restore-selection 混用。
-    if (result.worker_resume and (result.mode != .worker or result.resume_session != null or result.restore_selection != null or result.prompt != null)) return error.InvalidArguments;
+    // 内部 worker 的恢复标记只能在 worker 模式使用，且不得与公开 --restore-selection 混用。
+    if (result.worker_resume and (result.mode != .worker or result.restore_selection != null or result.prompt != null)) return error.InvalidArguments;
     // 内部 worker 的选择恢复同样只允许 worker 模式，并与 --worker-resume、公开模式参数互斥。
     if (result.worker_restore_selection != null and
-        (result.mode != .worker or result.worker_resume or result.resume_session != null or result.restore_selection != null or result.prompt != null)) return error.InvalidArguments;
+        (result.mode != .worker or result.worker_resume or result.restore_selection != null or result.prompt != null)) return error.InvalidArguments;
     return result;
 }
 
@@ -161,7 +159,6 @@ const linux_modes_help =
     \\Usage: thin
     \\       thin --print "prompt"
     \\       thin --restore-selection <32-lowerhex-session-id>
-    \\       thin --resume <32-lowerhex-session-id>
     \\       thin --daemon [--ssh-listen <numeric-address:port>]
     \\       thin --connect
     \\       thin --attach <32-lowerhex-session-id> [--takeover]
@@ -182,7 +179,7 @@ const linux_modes_help =
     \\Neither --connect nor --attach starts a service and neither sends a request.
     \\A missing service, endpoint or session is reported, never auto-started.
     \\--daemon, --connect and --attach are mutually exclusive and also exclude
-    \\--print, --resume and --restore-selection; a repeated mode flag is an error.
+    \\--print and --restore-selection; a repeated mode flag is an error.
     \\--takeover is valid only with --attach and replaces the previous writable console.
     \\Foreground, connect and attach need a terminal; the daemon does not.
     \\A session keeps one writable owner; an unattended dangerous command still waits.
@@ -196,13 +193,11 @@ const macos_modes_help =
     \\Usage: thin
     \\       thin --print "prompt"
     \\       thin --restore-selection <32-lowerhex-session-id>
-    \\       thin --resume <32-lowerhex-session-id>
     \\       thin --help | --version
     \\
     \\Modes: local foreground by default; --print runs one task without a TTY.
     \\Foreground workers and background tasks belong to this running instance.
     \\Exiting the foreground cancels and reaps its owned workers and tasks.
-    \\--resume restores a local checkpoint; it never automatically replays a request.
     \\SSH, --daemon, --connect, --attach, --takeover and --ssh-listen are unsupported.
     \\No persistent service or launchd job is installed or started.
     \\
@@ -241,9 +236,6 @@ const common_help =
     \\Up/Down browse this session's submitted inputs only from an empty composer.
     \\Manual edits stop browsing; navigation never submits. Keyboard recall is session-local.
     \\Session diagnostics are separate and still follow the recording settings below.
-    \\After normal exit and a successful save, only thin --resume <ID> is printed, followed by a blank line.
-    \\Empty chats print no session information or resume command.
-    \\Run the resume command from the same project with the current Thin version on PATH.
     \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles supported effort.
     \\/ opens command choices; /new [prompt] starts a fresh session. Up/Down wraps, Enter confirms (no Tab shortcut).
     \\Pickers: Up/Down selects, Enter confirms, Left returns, Esc cancels; at most 10 rows.
@@ -304,9 +296,8 @@ const common_help =
     \\It does NOT restore conversation history, tools, native replay or the old session ID.
     \\Missing providers, keys or usable model settings are shown in the dialogue interface.
     \\Use /login or /model before sending. --print cannot restore a selection.
-    \\--resume continues that SAME ID and model context, including native provider state.
+    \\/resume continues that SAME ID and model context, including native provider state.
     \\Loading never sends a request or reruns tools; only new input starts work.
-    \\The exit command is printed only after a successful full save. Empty chats create none.
     \\Checkpoints are private PLAINTEXT (0600), not redacted or encrypted; they can contain
     \\prompts, tool output and opaque reasoning. API credentials are resolved locally.
     \\Changing an API key does not prevent loading. There is no key-bound authentication.

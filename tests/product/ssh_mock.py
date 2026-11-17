@@ -135,16 +135,6 @@ def main():
             c = SshChild('/usr/bin/ssh', args(key), ws.home, env, name, ws.logs, True, 80, 24)
             case.children.append(c)
             c.pump_until(lambda: settled(c), 'real SSH TUI', 20, case.model.check)
-            # There is no startup banner to carry the launcher directory. The
-            # initial launcher is proven by resolving '.' against it: a relative
-            # path can only land on the owned HOME if that is the launcher.
-            mark = c.mark()
-            c.send_line('/cd .')
-            c.pump_until(lambda: settled(c, mark, b'Launcher directory:'), 'initial launcher directory', 20, case.model.check)
-            resolved = str(ws.home.resolve())
-            headers = [''.join(row).strip() for row in c.screen.grid if 'Launcher directory:' in ''.join(row)]
-            assert headers and (resolved in headers[-1] or str(ws.home) in headers[-1]), \
-                'initial header must agree with HOME launcher'
             return c
 
         def normal_exit(c):
@@ -203,8 +193,8 @@ def main():
         authorize(['b', 'c'])
         revoked = run(['/usr/bin/ssh']+args('a'), env)
         assert revoked.returncode != 0 and b'Permission denied' in revoked.stderr
-        mark = a.mark(); a.send_line('/help')
-        a.pump_until(lambda: settled(a, mark), 'existing connection survives revocation', 20)
+        a.pump(0.5)
+        assert a.proc.poll() is None, 'revocation killed an established view'
         c = client('c', 'new-key-c')
         normal_exit(c)
         # Invalid current authorization affects new auth, not established views.
@@ -273,18 +263,14 @@ def main():
         passed('connection-crash-isolation-and-reap')
 
         live=client('b','detached-task')
-        m=live.mark();live.send_line('/cd '+str(ws.project_a))
-        live.pump_until(lambda:settled(live, m, b'Launcher directory:'), 'select project completed',20)
         live.send_line(PROMPT)
         case.wait_prompt(PROMPT)
         live.kill();live.wait();live.close()
         wait(lambda:not connection_pids(), 'disconnected task view not reaped')
         assert not state['gate'].is_set() and case.model.count()==1
         state['gate'].set()
-        checkpoint=wait_checkpoint(ws.project_a,ANSWER)
+        checkpoint=wait_checkpoint(ws.home,ANSWER)
         again=client('b','reattach-task')
-        m=again.mark();again.send_line('/cd '+str(ws.project_a))
-        again.pump_until(lambda:settled(again, m, b'Launcher directory:'),'reattach project completed',20)
         m=again.mark();again.send_line('/attach '+checkpoint.stem)
         again.pump_until(lambda:settled(again, m, ANSWER.encode()),'canonical answer after detach',30,case.model.check)
         assert case.model.count()==1

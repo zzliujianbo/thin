@@ -23,11 +23,11 @@ test "slash suggestions preserve model login compact order and support local fuz
     const auth = suggestions("/lgn", 4, false);
     try std.testing.expectEqual(@as(usize, 1), auth.len);
     try std.testing.expectEqual(Command.auth, auth.commands[0]);
-    for ([_][]const u8{ "/new", "/ls", "/cd", "/attach", "/detach", "/exit" }) |query| {
+    for ([_][]const u8{ "/new", "/attach", "/detach", "/exit" }) |query| {
         const found = suggestions(query, query.len, false);
         try std.testing.expect(found.len >= 1);
-        // Subsequence matching may offer extra candidates (/ls also matches
-        // /close); the exact command must always be present.
+        // Subsequence matching may offer extra candidates; the exact command
+        // must always be present.
         var hit = false;
         for (found.commands[0..found.len]) |command| {
             if (std.mem.eql(u8, info(command).value, query)) hit = true;
@@ -63,7 +63,7 @@ test "resume is a remote root candidate and completes to its exact command" {
 }
 test "session commands are classified apart from local commands" {
     try std.testing.expect(!sessionOnly(.model) and !sessionOnly(.auth) and !sessionOnly(.compact) and !sessionOnly(.settings));
-    for ([_]Command{ .new_session, .sessions, .cd, .attach, .detach, .close, .exit }) |command| try std.testing.expect(sessionOnly(command));
+    for ([_]Command{ .new_session, .attach, .detach, .close, .exit }) |command| try std.testing.expect(sessionOnly(command));
 }
 test "slash suggestions exclude arguments multiline prompts paste and mid-token cursor" {
     for ([_][]const u8{ "", "hello /", " /model", "/login key", "/model\n", "/unknown", "/../", "/compact now", "/压缩", "/compact1" }) |value|

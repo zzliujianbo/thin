@@ -304,13 +304,12 @@ pub const Snapshot = struct {
     newest_id: ?u64 = null,
     newest_bytes: usize = 0,
     previews: []const QueuePreview = &.{},
-    running_sessions: usize = 0,
     /// Startup user prompts for input recall; bounded by the owner and valid
     /// until the next snapshot rebuild.
     input_history: []const []const u8 = &.{},
 };
 
-/// Session-management request. `id`, `cd` and `close` arguments are borrowed for
+/// Session-management request. `id` and `close` arguments are borrowed for
 /// the duration of `manage` only; the adapter must copy anything it retains.
 pub const SavedSession = @import("../core/session_metadata.zig").SavedSession;
 
@@ -318,28 +317,24 @@ pub const Manage = union(enum) {
     saved_sessions: void,
     new_session: void,
     @"resume": []const u8,
-    list: struct { running_only: bool = false, page: usize = 0 },
-    cd: []const u8,
     attach: struct { id: []const u8, takeover: bool = false },
     detach,
     exit,
     close: struct { id: []const u8, force: bool = false },
 };
 
-/// Management result. `notice`/`listing` are allocated with the allocator passed
+/// Management result. `notice` is allocated with the allocator passed
 /// to `manage` and freed by `Outcome.deinit`. `switched` asks the TUI to clear
 /// the old display/approval/queue/input-history state and adopt the new epoch;
 /// `exit` asks the frontend to leave without touching the daemon session.
 pub const Outcome = struct {
     notice: ?[]u8 = null,
-    listing: ?[]u8 = null,
     saved_sessions: ?[]SavedSession = null,
     switched: bool = false,
     exit: bool = false,
 
     pub fn deinit(self: *Outcome, a: std.mem.Allocator) void {
         if (self.notice) |value| a.free(value);
-        if (self.listing) |value| a.free(value);
         if (self.saved_sessions) |value| a.free(value);
         self.* = undefined;
     }
@@ -378,7 +373,7 @@ pub const VTable = struct {
     /// was already consumed.
     withdraw_fn: *const fn (*anyopaque, std.mem.Allocator, u64, u64) anyerror!?[]u8,
     /// Run a session-management request; the adapter owns path validation,
-    /// attach/takeover epochs, listing pagination and close confirmation needs.
+    /// attach/takeover epochs and close confirmation needs.
     manage_fn: *const fn (*anyopaque, std.mem.Allocator, Manage) anyerror!Outcome,
     /// Release this view/control without canceling the task. Called once when
     /// the TUI exits or the connection ends; must not fail or block forever.

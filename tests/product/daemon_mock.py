@@ -9,7 +9,7 @@ Everything here is an owned fixture, never a stub of the product:
 * one literal 127.0.0.1 Chat/SSE server whose responses are gated by this script,
 * an inline fake key inside the owned config (0600), no environment credential,
 * real `thin` processes: one `--daemon` Popen, real PTY `--connect`/`--attach`
-  clients, a real foreground `thin`, real `--resume` clients,
+  clients, and a real foreground `thin`,
 * one owned background service per daemon-reclaim case (bound 127.0.0.1:0, its
   own pid/port marker file) so SIGTERM convergence is observed on a real port.
 
@@ -22,32 +22,23 @@ Isolation rules:
 * No product wire/private AF_UNIX message format is asserted: the private
   endpoint layout and IPC framing stay backend-owned. Cases are black-box CLI
   + PTY, with session IDs read from the public `.thin/sessions/<32hex>.session`
-  names or from the public `/ls` display.
+  names.
 
 Coverage (one case per user-visible requirement):
 1. missing service: `--connect`/`--attach` fail explicitly with no spawned
    service and no inference; plain `thin` is not a daemon; mode conflicts are
    rejected by the CLI before any UI/session exists.
-2. daemon start, PTY `--connect`, `/cd` into an owned project, real inference
+2. daemon start, PTY `--connect` in an owned project, real inference
    POST gated by this script, SIGKILL of the front-end process (not Ctrl-C),
    then release: the daemon worker finishes, exactly one request was made, and
    `--attach <id>` replays the completed result without new inference.
-3. two project sessions really run in parallel (both requests gated at once),
-   each bash `pwd` proves its own root, a failed `/cd` keeps the previous
-   launcher directory, `/ls --running` reflects live sessions, and repeated
-   reconnects create no extra empty session.
-4. one writable console: a second `--attach` without `--takeover` is refused
+3. one writable console: a second `--attach` without `--takeover` is refused
    and does not displace the controller; explicit `--takeover` replaces it and
    a stale controller's Ctrl-C cannot cancel the running task.
-5. ownership boundaries: foreground-created session attached by a daemon client
-   (takeover view only, no owner migration) and daemon-created session attached
-   by an explicit `--takeover` client while the daemon console still holds the
-   writable lease; after the source owner closes, `--resume` sends no HTTP,
-   re-executes no tool and cannot steal the writer lock.
-6. an offline dangerous `rm` stays pending with no client (the owned
+4. an offline dangerous `rm` stays pending with no client (the owned
    fixture survives), and a reattached console sees the full approval popup,
    approves it explicitly, and the side effect happens exactly once.
-7. daemon SIGTERM cancels workers and owned background services: daemon, worker
+5. daemon SIGTERM cancels workers and owned background services: daemon, worker
    and service PIDs converge, the service port closes, no stale endpoint keeps
    accepting, and artifact permissions stay private (0700/0600). The owned
    service of this case exits only after a delay following TERM, so the daemon
@@ -82,7 +73,6 @@ ACK = b'\x1b[?25h'
 SYNC_BEGIN = b'\x1b[?2026h'
 FRAME_END = b'\x1b[?2026l' + ACK
 CSI = re.compile(rb'\x1b\[([0-9;?]*)([@-~])')
-HEX32 = re.compile(r'(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])')
 SESSION_NAME = re.compile(r'^([0-9a-f]{32})\.session$')
 CONTEXT_PREFIX = '[Context material'
 
@@ -705,11 +695,8 @@ class Workspace:
         self.data_home = self.root / 'data'
         self.tmp = self.root / 'tmp'
         self.logs = self.root / 'logs'
-        self.project_a = self.root / 'project-a'
-        self.project_b = self.root / 'project-b'
         for directory in (self.home, self.runtime, self.config_home, self.cache_home,
-                          self.state_home, self.data_home, self.tmp, self.logs,
-                          self.project_a, self.project_b):
+                          self.state_home, self.data_home, self.tmp, self.logs):
             directory.mkdir(parents=True, exist_ok=True)
             directory.chmod(0o700)
 
@@ -859,8 +846,7 @@ class Case:
         self.assert_no_secret()
         if self.model is not None:
             self.model.stop()
-        for project in (self.workspace.project_a, self.workspace.project_b):
-            assert_private_sessions(project)
+        assert_private_sessions(self.workspace.home)
         assert_private_runtime(self.workspace.runtime)
 
 
@@ -1247,40 +1233,6 @@ def detach_plan(fx, state, body):
     return text_answer(DETACH_ANSWER)
 
 
-def parallel_plan(fx, state, body):
-    users = real_users(body)
-    assert len(users) == 1, 'one canonical user turn per request, got %r' % (users,)
-    prompt = users[0]
-    calls, results = tool_history(body)
-    if prompt == PAR_A_PROMPT:
-        if not calls:
-            state['a1'].set()
-            assert state['b1'].wait(40), 'second session never started in parallel'
-            return tool_call('par-a-1', 'bash', {'command': 'pwd'})
-        assert len(calls) == 1 and calls[0]['id'] == 'par-a-1', 'one pwd call expected'
-        result = results.get('par-a-1')
-        assert result is not None, 'A tool result missing'
-        assert str(state['project_a']) in str(result), 'A ran outside its own root: %r' % (result,)
-        assert str(state['project_b']) not in str(result), 'A saw the sibling project root'
-        state['a2'].set()
-        assert state['release'].wait(60), 'parallel release was never signalled'
-        return text_answer(PAR_A_ANSWER)
-    if prompt == PAR_B_PROMPT:
-        if not calls:
-            state['b1'].set()
-            assert state['a1'].wait(40), 'first session never started'
-            return tool_call('par-b-1', 'bash', {'command': 'pwd'})
-        assert len(calls) == 1 and calls[0]['id'] == 'par-b-1', 'one pwd call expected'
-        result = results.get('par-b-1')
-        assert result is not None, 'B tool result missing'
-        assert str(state['project_b']) in str(result), 'B ran outside its own root: %r' % (result,)
-        assert str(state['project_a']) not in str(result), 'B saw the sibling project root'
-        state['b2'].set()
-        assert state['release'].wait(60), 'parallel release was never signalled'
-        return text_answer(PAR_B_ANSWER)
-    raise AssertionError('unexpected parallel prompt: %r' % (prompt,))
-
-
 def controller_plan(fx, state, body):
     users = real_users(body)
     assert users == [CONTROLLER_PROMPT], 'unexpected request users: %r' % (users,)
@@ -1289,26 +1241,6 @@ def controller_plan(fx, state, body):
     state['seen'].set()
     assert state['release'].wait(CONTROLLER_TIMEOUT), 'controller reply was never released'
     return text_answer(CONTROLLER_ANSWER)
-
-
-def ownership_plan(fx, state, body):
-    users = real_users(body)
-    assert len(users) == 1, 'unexpected request users: %r' % (users,)
-    prompt = users[0]
-    calls, results = tool_history(body)
-    if prompt == FG_PROMPT:
-        if not calls:
-            return tool_call('fg-tool-1', 'bash', {'command': 'printf fg-once > fg-tool-marker'})
-        assert len(calls) == 1 and calls[0]['id'] == 'fg-tool-1', 'one foreground tool expected'
-        assert results.get('fg-tool-1') is not None, 'foreground tool result missing'
-        return text_answer(FG_ANSWER)
-    if prompt == DB_PROMPT:
-        if not calls:
-            return tool_call('db-tool-1', 'bash', {'command': 'printf db-once > db-tool-marker'})
-        assert len(calls) == 1 and calls[0]['id'] == 'db-tool-1', 'one daemon tool expected'
-        assert results.get('db-tool-1') is not None, 'daemon tool result missing'
-        return text_answer(DB_ANSWER)
-    raise AssertionError('unexpected ownership prompt: %r' % (prompt,))
 
 
 def approval_plan(fx, state, body):
@@ -1367,24 +1299,24 @@ def case_no_service(app, base):
         assert case.model.count() == 0, 'mode conflicts must not infer'
 
         # --connect with no service: clear failure, no spawned service.
-        connect = case.client(['--connect'], case.workspace.project_a, 'connect-empty')
+        connect = case.client(['--connect'], case.workspace.home, 'connect-empty')
         connect.pump_until(lambda: connect.proc.poll() is not None, 'connect without service', 25)
         connect.drain()
         assert connect.wait_exit('connect failure') != 0, '--connect must fail without a service'
         assert_service_error(connect.text(), 'connect without service')
         assert case.model.count() == 0, 'failed --connect must not infer'
         assert_no_live_endpoint(case, timeout=3)
-        assert session_files(case.workspace.project_a) == [], 'failed --connect created a session'
+        assert session_files(case.workspace.home) == [], 'failed --connect created a session'
 
         # Second attempt must also fail: no service was started behind our back.
-        again = case.client(['--connect'], case.workspace.project_a, 'connect-again')
+        again = case.client(['--connect'], case.workspace.home, 'connect-again')
         again.pump_until(lambda: again.proc.poll() is not None, 'second connect failure', 25)
         again.drain()
         assert again.wait_exit('second connect failure') != 0
         assert_no_live_endpoint(case, timeout=3)
 
         # --attach with no service: explicit failure, no auto-start either.
-        attach = case.client(['--attach', '1' * 32], case.workspace.project_a, 'attach-empty')
+        attach = case.client(['--attach', '1' * 32], case.workspace.home, 'attach-empty')
         attach.pump_until(lambda: attach.proc.poll() is not None, 'attach without service', 25)
         attach.drain()
         assert attach.wait_exit('attach failure') != 0, '--attach must fail without a service'
@@ -1393,7 +1325,7 @@ def case_no_service(app, base):
         assert case.model.count() == 0
 
         # Default thin is ordinary foreground: it exits and leaves no daemon.
-        default = case.client([], case.workspace.project_a, 'default-foreground')
+        default = case.client([], case.workspace.home, 'default-foreground')
         default.pump_until(lambda: default.idle_after(0), 'default interactive idle', 30,
                            guard=case.model.check)
         default.send(b'\x04\x04')
@@ -1402,7 +1334,7 @@ def case_no_service(app, base):
         assert code == 0, 'ordinary thin exit status %r' % (code,)
         assert not runtime_sockets(case.workspace.runtime), 'plain thin left a daemon endpoint'
         assert_no_live_endpoint(case, timeout=3)
-        assert session_files(case.workspace.project_a) == [], 'empty chat created a session'
+        assert session_files(case.workspace.home) == [], 'empty chat created a session'
         assert case.model.count() == 0, 'plain thin startup inferred'
         return {'case': 'no-service', 'conflicts': 10, 'requests': 0}
     finally:
@@ -1417,15 +1349,11 @@ def case_detach_continues(app, base):
     case = Case(app, base, 'case2-detach')
     case.state.update({'seen': threading.Event(), 'gate': threading.Event()})
     case.start_model(detach_plan)
-    project = case.workspace.project_a
+    project = case.workspace.home
     try:
         case.start_daemon()
         client = case.client(['--connect'], project, 'detach-client')
         client.pump_until(lambda: client.idle_after(0), 'connect launcher idle', 30,
-                          guard=case.model.check)
-        mark = client.mark()
-        client.send_line('/cd ' + str(project))
-        client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'launcher cd completed', 20,
                           guard=case.model.check)
         client.send_line(DETACH_PROMPT)
         case.wait_prompt(DETACH_PROMPT)
@@ -1455,137 +1383,19 @@ def case_detach_continues(app, base):
 
 
 # ---------------------------------------------------------------------------
-# Case 3: parallel project sessions, root isolation, ls, failed /cd
-# ---------------------------------------------------------------------------
-
-def ls_view(case, cwd, running=False, at_least=1, timeout=30):
-    client = case.client(['--connect'], cwd, 'ls-client-%d' % len(case.children))
-    try:
-        client.pump_until(lambda: client.idle_after(0), 'ls launcher idle', 30,
-                          guard=case.model.check)
-        before_text = client.screen_text()
-        mark = client.mark()
-        client.send_line('/ls --running' if running else '/ls')
-        if at_least:
-            client.pump_until(lambda: client.frame_after(mark) and
-                              len(HEX32.findall(client.screen_text())) >= at_least,
-                              'ls listing', timeout, guard=case.model.check)
-        else:
-            # No absence marker exists; wait for a rendered listing change and a
-            # short settled observation window instead of parsing the echo only.
-            client.pump_until(lambda: client.frame_after(mark) and
-                              client.screen_text() != before_text,
-                              'ls listing', timeout, guard=case.model.check)
-            client.pump(0.6)
-        ids = set(HEX32.findall(client.screen_text()))
-        client.send(b'\x04\x04')
-        code = client.wait_exit('ls client exit', 20)
-        assert code == 0, 'launcher /ls exit status %r' % (code,)
-        return ids
-    finally:
-        client.cleanup()
-
-
-def case_parallel(app, base):
-    case = Case(app, base, 'case3-parallel')
-    case.state.update({
-        'project_a': case.workspace.project_a,
-        'project_b': case.workspace.project_b,
-        'a1': threading.Event(), 'b1': threading.Event(),
-        'a2': threading.Event(), 'b2': threading.Event(),
-        'release': threading.Event(),
-    })
-    case.start_model(parallel_plan)
-    project_a, project_b = case.workspace.project_a, case.workspace.project_b
-    try:
-        case.start_daemon()
-        client_a = case.client(['--connect'], project_a, 'parallel-a')
-        client_a.pump_until(lambda: client_a.idle_after(0), 'A launcher idle', 30,
-                            guard=case.model.check)
-        mark = client_a.mark()
-        # A failing /cd must keep the previous launcher directory/connection.
-        client_a.send_line('/cd /nonexistent-owned-directory-%d' % os.getpid())
-        client_a.pump_until(lambda: client_a.frame_after(mark, b'Directory is not accessible; launcher unchanged'), 'failed cd completed', 20,
-                            guard=case.model.check)
-        mark = client_a.mark()
-        client_a.send_line('/cd ' + str(project_a))
-        client_a.pump_until(lambda: client_a.idle_after(mark, b'Launcher directory:'), 'cd to A completed', 20,
-                            guard=case.model.check)
-        client_a.send_line(PAR_A_PROMPT)
-        case.wait_prompt(PAR_A_PROMPT)
-        assert case.state['a1'].wait(10), 'A request never reached the model'
-
-        client_b = case.client(['--connect'], project_b, 'parallel-b')
-        client_b.pump_until(lambda: client_b.idle_after(0), 'B launcher idle', 30,
-                            guard=case.model.check)
-        mark = client_b.mark()
-        client_b.send_line('/cd ' + str(project_b))
-        client_b.pump_until(lambda: client_b.idle_after(mark, b'Launcher directory:'), 'cd to B completed', 20,
-                            guard=case.model.check)
-        client_b.send_line(PAR_B_PROMPT)
-        case.wait_prompt(PAR_B_PROMPT)
-        assert case.state['b1'].wait(10), 'B request never reached the model'
-
-        # Both sessions are now executing their second round: real parallelism.
-        assert case.state['a2'].wait(30), 'A did not continue in parallel'
-        assert case.state['b2'].wait(30), 'B did not continue in parallel'
-        running_ids = ls_view(case, project_a, running=True, at_least=2)
-        assert len(running_ids) >= 2, '/ls --running hid live sessions: %r' % (running_ids,)
-
-        case.state['release'].set()
-        client_a.pump_until(lambda: client_a.idle_after(0, PAR_A_ANSWER.encode()),
-                            'A answer', 40, guard=case.model.check)
-        client_b.pump_until(lambda: client_b.idle_after(0, PAR_B_ANSWER.encode()),
-                            'B answer', 40, guard=case.model.check)
-        assert case.model.count(PAR_A_PROMPT) == 2, 'A must run exactly two rounds'
-        assert case.model.count(PAR_B_PROMPT) == 2, 'B must run exactly two rounds'
-
-        ids_a = {SESSION_NAME.match(path.name).group(1) for path in wait_sessions(project_a)}
-        ids_b = {SESSION_NAME.match(path.name).group(1) for path in wait_sessions(project_b)}
-        assert ids_a and ids_b and ids_a.isdisjoint(ids_b), 'project sessions not isolated'
-        all_ids = ls_view(case, project_a, running=False, at_least=2)
-        assert ids_a | ids_b <= all_ids, '/ls did not list both sessions: %r' % (all_ids,)
-        idle_running = ls_view(case, project_a, running=True, at_least=0)
-        assert not (ids_a | ids_b) & idle_running, '/ls --running still listed idle sessions'
-
-        before = (len(session_files(project_a)), len(session_files(project_b)))
-        for index in range(3):
-            reconnect = case.client(['--connect'], project_a, 'reconnect-%d' % index)
-            reconnect.pump_until(lambda: reconnect.idle_after(0), 'reconnect idle', 30,
-                                 guard=case.model.check)
-            reconnect.send(b'\x04\x04')
-            assert reconnect.wait_exit('reconnect exit', 25) == 0
-        after = (len(session_files(project_a)), len(session_files(project_b)))
-        assert before == after, 'reconnects created empty sessions: %r -> %r' % (before, after)
-        assert case.model.count() == 4, 'reconnects inferred: %d' % case.model.count()
-
-        client_a.send(b'\x04\x04')
-        client_b.send(b'\x04\x04')
-        assert client_a.wait_exit('A exit', 25) == 0
-        assert client_b.wait_exit('B exit', 25) == 0
-        return {'case': 'parallel', 'ids': sorted(ids_a | ids_b),
-                'requests': case.model.count()}
-    finally:
-        case.close()
-
-
-# ---------------------------------------------------------------------------
-# Case 4: one writable console, explicit takeover, stale controller ignored
+# Case 3: parallel project sessions and root isolation
 # ---------------------------------------------------------------------------
 
 def case_controller(app, base):
     case = Case(app, base, 'case4-controller')
     case.state.update({'seen': threading.Event(), 'release': threading.Event()})
     case.start_model(controller_plan)
-    project = case.workspace.project_a
+    project = case.workspace.home
     try:
         case.start_daemon()
         first = case.client(['--connect'], project, 'controller-first')
         first.pump_until(lambda: first.idle_after(0), 'first launcher idle', 30,
                          guard=case.model.check)
-        mark = first.mark()
-        first.send_line('/cd ' + str(project))
-        first.pump_until(lambda: first.idle_after(mark, b'Launcher directory:'), 'cd completed', 20, guard=case.model.check)
         busy = first.mark()
         first.send_line(CONTROLLER_PROMPT)
         case.wait_prompt(CONTROLLER_PROMPT)
@@ -1641,115 +1451,10 @@ def case_controller(app, base):
 # Case 5: ownership boundaries + resume without replay or lock stealing
 # ---------------------------------------------------------------------------
 
-def case_ownership(app, base):
-    case = Case(app, base, 'case5-ownership')
-    case.start_model(ownership_plan)
-    project_a, project_b = case.workspace.project_a, case.workspace.project_b
-    try:
-        case.start_daemon()
-
-        # -- foreground creates a session; a daemon client may view it only.
-        foreground = case.client([], project_a, 'foreground-owner')
-        foreground.pump_until(lambda: foreground.idle_after(0), 'foreground idle', 30,
-                              guard=case.model.check)
-        foreground.send_line(FG_PROMPT)
-        foreground.pump_until(lambda: foreground.idle_after(0, FG_ANSWER.encode()),
-                              'foreground answer', 40, guard=case.model.check)
-        fg_id = session_id(project_a)
-        assert (project_a / 'fg-tool-marker').read_text() == 'fg-once'
-        assert case.model.count(FG_PROMPT) == 2, 'foreground tool round count'
-
-        viewer = case.client(['--attach', fg_id, '--takeover'], project_a, 'daemon-viewer')
-        viewer.pump_until(lambda: viewer.frame_after(0, FG_ANSWER.encode()),
-                          'daemon client view of foreground session', 30,
-                          guard=case.model.check)
-        assert case.model.count() == 2, 'foreground attach caused inference'
-
-        # Source owner closes: the view dies with it, nothing is promoted.
-        foreground.send(b'\x04\x04')
-        foreground.wait_exit('foreground owner exit', 30)
-        deadline = time.monotonic() + 10
-        while viewer.proc.poll() is None and time.monotonic() < deadline:
-            viewer.pump(0.05)
-        viewer.pump(0.5)
-        assert case.model.count() == 2, 'daemon client promoted the foreground session'
-        assert (project_a / 'fg-tool-marker').read_text() == 'fg-once', \
-            'foreground tool re-executed after owner exit'
-        assert lock_is_free(project_a, fg_id), 'foreground writer lock was not released'
-        if viewer.proc.poll() is None:
-            viewer.send(b'\x04\x04')
-            viewer.wait_exit('viewer exit', 20)
-
-        # Foreground --resume shows history without new inference or tools.
-        resume_fg = case.client(['--resume', fg_id], project_a, 'foreground-resume')
-        resume_fg.pump_until(lambda: resume_fg.idle_after(0, FG_ANSWER.encode()),
-                             'foreground resume history', 40, guard=case.model.check)
-        assert case.model.count() == 2, 'foreground resume inferred'
-        assert (project_a / 'fg-tool-marker').read_text() == 'fg-once'
-        resume_fg.send(b'\x04\x04')
-        assert resume_fg.wait_exit('foreground resume exit', 25) == 0
-
-        # -- daemon creates a session; another client may view it only by an
-        # explicit takeover, because the daemon client still owns the console.
-        daemon_client = case.client(['--connect'], project_b, 'daemon-creator')
-        daemon_client.pump_until(lambda: daemon_client.idle_after(0), 'daemon launcher idle', 30,
-                                 guard=case.model.check)
-        mark = daemon_client.mark()
-        daemon_client.send_line('/cd ' + str(project_b))
-        daemon_client.pump_until(lambda: daemon_client.idle_after(mark, b'Launcher directory:'), 'daemon cd completed', 20,
-                                 guard=case.model.check)
-        daemon_client.send_line(DB_PROMPT)
-        daemon_client.pump_until(lambda: daemon_client.idle_after(0, DB_ANSWER.encode()),
-                                 'daemon answer', 40, guard=case.model.check)
-        db_id = session_id(project_b)
-        assert (project_b / 'db-tool-marker').read_text() == 'db-once'
-        before = case.model.count()
-        assert before == 4, 'daemon ownership rounds: %d' % before
-
-        plain_attach = case.client(['--attach', db_id, '--takeover'], project_b,
-                                   'takeover-attach')
-        plain_attach.pump_until(lambda: plain_attach.idle_after(0, DB_ANSWER.encode()),
-                                'takeover attach to daemon session', 30, guard=case.model.check)
-        assert case.model.count() == before, 'takeover attach inferred'
-        daemon_client.send(b'\x04\x04')
-        assert daemon_client.wait_exit('daemon client exit', 25) == 0
-        plain_attach.send(b'\x04\x04')
-        assert plain_attach.wait_exit('plain attach exit', 25) == 0
-
-        # Source owner (daemon) closes: resume must not replay anything.
-        stop_daemon(case)
-        assert (project_b / 'db-tool-marker').read_text() == 'db-once'
-        assert lock_is_free(project_b, db_id), 'daemon stop did not release the writer lock'
-
-        resume_one = case.client(['--resume', db_id], project_b, 'daemon-resume-one')
-        resume_one.pump_until(lambda: resume_one.idle_after(0, DB_ANSWER.encode()),
-                              'daemon resume history', 40, guard=case.model.check)
-        assert case.model.count() == before, 'resume inferred'
-        # Second writer must be refused while the first resume holds the lock.
-        resume_two = case.client(['--resume', db_id], project_b, 'daemon-resume-two')
-        resume_two.pump_until(lambda: resume_two.proc.poll() is not None,
-                              'second resume refusal', 25)
-        resume_two.drain()
-        assert resume_two.wait_exit('second resume refusal', 20) != 0, \
-            'second writer silently stole the checkpoint lock'
-        assert case.model.count() == before, 'refused resume inferred'
-        assert (project_b / 'db-tool-marker').read_text() == 'db-once'
-        resume_one.send(b'\x04\x04')
-        assert resume_one.wait_exit('daemon resume exit', 25) == 0
-        return {'case': 'ownership', 'foreground': fg_id, 'daemon': db_id,
-                'requests': case.model.count()}
-    finally:
-        case.close()
-
-
-# ---------------------------------------------------------------------------
-# Case 6: offline dangerous command needs explicit approval
-# ---------------------------------------------------------------------------
-
 def case_offline_approval(app, base):
     case = Case(app, base, 'case6-approval')
     case.state.update({'approved': threading.Event(), 'victim': None})
-    project = case.workspace.project_a
+    project = case.workspace.home
     victim = project / '.ssh' / 'fixture-marker'
     victim.parent.mkdir(parents=True)
     victim.write_text('owned\n')
@@ -1759,10 +1464,6 @@ def case_offline_approval(app, base):
         case.start_daemon()
         client = case.client(['--connect'], project, 'approval-client')
         client.pump_until(lambda: client.idle_after(0), 'approval launcher idle', 30,
-                          guard=case.model.check)
-        mark = client.mark()
-        client.send_line('/cd ' + str(project))
-        client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'approval cd completed', 20,
                           guard=case.model.check)
         client.send_line(APPROVAL_PROMPT)
         client.pump_until(lambda: client.frame_after(0, b'Y allow once'), 'approval popup', 40,
@@ -1843,7 +1544,7 @@ def case_offline_approval(app, base):
 
 def case_daemon_reclaim(app, base):
     case = Case(app, base, 'case7-reclaim')
-    project = case.workspace.project_a
+    project = case.workspace.home
     script = project / SERVICE_SCRIPT
     script.write_text(SERVICE_SOURCE)
     # Absolute owned path: the cmdline ownership check matches this exactly.
@@ -1855,10 +1556,6 @@ def case_daemon_reclaim(app, base):
         daemon = case.start_daemon()
         client = case.client(['--connect'], project, 'reclaim-client')
         client.pump_until(lambda: client.idle_after(0), 'reclaim launcher idle', 30,
-                          guard=case.model.check)
-        mark = client.mark()
-        client.send_line('/cd ' + str(project))
-        client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'reclaim cd completed', 20,
                           guard=case.model.check)
         client.send_line(SERVICE_PROMPT)
         client.pump_until(lambda: client.idle_after(0, SERVICE_ANSWER.encode()),
@@ -1941,17 +1638,12 @@ def case_streaming(app, base, daemon=False):
     try:
         case.model = StreamFixture(lambda body: text_answer('unused'))
         write_config(case.workspace.home, case.model.start())
-        project = case.workspace.project_a
+        project = case.workspace.home
         if daemon:
             case.start_daemon()
         client = case.client(['--connect'] if daemon else [], project, 'stream-view')
         client.pump_until(lambda: client.idle_after(0), 'stream initial idle', 25,
                           guard=case.model.check)
-        if daemon:
-            mark = client.mark()
-            client.send_line('/cd ' + str(project))
-            client.pump_until(lambda: client.idle_after(mark, b'Launcher directory:'), 'stream project completed', 20,
-                              guard=case.model.check)
         mark = client.mark()
         client.send_line('Stream the owned sequence without tool calls.')
         deadline = time.monotonic() + 15
@@ -2017,9 +1709,7 @@ def main():
         cases = (
             ('no service and mode conflicts', case_no_service),
             ('daemon detach and attach completion', case_detach_continues),
-            ('parallel project sessions', case_parallel),
             ('single console and takeover', case_controller),
-            ('ownership boundaries and resume', case_ownership),
             ('offline dangerous approval', case_offline_approval),
             ('daemon SIGTERM reclaim', case_daemon_reclaim),
             ('foreground incremental stream', case_streaming),

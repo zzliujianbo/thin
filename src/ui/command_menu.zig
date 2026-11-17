@@ -2,7 +2,7 @@
 const std = @import("std");
 const text = @import("text.zig");
 
-pub const Command = enum { model, auth, compact, settings, new_session, sessions, cd, attach, detach, close, @"resume", exit };
+pub const Command = enum { model, auth, compact, settings, new_session, attach, detach, close, @"resume", exit };
 pub const Item = struct { command: Command, value: []const u8, arguments: []const u8 = "", description: []const u8 };
 pub const items = [_]Item{
     .{ .command = .model, .value = "/model", .arguments = "[exact-id|--refresh]", .description = "Select model" },
@@ -10,8 +10,6 @@ pub const items = [_]Item{
     .{ .command = .compact, .value = "/compact", .description = "Compact conversation" },
     .{ .command = .settings, .value = "/settings", .description = "Global settings" },
     .{ .command = .new_session, .value = "/new", .arguments = "[prompt]", .description = "Start a new session" },
-    .{ .command = .sessions, .value = "/ls", .arguments = "[--running] [--page N]", .description = "List sessions" },
-    .{ .command = .cd, .value = "/cd", .arguments = "<dir>", .description = "Change launcher directory" },
     .{ .command = .attach, .value = "/attach", .arguments = "[--takeover] <id>", .description = "Attach a session" },
     .{ .command = .detach, .value = "/detach", .description = "Leave session view" },
     .{ .command = .close, .value = "/close", .arguments = "[--force] <id>", .description = "Close a session" },

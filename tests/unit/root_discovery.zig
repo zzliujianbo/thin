@@ -77,7 +77,6 @@ test {
     _ = @import("app/selection.zig");
     _ = @import("app/resume_codec.zig");
     _ = @import("app/resume_store.zig");
-    _ = @import("app/resume_command.zig");
     _ = @import("core/checkpoint.zig");
     _ = @import("app/journal.zig");
     _ = @import("app/session.zig");

@@ -176,7 +176,7 @@ check_sshd_config() {
         else
             pass
         fi
-        forbid_active "$file" '(^|[[:space:]])(--daemon|--print|--resume|--attach|--no-log)([[:space:]]|$)' \
+        forbid_active "$file" '(^|[[:space:]])(--daemon|--print|--attach|--no-log)([[:space:]]|$)' \
             "sshd 样例（登录路径不得携带守护/一次性/恢复参数）"
         forbid_active "$file" '(^|[[:space:]])(nohup|systemctl|setsid|sudo|exec)([[:space:]]|$)' \
             "sshd 样例（登录路径不得启动服务）"
@@ -230,7 +230,7 @@ check_daemon_unit() {
     fi
 
     # 只以 --daemon 启动：不得变成 SSH 入口、一次性模式或前台恢复，也不得自行脱离 systemd。
-    forbid_active "$file" '(^|[[:space:]])(--connect|--print|--attach|--resume|--no-log|--help)([[:space:]]|$)' \
+    forbid_active "$file" '(^|[[:space:]])(--connect|--print|--attach|--no-log|--help)([[:space:]]|$)' \
         "守护服务（ExecStart 不得携带其它运行模式参数）"
     forbid_active "$file" '(^|[[:space:]])(ba|z|k)?sh[[:space:]]+-c' "守护服务（不得用 shell -c 包装）"
     forbid_active "$file" '(^|[[:space:]])(nohup|setsid|screen|tmux)([[:space:]]|$)' \

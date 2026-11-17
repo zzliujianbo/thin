@@ -735,8 +735,7 @@ fn entryInterrupted(_: ?*const anyopaque) bool {
     return interrupt.signal() != 0;
 }
 
-// Terminal cleanup emits no session metadata. The application prints exactly
-// one resume command only after it has saved a nonempty conversation.
+// Terminal cleanup emits no session metadata.
 fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *const fn () u8) !u8 {
     if (!terminal.restore()) return error.TerminalRestoreFailed;
     const signal = read_signal();
@@ -2456,13 +2455,11 @@ const Ui = struct {
         const name = trimmed[0..name_end];
         const is_resume = std.mem.eql(u8, name, "/resume");
         const is_new = std.mem.eql(u8, name, "/new");
-        const is_list = std.mem.eql(u8, name, "/ls");
-        const is_cd = std.mem.eql(u8, name, "/cd");
-        const is_attach = std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch");
+        const is_attach = std.mem.eql(u8, name, "/attach");
         const is_detach = std.mem.eql(u8, name, "/detach");
         const is_exit = std.mem.eql(u8, name, "/exit");
         const is_close = std.mem.eql(u8, name, "/close");
-        if (!(is_resume or is_new or is_list or is_cd or is_attach or is_detach or is_exit or is_close)) return false;
+        if (!(is_resume or is_new or is_attach or is_detach or is_exit or is_close)) return false;
         // The editor is wiped below; parse an owned copy so arguments stay valid.
         const owned = self.allocator.dupe(u8, trimmed) catch {
             self.wipeEditor();
@@ -2517,42 +2514,8 @@ const Ui = struct {
             self.applyManage(backend, if (is_detach) .detach else .exit);
             return true;
         }
-        if (is_cd) {
-            if (rest.len == 0 or rest.len > 4096) {
-                self.notice = "Usage: /cd <directory>";
-                return true;
-            }
-            // No chdir and no bash string: the backend validates the path,
-            // detaches first and changes only the launcher directory.
-            self.applyManage(backend, .{ .cd = rest });
-            return true;
-        }
         var words: [4][]const u8 = undefined;
         const count = splitWords(rest, &words);
-        if (is_list) {
-            var running_only = false;
-            var page: usize = 0;
-            var index: usize = 0;
-            while (index < count) : (index += 1) {
-                const word = words[index];
-                if (std.mem.eql(u8, word, "--running")) {
-                    running_only = true;
-                    continue;
-                }
-                if (std.mem.eql(u8, word, "--page") and index + 1 < count) {
-                    index += 1;
-                    page = std.fmt.parseInt(usize, words[index], 10) catch {
-                        self.notice = "Usage: /ls [--running] [--page N]";
-                        return true;
-                    };
-                    continue;
-                }
-                self.notice = "Usage: /ls [--running] [--page N]";
-                return true;
-            }
-            self.applyManage(backend, .{ .list = .{ .running_only = running_only, .page = page } });
-            return true;
-        }
         var force = false;
         var takeover = false;
         var id: ?[]const u8 = null;
@@ -2732,13 +2695,10 @@ const Ui = struct {
         // Leaving the owner view ends any handled-terminal wait; the result and
         // its notice stay as the last known state instead of a busy display.
         if (self.remote()) |client| if (!client.snapshot().attached and self.remote_terminal_wait) self.releaseRemoteTerminalWait();
-        if (outcome.listing) |listing| _ = self.add(.notice, listing) catch {};
         if (outcome.notice) |notice| {
-            // Transfer ownership instead of copying a bounded listing twice.
+            // Transfer ownership instead of copying the notice twice.
             outcome.notice = null;
             self.adoptNotice(notice);
-        } else if (outcome.listing != null) {
-            self.notice = "Ready";
         }
         self.submitNewPrompt() catch |err| {
             self.notice = self.describeError(err);
@@ -4664,8 +4624,8 @@ const Ui = struct {
             synthetic = try std.fmt.allocPrint(self.allocator, "!{s}", .{self.editor.bytes.items});
             break :blk synthetic.?;
         } else typed;
-        // Session management resolves before steering: /ls, /cd, /attach,
-        // /detach, /exit and /close work while a task is busy and never enter
+        // Session management resolves before steering: /attach, /detach,
+        // /exit and /close work while a task is busy and never enter
         // the model, Steering or FollowUp. Command mode is already a bash task.
         if (!self.command_mode and self.runManageText(command)) return;
         if (self.terminal_notice_pending != null) return;
@@ -4715,14 +4675,6 @@ const Ui = struct {
                 return;
             };
             self.notice = "Refreshing official model metadata...";
-            return;
-        }
-        if (std.mem.eql(u8, command, "/help")) {
-            self.wipeEditor();
-            _ = try self.add(.notice, if (self.remote() != null)
-                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n/new [prompt]  Start a new session\n/ls [--running] [--page N]  List sessions\n/resume [id]  Resume saved session\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
-            else
-                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n!command  Run a local command without main-model inference");
             return;
         }
         if (std.mem.eql(u8, command, "/settings") or std.mem.startsWith(u8, command, "/settings ") or std.mem.startsWith(u8, command, "/settings\t")) {
@@ -4786,7 +4738,7 @@ const Ui = struct {
             const idle = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
             if (!auth and !codex) {
-                self.notice = "Unknown command; use /help, /model, /login, /compact or /settings";
+                self.notice = "Unknown command; use /model, /login, /compact or /settings";
             } else if (!idle) {
                 self.notice = "Setup requires an idle, non-pasted session";
             } else {
@@ -7074,7 +7026,7 @@ const Ui = struct {
     fn prepareComposer(self: *Ui, a: std.mem.Allocator, state: Connection.State, cols: usize) !PreparedComposer {
         // Mask only genuinely sensitive or invalid slash arguments. Trailing
         // whitespace alone never hides anything, and product-supported ordinary
-        // arguments (/attach, /cd, /close, /ls) stay visible and editable.
+        // arguments (/attach, /close) stay visible and editable.
         const trimmed = std.mem.trimStart(u8, self.editor.bytes.items, " \t\r\n");
         const is_model = modelCommand(trimmed);
         const command_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
@@ -8061,19 +8013,11 @@ fn sensitiveArguments(name: []const u8, rest: []const u8) bool {
     const args = std.mem.trim(u8, rest, " \t\r\n");
     if (args.len == 0) return false; // Trailing whitespace alone is never sensitive.
     if (std.mem.findAny(u8, args, "\r\n") != null) return true; // Commands are single-line.
-    if (std.mem.eql(u8, name, "/cd")) return args.len > 4096;
     if (std.mem.eql(u8, name, "/model")) return !picker_module.manualName(args);
-    if (std.mem.eql(u8, name, "/ls")) return !listArgumentsValid(args);
-    if (std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch") or std.mem.eql(u8, name, "/close"))
+    if (std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/close"))
         return !sessionArgumentsValid(name, args);
-    // /login, /compact, /help, /detach, /exit and unknown commands take no
+    // /login, /compact, /detach, /exit and unknown commands take no
     // arguments; non-empty text cannot be told apart from an accidental paste.
-    return true;
-}
-
-fn decimalWord(word: []const u8) bool {
-    if (word.len == 0) return false;
-    for (word) |byte| if (byte < '0' or byte > '9') return false;
     return true;
 }
 
@@ -8087,24 +8031,6 @@ fn splitQuiet(value: []const u8, out: *[4][]const u8) usize {
         count += 1;
     }
     return count;
-}
-
-fn listArgumentsValid(args: []const u8) bool {
-    var words: [4][]const u8 = undefined;
-    const count = splitQuiet(args, &words);
-    if (count > words.len) return false;
-    var index: usize = 0;
-    while (index < count) : (index += 1) {
-        const word = words[index];
-        if (std.mem.eql(u8, word, "--running")) continue;
-        if (std.mem.eql(u8, word, "--page") and index + 1 < count and decimalWord(words[index + 1])) {
-            index += 1;
-            continue;
-        }
-        if (decimalWord(word)) continue;
-        return false;
-    }
-    return true;
 }
 
 fn sessionArgumentsValid(name: []const u8, args: []const u8) bool {

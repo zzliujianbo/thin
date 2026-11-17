@@ -15,7 +15,7 @@
 - **不做**：macOS SSH 入口、TCP SSH 监听、常驻 daemon、daemon 会话接入/断线续跑、launchd 或其他服务托管。这些不再是 macOS 发布或合并门槛，也不是需要补齐的“临时缺失”。
 - **保留 Linux 功能**：不删除或禁用既有 Linux SSH、daemon 及其测试；Linux 回归仍覆盖原功能。
 - **内部 worker/IPC 仍需做**：当前普通前台也启动实例自有 worker、使用本地 Unix socket 和部分 `daemon/` 下的共享代码。这不是用户级常驻 daemon，不能因取消 daemon 支持就整目录删除或跳过安全、回收与持久化边界。
-- 本地 `--resume` 等 checkpoint 恢复继续保留；不为 daemon 会话额外实现 attach/takeover。若共享的 attach 逻辑是现有前台所必需，只处理本地所需路径。
+- 本地 checkpoint 恢复继续保留；不为 daemon 会话额外实现 attach/takeover。若共享的 attach 逻辑是现有前台所必需，只处理本地所需路径。
 - 产品能力开关与 Darwin 本地后端代码已完成，本机 Debug/ReleaseSmall 产品构建、完整单元和四套既有本地端到端验收均通过；最低 macOS 版本及其他 Mac 机器验证明确排除。
 - 先按用户要求完成代码、统一构建/单元测试并停止；随后经明确授权完成既有 CLI/TUI 端到端验收，再追加安装脚本适配及临时目录验收。用户现已授权提交并推送 `feat/macos-support`；不向真实安装目录安装，不发布或合并到 `main`。
 
@@ -187,7 +187,7 @@ P1a 当时只迁移通用文件/锁调用；`daemon/unix.zig`、registry 的其�
 
 本机产物及日志目录：`/tmp/thin-macos-e2e.30XEQI`（临时证据，不是仓库产物）。最终文件为 `app-{debug,small}.log`、`memory-cli-{debug,small}.log`、`memory-tui-{debug,small}.log`、`background-{debug,small}.log`、`unit-{debug,small}.log`，产品与驱动在 `bin/`。完整 unit 根编译后直接运行，避免构建协议掩盖崩溃进度；Linux 最终语义检查见 `linux-semantic.log`。
 
-复跑使用上述既有脚本与同模式产品/PTY 驱动，`TMPDIR=/tmp`；app 入口必须不带 `--resume-only` 或 `--selection-restore-only` 等子集开关。全部为私有配置与 loopback HTTP/真实 PTY，不以这些结果宣称真实提供方、外网 TLS/代理或生产压力已验证。本轮验收至此结束。
+复跑使用上述既有脚本与同模式产品/PTY 驱动，`TMPDIR=/tmp`；app 入口必须不带 `--selection-restore-only` 等子集开关。全部为私有配置与 loopback HTTP/真实 PTY，不以这些结果宣称真实提供方、外网 TLS/代理或生产压力已验证。本轮验收至此结束。
 
 不要求 macOS daemon/SSH 接入、脱离前台后的常驻任务或远程重连；增加不支持参数的负向验收，证明拒绝时没有监听、服务/worker 启动或模型请求等副作用。
 

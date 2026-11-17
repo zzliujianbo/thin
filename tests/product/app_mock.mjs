@@ -21,7 +21,6 @@ import {settingsRegressions} from './settings_mock.mjs';
 import {imageModelRegressions} from './image_model_mock.mjs';
 import {settingsValuesRegressions} from './settings_values_mock.mjs';
 import {selectionRestoreRegressions} from './selection_restore_mock.mjs';
-import {fullResumeRegressions} from './full_resume_mock.mjs';
 
 // 命令行参数：第一个是 thin 可执行文件的绝对路径，第二个是 thin-app-pty 驱动的绝对路径。
 const [appArg, ptyArg] = process.argv.slice(2);
@@ -679,7 +678,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
       const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','auth-missing','auth-empty','menu-navigation','auth-go','model-select-empty'].includes(kind);
       if (silentExit) assert.equal(ids.length,0, 'empty exit must not announce a session');
       else if (kind === 'model-select') assert(ids.length <= 1); // Transient unsaved profiles can refuse checkpointing.
-      else assert.equal(ids.length,1, 'saved conversation must print exactly one resume command');
+      else assert.equal(ids.length,1, 'saved conversation must announce exactly one session id');
       const announced = ids[0]?.[1];
       const logDir = join(project,'.thin/sessions');
       if (announced && await exists(logDir) && (await stat(logDir)).isDirectory()) {
@@ -952,8 +951,6 @@ try {
     await timed('suite', 'log', () => logRegressions(app,pty));
   } else if (process.argv.includes('--selection-restore-only')) {
     await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));
-  } else if (process.argv.includes('--resume-only')) {
-    await timed('suite', 'full-resume', () => fullResumeRegressions({app,pty,execute}));
   } else if (process.argv.includes('--tool-presentation-only')) {
     for (const kind of ['tool-icons','file-stats','memory-summary']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (!watchdogOnly) {
@@ -986,7 +983,6 @@ try {
   await timed('suite', 'image-model', () => imageModelRegressions({app,pty,execute,send}));
   await timed('suite', 'settings-values', () => settingsValuesRegressions({app,pty,execute,send}));
   await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));
-  await timed('suite', 'full-resume', () => fullResumeRegressions({app,pty,execute}));
   console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
   }
 
@@ -997,7 +993,7 @@ try {
   const frame = /^\s+at .*\/tests\/product\/([a-zA-Z0-9_-]+\.mjs):(\d+):\d+\)?$/m.exec(error.stack ?? '');
   const location = /^[a-zA-Z0-9_-]+\.mjs:\d+$/.test(error.fixtureLocation ?? '')
     ? error.fixtureLocation : frame ? `${frame[1]}:${frame[2]}` : 'unknown';
-  const label = /^(?:log|selection|settings|resume|login|pty)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_=-]+$/.test(error.fixtureCheck ?? '')
+  const label = /^(?:log|selection|settings|login|pty)\/[a-z-]+$/.test(error.fixtureCase ?? '') && /^[a-zA-Z0-9 /:_=-]+$/.test(error.fixtureCheck ?? '')
     ? `${error.fixtureCase}: ${error.fixtureCheck} at ${location}` : `offline fixture assertion at ${location} (details withheld)`;
   console.error(`FAIL application acceptance: ${label}`);
   process.exitCode = 1;

@@ -39,17 +39,9 @@ test "CLI selection restore is explicit bounded and interactive only" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--restore-selection", id, "-p", "go" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--restore-selection", id, "--restore-selection", id }));
 }
-test "CLI resume is distinct same-session interactive selection and rejects conflicts" {
+test "CLI no longer accepts the removed resume flag" {
     const id = "0123456789abcdef0123456789abcdef";
-    const options = try parse(&.{ "thin", "--resume", id });
-    try std.testing.expectEqualStrings(id, &options.resume_session.?);
-    try std.testing.expect(options.restore_selection == null);
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume" }));
-    try std.testing.expectError(error.InvalidSessionID, parse(&.{ "thin", "--resume", "../invalid" }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--resume", id }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--restore-selection", id }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--restore-selection", id, "--resume", id }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--print", "go" }));
+    try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--resume", id }));
 }
 test "CLI ordinary tools run directly and print requires a prompt" {
     const options = try parse(&.{ "thin", "--print", "hello" });
@@ -65,7 +57,7 @@ test "CLI ordinary tools run directly and print requires a prompt" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print" }));
     try std.testing.expectError(error.UnknownOption, parse(&.{ "thin", "--config", "other.json" }));
 }
-test "CLI defaults to foreground and resume stays foreground" {
+test "CLI defaults to foreground and selection restore stays foreground" {
     const plain = try parse(&.{"thin"});
     try std.testing.expectEqual(Mode.foreground, plain.mode);
     try std.testing.expect(plain.attach_session == null and !plain.takeover);
@@ -74,9 +66,6 @@ test "CLI defaults to foreground and resume stays foreground" {
     try std.testing.expect(!plain.worker_resume);
 
     const id = "0123456789abcdef0123456789abcdef";
-    const resumed = try parse(&.{ "thin", "--resume", id });
-    try std.testing.expectEqual(Mode.foreground, resumed.mode);
-    try std.testing.expectEqualStrings(id, &resumed.resume_session.?);
     const restored = try parse(&.{ "thin", "--restore-selection", id });
     try std.testing.expectEqual(Mode.foreground, restored.mode);
     try std.testing.expectEqualStrings(id, &restored.restore_selection.?);
@@ -110,12 +99,10 @@ test "CLI daemon connect attach are exclusive with each other and other run mode
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--connect" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--attach", other }));
 
-    // 与 --print/--resume/--restore-selection 冲突，包括反向顺序。
+    // 与 --print/--restore-selection 冲突，包括反向顺序。
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--print", "go" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--print", "go", "--connect" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--print", "go" }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--resume", id }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--resume", id, "--connect" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--attach", id, "--restore-selection", id }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--restore-selection", id, "--attach", id }));
 
@@ -169,9 +156,8 @@ test "CLI internal worker carries endpoint session and owner" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--daemon", "--internal-worker", socket, id, "daemon" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--print", "go" }));
 
-    // --worker-resume 是内部标记：不能与公开 --resume/--restore-selection 混用，也不能单独使用。
+    // --worker-resume 是内部标记：不能与公开 --restore-selection 混用，也不能单独使用。
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--worker-resume" }));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--resume", id }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--internal-worker", socket, id, "daemon", "--restore-selection", id }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "thin", "--worker-resume", "--worker-resume", "--internal-worker", socket, id, "daemon" }));
     try std.testing.expect(std.mem.indexOf(u8, help, "--worker-restore-selection") == null);
@@ -211,7 +197,6 @@ test "CLI worker restore-selection is worker-only and exclusive" {
         &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--worker-restore-selection", prior }, // 重复
         &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-resume", "--worker-restore-selection", prior }, // 与 worker-resume 混用
         &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--worker-resume" },
-        &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--resume", id }, // 公开 resume
         &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--restore-selection", id }, // 公开 restore
         &.{ "thin", "--internal-worker", socket, id, "daemon", "--worker-restore-selection", prior, "--print", "go" }, // 公开 print
     };
@@ -224,7 +209,7 @@ test "CLI worker restore-selection is worker-only and exclusive" {
 test "CLI help documents explicit modes without advertising internal entry" {
     if (@import("builtin").os.tag == .macos) {
         try std.testing.expect(std.mem.indexOf(u8, help, "macOS local mode") != null);
-        try std.testing.expect(std.mem.indexOf(u8, help, "--resume <32-lowerhex-session-id>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, help, "/resume continues that SAME ID") != null);
         try std.testing.expect(std.mem.indexOf(u8, help, "are unsupported") != null);
         try std.testing.expect(std.mem.indexOf(u8, help, "Only --daemon explicitly runs") == null);
         try std.testing.expect(std.mem.indexOf(u8, help, "--internal-worker") == null);

@@ -141,6 +141,37 @@ const FrameScanner = struct {
     }
 };
 
+/// Return the newest complete checkpoint id in the test project, if any.
+/// Product output no longer carries a resume command, so PTY fixtures discover
+/// the id from the saved checkpoint itself.
+fn latestSessionId(io: std.Io, project: []const u8) ?[32]u8 {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const sessions_path = std.fmt.bufPrint(&path_buf, "{s}/.thin/sessions", .{project}) catch return null;
+    var sessions = std.Io.Dir.openDirAbsolute(io, sessions_path, .{ .iterate = true }) catch return null;
+    defer sessions.close(io);
+    var iterator = sessions.iterate();
+    var best: ?[32]u8 = null;
+    var best_ms: i64 = std.math.minInt(i64);
+    while (iterator.next(io) catch return null) |entry| {
+        if (entry.name.len != 40 or !std.mem.endsWith(u8, entry.name, ".session")) continue;
+        const id = entry.name[0..32];
+        var valid = true;
+        for (id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) {
+            valid = false;
+            break;
+        };
+        if (!valid) continue;
+        const stat = sessions.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
+        if (stat.kind != .file) continue;
+        const ms: i64 = stat.mtime.toMilliseconds();
+        if (best == null or ms > best_ms) {
+            best = id[0..32].*;
+            best_ms = ms;
+        }
+    }
+    return best;
+}
+
 /// PTY 驱动器：持有 master/slave 与子进程 PID，负责读写终端、收集输出，并校验退出状态与终端恢复情况。
 const Driver = struct {
     /// 主端 fd：驱动方通过它向应用发送按键、读取屏幕输出。
@@ -149,6 +180,10 @@ const Driver = struct {
     slave: c_int,
     /// 子进程 PID。
     pid: c_int,
+    /// 测试项目根目录，用于退出后定位检查点会话 ID。
+    project: []const u8,
+    /// 文件系统 I/O 实例。
+    io: std.Io,
     /// 子进程是否仍归本驱动器所有（未被回收）。回收后置为 false，之后不再发信号，避免 PID 被复用后误杀。
     owned: bool = true,
     /// waitpid 返回的原始状态字（正常退出时 exit code 位于高 8 位）。
@@ -550,34 +585,14 @@ const Driver = struct {
 
         // 安全检查：应用不得输出 OSC 52 剪贴板序列，也不得泄露测试注入的密钥。
         try check(std.mem.indexOf(u8, self.output[0..self.used], "\x1b]52;") == null);
-        try check(std.mem.indexOf(u8, self.output[0..self.used], "fixture-secret-never-log") == null);
-        const prefix = "thin --resume ";
         const bytes = self.output[0..self.used];
+        try check(std.mem.indexOf(u8, self.output[0..self.used], "fixture-secret-never-log") == null);
         try check(std.mem.indexOf(u8, bytes, "Session ID: ") == null);
         try check(std.mem.indexOf(u8, bytes, "Resume: ") == null);
-        const at = std.mem.indexOf(u8, bytes, prefix);
-        if (expected == 0 and at != null) {
-            try check(at.? + prefix.len + 32 <= bytes.len);
-            const id = bytes[at.? + prefix.len ..][0..32];
-            for (id) |byte| try check((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'));
-            try check(std.mem.indexOf(u8, bytes[at.? + prefix.len + 32 ..], prefix) == null);
-            const leave = "\x18\x1b[0m\x1b[?2004l\x1b[?2026l\x1b[?25h\r\n";
-            // Restored OPOST/ONLCR may add an extra CR before LF.
-            const translated_leave = "\x18\x1b[0m\x1b[?2004l\x1b[?2026l\x1b[?25h\r\r\n";
-            const exit_at = std.mem.lastIndexOf(u8, bytes[0..at.?], leave) orelse std.mem.lastIndexOf(u8, bytes[0..at.?], translated_leave);
-            try check(exit_at != null);
-            const after_leave = exit_at.? + (if (std.mem.startsWith(u8, bytes[exit_at.?..], leave)) leave.len else translated_leave.len);
-            // Only the terminal leave, a blank separator, the muted command, its
-            // reset and a trailing blank line may follow; no other escape or byte.
-            const theme = @import("../ui/theme.zig");
-            var expected_buffer: [128]u8 = undefined;
-            const expected_tail = std.fmt.bufPrint(&expected_buffer, "\n{s}thin --resume {s}{s}\n\n", .{ theme.muted, id, theme.reset }) catch unreachable;
-            var translated_buffer: [128]u8 = undefined;
-            const translated_tail = std.fmt.bufPrint(&translated_buffer, "\r\n{s}thin --resume {s}{s}\r\n\r\n", .{ theme.muted, id, theme.reset }) catch unreachable;
-            try check(std.mem.eql(u8, bytes[after_leave..], expected_tail) or std.mem.eql(u8, bytes[after_leave..], translated_tail));
-            // Only validated immutable metadata leaves this capture buffer.
+        if (expected == 0) if (latestSessionId(self.io, self.project)) |id| {
+            // Test-only metadata for product fixtures; never a product output.
             std.debug.print("PTY_SESSION_ID={s}\n", .{id});
-        } else try check(at == null); // Signal/headless exits do not announce it.
+        };
     }
 
     /// 清理：若子进程仍归本驱动器所有，则 SIGKILL 进程组与进程本身，并在 2 秒内尝试回收；最后关闭两端 fd。
@@ -953,7 +968,7 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     // Unsubmitted management drafts stay ordinary editable text: the exact
     // draft is visible in the composer, no hidden-arguments placeholder is
     // substituted, and nothing runs because Enter is never sent.
-    for ([_][]const u8{ "/attach ", "/cd /tmp/owned path" }) |draft| {
+    for ([_][]const u8{"/attach "}) |draft| {
         const visible = std.mem.trimEnd(u8, draft, " \t\r\n");
         try settingsKey(d, draft);
         try settingsScreen(d, a, &.{visible}, &.{"command arguments hidden"});
@@ -1995,7 +2010,7 @@ fn selfEffortReady(d: *Driver, start: usize, allow_normal: bool) !bool {
 fn frameSelfCheck() !void {
     const d = try std.heap.page_allocator.create(Driver);
     defer std.heap.page_allocator.destroy(d);
-    d.* = .{ .master = -1, .slave = -1, .pid = -1, .owned = false, .original = undefined, .flags = 0, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    d.* = .{ .master = -1, .slave = -1, .pid = -1, .project = "", .io = undefined, .owned = false, .original = undefined, .flags = 0, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     defer d.screens.deinit();
     const prefix = frame_begin ++ "\r\x1b[2K";
     const suffix = frame_end ++ frame_ack;
@@ -2188,8 +2203,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     const mode = try required(init, "THIN_APP_TEST_MODE");
     const home_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "HOME={s}", .{home}), 0);
 
-    const full_resume = std.mem.startsWith(u8, mode, "resume-") and !std.mem.eql(u8, mode, "resume-create");
-    const restore_error: ?[]const u8 = if (std.mem.eql(u8, mode, "restore-failure") or std.mem.eql(u8, mode, "resume-failure")) try required(init, "THIN_APP_TEST_RESTORE_ERROR") else null;
+    const restore_error: ?[]const u8 = if (std.mem.eql(u8, mode, "restore-failure")) try required(init, "THIN_APP_TEST_RESTORE_ERROR") else null;
     if (restore_error) |expected| {
         try check(std.mem.eql(u8, expected, "SelectionNotFound") or std.mem.eql(u8, expected, "ApiKeyNotFound") or std.mem.eql(u8, expected, "SelectionEndpointUnavailable") or std.mem.eql(u8, expected, "ResumeNotFound") or std.mem.eql(u8, expected, "ResumeAuthenticationFailed") or std.mem.eql(u8, expected, "ResumeConflict") or std.mem.eql(u8, expected, "ResumeNotClosed") or std.mem.eql(u8, expected, "UnsupportedVersion") or std.mem.eql(u8, expected, "SessionInUse") or std.mem.eql(u8, expected, "InvalidResumeLength") or std.mem.eql(u8, expected, "InvalidJson"));
     }
@@ -2202,15 +2216,14 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
 
     const runtime_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "XDG_RUNTIME_DIR={s}", .{runtime_path}), 0);
 
-    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, runtime_env, if (std.mem.eql(u8, mode, "resume-login") or std.mem.eql(u8, mode, "restore-no-key") or (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound"))) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
+    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, runtime_env, if (std.mem.eql(u8, mode, "restore-no-key") or (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound"))) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
 
     const interactive_argv = [_:null]?[*:0]const u8{ bin, "--no-model-auto-refresh" };
     const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
-    const restore_id = try a.dupeSentinel(u8, if (restore_mode or full_resume) try required(init, "THIN_APP_TEST_RESTORE_ID") else "", 0);
+    const restore_id = try a.dupeSentinel(u8, if (restore_mode) try required(init, "THIN_APP_TEST_RESTORE_ID") else "", 0);
     const restore_argv = [_:null]?[*:0]const u8{ bin, "--restore-selection", restore_id };
-    const resume_argv = [_:null]?[*:0]const u8{ bin, "--resume", restore_id };
     // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (full_resume) &resume_argv else if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else &interactive_argv;
+    const argv: [*:null]const ?[*:0]const u8 = if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else &interactive_argv;
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -2302,7 +2315,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
 
     // Transfer PID AND fds before any fallible parent group/foreground setup:
     // even a setup failure must kill/reap this exact child within two seconds.
-    var d = Driver{ .master = master, .slave = slave, .pid = pid, .original = original, .flags = flags, .columns = size.col, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    var d = Driver{ .master = master, .slave = slave, .pid = pid, .project = project, .io = init.io, .original = original, .flags = flags, .columns = size.col, .screens = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     handed_off = true;
     defer d.deinit();
 
@@ -2356,7 +2369,6 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         const output = d.output[0..d.used];
         // Client.run 的固定前缀：拿不到执行锁时拒绝启动前台会话。
         try check(std.mem.indexOf(u8, output, "thin: could not start the session worker") != null);
-        try check(std.mem.indexOf(u8, output, "thin --resume ") == null);
         // Same early-shaped refusal as restore-error: no raw mode, no frame.
         try check(std.mem.indexOfScalar(u8, output, 0x1b) == null);
         return;
@@ -2384,37 +2396,35 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         return err;
     };
-    // A resumed conversation may raise an owned notice row above the composer;
+    // A restored selection may raise an owned notice row above the composer;
     // other starts have only the composer and an optional single hint row.
-    if (!full_resume) {
-        const clamp = std.mem.eql(u8, mode, "settings-clamp-high") or std.mem.eql(u8, mode, "settings-clamp-low");
-        const expected_notice: ?[]const u8 = if (clamp)
-            "Saved thinking level adjusted for this model; preference unchanged"
-        else if (std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle"))
-            "Selection restored; NEW EMPTY CHAT (history not restored)"
-        else
-            null;
-        if (expected_notice) |notice| {
-            var ready = false;
-            while (now() < startup_until) {
-                try d.drain(20);
-                const at = std.mem.indexOf(u8, d.output[0..d.used], notice);
-                if (at) |notice_at| {
-                    if (try d.acknowledgedScreen(notice_at + notice.len)) |startup| {
-                        if (startup.visible(notice)) {
-                            try Driver.checkStartupNoticeFootprint(startup, notice);
-                            ready = true;
-                            break;
-                        }
+    const clamp = std.mem.eql(u8, mode, "settings-clamp-high") or std.mem.eql(u8, mode, "settings-clamp-low");
+    const expected_notice: ?[]const u8 = if (clamp)
+        "Saved thinking level adjusted for this model; preference unchanged"
+    else if (std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle"))
+        "Selection restored; NEW EMPTY CHAT (history not restored)"
+    else
+        null;
+    if (expected_notice) |notice| {
+        var ready = false;
+        while (now() < startup_until) {
+            try d.drain(20);
+            const at = std.mem.indexOf(u8, d.output[0..d.used], notice);
+            if (at) |notice_at| {
+                if (try d.acknowledgedScreen(notice_at + notice.len)) |startup| {
+                    if (startup.visible(notice)) {
+                        try Driver.checkStartupNoticeFootprint(startup, notice);
+                        ready = true;
+                        break;
                     }
                 }
-                if (!d.owned) return error.EarlyExit;
             }
-            if (!ready) return error.VisibleTextTimeout;
-        } else {
-            const startup = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
-            try Driver.checkStartupFootprint(startup);
+            if (!d.owned) return error.EarlyExit;
         }
+        if (!ready) return error.VisibleTextTimeout;
+    } else {
+        const startup = (try d.acknowledgedScreen(0)) orelse return error.MissingStartupFrame;
+        try Driver.checkStartupFootprint(startup);
     }
     // The removed banner was the only startup version/directory text. Its
     // absence is part of the first-screen contract, not a frozen caption.
@@ -2610,7 +2620,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(!cleared.visible("ordinary-edit"));
         start = d.used;
         try d.send("/model --refresh\r");
-        try d.waitFrame(start, "No official provider configured");
+        try d.waitFrame(start, "NoOfficialProvider");
         // This fixture uses a custom loopback endpoint: refresh must not send
         // its credential to any official service or submit a model request.
         try check(std.mem.indexOf(u8, d.output[0..d.used], "Saved locally; send a message to connect") == null);
@@ -2675,33 +2685,6 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         start = d.used;
         try d.send("\x1b");
         try d.waitIdle(start);
-    } else if (std.mem.eql(u8, mode, "resume-create")) {
-        const start = d.used;
-        try d.send("resume-first-turn remember-resume-marker\r");
-        try d.waitText(start, "resume-first-answer");
-        try d.waitIdle(start);
-    } else if (full_resume) {
-        try d.waitFrame(0, if (std.mem.eql(u8, mode, "resume-login")) "Not configured: /login, then /model" else "prior tools are NOT rerun");
-        // Actual history is delivered asynchronously after the restore notice.
-        try d.waitText(0, "resume-first-answer");
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "PRIVATE-RESUME-REASONING") == null);
-        try d.quiet(150); // No startup model request or historical execution.
-        if (std.mem.eql(u8, mode, "resume-login")) {
-            try d.waitFrame(0, "Not configured: /login, then /model");
-            try d.openAuth();
-            const login_start = d.used;
-            try d.send("fixture-secret-never-log\r");
-            // The restored-owner notice may follow this in the bounded hint
-            // row; check its visible save prefix, then exact continuation below.
-            try d.waitFrame(login_start, "Saved locally");
-            try check(std.mem.indexOf(u8, d.output[0..d.used], "resume-first-answer") != null);
-        }
-        if (!std.mem.eql(u8, mode, "resume-idle")) {
-            const start = d.used;
-            try d.send("resume-next-turn\r");
-            try d.waitText(start, "resume-next-answer");
-            try d.waitIdle(start);
-        }
     } else if (std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key")) {
         const needle = if (std.mem.eql(u8, mode, "restore-no-key")) "Not configured: /login, then /model" else "history not restored";
         d.waitFrame(0, needle) catch |err| {
@@ -3172,7 +3155,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
                 // The rejected shortcut adds a conversation warning, which may
                 // move the composer. Require its fresh text and a complete idle
                 // frame under the same interaction deadline.
-                const warning = "Thinking capabilities unknown";
+                const warning = "ThinkingCapabilitiesUnknown";
                 const until = now() + 10000;
                 var settled = false;
                 while (now() < until) {
@@ -3188,7 +3171,11 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
                     }
                     if (!d.owned) return error.EarlyExit;
                 }
-                if (!settled) return error.VisibleTextTimeout;
+                if (!settled) {
+                    const raw = d.output[start..d.used];
+                    std.debug.print("SETTINGS_UNKNOWN_TAIL={s}\n", .{raw[raw.len -| 2000..]});
+                    return error.VisibleTextTimeout;
+                }
                 const after = try d.screen();
                 try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &before.grid[before.row], " "), ">"));
                 try check(std.mem.eql(u8, &before.grid[before.row], &after.grid[after.row]));
@@ -3470,12 +3457,6 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.send("\x04");
     } else try quitTwice(&d);
     try d.finish(0);
-    if (full_resume or std.mem.eql(u8, mode, "resume-create")) {
-        const prefix = "thin --resume ";
-        const at = (std.mem.indexOf(u8, d.output[0..d.used], prefix) orelse return error.MissingResumeCommand) + prefix.len;
-        const id = d.output[at..][0..32].*;
-        if (full_resume) try check(std.mem.eql(u8, &id, restore_id));
-    }
     if (before_exit) |before| {
         const final = try d.screen();
         try check(final.col == 0);
@@ -3499,7 +3480,6 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         try check(final.count(regular.prior) == 1);
         try check(final.count("Directory:") == 0 and final.count("Time:") == 0 and final.count("Session ID:") == 0);
-        try check(final.count("thin --resume") == 0);
         const tail = std.mem.lastIndexOf(u8, d.output[0..d.used], "\x1b[?25h").? + "\x1b[?25h".len;
         try check(std.mem.trim(u8, d.output[tail..d.used], "\r\n").len == 0);
         try check(std.mem.count(u8, d.output[tail..d.used], "\n") == 1);

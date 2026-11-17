@@ -8,7 +8,7 @@
 
 ## 实现状态
 
-本地代码（CLI、守护服务、前台 worker、typed TUI、客户端、会话注册表与写租约）及隔离离线验收入口均已落地。隔离验收覆盖：无服务时的拒绝、断线续跑、并行项目与 `/ls`、takeover 与前后台互通及历史、审批、守护服务停止时的资源回收。本文不报告具体测试数量；完整 Debug 与 ReleaseSmall 的聚合结果须以对应冻结源码上的验收证据为准，本文件不以局部通过替代完整通过。
+本地代码（CLI、守护服务、前台 worker、typed TUI、客户端、会话注册表与写租约）及隔离离线验收入口均已落地。隔离验收覆盖：无服务时的拒绝、断线续跑、takeover 与前后台互通及历史、审批、守护服务停止时的资源回收。本文不报告具体测试数量；完整 Debug 与 ReleaseSmall 的聚合结果须以对应冻结源码上的验收证据为准，本文件不以局部通过替代完整通过。
 
 `deploy/` 下的 SSH 样例**未安装、未启用**；真实 SSH/PAM/systemd/linger 登录链路、目标环境 logout 行为与 PTY 尺寸变化均未获授权、未执行。因此本文件不宣称任何环境已上线、已验证登录链路或已通过部署验收。第 5 节清单是部署后的人工检查项，不是本轮结果。
 
@@ -19,12 +19,12 @@
 | `thin` | 默认前台模式。不监听端口、不启动常驻服务、不自动进入守护模式。 |
 | `thin --daemon` | 显式进入该 UID 的守护服务模式，由 systemd 用户服务托管。 |
 | `thin --connect` | SSH 的 ForceCommand 目标：TUI 连接本 UID 已运行的守护服务。 |
-| `thin --attach <id>` / `thin --resume <id>` | 连接/恢复既有会话，同样不会隐式拉起守护服务。 |
+| `thin --attach <id>` | 连接既有会话；已保存会话可在 TUI 中用 `/resume` 恢复，不会隐式拉起守护服务。 |
 | `thin --print "..."` | 一次性模式，与守护/连接模式互斥。 |
 
 关键约束：
 
-- 守护服务只能由 `thin --daemon` 显式启动。普通 `thin`、`--connect`、`--attach`、`--resume` 都不会启动它；守护未运行时 `--connect` 明确报错并非零退出，SSH 会话随即结束。
+- 守护服务只能由 `thin --daemon` 显式启动。普通 `thin`、`--connect`、`--attach` 都不会启动它；守护未运行时 `--connect` 明确报错并非零退出，SSH 会话随即结束。
 - `--connect` 不携带、也不接受 `--daemon` 参数；样例里的 ForceCommand 字符串由管理员固定，客户端无法追加参数。
 - 三种模式互斥，冲突时明确报错，不静默切换。
 
@@ -110,7 +110,7 @@ systemd-analyze --user verify ~/.config/systemd/user/thin-daemon.service
 ## 7. 中断语义：不保证任务连续
 
 - 会话进程内已经完成的任务边界（用户/助手提交、完整工具结果、压缩、finished）会增量写入 checkpoint；守护服务重启或机器崩溃后，可从最后一次完整边界恢复。
-- **不保证断电/崩溃后的任务连续**：正在执行的推理请求、正在跑的工具、网络连接、审批令牌和后台进程句柄都无法恢复。这类会话被标记为 interrupted，需要用户显式 `--attach`/`--resume` 后重新决定是否继续。
+- **不保证断电/崩溃后的任务连续**：正在执行的推理请求、正在跑的工具、网络连接、审批令牌和后台进程句柄都无法恢复。这类会话被标记为 interrupted，需要用户显式 `--attach` 或在 TUI 中使用 `/resume` 后重新决定是否继续。
 - **重启不重放**：`Restart=on-failure` 只重启服务进程本身。Thin 不自动重放已中断的任务，不重新提交收费推理请求，也不会按遗留 PID 去重新发信号。
 - 会话的请求超时、工具预算、低价保护与危险命令显式审批在守护模式下同样生效；"断线不取消"不等于移除这些限制。
 - 无人连接时遇到需要审批的危险操作，保持等待，绝不放行。
@@ -135,13 +135,12 @@ systemctl daemon-reload
 
 样例与本文依赖的本地接口已写入 `src/`；下列 1–6 描述当前实现，7 列出验收边界。本节只同步语义，不构成上线或验收结论。
 
-1. 运行模式：`thin` 为普通前台；只有显式 `thin --daemon` 启动该 UID 的守护服务。`--connect`、`--attach`、`--resume` 都不会隐式拉起守护服务；与 `--print` 等模式互斥时明确报错。
+1. 运行模式：`thin` 为普通前台；只有显式 `thin --daemon` 启动该 UID 的守护服务。`--connect`、`--attach` 都不会隐式拉起守护服务；与 `--print` 等模式互斥时明确报错。
 2. 端点与对端校验：`$XDG_RUNTIME_DIR/thin/daemon.sock`（目录 0700、socket 0600）；未设置可用 `XDG_RUNTIME_DIR` 时回退 `/tmp/thin-<uid>`（同样 0700/0600）。接受连接时校验对端 UID（`SO_PEERCRED`）。
 3. 会话发现：`~/.thin/session-index/<project-key>/<id>.json` 只作定位/状态摘要，可重建；权威仍是项目下 `.thin/sessions/<id>.session` 的 checkpoint 与固定 `.resume-lock`。
-4. 写权限：固定 lock inode + CAS 决定执行/保存权；锁文件不删除、不抢占。所有 Runtime 都必须持有租约；`--resume --no-log` 也不例外：禁用日志只关闭 checkpoint/日志发布，不等于允许同一会话出现第二个 Runtime。受理前若锁目录不可用，直接拒绝任务且不发起 HTTP；受理后的可选日志或保存失败只影响日志/持久化，不重放主任务。
-5. 恢复不重放：从 checkpoint 恢复不自动重放工具调用或推理请求；守护服务重启后中断会话标记为 interrupted，需要显式 `--attach`/`--resume`。空 idle 会话若只有固定锁或空 discovery 元数据、没有 checkpoint，不视为已保存；存在 checkpoint 时保留私有定位记录。恢复的 history 异步到达，缺失恢复来源的错误保留原有分类。
-6. 会话命令（`--connect` 的 launcher）：从 HOME 开始；`/cd` 只改变 launcher 目录，下一次输入才在所选目录创建固定根会话，原会话及其根目录不变；`/detach` 不取消会话。命令为 `/attach [--takeover] <id>`（`/attch` 为兼容别名）、`/ls [--running] [--page N]`、`/close [--force] <id>`、`/exit`。
-   - `/ls` 默认列出全部已登记会话；`--running` 只保留实时 busy 或待审批（pending）的记录，并把探测超时/状态不明的记录显式标为 unknown，不把“活进程”一律算作忙。
+4. 写权限：固定 lock inode + CAS 决定执行/保存权；锁文件不删除、不抢占。所有 Runtime 都必须持有租约；任何恢复（包括 TUI `/resume`）也不例外：禁用日志只关闭 checkpoint/日志发布，不等于允许同一会话出现第二个 Runtime。受理前若锁目录不可用，直接拒绝任务且不发起 HTTP；受理后的可选日志或保存失败只影响日志/持久化，不重放主任务。
+5. 恢复不重放：从 checkpoint 恢复不自动重放工具调用或推理请求；守护服务重启后中断会话标记为 interrupted，需要显式 `--attach` 或在 TUI 中使用 `/resume`。空 idle 会话若只有固定锁或空 discovery 元数据、没有 checkpoint，不视为已保存；存在 checkpoint 时保留私有定位记录。恢复的 history 异步到达，缺失恢复来源的错误保留原有分类。
+6. 会话命令（`--connect` 的 launcher）：目录在启动时固定，不再通过 slash 命令切换；`/detach` 不取消会话。命令为 `/attach [--takeover] <id>`、`/close [--force] <id>`、`/exit`。
    - `/close` 是否针对当前视图由 worker epoch + busy 原子判断；对非当前、经 owner 管理器停止的会话（前台自有或 daemon 自有）统一要求 `--force`，以避免“probe 之后又新起任务”的竞态。外部前台所有者需要先取得 controller，再原子关闭。
 7. 验收边界：
    - 隔离离线验收入口覆盖本节所述行为；完整 Debug 与 ReleaseSmall 的聚合结果以对应冻结源码上的验收证据为准。
