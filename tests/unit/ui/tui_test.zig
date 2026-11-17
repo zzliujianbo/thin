@@ -4422,7 +4422,7 @@ test "input policy pauses stay red in conversation and out of the footer" {
         ui.removeRecord(ui.records.items.len - 1);
     }
 }
-test "neutral footer keeps queue and capability pending but not terminal or storage faults" {
+test "neutral footer keeps capability pending but not queue counts or storage faults" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -4440,28 +4440,26 @@ test "neutral footer keeps queue and capability pending but not terminal or stor
     ui.notice = Ui.terminalNotice(result);
     ui.queueTerminalNotice(result);
     const expected = "Default thinking: medium; awaiting model capabilities | Saved thinking level not applied: model capabilities unknown";
-    try std.testing.expectEqualStrings(expected, try ui.footerHint(arena.allocator(), state));
+    try std.testing.expectEqualStrings(expected, try ui.hint(arena.allocator(), state));
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Paused: InputBudgetExceeded") != null);
     testAcknowledgeFullFrame(&ui);
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "retained queued input");
-    ui.inbox.pause();
     try std.testing.expect(ui.remote() == null);
     try std.testing.expectEqual(@as(usize, 1), ui.queueSnapshot().follow_up);
-    try std.testing.expect(ui.queueSnapshot().paused);
     states: {
         var queued_state = state;
         queued_state.settings_notice = null;
         queued_state.pending_default_effort = null;
-        const queued = try ui.footerHint(arena.allocator(), queued_state);
-        try std.testing.expect(std.mem.find(u8, queued, "S:0 F:1 paused (/queue resume)") != null);
-        try std.testing.expect(std.mem.find(u8, queued, "InputBudgetExceeded") == null);
+        const queued = try ui.hint(arena.allocator(), queued_state);
+        try std.testing.expect(std.mem.find(u8, queued, "Steering") == null);
+        try std.testing.expect(std.mem.find(u8, queued, "FollowUp") == null);
         break :states;
     }
     // Storage faults are migrated by observeAdvisories, not aggregated here.
     state.settings_error = error.TestSettingsFailure;
     state.log_error = error.TestLogFailure;
-    const storage = try ui.footerHint(arena.allocator(), state);
+    const storage = try ui.hint(arena.allocator(), state);
     try std.testing.expect(std.mem.find(u8, storage, "SETTINGS FAILED") == null);
     try std.testing.expect(std.mem.find(u8, storage, "REC FAILED") == null);
     // Explicit cancellation stays plain and is never a footer terminal.
@@ -6918,7 +6916,7 @@ test "memory activity stays static while the foreground is idle" {
     try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), ui.connection.current()));
 }
 
-test "idle memory and background activity stays static with paused preview" {
+test "idle memory and background activity stays static with queued preview" {
     const Fixture = struct {
         fn current(_: *anyopaque) Connection.State {
             return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = 1 }, .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } } };
@@ -6931,9 +6929,7 @@ test "idle memory and background activity stays static with paused preview" {
     defer ui.deinit();
     ui.connection.current_fn = Fixture.current;
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "queued input");
-    ui.inbox.pause();
     try std.testing.expect(!ui.busy);
-    try std.testing.expect(ui.queueSnapshot().paused);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const line = try ui.activityLine(arena.allocator(), ui.connection.current());
@@ -7355,7 +7351,7 @@ test "notice severity colors conversation rows and never reaches the neutral foo
     try std.testing.expect(std.mem.find(u8, ui.records.items[2].lines[0], theme.failure ++ "failure-result") != null);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expect(std.mem.indexOfScalar(u8, try ui.footerHint(arena.allocator(), ui.connection.current()), '\x1b') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, try ui.hint(arena.allocator(), ui.connection.current()), '\x1b') == null);
 }
 test "wrapped composer cursor is ACK owned across sparse redraws" {
     var cancel: p.Cancellation = .{};
@@ -8310,7 +8306,7 @@ test "popup close restores every visible transcript row for root provider and mo
                 try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
                 var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
                 defer arena.deinit();
-                const expected_hint = try ui.footerHint(arena.allocator(), ui.connection.current());
+                const expected_hint = try ui.hint(arena.allocator(), ui.connection.current());
                 try std.testing.expect(expected_hint.len != 0);
                 try std.testing.expect(std.mem.indexOfScalar(u8, expected_hint, '\n') == null);
                 try std.testing.expectEqual(@as(usize, 1), ui.tail_composer_rows);
@@ -9907,7 +9903,6 @@ test "inline stop keeps unrelated persistent hint without repeating queue counts
     try screen.replay(ui.frame);
     try std.testing.expect(screen.visible("Operation pending; input kept"));
     try std.testing.expect(screen.visible("Steering 1 FollowUp 0"));
-    try std.testing.expect(!screen.visible("S:1 F:0"));
     try std.testing.expect(ui.frame_stop != null);
 }
 test "inline busy close offers safe cancel without closing" {
@@ -10042,7 +10037,7 @@ test "stop clear requires fresh complete ACK and independent dangerous Enter wit
     try ui.parser.feed("\r\x03", sink);
     try std.testing.expect(cancel.isRequested() and !ui.stop_open);
     try std.testing.expect(ui.inbox.snapshot().newest_id == null);
-    try std.testing.expect(ui.inbox.snapshot().paused);
+    try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().steering + ui.inbox.snapshot().follow_up);
     try std.testing.expectEqualStrings("keep my draft", ui.editor.bytes.items);
 }
 test "stop modal rejects queue revision resize paste and repeated CtrlC authority" {
@@ -10157,7 +10152,6 @@ test "ordinary submission preserves draft and pending queue after owner change" 
     try Ui.key(&ui, .enter);
     try std.testing.expectEqualStrings("new draft", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
-    try std.testing.expect(ui.inbox.snapshot().paused);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
     try std.testing.expect(!ui.busy and ui.future == null and !ui.ctrl_d_exit and !ui.exitAuthorized());
@@ -10196,20 +10190,8 @@ test "queued launch waits for joined success preserves draft and restores OOM wi
     ui.allocator = std.testing.allocator;
     try std.testing.expect(!ui.busy and ui.future == null);
     try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
-    try std.testing.expect(ui.inbox.snapshot().paused);
     try std.testing.expectEqual(@as(usize, 1), ui.input_history.entries.items.len);
     try std.testing.expectEqualStrings("unfinished draft", ui.editor.bytes.items);
-    // A normal submission must not silently resume the queue. Explicit resume
-    // is tested here at the Inbox seam, without sending /queue to the model.
-    ui.inbox.@"resume"();
-    try ui.dispatchNext();
-    try std.testing.expectEqualStrings("unfinished draft", ui.editor.bytes.items);
-    try std.testing.expectEqualStrings("followup prompt", ui.prompt.?);
-    try std.testing.expectEqual(@as(usize, 2), ui.input_history.entries.items.len);
-    try ui.complete();
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
-    try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().follow_up);
-    try std.testing.expect(runtime.inbox == null);
 }
 test "configure enables same-process submit without sending secrets or commands" {
     const cfg = @import("../core/config.zig");
@@ -10285,6 +10267,138 @@ test "resume root Tab completion and help show the remote command" {
     try typeDraft(&ui, "/help");
     try ui.submit();
     try std.testing.expect(publishedNotice(&ui, "/resume [id]"));
+    try std.testing.expect(publishedNotice(&ui, "/new [prompt]  Start a new session"));
+}
+test "new starts a fresh session and resets the previous view" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.add(.notice, "old session row");
+    fake.manage_switched = true;
+    try typeDraft(&ui, "/new");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .new_session), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try std.testing.expectEqual(@as(u64, 7), ui.remote_epoch);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try std.testing.expect(ui.busy);
+}
+test "new submits the supplied prompt as ordinary text after switching" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.manage_switched = true;
+    try typeDraft(&ui, "/new hello world");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .new_session), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 1), fake.submits);
+    try std.testing.expectEqual(session_client.TaskKind.prompt, fake.last_submit_kind);
+    try std.testing.expectEqualStrings("hello world", fake.text[0..fake.text_len]);
+    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings("hello world", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("hello world", ui.input_history.entries.items[0]);
+    try std.testing.expect(ui.busy);
+}
+test "new prompt survives async admission failure" {
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    actions.next = actions.requests.len;
+    var fake: FakeRemote = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try typeDraft(&ui, "/new queued prompt");
+    try ui.submit();
+    try std.testing.expect(ui.new_prompt == null);
+    try std.testing.expectEqualStrings("queued prompt", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), fake.manages);
+    try std.testing.expectEqualStrings("Queue is full; draft kept", ui.notice);
+}
+test "new prompt keeps internal newlines" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.manage_switched = true;
+    try typeDraft(&ui, "/new first\nsecond");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(usize, 1), fake.submits);
+    try std.testing.expectEqualStrings("first\nsecond", fake.text[0..fake.text_len]);
+    try std.testing.expectEqualStrings("first\nsecond", ui.records.items[0].body.items);
+}
+test "new prompt beginning with a slash stays literal text" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    fake.manage_switched = true;
+    try typeDraft(&ui, "/new /help me");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(usize, 1), fake.submits);
+    try std.testing.expectEqualStrings("/help me", fake.text[0..fake.text_len]);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings("/help me", ui.records.items[0].body.items);
+}
+test "new prompt is restored when starting the session fails" {
+    var fake: FakeRemote = .{ .manage_failure = error.Busy };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try typeDraft(&ui, "/new keep this prompt");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqualStrings("keep this prompt", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("Session is busy", ui.notice);
+}
+test "asynchronous new submits the supplied prompt after switching" {
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    try typeDraft(&ui, "/new async prompt");
+    try ui.submit();
+    try std.testing.expect(actions.requests[0].?.action.manage == .new_session);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    fake.snapshot.control_epoch += 1;
+    actions.complete(.{ .managed = .{ .switched = true } }, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.new_prompt == null);
+    try std.testing.expectEqualStrings("async prompt", ui.editor.bytes.items);
+    try std.testing.expectEqualStrings("async prompt", actions.requests[1].?.action.submit.text);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqualStrings("async prompt", ui.records.items[0].body.items);
 }
 test "resume empty list and failed request preserve display and draft" {
     var cancel: p.Cancellation = .{};
@@ -12921,7 +13035,7 @@ test "async queue reply does not block body delivery or erase typeahead" {
     ui.pumpAsync();
     try std.testing.expectEqualStrings("typeahead", ui.editor.bytes.items);
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expect(publishedNotice(&ui, "Steering pending"));
+    try std.testing.expect(publishedNotice(&ui, "Steering queued"));
 }
 test "late async approval cannot clear or relabel a newer permission" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
@@ -12961,7 +13075,7 @@ test "remote queue sends bind the current epoch and are never launched locally" 
     try std.testing.expectEqual(session_client.QueueKind.steering, fake.last_enqueue_kind);
     try std.testing.expectEqualStrings("please continue", fake.text[0..fake.text_len]);
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expect(publishedNotice(&ui, "Steering pending"));
+    try std.testing.expect(publishedNotice(&ui, "Steering queued"));
     try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().steering);
 
     ui.busy = false;
@@ -13174,12 +13288,11 @@ test "remote finished terminal is consumed from an idle local view without a fut
     try ui.finishReadyTask();
     try std.testing.expectEqual(r.Status.success, ui.last_terminal.?.status);
 }
-test "remote paused failure text publishes once and empty paused queue stays hidden" {
+test "remote paused failure text publishes once without queue footer" {
     var fake = FakeRemote{ .snapshot = .{
         .available = true,
         .attached = true,
         .control_epoch = 12,
-        .queue_paused = true,
     } };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -13205,13 +13318,12 @@ test "remote paused failure text publishes once and empty paused queue stays hid
     ui.notice = "Ready";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const line = try ui.footerHint(arena.allocator(), ui.connection.current());
+    const line = try ui.hint(arena.allocator(), ui.connection.current());
     try std.testing.expectEqualStrings("", line);
-    try std.testing.expect(ui.queueSnapshot().paused);
     ui.observeAdvisories();
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     fake.snapshot.follow_up = 1;
-    try std.testing.expectEqualStrings("S:0 F:1 paused (/queue resume)", try ui.footerHint(arena.allocator(), ui.connection.current()));
+    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), ui.connection.current()));
 }
 test "handled remote terminal keeps the busy composer until ordered owner idle" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .mode = .calling_model, .control_epoch = 14 } };
@@ -13757,4 +13869,86 @@ fn replayMessages(ui: *Ui, a: std.mem.Allocator, messages: []const p.Message) !v
             else => {},
         },
     };
+}
+
+test "ssh editing shortcuts update the composer" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("one two", sink);
+    try std.testing.expectEqual(@as(usize, 7), ui.editor.cursor);
+    try ui.parser.feed("\x02\x06", sink);
+    try std.testing.expectEqual(@as(usize, 7), ui.editor.cursor);
+    try ui.parser.feed("\x17", sink);
+    try std.testing.expectEqualStrings("one ", ui.editor.bytes.items);
+    try ui.parser.feed("\x15", sink);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try ui.parser.feed("one two three", sink);
+    try ui.parser.feed("\x1bb", sink);
+    try std.testing.expectEqual(@as(usize, 8), ui.editor.cursor);
+    try ui.parser.feed("\x1bf", sink);
+    try std.testing.expectEqual(@as(usize, 13), ui.editor.cursor);
+    try ui.parser.feed("\x1b\x7f", sink);
+    try std.testing.expectEqualStrings("one two ", ui.editor.bytes.items);
+}
+
+test "queue previews use compact type labels without ids or pending" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    _ = try ui.inbox.enqueue(std.testing.allocator, .steering, "keep-steer");
+    _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "keep-follow");
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("Steering ~ keep-steer"));
+    try std.testing.expect(screen.visible("FollowUp ~ keep-follow"));
+    try std.testing.expect(!screen.visible("Steering pending"));
+    try std.testing.expect(!screen.visible("#1"));
+    try std.testing.expect(!screen.visible("#2"));
+}
+
+test "compaction status and result are visible in the conversation" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+
+    try ui.applyEvent(.{ .state = .compacting }, false, true);
+    try std.testing.expect(ui.compaction_active);
+    var status = false;
+    for (ui.records.items) |record| {
+        if (std.mem.eql(u8, record.body.items, "Compacting context...")) status = true;
+    }
+    try std.testing.expect(status);
+
+    try ui.applyEvent(.{ .compacted = .{ .before = 100, .after = 40 } }, false, true);
+    try std.testing.expect(!ui.compaction_active);
+    var compacted = false;
+    for (ui.records.items) |record| {
+        if (std.mem.startsWith(u8, record.body.items, "Context compacted:")) compacted = true;
+    }
+    try std.testing.expect(compacted);
+
+    try ui.applyEvent(.{ .state = .compacting }, false, true);
+    try ui.applyEvent(.{ .compaction_failed = error.InsufficientCompaction }, false, true);
+    try std.testing.expect(!ui.compaction_active);
+    var failed = false;
+    for (ui.records.items) |record| {
+        if (std.mem.startsWith(u8, record.body.items, "Compaction did not reduce")) failed = true;
+    }
+    try std.testing.expect(failed);
+
+    try ui.applyEvent(.{ .compaction_skipped = .{ .reason = .limit } }, false, true);
+    var skipped = false;
+    for (ui.records.items) |record| {
+        if (std.mem.startsWith(u8, record.body.items, "Automatic compaction skipped:")) skipped = true;
+    }
+    try std.testing.expect(skipped);
 }

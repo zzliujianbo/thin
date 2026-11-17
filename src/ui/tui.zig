@@ -743,7 +743,7 @@ fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *con
 const pending_session_notice = "Waiting for session...";
 
 /// TUI 的全部状态。只在 UI 线程（run/loop）中访问；后台 Job 只通过 bridge 与之通信。
-const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, queue_resume, configure, codex_login, model, effort, preference, setting, image, proxy, proxy_address, refresh };
+const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, configure, codex_login, model, effort, preference, setting, image, proxy, proxy_address, refresh };
 const AsyncPending = struct {
     ticket: u64,
     purpose: AsyncPurpose,
@@ -840,6 +840,9 @@ const delivery_fence_capacity = 256;
 /// obligation, so it must never inherit the current body's accepted end.
 const DeliveryReceipt = struct { id: u64, generation: u64, reasoning: bool = false, source: bool = true, permission_id: ?u64 = null, permission_epoch: u64 = 0 };
 
+const queue_retry_initial_ms: u64 = 250;
+const queue_retry_max_ms: u64 = 5_000;
+
 const Ui = struct {
     /// 分配显示记录、草稿与帧缓冲的内存分配器。
     allocator: std.mem.Allocator,
@@ -849,6 +852,9 @@ const Ui = struct {
     async_stop_intent: u64 = 0,
     stop_instance: u64 = 0,
     withdrawn_draft: ?[]u8 = null,
+    /// Owned prompt supplied with `/new`; moved into the editor only after the
+    /// new session view is adopted, then submitted through the normal remote path.
+    new_prompt: ?[]u8 = null,
     /// 事件队列与审批应答通道，运行时与 UI 的唯一桥梁。
     bridge: *bridge_module.Bridge,
     /// 取消信号，与后台任务共享。
@@ -959,6 +965,9 @@ const Ui = struct {
     queue_owner: ?struct { runtime: *r.Runtime, session: ?[32]u8 } = null,
     task_epoch: u64 = 0,
     queue_revision: u64 = 0,
+    /// Bounded retry after a queued task fails to start; not queue state.
+    queue_retry_at_ms: u64 = 0,
+    queue_retry_delay_ms: u64 = queue_retry_initial_ms,
     stop_open: bool = false,
     stop_danger: bool = false,
     stop_generation: u64 = 0,
@@ -1032,6 +1041,9 @@ const Ui = struct {
     resize_waiting: bool = false,
     /// UI接收状态：用于计时/忙碌标记，不显示常驻mode文字。
     mode: ?r.State = null,
+    /// A compaction notice is currently waiting for its result.
+    compaction_active: bool = false,
+    compaction_status_id: ?u64 = null,
     /// 仅必要的错误、设置和隔离提示使用临时hint。
     notice: []const u8 = "Ready",
     /// Last owner-published advisory string already turned into one display
@@ -1212,6 +1224,10 @@ const Ui = struct {
             std.crypto.secureZero(u8, bytes);
             self.allocator.free(bytes);
         }
+        if (self.new_prompt) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            self.allocator.free(bytes);
+        }
     }
 
     // ---- Remote session adapter -------------------------------------------------
@@ -1311,13 +1327,66 @@ const Ui = struct {
         if (self.editor_revision == pending.editor_revision and std.mem.eql(u8, self.editor.bytes.items, pending.original_editor)) self.wipeEditor();
     }
 
-    fn adoptWithdrawn(self: *Ui, bytes: []u8) void {
+    fn adoptEditorOwned(self: *Ui, bytes: []u8) void {
         self.editor.deinit();
         self.editor = .{ .allocator = self.allocator, .bytes = .{ .items = bytes, .capacity = bytes.len, .pointer_stability = .{} }, .cursor = bytes.len };
         self.editor_pasted = false;
         self.input_history.index = null;
         self.vertical_column = null;
+    }
+
+    fn adoptWithdrawn(self: *Ui, bytes: []u8) void {
+        self.adoptEditorOwned(bytes);
         self.publishNotice("Pending message withdrawn as plain draft");
+    }
+
+    /// Put a prompt supplied with `/new` back into the composer when starting
+    /// the new session failed, so the user's input is not lost.
+    fn restoreNewPrompt(self: *Ui) void {
+        const prompt = self.new_prompt orelse return;
+        self.new_prompt = null;
+        if (self.editor.bytes.items.len != 0) {
+            std.crypto.secureZero(u8, prompt);
+            self.allocator.free(prompt);
+            self.notice = "New session failed; composer changed, prompt not restored";
+            self.requestDraw();
+            return;
+        }
+        self.adoptEditorOwned(prompt);
+        self.requestDraw();
+    }
+
+    /// Submit a prompt supplied with `/new`. Ordinary text goes through the
+    /// normal submit path, preserving idle barriers, history, receipts and draft
+    /// recovery. A leading `/` or `!` is still literal prompt text.
+    fn submitNewPrompt(self: *Ui) !void {
+        const prompt = self.new_prompt orelse return;
+        self.new_prompt = null;
+        self.adoptEditorOwned(prompt);
+        const value = self.editor.bytes.items;
+        if (value.len != 0 and (value[0] == '/' or value[0] == '!')) return self.submitEditorPrompt();
+        return self.submit();
+    }
+
+    /// Literal prompt admission for text that the normal submit path would
+    /// interpret as a slash or local command.
+    fn submitEditorPrompt(self: *Ui) !void {
+        if (self.exitAuthorized() or self.terminal_notice_pending != null) return;
+        if (self.busy) {
+            self.notice = "New session is busy; prompt kept";
+            return;
+        }
+        if (self.poisoned) {
+            self.notice = "Cleanup unconfirmed; prompt kept";
+            return;
+        }
+        const value = self.editor.bytes.items;
+        if (std.mem.trim(u8, value, " \\t\\r\\n").len == 0) return;
+        const client = self.remote() orelse {
+            self.notice = "Session unavailable; prompt kept";
+            return;
+        };
+        if (try self.remoteStart(client, .prompt, value)) self.wipeEditor();
     }
 
     fn activateStop(self: *Ui) void {
@@ -1346,6 +1415,7 @@ const Ui = struct {
             defer pending.deinit(self.allocator);
             if (completion.obsolete) {
                 if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
+                if (pending.purpose == .manage and completion.request.action.manage == .new_session) self.restoreNewPrompt();
                 // A superseded login attempt must never strand an opening panel
                 // nor keep a deferred cancellation armed for a dead generation.
                 if (pending.purpose == .codex_login) {
@@ -1366,6 +1436,7 @@ const Ui = struct {
             }
             if (completion.failure) |err| {
                 if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
+                if (pending.purpose == .manage and completion.request.action.manage == .new_session) self.restoreNewPrompt();
                 if (pending.purpose == .codex_login) {
                     const start = completion.request.action.codex_login.action == .start;
                     self.codex_opening = false;
@@ -1425,7 +1496,7 @@ const Ui = struct {
             },
             .enqueue => {
                 self.clearSubmittedEditor(pending);
-                self.publishNotice(if (action.enqueue.kind == .steering) "Steering pending" else "FollowUp pending");
+                self.publishNotice(if (action.enqueue.kind == .steering) "Steering queued" else "FollowUp queued");
             },
             .withdraw => {
                 if (completion.value != .withdrawn) return;
@@ -1466,10 +1537,6 @@ const Ui = struct {
             },
             .release_stop => if (self.async_stop_intent == pending.ticket and self.last_terminal == null) {
                 self.notice = "Stop dismissed";
-            },
-            .queue_resume => {
-                self.clearSubmittedEditor(pending);
-                self.publishNotice("Queue resumed");
             },
             .configure => {
                 if (self.secret_mode) self.endSecret();
@@ -1557,7 +1624,6 @@ const Ui = struct {
             .follow_up = snapshot.follow_up,
             .newest_id = snapshot.newest_id,
             .newest_bytes = snapshot.newest_bytes,
-            .paused = snapshot.queue_paused,
             .confirming = self.stop_open,
             .active = snapshot.busy,
             .epoch = snapshot.control_epoch,
@@ -2297,6 +2363,8 @@ const Ui = struct {
         self.reasoning = null;
         self.last_terminal = null;
         self.mode = null;
+        self.compaction_active = false;
+        self.compaction_status_id = null;
         self.display = .{};
         self.fast_step = 0;
         self.fast_next_ms = 0;
@@ -2367,13 +2435,14 @@ const Ui = struct {
         const name_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
         const name = trimmed[0..name_end];
         const is_resume = std.mem.eql(u8, name, "/resume");
+        const is_new = std.mem.eql(u8, name, "/new");
         const is_list = std.mem.eql(u8, name, "/ls");
         const is_cd = std.mem.eql(u8, name, "/cd");
         const is_attach = std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch");
         const is_detach = std.mem.eql(u8, name, "/detach");
         const is_exit = std.mem.eql(u8, name, "/exit");
         const is_close = std.mem.eql(u8, name, "/close");
-        if (!(is_resume or is_list or is_cd or is_attach or is_detach or is_exit or is_close)) return false;
+        if (!(is_resume or is_new or is_list or is_cd or is_attach or is_detach or is_exit or is_close)) return false;
         // The editor is wiped below; parse an owned copy so arguments stay valid.
         const owned = self.allocator.dupe(u8, trimmed) catch {
             self.wipeEditor();
@@ -2388,7 +2457,9 @@ const Ui = struct {
         };
         const name_end_owned = std.mem.findAny(u8, owned, " \t\r\n") orelse owned.len;
         const rest = std.mem.trim(u8, owned[name_end_owned..], " \t");
-        if (std.mem.findScalar(u8, owned, '\n') != null or std.mem.findScalar(u8, owned, '\r') != null or std.mem.findScalar(u8, owned, 0) != null) {
+        if (std.mem.findScalar(u8, owned, 0) != null or
+            (!is_new and (std.mem.findScalar(u8, owned, '\n') != null or std.mem.findScalar(u8, owned, '\r') != null)))
+        {
             self.notice = "Session commands are single-line";
             return true;
         }
@@ -2400,6 +2471,22 @@ const Ui = struct {
             } else true) {
                 self.applyManage(backend, .{ .@"resume" = rest });
             } else self.notice = "Usage: /resume [32-hex-id]";
+            return true;
+        }
+        if (is_new) {
+            if (self.new_prompt) |old| {
+                std.crypto.secureZero(u8, old);
+                self.allocator.free(old);
+                self.new_prompt = null;
+            }
+            const prompt = std.mem.trim(u8, owned[name_end_owned..], " \t\r\n");
+            if (prompt.len != 0) {
+                self.new_prompt = self.allocator.dupe(u8, prompt) catch {
+                    self.notice = "Out of memory; command not sent";
+                    return true;
+                };
+            }
+            self.applyManage(backend, .new_session);
             return true;
         }
         if (is_detach or is_exit) {
@@ -2566,11 +2653,15 @@ const Ui = struct {
 
     fn applyManage(self: *Ui, client: session_client.Client, request: session_client.Manage) void {
         if (self.connection.async_actions != null) {
-            if (self.beginAsync(.{ .manage = request }, .manage) == null and request == .saved_sessions) self.clearResumePending();
+            if (self.beginAsync(.{ .manage = request }, .manage) == null) {
+                if (request == .saved_sessions) self.clearResumePending();
+                if (request == .new_session) self.restoreNewPrompt();
+            }
             return;
         }
         var outcome = client.manage(self.allocator, request) catch |err| {
             if (request == .saved_sessions) self.clearResumePending();
+            if (request == .new_session) self.restoreNewPrompt();
             self.notice = session_client.describe(err);
             self.requestDraw();
             return;
@@ -2608,9 +2699,16 @@ const Ui = struct {
                 self.editor.deinit();
                 self.editor = parked;
                 self.editor_pasted = pasted;
-                result catch return;
-            } else self.resetSessionView(client.snapshot()) catch return;
+                result catch {
+                    self.restoreNewPrompt();
+                    return;
+                };
+            } else self.resetSessionView(client.snapshot()) catch {
+                self.restoreNewPrompt();
+                return;
+            };
         };
+        if (!outcome.switched) self.restoreNewPrompt();
         // Leaving the owner view ends any handled-terminal wait; the result and
         // its notice stay as the last known state instead of a busy display.
         if (self.remote()) |client| if (!client.snapshot().attached and self.remote_terminal_wait) self.releaseRemoteTerminalWait();
@@ -2622,6 +2720,9 @@ const Ui = struct {
         } else if (outcome.listing != null) {
             self.notice = "Ready";
         }
+        self.submitNewPrompt() catch |err| {
+            self.notice = session_client.describe(err);
+        };
         if (leaving) self.requestQuit();
         self.requestDraw();
     }
@@ -2866,8 +2967,8 @@ const Ui = struct {
     fn oneShotNoticeLevel(value: []const u8) NoticeLevel {
         if (std.mem.eql(u8, value, "Selection restored; NEW EMPTY CHAT (history not restored)")) return .plain;
         const plain_prefixes = [_][]const u8{
-            "Saved",         "Key saved",         "Model selected", "Setup canceled", "Stop dismissed",
-            "Queue resumed", "Message withdrawn", "Request denied", "Allowed once",
+            "Saved",             "Key saved",      "Model selected", "Setup canceled", "Stop dismissed",
+            "Message withdrawn", "Request denied", "Allowed once",
         };
         for (plain_prefixes) |prefix| if (std.mem.startsWith(u8, value, prefix)) return .plain;
         return .warning;
@@ -2987,18 +3088,6 @@ const Ui = struct {
         }
         if (parts.items.len == 0) return "";
         return std.mem.join(a, " · ", parts.items);
-    }
-
-    fn footerHint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
-        const base = try self.hint(a, state);
-        const queue = self.queueSnapshot();
-        // A paused empty Inbox has nothing to resume. The task failure is the
-        // actionable issue; do not invent a second warning for S:0/F:0.
-        if (queue.steering == 0 and queue.follow_up == 0) return base;
-        return std.fmt.allocPrint(a, "{s}{s}S:{d} F:{d} {s}", .{
-            base,                                                      if (base.len != 0) " | " else "", queue.steering, queue.follow_up,
-            if (queue.paused) "paused (/queue resume)" else "pending",
-        });
     }
 
     /// 正文的首个非空增量替换三行思考；迟到的推理不再抢回正文区域。
@@ -3188,7 +3277,7 @@ const Ui = struct {
                     return;
                 }
             },
-            .user_committed, .tool_result, .compacted, .compaction_failed, .fallback => {},
+            .user_committed, .tool_result, .compacted, .compaction_failed, .compaction_skipped, .fallback => {},
             else => return,
         }
         if (candidate == null) candidate = self.newestDeliveryRecord(before.next_id);
@@ -3209,6 +3298,51 @@ const Ui = struct {
     fn recordIndexOfId(self: *const Ui, id: u64) ?usize {
         if (id == 0) return null;
         return self.record_index.get(id);
+    }
+
+    fn beginCompactionStatus(self: *Ui) !void {
+        if (self.compaction_active) return;
+        self.compaction_active = true;
+        const index = try self.add(.notice, "Compacting context...");
+        self.records.items[index].single_row = true;
+        self.compaction_status_id = self.records.items[index].id;
+    }
+
+    fn finishCompactionStatus(self: *Ui, message: []const u8) !void {
+        if (self.compaction_status_id) |id| {
+            self.compaction_status_id = null;
+            if (self.recordIndexOfId(id)) |index| {
+                const record = &self.records.items[index];
+                // A notice already committed to scrollback cannot be edited
+                // reliably; keep it as history and append the outcome.
+                if (!record.output) {
+                    record.body.clearRetainingCapacity();
+                    try record.append(self.allocator, message);
+                    record.single_row = false;
+                    record.invalidate();
+                    self.requestDraw();
+                    return;
+                }
+            }
+        }
+        _ = try self.add(.notice, message);
+    }
+
+    fn compactionFailureNotice(err: anyerror) []const u8 {
+        return switch (err) {
+            error.NoCompactionCandidate => "No history can be safely compacted yet; context was not changed.",
+            error.InsufficientCompaction => "Compaction did not reduce context enough; context was not changed.",
+            error.InvalidSummary => "Summary was empty or invalid; context was not changed.",
+            error.SummaryRequestedTool => "Summary requested tools; context was not changed.",
+            error.SummaryFailed => "Summary request failed; context was not changed.",
+            else => @errorName(err),
+        };
+    }
+
+    fn settleInterruptedCompaction(self: *Ui) void {
+        if (!self.compaction_active) return;
+        self.compaction_active = false;
+        self.finishCompactionStatus("Compaction interrupted; context was not changed.") catch {};
     }
 
     /// One typed event applied to the UI. Local workers reach this through the
@@ -3237,6 +3371,7 @@ const Ui = struct {
                     self.notice = "Attached; task is running";
                     self.approval_paste_seen = false;
                 }
+                if (state == .compacting) try self.beginCompactionStatus();
                 self.mode = state;
             },
             .user_committed => |v| {
@@ -3312,15 +3447,21 @@ const Ui = struct {
                 _ = try self.add(.notice, "Responses unsupported: switched once to Chat for this process.");
             },
             .compacted => |v| {
+                self.compaction_active = false;
                 const message = try std.fmt.allocPrint(self.allocator, "Context compacted: estimated input {d} -> {d} tokens. Display history is separate.", .{ v.before, v.after });
                 defer self.allocator.free(message);
-                _ = try self.add(.notice, message);
+                try self.finishCompactionStatus(message);
             },
             .compaction_failed => |err| {
-                _ = try self.add(.notice, if (err == error.NoCompactionCandidate)
-                    "No history can be safely compacted yet; context was not changed."
-                else
-                    @errorName(err));
+                self.compaction_active = false;
+                try self.finishCompactionStatus(compactionFailureNotice(err));
+            },
+            .compaction_skipped => |value| {
+                self.compaction_active = false;
+                _ = try self.add(.notice, switch (value.reason) {
+                    .recent => "Automatic compaction skipped: context has not grown enough since the last compaction.",
+                    .limit => "Automatic compaction skipped: per-task limit reached; context remains within budget.",
+                });
             },
             .memory_completed => |terminal| try self.acceptMemoryCompletion(terminal),
             .background_completed => |terminal| try self.appendBackgroundCompletion(terminal),
@@ -3676,7 +3817,7 @@ const Ui = struct {
                     self.settings_menu.generation +%= 1;
                 }
             },
-            .backspace, .delete, .clear, .kill_end => if (picker.editing) {
+            .backspace, .delete, .clear, .kill_start, .kill_end => if (picker.editing) {
                 if (event_ == .backspace or event_ == .delete) picker.backspace() else picker.clear();
                 self.settings_menu.generation +%= 1;
             },
@@ -3889,12 +4030,12 @@ const Ui = struct {
                 _ = try self.editor.insert(value.value);
                 if (value.pasted) self.notice = "Address pasted; review it, then Enter after redraw saves";
             },
-            .backspace, .delete, .clear, .kill_end => {
+            .backspace, .delete, .clear, .kill_start, .kill_end => {
                 self.proxyAddressChanged();
                 switch (event_) {
                     .backspace => self.editor.backspace(),
                     .delete => self.editor.delete(),
-                    .clear => self.wipeEditor(),
+                    .clear, .kill_start => self.wipeEditor(),
                     .kill_end => self.editor.bytes.items.len = self.editor.cursor,
                     else => unreachable,
                 }
@@ -3988,12 +4129,12 @@ const Ui = struct {
                     } else self.notice = "Search limit: 256 bytes";
                 }
             },
-            .backspace, .delete, .clear, .kill_end => if (self.settingsQueryOpen()) {
+            .backspace, .delete, .clear, .kill_start, .kill_end => if (self.settingsQueryOpen()) {
                 self.settingsQueryChanged();
                 switch (event_) {
                     .backspace => self.editor.backspace(),
                     .delete => self.editor.delete(),
-                    .clear => self.wipeEditor(),
+                    .clear, .kill_start => self.wipeEditor(),
                     .kill_end => self.editor.bytes.items.len = self.editor.cursor,
                     else => unreachable,
                 }
@@ -4266,7 +4407,7 @@ const Ui = struct {
             .text => |value| if (value.pasted) {
                 self.provider_picker.markPaste();
             },
-            .clear => self.provider_picker.clear(),
+            .clear, .kill_start => self.provider_picker.clear(),
             .left => try self.backToCommands(.auth),
             .up, .down => self.provider_picker.move(event_ == .down, self.provider_choices.len),
             .enter => {
@@ -4423,7 +4564,7 @@ const Ui = struct {
                 if (std.mem.indexOfScalar(u8, value.value, '\n') != null) return;
                 if (!try picker.insert(value.value, value.pasted)) self.notice = "Search limit: 1024 bytes";
             },
-            .clear => picker.clear(),
+            .clear, .kill_start => picker.clear(),
             .backspace => {
                 picker.query.backspace();
                 picker.changed();
@@ -4491,33 +4632,6 @@ const Ui = struct {
             }
             return;
         }
-        if (std.mem.eql(u8, command, "/queue resume")) {
-            if (!self.settingsIdle() or self.editor_pasted or self.parser.escape_len != 0 or self.parser.utf8_len != 0) {
-                self.notice = "Queue resume requires idle, fresh input";
-                return;
-            }
-            if (!self.queueOwnerMatches()) {
-                self.notice = "Queue belongs to another session; Ctrl-C to clear explicitly";
-                return;
-            }
-            if (self.remote()) |client| {
-                if (self.connection.async_actions != null) {
-                    _ = self.beginAsync(.queue_resume, .queue_resume);
-                    return;
-                }
-                client.queueResume(self.remote_epoch) catch |err| {
-                    self.notice = session_client.describe(err);
-                    return;
-                };
-                self.wipeEditor();
-                self.publishNotice("Queue resumed");
-                return;
-            }
-            self.inbox.@"resume"();
-            self.wipeEditor();
-            self.publishNotice("Queue resumed");
-            return;
-        }
         if (std.mem.eql(u8, command, "/model --refresh")) {
             const allowed = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
@@ -4543,7 +4657,7 @@ const Ui = struct {
         if (std.mem.eql(u8, command, "/help")) {
             self.wipeEditor();
             _ = try self.add(.notice, if (self.remote() != null)
-                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n/ls [--running] [--page N]  List sessions\n/resume [id]  Resume saved session\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
+                "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n/new [prompt]  Start a new session\n/ls [--running] [--page N]  List sessions\n/resume [id]  Resume saved session\n/cd <dir>  Change launcher directory\n/attach [--takeover] <id>  Attach a session\n/detach  Leave the session view\n/close [--force] <id>  Close a session\n/exit  Leave this frontend\n!command  Run a local command without main-model inference"
             else
                 "/model  Select model\n/login  Configure provider\n/compact  Compact conversation\n/settings  Global settings (Low-price input, Image model)\n!command  Run a local command without main-model inference");
             return;
@@ -4572,7 +4686,6 @@ const Ui = struct {
                 }
                 self.startCompaction(runtime) catch |err| {
                     if (err != error.QueueOwnerChanged) return err;
-                    self.inbox.pause();
                     self.notice = "Queue belongs to another session; Ctrl-C to confirm clearing it";
                 };
             } else {
@@ -4651,7 +4764,6 @@ const Ui = struct {
 
         self.startPrompt(runtime, self.editor.bytes.items, if (local_command) .command else .prompt) catch |err| {
             if (err != error.QueueOwnerChanged) return err;
-            self.inbox.pause();
             self.notice = "Queue belongs to another session; Ctrl-C to confirm clearing it";
             self.parser.stop_feed = true;
             return;
@@ -4976,7 +5088,7 @@ const Ui = struct {
             };
             self.wipeEditor();
             self.parser.stop_feed = true;
-            self.publishNotice(if (kind == .steering) "Steering pending" else "FollowUp pending");
+            self.publishNotice(if (kind == .steering) "Steering queued" else "FollowUp queued");
             return;
         }
         if (self.attached_runtime == null) {
@@ -4989,7 +5101,7 @@ const Ui = struct {
         };
         self.wipeEditor();
         self.parser.stop_feed = true;
-        self.publishNotice(if (kind == .steering) "Steering pending" else "FollowUp pending");
+        self.publishNotice(if (kind == .steering) "Steering queued" else "FollowUp queued");
     }
 
     fn dispatchNext(self: *Ui) !void {
@@ -4997,27 +5109,30 @@ const Ui = struct {
         if (self.remote() != null) return;
         if (self.terminal_notice_pending != null or self.busy or self.future != null or self.exitAuthorized() or self.poisoned or self.stop_open or
             self.secret_mode or self.secret_quarantine or self.settings_open or self.provider_open or self.model_picker != null) return;
-        // finishRun's sticky pause is authoritative, including explicit resume.
-        if (!self.queueOwnerMatches()) {
-            self.inbox.pause();
+        if (self.clock_ms < self.queue_retry_at_ms) return;
+        if (!self.queueOwnerMatches()) return;
+        const lease = self.inbox.claimNext() orelse {
+            self.queue_retry_at_ms = 0;
+            self.queue_retry_delay_ms = queue_retry_initial_ms;
             return;
-        }
-        const lease = self.inbox.claimNext() orelse return;
+        };
         const runtime = self.connection.current().runtime orelse {
             self.inbox.restore(lease);
-            self.inbox.pause();
             return;
         };
         self.startPrompt(runtime, lease.text, .prompt) catch {
             self.inbox.restore(lease);
-            self.inbox.pause();
-            self.notice = "Queued launch failed; message kept; /queue resume retries";
+            self.queue_retry_at_ms = self.clock_ms +| self.queue_retry_delay_ms;
+            self.queue_retry_delay_ms = @min(self.queue_retry_delay_ms * 2, queue_retry_max_ms);
+            self.notice = "Queued launch failed; message kept";
             self.requestDraw();
             return;
         };
         if (self.inbox.commit(lease)) |value| {
             var entry = value;
             entry.deinit();
+            self.queue_retry_at_ms = 0;
+            self.queue_retry_delay_ms = queue_retry_initial_ms;
         }
         self.requestDraw();
     }
@@ -5273,7 +5388,6 @@ const Ui = struct {
             self.parser.stop_feed = true;
             return;
         }
-        self.inbox.pause();
         self.cancel.cancel();
         self.notice = "Cancellation requested; cleaning up, not rolling back effects";
         self.clearPermission();
@@ -5307,7 +5421,7 @@ const Ui = struct {
             },
             .paste_start => self.parser.secret_paste = true,
             .backspace, .delete => self.secret.erase(),
-            .clear => {
+            .clear, .kill_start => {
                 self.secret.wipe();
                 self.notice = "Ready";
             },
@@ -5497,7 +5611,7 @@ const Ui = struct {
         }
         if (self.secret_quarantine) {
             switch (event_) {
-                .escape, .clear => {
+                .escape, .clear, .kill_start => {
                     self.secret_quarantine = false;
                     self.parser.secretMode(false);
                 },
@@ -5539,11 +5653,11 @@ const Ui = struct {
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
         switch (event_) {
-            .text, .tab, .backspace, .delete, .clear, .kill_end => self.editor_revision +%= 1,
+            .text, .tab, .backspace, .delete, .clear, .kill_start, .kill_end, .kill_word => self.editor_revision +%= 1,
             else => {},
         }
         switch (event_) {
-            .backspace, .delete, .clear, .kill_end => {
+            .backspace, .delete, .clear, .kill_start, .kill_end, .kill_word => {
                 self.input_history.index = null;
                 self.dropHistoryDraft();
             },
@@ -5552,7 +5666,7 @@ const Ui = struct {
         self.refreshCommandMenu();
         // Edits/cursor changes revoke old authority even if candidates stay equal.
         switch (event_) {
-            .text, .paste_start, .backspace, .delete, .left, .right, .home, .end, .clear, .kill_end => self.command_menu.changed(),
+            .text, .paste_start, .backspace, .delete, .left, .right, .cursor_left, .cursor_right, .word_left, .word_right, .home, .end, .clear, .kill_start, .kill_end, .kill_word => self.command_menu.changed(),
             else => {},
         }
         // The slash menu is non-modal: it only captures navigation keys while it
@@ -5626,15 +5740,22 @@ const Ui = struct {
             .page_up, .page_down => {},
             .backspace => self.editor.backspace(),
             .delete => self.editor.delete(),
-            .left => self.editor.left(),
-            .right => self.editor.right(),
+            .left, .cursor_left => self.editor.left(),
+            .right, .cursor_right => self.editor.right(),
+            .word_left => self.editor.wordLeft(),
+            .word_right => self.editor.wordRight(),
             .home => self.editor.cursor = 0,
             .end => self.editor.cursor = self.editor.bytes.items.len,
             .clear => {
                 self.editor.clear();
                 self.editor_pasted = false;
             },
+            .kill_start => {
+                self.editor.killStart();
+                self.editor_pasted = false;
+            },
             .kill_end => self.editor.bytes.items.len = self.editor.cursor,
+            .kill_word => self.editor.killWord(),
         }
         // Any editor mutation re-evaluates the slash menu; a changed token clears
         // an earlier Esc dismissal so suggestions reappear while typing.
@@ -6079,7 +6200,6 @@ const Ui = struct {
         const result = self.last_terminal.?;
 
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
-        if (result.status != .success and !is_remote) self.inbox.pause();
         self.poisoned = if (result.detail) |detail| detail == error.CleanupFailed or detail == error.UnsafeToContinue else false;
         self.notice = terminalNotice(result);
         // Foreground terminal detail is delivered once into the conversation;
@@ -6098,6 +6218,7 @@ const Ui = struct {
         self.clearActiveTool();
         self.clearToolCaptions();
         self.tool_views.clear(self.allocator);
+        self.settleInterruptedCompaction();
         self.mode = null;
         // The owner can still report this task busy after delivering its
         // terminal. Keep the composer busy instead of painting an idle prompt
@@ -7337,7 +7458,7 @@ const Ui = struct {
         // The question already contains queue counts. Keep unrelated persistent
         // notices, but do not repeat the stop confirmation or queue summary.
         const modal_hint = if (modal_text != null) try self.hint(a, state) else "";
-        const hint_line = if (modal_text == null) try self.footerHint(a, state) else if (std.mem.eql(u8, modal_hint, "Confirm stop")) "" else modal_hint;
+        const hint_line = if (modal_text == null) try self.hint(a, state) else if (std.mem.eql(u8, modal_hint, "Confirm stop")) "" else modal_hint;
         const activity_line = if (modal_text == null) try self.activityLine(a, state) else "";
         const status_rows: usize = @as(usize, @intFromBool(hint_line.len != 0)) + @as(usize, @intFromBool(activity_line.len != 0));
         // Normal output keeps its empty gap; acknowledged shell-like idle
@@ -7411,8 +7532,8 @@ const Ui = struct {
                 for (preview_bytes[0..entry.len]) |*byte_| {
                     if (byte_.* == '\n' or byte_.* == '\r' or byte_.* == '\t') byte_.* = ' ';
                 }
-                try queue_lines.append(a, try std.fmt.allocPrint(a, "{s} pending #{d}: {s}", .{
-                    if (entry.kind == .steering) "Steering" else "FollowUp", entry.id, preview_bytes[0..entry.len],
+                try queue_lines.append(a, try std.fmt.allocPrint(a, "{s} · {s}", .{
+                    if (entry.kind == .steering) "Steering" else "FollowUp", preview_bytes[0..entry.len],
                 }));
             }
         }
@@ -7824,7 +7945,6 @@ fn sensitiveArguments(name: []const u8, rest: []const u8) bool {
     if (std.mem.eql(u8, name, "/ls")) return !listArgumentsValid(args);
     if (std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/attch") or std.mem.eql(u8, name, "/close"))
         return !sessionArgumentsValid(name, args);
-    if (std.mem.eql(u8, name, "/queue")) return !std.mem.eql(u8, args, "resume");
     // /login, /compact, /help, /detach, /exit and unknown commands take no
     // arguments; non-empty text cannot be told apart from an accidental paste.
     return true;

@@ -682,6 +682,32 @@ test "connect create uses control and reads the session field" {
     try std.testing.expectEqualStrings("create", second.value.object.get("op").?.string);
     try std.testing.expect(client.conn == null and client.session == null);
 }
+test "new session creates on control and keeps the current view on failure" {
+    const a = testing.allocator;
+    const current: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    const fresh = "fedcba9876543210fedcba9876543210";
+    var pair = try connectClientWithControl(a);
+    defer pair.deinit();
+    const client = pair.client;
+    client.session = current;
+
+    // A malformed create reply stops before any endpoint is dialled.
+    try pair.reply(1, "\"endpoint\":\"/nonexistent/thin/worker.sock\"");
+    try std.testing.expectError(error.ProtocolError, client.manageNew());
+    const first = try readFrameJson(&pair, a);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("create", first.value.object.get("op").?.string);
+    try std.testing.expectEqualStrings(client.launcher, first.value.object.get("project").?.string);
+    try std.testing.expectEqual(current, client.session.?);
+
+    // A valid identity still preserves the old view until the new worker joins.
+    try pair.reply(2, "\"session\":\"" ++ fresh ++ "\",\"endpoint\":\"/nonexistent/thin/worker.sock\"");
+    try std.testing.expectError(error.Transport, client.manageNew());
+    const second = try readFrameJson(&pair, a);
+    defer second.deinit();
+    try std.testing.expectEqualStrings("create", second.value.object.get("op").?.string);
+    try std.testing.expectEqual(current, client.session.?);
+}
 test "connect settings stay on control and readiness comes from the owner" {
     const a = testing.allocator;
     var pair = try connectClientWithControl(a);
@@ -880,7 +906,7 @@ test "snapshot attachment and owner queues do not replace display items" {
     const client = pair.client;
 
     try client.pushEvent(.{ .string = "{\"t\":\"text\",\"epoch\":5,\"v\":\"queued display\"}" });
-    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":false,\"pending\":99,\"queue_revision\":9,\"queue_paused\":true,\"steering\":2,\"follow_up\":1,\"newest_id\":17,\"newest_bytes\":24,\"previews\":[{\"id\":17,\"kind\":\"steering\",\"text\":\"next\"},{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(1, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":false,\"pending\":99,\"queue_revision\":9,\"steering\":2,\"follow_up\":1,\"newest_id\":17,\"newest_bytes\":24,\"previews\":[{\"id\":17,\"kind\":\"steering\",\"text\":\"next\"},{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     {
         var response = try client.readResponse(1, quick_timeout_ms);
         defer response.deinit();
@@ -892,7 +918,6 @@ test "snapshot attachment and owner queues do not replace display items" {
     try testing.expect(first.attached);
     try testing.expectEqual(@as(u64, 5), first.control_epoch);
     try testing.expectEqual(@as(u64, 9), first.queue_revision);
-    try testing.expect(first.queue_paused);
     try testing.expectEqual(@as(usize, 2), first.steering);
     try testing.expectEqual(@as(usize, 1), first.follow_up);
     try testing.expectEqual(@as(?u64, 17), first.newest_id);
@@ -908,7 +933,7 @@ test "snapshot attachment and owner queues do not replace display items" {
     try testing.expect(Client.bufferedFn(@ptrCast(client)));
 
     // The pending permission on the wire is not the owned display queue.
-    try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"pending\":null,\"queue_revision\":10,\"queue_paused\":false,\"steering\":0,\"follow_up\":1,\"previews\":[{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
+    try pair.reply(2, "\"snapshot\":{\"background\":{\"active_count\":0},\"epoch\":5,\"attached\":true,\"pending\":null,\"queue_revision\":10,\"steering\":0,\"follow_up\":1,\"previews\":[{\"id\":18,\"kind\":\"follow_up\",\"text\":\"later\"}],\"memory\":{\"enabled\":false,\"revision\":0,\"active\":null,\"queued_count\":0,\"last_terminal\":null}}");
     {
         var response = try client.readResponse(2, quick_timeout_ms);
         defer response.deinit();
@@ -918,7 +943,6 @@ test "snapshot attachment and owner queues do not replace display items" {
     const second = Client.snapshotFn(@ptrCast(client));
     try testing.expect(second.attached);
     try testing.expectEqual(@as(u64, 10), second.queue_revision);
-    try testing.expect(!second.queue_paused);
     try testing.expectEqual(@as(usize, 0), second.steering);
     try testing.expectEqual(@as(usize, 1), second.follow_up);
     try testing.expectEqual(@as(usize, 1), second.previews.len);

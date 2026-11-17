@@ -567,13 +567,13 @@ const Driver = struct {
             const exit_at = std.mem.lastIndexOf(u8, bytes[0..at.?], leave) orelse std.mem.lastIndexOf(u8, bytes[0..at.?], translated_leave);
             try check(exit_at != null);
             const after_leave = exit_at.? + (if (std.mem.startsWith(u8, bytes[exit_at.?..], leave)) leave.len else translated_leave.len);
-            // Only the terminal leave, a blank separator, the green command and
-            // its reset may follow; no other escape or stray byte.
+            // Only the terminal leave, a blank separator, the muted command, its
+            // reset and a trailing blank line may follow; no other escape or byte.
             const theme = @import("../ui/theme.zig");
             var expected_buffer: [128]u8 = undefined;
-            const expected_tail = std.fmt.bufPrint(&expected_buffer, "\n{s}thin --resume {s}{s}\n", .{ theme.muted, id, theme.reset }) catch unreachable;
+            const expected_tail = std.fmt.bufPrint(&expected_buffer, "\n{s}thin --resume {s}{s}\n\n", .{ theme.muted, id, theme.reset }) catch unreachable;
             var translated_buffer: [128]u8 = undefined;
-            const translated_tail = std.fmt.bufPrint(&translated_buffer, "\r\n{s}thin --resume {s}{s}\r\n", .{ theme.muted, id, theme.reset }) catch unreachable;
+            const translated_tail = std.fmt.bufPrint(&translated_buffer, "\r\n{s}thin --resume {s}{s}\r\n\r\n", .{ theme.muted, id, theme.reset }) catch unreachable;
             try check(std.mem.eql(u8, bytes[after_leave..], expected_tail) or std.mem.eql(u8, bytes[after_leave..], translated_tail));
             // Only validated immutable metadata leaves this capture buffer.
             std.debug.print("PTY_SESSION_ID={s}\n", .{id});
@@ -1832,13 +1832,13 @@ fn selectionBusyFrame(d: *Driver, start: usize, slot: []const u8, draft: []const
             } else false;
             has_expected_rejection_notice = view.visible("Only ordinary conversation text can be queued");
             has_model_selection_idle_notice = view.visible("Model selection requires an idle, non-pasted session");
-            has_steering = view.visible("Steering pending");
+            has_steering = view.visible("Steering queued");
             observed_effort_minimal = std.mem.indexOf(u8, row, "(fixture-model) minimal") != null;
             busy_marker_present = std.mem.indexOf(u8, row, "~ ") != null;
             if (std.mem.eql(u8, std.mem.trimEnd(u8, row, " "), std.mem.trimEnd(u8, prefix, " ")) and
                 (!rejected or view.visible("Only ordinary conversation text can be queued")))
             {
-                try check(!view.visible("Steering pending"));
+                try check(!view.visible("Steering queued"));
                 return;
             }
         }
@@ -1869,21 +1869,21 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         if (natural) try queuedFile(d, a, project, "natural-awaiting");
         try d.waitBusy(start);
     }
-    try queuedKey(d, a, "keep-steer\r", &.{"Steering pending #1: keep-steer"});
+    try queuedKey(d, a, "keep-steer\r", &.{ "Steering", "keep-steer" });
     try queuedDraft(d, a, "");
-    try queuedKey(d, a, if (withdraw) "old-follow\x1b\r" else "keep-follow\x1b\r", &.{if (withdraw) "FollowUp pending #2: old-follow" else "FollowUp pending #2: keep-follow"});
+    try queuedKey(d, a, if (withdraw) "old-follow\x1b\r" else "keep-follow\x1b\r", &.{ "FollowUp", if (withdraw) "old-follow" else "keep-follow" });
     try queuedDraft(d, a, "");
     if (withdraw) {
         try queuedKey(d, a, "\x1b", &.{"old-follow"});
         try queuedDraft(d, a, "old-follow");
         try queuedGate(d, a, project, "withdrawn-follow");
         // Retyping after Ctrl-U and Enter creates a NEW Steering message.
-        try queuedKey(d, a, "\x15new-steer\r", &.{"Steering pending #3: new-steer"});
+        try queuedKey(d, a, "\x15new-steer\r", &.{ "Steering", "new-steer" });
         try queuedDraft(d, a, "");
         try queuedKey(d, a, "\x1b", &.{"new-steer"});
         try queuedDraft(d, a, "new-steer");
         // And a second recall can freely switch back to FollowUp.
-        try queuedKey(d, a, "\x15new-follow\x1b\r", &.{"FollowUp pending #4: new-follow"});
+        try queuedKey(d, a, "\x15new-follow\x1b\r", &.{ "FollowUp", "new-follow" });
         try queuedDraft(d, a, "");
     }
     if (steer or withdraw) {
@@ -1900,8 +1900,8 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         defer a.destroy(confirmation);
         try approvalCancelScreen(d, confirmation);
         try checkConfirmationRow(confirmation, "Task running", "> Continue", "Stop and clear");
-        try check(confirmation.visible("Steering pending #1: keep-steer"));
-        try check(confirmation.visible("FollowUp pending #2: keep-follow"));
+        try check(confirmation.visible("Steering") and confirmation.visible("keep-steer"));
+        try check(confirmation.visible("FollowUp") and confirmation.visible("keep-follow"));
         try queuedGate(d, a, project, "modal-default");
         // Each probe must cause an observable safe-selection transition.
         // Consecutive writes are NOT application read boundaries: without
@@ -1910,7 +1910,7 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         try queuedKey(d, a, "\x03\x03\r", &.{"> Continue"});
         try queuedKey(d, a, "\x1b[B", &.{"> Stop and clear"});
         try queuedKey(d, a, "\x1b[200~\r\x03\x1b[201~", &.{"> Continue"});
-        try queuedKey(d, a, "\x1b", &.{ "Steering pending #1: keep-steer", "FollowUp pending #2: keep-follow", "preserved-draft" });
+        try queuedKey(d, a, "\x1b", &.{ "Steering", "keep-steer", "FollowUp", "keep-follow", "preserved-draft" });
         try queuedDraft(d, a, "preserved-draft");
         try queuedGate(d, a, project, "modal-dismissed");
         try queuedKey(d, a, "\x03", &.{"> Continue"});

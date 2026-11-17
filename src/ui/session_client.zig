@@ -297,7 +297,6 @@ pub const Snapshot = struct {
     launcher_dir: ?[]const u8 = null,
     control_epoch: u64 = 0,
     queue_revision: u64 = 0,
-    queue_paused: bool = false,
     steering: usize = 0,
     follow_up: usize = 0,
     newest_id: ?u64 = null,
@@ -315,6 +314,7 @@ pub const SavedSession = @import("../core/session_metadata.zig").SavedSession;
 
 pub const Manage = union(enum) {
     saved_sessions: void,
+    new_session: void,
     @"resume": []const u8,
     list: struct { running_only: bool = false, page: usize = 0 },
     cd: []const u8,
@@ -375,8 +375,6 @@ pub const VTable = struct {
     /// Withdraw one pending queue entry into caller-owned text, or null when it
     /// was already consumed.
     withdraw_fn: *const fn (*anyopaque, std.mem.Allocator, u64, u64) anyerror!?[]u8,
-    /// Explicitly resume a paused queue.
-    queue_resume_fn: *const fn (*anyopaque, u64) anyerror!void,
     /// Run a session-management request; the adapter owns path validation,
     /// attach/takeover epochs, listing pagination and close confirmation needs.
     manage_fn: *const fn (*anyopaque, std.mem.Allocator, Manage) anyerror!Outcome,
@@ -435,9 +433,6 @@ pub const Client = struct {
     }
     pub fn withdraw(self: Client, a: std.mem.Allocator, epoch: u64, id: u64) !?[]u8 {
         return self.vtable.withdraw_fn(self.context, a, epoch, id);
-    }
-    pub fn queueResume(self: Client, epoch: u64) !void {
-        try self.vtable.queue_resume_fn(self.context, epoch);
     }
     pub fn manage(self: Client, a: std.mem.Allocator, request: Manage) !Outcome {
         return self.vtable.manage_fn(self.context, a, request);

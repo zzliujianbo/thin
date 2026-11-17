@@ -648,7 +648,6 @@ const FakeRemote = struct {
     enqueues: usize = 0,
     last_enqueue_epoch: u64 = 0,
     last_enqueue_kind: session_client.QueueKind = .steering,
-    resumes: usize = 0,
     manages: usize = 0,
     last_manage: ?std.meta.Tag(session_client.Manage) = null,
     manage_switched: bool = false,
@@ -764,9 +763,6 @@ const FakeRemote = struct {
     fn withdrawFn(_: *anyopaque, _: std.mem.Allocator, _: u64, _: u64) anyerror!?[]u8 {
         return null;
     }
-    fn queueResumeFn(ctx: *anyopaque, _: u64) anyerror!void {
-        from(ctx).resumes += 1;
-    }
     fn manageFn(ctx: *anyopaque, a: std.mem.Allocator, request: session_client.Manage) anyerror!session_client.Outcome {
         const self = from(ctx);
         self.manages += 1;
@@ -794,7 +790,6 @@ const FakeRemote = struct {
         .approve_fn = approveFn,
         .enqueue_fn = enqueueFn,
         .withdraw_fn = withdrawFn,
-        .queue_resume_fn = queueResumeFn,
         .manage_fn = manageFn,
         .detach_fn = detachFn,
     };

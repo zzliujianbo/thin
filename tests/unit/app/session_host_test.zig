@@ -320,7 +320,8 @@ test "host live thinking crosses two real task requests and merges only after jo
     try std.testing.expect(std.mem.indexOf(u8, late, "\"ok\":true") != null);
     try std.testing.expectEqualStrings("low", app.config.value.model.reasoning_effort.?);
     try std.testing.expectEqualStrings("high", app.thinking_control.get().?.reasoning_effort.?);
-    host.inbox.pause();
+    // Hold automatic dispatch without the removed queue pause state.
+    host.dispatch_retry_at_ms = std.math.maxInt(u64);
     _ = try host.inbox.enqueue(a, .follow_up, "follow up");
     host.pump(0);
     try std.testing.expect(host.task == null and !host.session.owner_task_active);
@@ -1815,7 +1816,7 @@ test "history baseline keeps newest rows within a byte budget" {
     try std.testing.expect(entries.len > 0 and entries.len < 10);
     try std.testing.expectEqualStrings("item-9", entries[entries.len - 1].object.get("v").?.string);
 }
-test "accepted queue entries are kept and paused when no runtime can start them" {
+test "accepted queue entries are kept when no runtime can start them" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1842,17 +1843,6 @@ test "accepted queue entries are kept and paused when no runtime can start them"
     host.pump(0);
     try std.testing.expectEqual(@as(usize, 1), host.inbox.snapshot().follow_up);
     try std.testing.expect(host.task == null);
-
-    // An explicit resume while still unavailable also keeps the message.
-    const resumed = try dispatchJson(host, a, "{\"v\":5,\"id\":62,\"op\":\"queue_resume\",\"epoch\":1}", 1);
-    defer a.free(resumed);
-    host.pump(0);
-    try std.testing.expectEqual(@as(usize, 1), host.inbox.snapshot().follow_up);
-    var rendered: usize = 0;
-    for (host.events.items.items) |entry| {
-        if (std.mem.indexOf(u8, entry.json, "next step") != null) rendered += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 0), rendered);
 }
 test "snapshot reply encodes caller-owned queued previews consistently" {
     const a = std.testing.allocator;
@@ -1956,7 +1946,6 @@ test "snapshot reply encodes caller-owned queued previews consistently" {
         try std.testing.expectEqual(@as(i64, 2), try Probe.integer(object, "queue_revision"));
         try std.testing.expectEqual(@as(i64, 2), try Probe.integer(object, "newest_id"));
         try std.testing.expectEqual(@as(i64, @intCast(expected[1].len)), try Probe.integer(object, "newest_bytes"));
-        try std.testing.expectEqual(false, try Probe.boolean(object, "queue_paused"));
 
         const previews = try Probe.arrayOf(try Probe.of(object, "previews"));
         try std.testing.expectEqual(expected.len, previews.len);

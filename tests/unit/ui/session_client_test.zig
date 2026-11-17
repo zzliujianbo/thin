@@ -136,7 +136,6 @@ test "setConfirming is optional and refuses without an adapter" {
         .approve_fn = undefined,
         .enqueue_fn = undefined,
         .withdraw_fn = undefined,
-        .queue_resume_fn = undefined,
         .manage_fn = undefined,
         .detach_fn = undefined,
     };

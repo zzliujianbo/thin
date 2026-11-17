@@ -44,7 +44,6 @@ test "steering larger than former response cap commits once and completes" {
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.users);
     try std.testing.expectEqual(@as(usize, 0), box.snapshot().steering);
-    try std.testing.expect(!box.snapshot().paused);
     var found = false;
     for (runtime.messages()) |message| for (message.blocks) |block| {
         if (message.role == .user and block == .text and std.mem.eql(u8, block.text, &payload)) found = true;
@@ -70,7 +69,6 @@ test "steering skips pending tools and completes without round quota" {
     try std.testing.expectEqual(@as(usize, 0), fake.executions);
     try std.testing.expectEqual(@as(usize, 1), fake.users);
     try std.testing.expectEqual(@as(usize, 2), fake.results);
-    try std.testing.expect(!box.snapshot().paused);
 }
 test "steering pre-send event does not spend a round and late seal stays pending" {
     for ([_]Stage{ .request, .late }) |stage| {
@@ -107,7 +105,6 @@ test "steering history clone OOM restores unconsumed reserved text" {
     try std.testing.expectEqual(error.OutOfMemory, terminal.detail.?);
     try std.testing.expectEqual(@as(usize, 0), fake.users);
     const snap = box.snapshot();
-    try std.testing.expect(snap.paused);
     try std.testing.expectEqual(@as(usize, 1), snap.steering);
     try std.testing.expectEqual(@as(usize, large.len), snap.newest_bytes);
     var entry = box.withdraw(snap.newest_id.?).?;
@@ -153,7 +150,6 @@ test "steering confirmation blocks new tool launch without skipping empty modal 
         try std.testing.expectEqual(if (canceled) r.Status.canceled else r.Status.success, terminal.status);
         try std.testing.expectEqual(@as(usize, if (mode == 1) 2 else if (mode == 3) 1 else 0), fake.executions);
         try std.testing.expectEqual(@as(usize, if (mode == 0) 1 else 0), fake.users);
-        if (canceled) try std.testing.expect(box.snapshot().paused);
         if (mode >= 3) {
             try std.testing.expectEqual(@as(usize, 0), fake.calls);
             try std.testing.expectEqual(@as(usize, 1), box.snapshot().steering);

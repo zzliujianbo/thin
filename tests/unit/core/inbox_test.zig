@@ -17,7 +17,7 @@ test "steering inbox priority restore reservation tombstone and pause" {
     try std.testing.expect(box.cancelClear(snap.revision, &cancel));
     try std.testing.expectEqualStrings("now", again.text);
     box.restore(again);
-    box.finishRun(true);
+    box.finishRun();
     try std.testing.expect(box.claimNext() == null);
     try std.testing.expectEqual(@as(usize, 0), box.snapshot().steering);
 }
@@ -124,7 +124,7 @@ test "run-gated delivery linearizes with sealing and leaves UI enqueue unchanged
     const next = try box.enqueue(a, .steering, "next turn");
     try std.testing.expect(box.claimSteering() == null);
     try std.testing.expectError(error.RunSealed, box.enqueueForRun(a, .steering, "during seal"));
-    box.finishRun(true);
+    box.finishRun();
     try std.testing.expectError(error.RunSealed, box.enqueueForRun(a, .steering, "after finish"));
     // claimSteering requires an active run; claimNext deliberately still lets an
     // idle box prefer the queued steering entry. Restore that entry before the
@@ -137,4 +137,17 @@ test "run-gated delivery linearizes with sealing and leaves UI enqueue unchanged
     const resumed = box.claimSteering().?;
     try std.testing.expectEqual(next, resumed.id);
     box.restore(resumed);
+}
+
+test "finishRun failure leaves the next queued message claimable" {
+    const a = std.testing.allocator;
+    var box: Inbox = .{};
+    defer box.deinit();
+    box.beginRun();
+    const id = try box.enqueue(a, .steering, "after failure");
+    box.finishRun();
+    const lease = box.claimNext().?;
+    try std.testing.expectEqual(id, lease.id);
+    try std.testing.expectEqualStrings("after failure", lease.text);
+    box.restore(lease);
 }

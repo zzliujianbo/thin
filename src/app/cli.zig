@@ -237,14 +237,15 @@ const common_help =
     \\A fresh session starts at 0.0%; unreported usage shows ?. Safety budgets still use estimates.
     \\Startup shows three lines: Thin version, directory, local time with UTC offset.
     \\Enter sends; Ctrl+J adds newline; Esc or Ctrl+C cancels the current task; Ctrl+D exits.
+    \\Input: Ctrl+A/E line edges; Ctrl+B/F cursor; Ctrl+K/U kill to end/start; Ctrl+W or Alt+Backspace deletes word; Alt+B/F or Ctrl+Left/Right moves by word.
     \\Up/Down browse this session's submitted inputs only from an empty composer.
     \\Manual edits stop browsing; navigation never submits. Keyboard recall is session-local.
     \\Session diagnostics are separate and still follow the recording settings below.
-    \\After normal exit and a successful save, only thin --resume <ID> is printed.
+    \\After normal exit and a successful save, only thin --resume <ID> is printed, followed by a blank line.
     \\Empty chats print no session information or resume command.
     \\Run the resume command from the same project with the current Thin version on PATH.
     \\PgUp/PgDn scroll; Ctrl+R toggles visible reasoning; Shift+Tab cycles supported effort.
-    \\/ opens /model and /login choices; Up/Down wraps, Enter confirms (no Tab shortcut).
+    \\/ opens command choices; /new [prompt] starts a fresh session. Up/Down wraps, Enter confirms (no Tab shortcut).
     \\Pickers: Up/Down selects, Enter confirms, Left returns, Esc cancels; at most 10 rows.
     \\Tab and PgUp/PgDn are not picker shortcuts. Esc also clears secret-paste quarantine.
     \\/model directly lists models for locally logged-in aliases; /model exact-id selects while idle.

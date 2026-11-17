@@ -179,6 +179,8 @@ pub fn inputBudgetPause(detail: ?anyerror) bool {
 }
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
+pub const CompactionSkipReason = enum { recent, limit };
+
 pub const Event = union(enum) {
     background_completed: @import("background_status.zig").Terminal,
     /// 阶段切换。
@@ -211,6 +213,8 @@ pub const Event = union(enum) {
     compacted: struct { before: usize, after: usize },
     /// 压缩失败；旧历史保持不变。
     compaction_failed: anyerror,
+    /// 自动压缩被增长保护或每任务上限跳过；旧历史保持不变。
+    compaction_skipped: struct { reason: CompactionSkipReason },
     /// Session-owned auxiliary completion, display only. Never a Runtime
     /// task result, model message, or canonical Journal observation.
     memory_completed: @import("memory_status.zig").Terminal,
@@ -400,6 +404,9 @@ pub fn isLocalCommand(id: []const u8) bool {
 pub const local_command_note = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response.";
 
 /// Agent loop; owner serializes selection and worker execution.
+const max_auto_compactions: u8 = 2;
+const auto_compaction_growth_divisor: usize = 20;
+
 pub const Runtime = struct {
     /// 长期分配器；压缩的临时数据与单轮结果都从它派生 arena。
     allocator: std.mem.Allocator,
@@ -437,6 +444,11 @@ pub const Runtime = struct {
     /// Display only: latest individual request total (normal OR summary).
     /// null means unreported/overflow; cached/reasoning tokens aren't added again.
     last_context_tokens: ?u64 = 0,
+    /// Last normal request's provider-reported input tokens and the estimate
+    /// used for that same request. The delta since then lets automatic
+    /// compaction use actual usage without discarding new history.
+    last_normal_input_tokens: ?u64 = null,
+    last_normal_estimated_tokens: usize = 0,
     /// 运行中标志：run 入口 swap 置位，defer 清除，防止重入。
     busy: std.atomic.Value(bool) = .init(false),
     /// 递增的调用/权限 ID（允许回绕），与宿主事件关联。
@@ -594,7 +606,10 @@ pub const Runtime = struct {
             self.discardNativeReplay();
             self.estimator = .{};
         }
-        if (plan.invalidate_context) self.last_context_tokens = if (self.history.items.len == 0) 0 else null;
+        if (plan.invalidate_context) {
+            self.last_context_tokens = if (self.history.items.len == 0) 0 else null;
+            self.resetNormalContextBaseline();
+        }
         self.selector = plan.selector;
     }
 
@@ -748,6 +763,7 @@ pub const Runtime = struct {
         // The last server-confirmed display statistic is independent of whether
         // native replay remains valid for the rewritten tool prefix.
         self.last_context_tokens = state.last_context_tokens;
+        self.resetNormalContextBaseline();
         // No saved poison, approval counter or grants become live authority.
         // Current declared context/output/input budgets are untouched.
         self.poisoned = false;
@@ -767,6 +783,23 @@ pub const Runtime = struct {
         }
         old_arena.deinit();
         self.allocator.free(old_system);
+    }
+
+    fn resetNormalContextBaseline(self: *Runtime) void {
+        self.last_normal_input_tokens = null;
+        self.last_normal_estimated_tokens = 0;
+    }
+
+    /// Use the last normal request's actual input count plus the estimated
+    /// growth since that request. The estimator remains the hard-budget guard;
+    /// this only avoids triggering an unnecessary paid summary when it is
+    /// systematically high.
+    fn automaticCompactionTokens(self: *const Runtime, estimated: usize) usize {
+        const actual = self.last_normal_input_tokens orelse return estimated;
+        if (self.last_normal_estimated_tokens == 0) return estimated;
+        const growth = estimated -| self.last_normal_estimated_tokens;
+        const current = actual +| @as(u64, @intCast(growth));
+        return std.math.cast(usize, current) orelse std.math.maxInt(usize);
     }
 
     /// 估算当前上下文 token 数（系统提示词 + 工具 schema + 历史），用于决定是否压缩。
@@ -812,6 +845,13 @@ pub const Runtime = struct {
         edited_files: std.StringHashMapUnmanaged(void) = .empty,
         /// Possible paid summary attempts, including transport throws before usage.
         summary_attempts: u64 = 0,
+        /// Whether a no-candidate notice was already shown for this task.
+        compaction_skipped_notified: bool = false,
+        /// Successful automatic compactions this task, and the post-summary
+        /// estimate used for the growth guard.
+        auto_compactions: u8 = 0,
+        auto_after_tokens: usize = 0,
+        auto_skip_notified: bool = false,
         /// 累计的用量与终态，run 结束时返回。
         terminal: Terminal = .{ .status = .success },
 
@@ -863,13 +903,12 @@ pub const Runtime = struct {
         if (self.busy.swap(true, .acq_rel)) return error.Busy;
         defer self.busy.store(false, .release);
         if (self.inbox) |box| box.beginRun();
-        var inbox_success = false;
         defer if (self.inbox) |box| {
             if (self.steering_lease) |lease| {
                 box.restore(lease);
                 self.steering_lease = null;
             }
-            box.finishRun(inbox_success);
+            box.finishRun();
         };
         self.observer.notify(.{ .submitted = switch (operation) {
             .prompt, .command => |text| text,
@@ -938,11 +977,9 @@ pub const Runtime = struct {
         task.terminal.tool_calls = task.tool_calls;
         task.terminal.files_edited = @intCast(task.edited_files.count());
         task.terminal.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
-        inbox_success = task.terminal.status == .success;
         var finished_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .finished_emit });
         self.emit(.{ .finished = task.terminal }, cancel) catch |err| {
             finished_span.fail(err);
-            inbox_success = false;
         };
         finished_span.finish(.ok);
         return task.terminal;
@@ -1604,8 +1641,13 @@ pub const Runtime = struct {
             };
             if (!canceled_without_total) self.last_context_tokens = total;
             task.terminal.usage.add(purpose, usage);
-            // 用真实 input_tokens 校准估算。
+            // 用真实 input_tokens 校准估算，并保留正常请求的实际输入，
+            // 供下一次自动压缩判断使用。摘要请求不会覆盖这个基线。
             self.estimator.observe(raw, usage.input_tokens);
+            if (purpose == .normal) {
+                self.last_normal_input_tokens = usage.input_tokens;
+                self.last_normal_estimated_tokens = if (usage.input_tokens != null) self.estimator.tokens(raw) else 0;
+            }
         }
 
         if (result.fallback_usage) |first| try self.emit(.{ .usage = .{ .purpose = purpose, .protocol = .responses, .value = first } }, cancel);
@@ -1617,12 +1659,38 @@ pub const Runtime = struct {
     fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
         try context.validateInputPolicy(self.config.*);
         const budget = context.inputBudget(self.config.*);
-        const before = self.estimatedTokens();
+        const estimated = self.estimatedTokens();
         if (!self.config.limits.compaction_enabled) {
-            if (before > budget) return context.inputBudgetError(self.config.*);
+            if (estimated > budget) return context.inputBudgetError(self.config.*);
             return;
         }
-        if (before < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) return;
+        const trigger = self.automaticCompactionTokens(estimated);
+        if (trigger < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) {
+            // Actual usage can justify a lower trigger, but it never relaxes
+            // the hard physical/price limit enforced by the estimator.
+            if (estimated > budget) return context.inputBudgetError(self.config.*);
+            return;
+        }
+        const cap_reached = task.auto_compactions >= max_auto_compactions;
+        if (cap_reached and estimated <= budget) {
+            if (!task.auto_skip_notified) {
+                task.auto_skip_notified = true;
+                try self.emit(.{ .compaction_skipped = .{ .reason = .limit } }, cancel);
+            }
+            return;
+        }
+        // Beyond the soft cap, an input already over the hard budget still
+        // needs an emergency summary. Refusing here would fail a long task
+        // that is otherwise still making progress.
+        if (task.auto_compactions != 0 and estimated <= budget and
+            estimated < task.auto_after_tokens +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
+        {
+            if (!task.auto_skip_notified) {
+                task.auto_skip_notified = true;
+                try self.emit(.{ .compaction_skipped = .{ .reason = .recent } }, cancel);
+            }
+            return;
+        }
         const attempts = task.summary_attempts;
         self.compact(cancel, task, .automatic) catch |err| {
             // Cleanup failure is terminal even before a summary attempt. Never
@@ -1637,11 +1705,20 @@ pub const Runtime = struct {
                 try checkCanceled(cancel);
                 return error.InputBudgetSummaryFailed;
             }
-            if (err == error.NoCompactionCandidate and self.estimatedTokens() <= budget) return;
+            const current = self.estimatedTokens();
+            if (err == error.NoCompactionCandidate and current <= budget) {
+                // Surface the condition once per task instead of retrying a
+                // summary that has no safe prefix on every model round.
+                if (!task.compaction_skipped_notified) {
+                    task.compaction_skipped_notified = true;
+                    try self.emit(.{ .compaction_failed = err }, cancel);
+                }
+                return;
+            }
             try self.emit(.{ .compaction_failed = err }, cancel);
             // Failed compaction never mutates the old history. It may continue
             // only if that old input still fits the hard input budget.
-            if (self.estimatedTokens() > budget) return context.inputBudgetError(self.config.*);
+            if (current > budget) return context.inputBudgetError(self.config.*);
         };
     }
 
@@ -1656,10 +1733,8 @@ pub const Runtime = struct {
         context.validateInputPolicy(self.config.*) catch |err| {
             if (planning != .manual or err != error.UnknownInputPriceThreshold) return err;
         };
-        const commit_budget = if (context.inputBudget(self.config.*) != 0)
-            context.inputBudget(self.config.*)
-        else
-            context.inputBudgetFor(self.config.*, .summary);
+        const normal_budget = context.inputBudget(self.config.*);
+        const commit_budget = if (normal_budget != 0) normal_budget else context.inputBudgetFor(self.config.*, .summary);
         const previous_context = self.last_context_tokens;
         const previous_history = self.history.items.ptr;
         defer if (self.history.items.ptr == previous_history) {
@@ -1780,6 +1855,12 @@ pub const Runtime = struct {
         self.protected_index = if (selection.protected_index < selection.cut) 1 else selection.protected_index - selection.cut + 1;
 
         old_arena.deinit();
+        self.last_context_tokens = null;
+        self.resetNormalContextBaseline();
+        if (planning == .automatic) {
+            task.auto_compactions +|= 1;
+            task.auto_after_tokens = after;
+        }
         try self.emit(.{ .compacted = .{ .before = before, .after = after } }, cancel);
     }
 

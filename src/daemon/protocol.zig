@@ -195,7 +195,6 @@ pub const Op = enum {
     approve,
     enqueue,
     withdraw,
-    queue_resume,
     settings,
     model_select,
     effort,
@@ -897,6 +896,10 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("t", "compaction_failed");
             try out.field("code", failureCode(err));
         },
+        .compaction_skipped => |value| {
+            try out.field("t", "compaction_skipped");
+            try out.field("reason", @tagName(value.reason));
+        },
         .background_completed => |terminal| {
             try out.field("t", "background_completed");
             try encodeBackgroundTerminal(&out, terminal);
@@ -991,7 +994,6 @@ pub const Snapshot = struct {
     attached: bool = false,
     pending_permission: ?u64 = null,
     queue_revision: u64 = 0,
-    queue_paused: bool = false,
     steering: u32 = 0,
     follow_up: u32 = 0,
     newest_id: ?u64 = null,
@@ -1026,7 +1028,6 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.field("attached", snapshot.attached);
     try out.field("pending", snapshot.pending_permission);
     try out.field("queue_revision", snapshot.queue_revision);
-    try out.field("queue_paused", snapshot.queue_paused);
     try out.field("steering", snapshot.steering);
     try out.field("follow_up", snapshot.follow_up);
     try out.field("newest_id", snapshot.newest_id);
@@ -1576,6 +1577,8 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
     } else if (std.mem.eql(u8, kind, "compaction_failed")) {
         const failure = failureFromName(try requireText(object, "code"));
         event = .{ .compaction_failed = Failure.toError(failure) orelse error.RemoteFailure };
+    } else if (std.mem.eql(u8, kind, "compaction_skipped")) {
+        event = .{ .compaction_skipped = .{ .reason = try requireEnum(r.CompactionSkipReason, object, "reason") } };
     } else if (std.mem.eql(u8, kind, "assistant")) {
         const array = try requireArray(object, "blocks");
         const count = array.items.len;

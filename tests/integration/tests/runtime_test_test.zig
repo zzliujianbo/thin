@@ -26,7 +26,7 @@ test "system prompt keeps evidence authority and quoted Memory boundaries explic
     try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
     try std.testing.expectEqual(@as(u32, 0), fake.executions);
 }
-test "automatic no candidate is quiet below normal budget and manual no candidate is unchanged" {
+test "automatic no candidate is reported once and manual no candidate is unchanged" {
     var fake: Fake = .{ .stop_after = 0 };
     var config = configuration();
     var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
@@ -43,7 +43,7 @@ test "automatic no candidate is quiet below normal budget and manual no candidat
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(r.Status.success, (try runtime.run("Do the task", &cancel)).status);
     try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
-    try std.testing.expect(fake.compaction_error == null);
+    try std.testing.expectEqual(error.NoCompactionCandidate, fake.compaction_error.?);
     // Empty history is a friendly manual notice, not a fake summary success.
     var empty: Fake = .{};
     var other = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, empty.model(), empty.executor(), empty.host(), "");
@@ -55,6 +55,28 @@ test "automatic no candidate is quiet below normal budget and manual no candidat
     try std.testing.expectEqual(error.NoCompactionCandidate, empty.compaction_error.?);
     try std.testing.expectEqual(@as(u32, 0), empty.normal_calls + empty.summary_calls + empty.compactions);
     try std.testing.expectEqualDeep(before, other.messages());
+}
+
+test "automatic compaction uses actual input plus estimated growth" {
+    var fake: Fake = .{ .stop_after = 0 };
+    var config = configuration();
+    var runtime = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, fake.model(), fake.executor(), fake.host(), "");
+    defer runtime.deinit();
+    fake.current_runtime = &runtime;
+    const pending = [_]p.Message{.{ .role = .user, .blocks = &.{.{ .text = "Do the task" }} }};
+    const incoming = runtime.estimator.tokens(context.rawTokens(runtime.system, &tool_schemas, &pending));
+    config.model.context_tokens = windowForInputBudget(@intCast(incoming * 100 / 81));
+    const budget = context.inputBudget(config);
+    const trigger_at = context.threshold(budget, cfg.Policy.compaction_trigger_percent);
+    try std.testing.expect(incoming > trigger_at);
+    // A previous actual request was just below the trigger. The estimator's
+    // current value is above it, but there is no new history to justify a
+    // paid summary.
+    runtime.last_normal_input_tokens = @intCast(trigger_at - 1);
+    runtime.last_normal_estimated_tokens = incoming;
+    var cancel: p.Cancellation = .{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("Do the task", &cancel)).status);
+    try std.testing.expectEqual(@as(u32, 0), fake.summary_calls);
 }
 test "checkpoint runtime restores owned context without replaying tools or authorization" {
     const a = std.testing.allocator;

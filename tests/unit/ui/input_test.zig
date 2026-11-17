@@ -212,3 +212,52 @@ test "secret paste control bytes and embedded terminator enter never become save
     try parser.feed("\xff", sink);
     try std.testing.expectEqual(@as(u8, 0), record.data[record.len - 1]);
 }
+
+test "ssh editing control bytes map to cursor word and kill events" {
+    var record = Record{};
+    var parser = Parser{};
+    const sink = Sink{ .context = &record, .emit_fn = Record.event };
+    try parser.feed("\x02\x06\x17\x15", sink);
+    try std.testing.expectEqual(@as(usize, 1), record.cursor_lefts);
+    try std.testing.expectEqual(@as(usize, 1), record.cursor_rights);
+    try std.testing.expectEqual(@as(usize, 1), record.kill_words);
+    try std.testing.expectEqual(@as(usize, 1), record.kill_starts);
+
+    try parser.feed("\x1bb\x1bB\x1bf\x1bF", sink);
+    try std.testing.expectEqual(@as(usize, 2), record.word_lefts);
+    try std.testing.expectEqual(@as(usize, 2), record.word_rights);
+
+    try parser.feed("\x1b[1;5D\x1b[1;3C\x1b[5D\x1b[5C", sink);
+    try std.testing.expectEqual(@as(usize, 4), record.word_lefts);
+    try std.testing.expectEqual(@as(usize, 4), record.word_rights);
+
+    try parser.feed("\x1b\x7f", sink);
+    try std.testing.expectEqual(@as(usize, 2), record.kill_words);
+    try std.testing.expectEqual(@as(usize, 0), record.len);
+}
+test "editor ssh word motions and kills preserve cluster boundaries" {
+    try text.initLocale();
+    var editor = Editor{ .allocator = std.testing.allocator };
+    defer editor.deinit();
+    try std.testing.expect(try editor.insert("one two  three"));
+    editor.wordLeft();
+    try std.testing.expectEqual(@as(usize, 9), editor.cursor);
+    editor.wordRight();
+    try std.testing.expectEqual(editor.bytes.items.len, editor.cursor);
+    editor.killWord();
+    try std.testing.expectEqualStrings("one two  ", editor.bytes.items);
+    editor.wordLeft();
+    try std.testing.expectEqual(@as(usize, 4), editor.cursor);
+    editor.cursor = 9;
+    editor.killWord();
+    try std.testing.expectEqualStrings("one ", editor.bytes.items);
+    editor.killStart();
+    try std.testing.expectEqualStrings("", editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), editor.cursor);
+
+    try std.testing.expect(try editor.insert("abcdef"));
+    editor.cursor = 3;
+    editor.killStart();
+    try std.testing.expectEqualStrings("def", editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), editor.cursor);
+}

@@ -33,7 +33,6 @@ pub const Snapshot = struct {
     follow_up: usize = 0,
     newest_id: ?u64 = null,
     newest_bytes: usize = 0,
-    paused: bool,
     confirming: bool,
     active: bool,
     epoch: u64,
@@ -48,7 +47,6 @@ pub const Inbox = struct {
     next_id: u64 = 0,
     revision: u64 = 0,
     epoch: u64 = 0,
-    paused: bool = false,
     confirming: bool = false,
     active: bool = false,
     sealed: bool = true,
@@ -64,7 +62,7 @@ pub const Inbox = struct {
         self.revision +|= 1;
     }
     fn eligible(self: *Inbox) bool {
-        return !self.paused and !self.confirming;
+        return !self.confirming;
     }
     fn pending(self: *Inbox, kind: Kind) ?usize {
         var index: ?usize = null;
@@ -117,7 +115,7 @@ pub const Inbox = struct {
     pub fn snapshot(self: *Inbox) Snapshot {
         self.lock();
         defer self.unlock();
-        var result = Snapshot{ .revision = self.revision, .paused = self.paused, .confirming = self.confirming, .active = self.active, .epoch = self.epoch };
+        var result = Snapshot{ .revision = self.revision, .confirming = self.confirming, .active = self.active, .epoch = self.epoch };
         // Counts cover the entire queue; previews remain display-only.
         for (self.slots.items) |slot| if (slot) |s| {
             if (s.leased or s.tombstone) continue;
@@ -231,12 +229,11 @@ pub const Inbox = struct {
         self.changed();
         return true;
     }
-    pub fn finishRun(self: *Inbox, success: bool) void {
+    pub fn finishRun(self: *Inbox) void {
         self.lock();
         defer self.unlock();
         self.active = false;
         self.sealed = true;
-        if (!success) self.paused = true;
         self.changed();
     }
     pub fn pauseClaims(self: *Inbox, value: bool) void {
@@ -244,20 +241,6 @@ pub const Inbox = struct {
         defer self.unlock();
         if (self.confirming != value) {
             self.confirming = value;
-            self.changed();
-        }
-    }
-    pub fn pause(self: *Inbox) void {
-        self.setPaused(true);
-    }
-    pub fn @"resume"(self: *Inbox) void {
-        self.setPaused(false);
-    }
-    fn setPaused(self: *Inbox, value: bool) void {
-        self.lock();
-        defer self.unlock();
-        if (self.paused != value) {
-            self.paused = value;
             self.changed();
         }
     }
@@ -272,7 +255,6 @@ pub const Inbox = struct {
                 slot.* = null;
             }
         };
-        self.paused = true;
         self.confirming = false;
         self.changed();
         return true;

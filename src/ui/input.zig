@@ -15,10 +15,16 @@ pub const Event = union(enum) {
     delete,
     left,
     right,
+    cursor_left,
+    cursor_right,
+    word_left,
+    word_right,
     home,
     end,
     clear,
+    kill_start,
     kill_end,
+    kill_word,
     cancel,
     quit,
     up,
@@ -188,6 +194,14 @@ pub const Parser = struct {
                 .{ "\x1b[3~", Event.delete },         .{ "\x1b[5~", Event.page_up },
                 .{ "\x1b[6~", Event.page_down },      .{ "\x1b[Z", Event.cycle_effort },
                 .{ "\x1b[1;2Z", Event.cycle_effort }, .{ "\x1b[9;2u", Event.cycle_effort },
+                .{ "\x1b[1;5D", Event.word_left },    .{ "\x1b[1;5C", Event.word_right },
+                .{ "\x1b[1;3D", Event.word_left },    .{ "\x1b[1;3C", Event.word_right },
+                .{ "\x1b[5D", Event.word_left },      .{ "\x1b[5C", Event.word_right },
+                .{ "\x1bb", Event.word_left },        .{ "\x1bB", Event.word_left },
+                .{ "\x1bf", Event.word_right },       .{ "\x1bF", Event.word_right },
+                .{ "\x1b[98;3u", Event.word_left },   .{ "\x1b[102;3u", Event.word_right },
+                .{ "\x1b[98;5u", Event.cursor_left }, .{ "\x1b[102;5u", Event.cursor_right },
+                .{ "\x1b\x7f", Event.kill_word },
             };
             inline for (keys) |key| if (std.mem.eql(u8, seq, key[0])) {
                 if (self.secret and key[1] == .cycle_effort) return;
@@ -261,9 +275,12 @@ pub const Parser = struct {
             10 => return sink.emit(.{ .text = .{ .value = "\n", .pasted = false } }),
             8, 127 => return sink.emit(.backspace),
             1 => return sink.emit(.home),
+            2 => return sink.emit(.cursor_left),
             5 => return sink.emit(.end),
-            21 => return sink.emit(.clear),
+            6 => return sink.emit(.cursor_right),
+            21 => return sink.emit(.kill_start),
             11 => return sink.emit(.kill_end),
+            23 => return sink.emit(.kill_word),
             18 => return sink.emit(.toggle_reasoning),
             9 => return sink.emit(if (self.secret) .{ .text = .{ .value = "\t", .pasted = false } } else .tab),
             // 中文：未映射的其他控制字符直接忽略。
@@ -350,15 +367,23 @@ pub const Editor = struct {
         self.cursor = 0;
     }
 
-    /// 返回光标前一个字形簇的起始偏移：从头逐簇前进，直到下一簇会到达或越过光标。
-    fn previous(self: *Editor) usize {
+    /// Return the start of the cluster immediately before `cursor`.
+    fn previousAt(self: *Editor, cursor: usize) usize {
         var pos: usize = 0;
-        while (pos < self.cursor) {
+        while (pos < cursor) {
             const next = text.nextCluster(self.bytes.items, pos, 0).end;
-            if (next >= self.cursor) return pos;
+            if (next >= cursor) return pos;
             pos = next;
         }
         return 0;
+    }
+
+    fn previous(self: *Editor) usize {
+        return self.previousAt(self.cursor);
+    }
+
+    fn spaceAt(self: *Editor, pos: usize) bool {
+        return pos < self.bytes.items.len and std.ascii.isWhitespace(self.bytes.items[pos]);
     }
 
     /// 光标左移一个字形簇。
@@ -369,6 +394,40 @@ pub const Editor = struct {
     /// 光标右移一个字形簇；已在末尾时不动。
     pub fn right(self: *Editor) void {
         if (self.cursor < self.bytes.items.len) self.cursor = text.nextCluster(self.bytes.items, self.cursor, 0).end;
+    }
+
+    /// Move to the start of the previous whitespace-delimited word.
+    pub fn wordLeft(self: *Editor) void {
+        var pos = self.cursor;
+        while (pos > 0 and self.spaceAt(self.previousAt(pos))) pos = self.previousAt(pos);
+        while (pos > 0 and !self.spaceAt(self.previousAt(pos))) pos = self.previousAt(pos);
+        self.cursor = pos;
+    }
+
+    /// Move to the end of the next whitespace-delimited word.
+    pub fn wordRight(self: *Editor) void {
+        var pos = self.cursor;
+        while (pos < self.bytes.items.len and self.spaceAt(pos)) pos = text.nextCluster(self.bytes.items, pos, 0).end;
+        while (pos < self.bytes.items.len and !self.spaceAt(pos)) pos = text.nextCluster(self.bytes.items, pos, 0).end;
+        self.cursor = pos;
+    }
+
+    /// Delete from the start of the line through the cursor.
+    pub fn killStart(self: *Editor) void {
+        if (self.cursor == 0) return;
+        std.mem.copyForwards(u8, self.bytes.items[0..], self.bytes.items[self.cursor..]);
+        self.bytes.items.len -= self.cursor;
+        self.cursor = 0;
+    }
+
+    /// Delete the whitespace-delimited word before the cursor.
+    pub fn killWord(self: *Editor) void {
+        const end = self.cursor;
+        self.wordLeft();
+        const start = self.cursor;
+        if (start == end) return;
+        std.mem.copyForwards(u8, self.bytes.items[start..], self.bytes.items[end..]);
+        self.bytes.items.len -= end - start;
     }
 
     /// 删除光标处的一个字形簇；光标在末尾时不动。

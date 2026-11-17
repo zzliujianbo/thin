@@ -8,6 +8,12 @@ const Record = struct {
     pasted: usize = 0,
     cycles: usize = 0,
     escapes: usize = 0,
+    cursor_lefts: usize = 0,
+    cursor_rights: usize = 0,
+    word_lefts: usize = 0,
+    word_rights: usize = 0,
+    kill_starts: usize = 0,
+    kill_words: usize = 0,
 
     fn event(ctx: *anyopaque, ev: Event) !void {
         const self: *Record = @ptrCast(@alignCast(ctx));
@@ -23,6 +29,12 @@ const Record = struct {
             .cancel => self.cancels += 1,
             .cycle_effort => self.cycles += 1,
             .escape => self.escapes += 1,
+            .cursor_left => self.cursor_lefts += 1,
+            .cursor_right => self.cursor_rights += 1,
+            .word_left => self.word_lefts += 1,
+            .word_right => self.word_rights += 1,
+            .kill_start => self.kill_starts += 1,
+            .kill_word => self.kill_words += 1,
             else => {},
         }
     }

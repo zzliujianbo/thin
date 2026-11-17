@@ -358,7 +358,6 @@ const SnapshotCache = struct {
     /// control; an absent field is "unknown", not "no controller".
     epoch_known: bool = false,
     revision: u64 = 0,
-    paused: bool = false,
     steering: u32 = 0,
     follow_up: u32 = 0,
     newest_id: ?u64 = null,
@@ -817,7 +816,6 @@ pub const Client = struct {
             .launcher_dir = try arena.dupe(u8, self.launcher),
             .control_epoch = self.epoch,
             .queue_revision = if (cache.valid) cache.revision else 0,
-            .queue_paused = cache.valid and cache.paused,
             .steering = if (cache.valid) cache.steering else 0,
             .follow_up = if (cache.valid) cache.follow_up else 0,
             .newest_id = if (cache.valid) cache.newest_id else null,
@@ -940,7 +938,6 @@ pub const Client = struct {
             .approve => |v| try approveFn(self, epoch, v.id, v.decision),
             .enqueue => |v| try enqueueFn(self, epoch, v.kind, v.text),
             .withdraw => |id| return .{ .withdrawn = try withdrawFn(self, self.a, epoch, id) },
-            .queue_resume => try queueResumeFn(self, epoch),
             .manage => |command| return .{ .managed = try manageFn(self, self.a, command) },
             .configure => |v| if (v.provider) |provider| try configureProviderFn(self, provider, v.key) else try configureFn(self, v.key),
             .model => |name| try selectModelFn(self, name),
@@ -1067,7 +1064,6 @@ pub const Client = struct {
             cache.epoch_known = true;
         };
         cache.revision = get.uint(object, "queue_revision") orelse 0;
-        cache.paused = get.flag(object, "queue_paused");
         cache.steering = @intCast(@min(get.uint(object, "steering") orelse 0, std.math.maxInt(u32)));
         cache.follow_up = @intCast(@min(get.uint(object, "follow_up") orelse 0, std.math.maxInt(u32)));
         cache.newest_id = get.uint(object, "newest_id");
@@ -1815,17 +1811,6 @@ pub const Client = struct {
         return try a.dupe(u8, text);
     }
 
-    fn queueResumeFn(context: *anyopaque, epoch: u64) anyerror!void {
-        const self = fromContext(context);
-        var req = try self.request(.queue_resume);
-        defer req.deinit();
-        try req.put("epoch", epoch);
-        var resp = try req.exchange(quick_timeout_ms);
-        defer resp.deinit();
-        self.dirty = true;
-        self.rebuild();
-    }
-
     fn detachFn(context: *anyopaque) void {
         const self = fromContext(context);
         if (self.conn != null and self.epoch != 0) {
@@ -1995,7 +1980,6 @@ pub const Client = struct {
         if (valueU64(state.get("epoch") orelse return error.ProtocolError) != view.epoch) return error.StaleControl;
         _ = valueBool(state.get("busy") orelse return error.ProtocolError) orelse return error.ProtocolError;
         if (!(valueBool(state.get("attached") orelse return error.ProtocolError) orelse return error.ProtocolError)) return error.StaleControl;
-        _ = valueBool(state.get("queue_paused") orelse return error.ProtocolError) orelse return error.ProtocolError;
         for ([_][]const u8{ "task", "queue_revision", "steering", "follow_up" }) |name| {
             _ = valueU64(state.get(name) orelse return error.ProtocolError) orelse return error.ProtocolError;
         }
@@ -2208,10 +2192,10 @@ pub const Client = struct {
         return self.mode == .connect;
     }
 
-    /// Create the session this launcher owns (foreground worker) or ask the
-    /// daemon to create one (connect mode). Only explicit user actions reach it.
-    fn ensureSession(self: *Client) !void {
-        if (self.conn != null) return;
+    /// Start a fresh session this launcher owns (foreground worker) or ask the
+    /// daemon to create one (connect mode). The previous view stays usable until
+    /// the new worker is joined; only an explicit user action reaches this.
+    fn startSession(self: *Client) !void {
         if (self.worksFromDaemon()) {
             var req = try self.controlRequest(.create);
             defer req.deinit();
@@ -2232,7 +2216,15 @@ pub const Client = struct {
         // The foreground owner publishes its endpoint so `/ls`, SSH and
         // `--attach` can discover it; a failed publication closes it again.
         const record = try self.startOwnedWorker(self.launcher, null, null);
-        try self.joinWorker(record.endpoint, record.id, true, record.project);
+        self.joinWorker(record.endpoint, record.id, true, record.project) catch |err| {
+            if (self.workers) |*workers| workers.close(record.id, record.project) catch {};
+            return err;
+        };
+    }
+
+    fn ensureSession(self: *Client) !void {
+        if (self.conn != null) return;
+        try self.startSession();
     }
 
     /// One complete, bounded checkpoint in `project`. Read-only: no writer lock is
@@ -2332,6 +2324,7 @@ pub const Client = struct {
         const self = fromContext(context);
         return switch (options) {
             .saved_sessions => self.manageSavedSessions(a),
+            .new_session => self.manageNew(),
             .@"resume" => |id| self.manageResume(a, id),
             .list => |args| self.manageList(a, args.running_only, args.page),
             .cd => |path| self.manageCd(path),
@@ -2340,6 +2333,18 @@ pub const Client = struct {
             .exit => .{ .exit = true },
             .close => |args| self.manageClose(args.id, args.force),
         };
+    }
+
+    /// `/new` opens an empty session in the current launcher. The previous
+    /// session is only detached: it keeps running and its history stays saved.
+    fn manageNew(self: *Client) !session_client.Outcome {
+        const notice = try self.a.dupe(u8, if (self.session != null)
+            "New session; previous session keeps running"
+        else
+            "New session");
+        errdefer self.a.free(notice);
+        try self.startSession();
+        return .{ .switched = true, .notice = notice };
     }
 
     fn manageSavedSessions(self: *Client, a: std.mem.Allocator) !session_client.Outcome {
@@ -2929,7 +2934,6 @@ const table = session_client.VTable{
     .approve_fn = Client.approveFn,
     .enqueue_fn = Client.enqueueFn,
     .withdraw_fn = Client.withdrawFn,
-    .queue_resume_fn = Client.queueResumeFn,
     .manage_fn = Client.manageFn,
     .detach_fn = Client.detachFn,
 };

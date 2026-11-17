@@ -19,7 +19,6 @@ pub const Action = union(enum) {
     approve: struct { id: u64, decision: runtime.Decision },
     enqueue: struct { kind: session.QueueKind, text: []const u8 },
     withdraw: u64,
-    queue_resume,
     manage: session.Manage,
     configure: struct { provider: ?config.providers.Id, key: []const u8 },
     codex_login: struct { action: codex_login.Action, generation: u64 },

@@ -262,6 +262,9 @@ const Controller = struct {
 
 /// Decision result of one dispatch call: the encoded frame plus nothing else.
 /// All state changes are already committed when the frame is returned.
+const dispatch_retry_initial_ms: u64 = 250;
+const dispatch_retry_max_ms: u64 = 5_000;
+
 pub const SessionHost = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -301,6 +304,9 @@ pub const SessionHost = struct {
     /// Tests only: lower the baseline byte budget; production uses the transport max.
     test_history_budget: ?usize = null,
     pending_event: ?struct { item: bridge_mod.Item, json: []u8 } = null,
+    /// Bounded retry after a queued task fails to start; not a queue state.
+    dispatch_retry_at_ms: u64 = 0,
+    dispatch_retry_delay_ms: u64 = dispatch_retry_initial_ms,
     pending_terminal: ?struct { terminal: r.Terminal, json: []u8 } = null,
     next_seq: u64 = 1,
     /// Rotate independent notification sources even with a one-entry live ring.
@@ -476,7 +482,6 @@ pub const SessionHost = struct {
     // The source is parameterized only to exercise the same admission path
     // with an isolated deterministic FIFO in inline tests.
     fn pumpFrom(self: *SessionHost, now_ms: u64, source: anytype) void {
-        _ = now_ms;
         while (true) {
             if (self.pending_event == null) {
                 const item = self.bridge.pop() orelse break;
@@ -529,22 +534,27 @@ pub const SessionHost = struct {
         // A completed login may reload configuration only after the primary
         // owner has fully joined, not merely after runtime.busy went false.
         if (self.task == null) _ = self.session.pollCodexLogin() catch false;
-        self.dispatchNext();
+        self.dispatchNext(now_ms);
     }
 
     /// Start one accepted queued (steering/follow-up) message when this host is
     /// idle. Mirrors the local TUI lease transaction: claim, start, commit; a
-    /// failed start restores the entry and pauses the queue so nothing is
-    /// silently dropped or replayed. Remote clients never launch jobs.
-    fn dispatchNext(self: *SessionHost) void {
-        if (self.closing or self.fatal != null) return;
+    /// failed start restores the entry and backs off so nothing is silently
+    /// dropped or replayed. Remote clients never launch jobs.
+    fn dispatchNext(self: *SessionHost, now_ms: u64) void {
+        if (self.closing or self.fatal != null or now_ms < self.dispatch_retry_at_ms) return;
         if (self.task != null or self.pending_event != null or self.pending_terminal != null) return;
         if (self.session.app == null or self.session.read_only) return;
         if (self.session.app) |app| if (app.runtime.busy.load(.acquire) or app.runtime.poisoned) return;
-        const lease = self.inbox.claimNext() orelse return;
+        const lease = self.inbox.claimNext() orelse {
+            self.dispatch_retry_at_ms = 0;
+            self.dispatch_retry_delay_ms = dispatch_retry_initial_ms;
+            return;
+        };
         _ = self.startTask(.prompt, lease.text) catch {
             self.inbox.restore(lease);
-            self.inbox.pause();
+            self.dispatch_retry_at_ms = now_ms +| self.dispatch_retry_delay_ms;
+            self.dispatch_retry_delay_ms = @min(self.dispatch_retry_delay_ms * 2, dispatch_retry_max_ms);
             return;
         };
         if (self.inbox.commit(lease)) |value| {
@@ -553,9 +563,12 @@ pub const SessionHost = struct {
             // exactly one canonical user row for live/remote views.
             self.noteQueuedUser(entry.id, entry.text);
             entry.deinit();
+            self.dispatch_retry_at_ms = 0;
+            self.dispatch_retry_delay_ms = dispatch_retry_initial_ms;
         } else {
             self.inbox.restore(lease);
-            self.inbox.pause();
+            self.dispatch_retry_at_ms = now_ms +| self.dispatch_retry_delay_ms;
+            self.dispatch_retry_delay_ms = @min(self.dispatch_retry_delay_ms * 2, dispatch_retry_max_ms);
         }
     }
 
@@ -791,7 +804,6 @@ pub const SessionHost = struct {
         self.partial_text.reset();
         self.partial_reasoning.reset();
         self.resetDraftMarks();
-        if (terminal.status != .success) self.inbox.pause();
         if (terminal.detail) |detail| if (detail == error.CleanupFailed) {
             self.fatal = error.CleanupFailed;
         };
@@ -1153,7 +1165,6 @@ pub const SessionHost = struct {
             .approve => self.handleApprove(a, request, connection_id),
             .enqueue => self.handleEnqueue(a, request, connection_id),
             .withdraw => self.handleWithdraw(a, request, connection_id),
-            .queue_resume => self.handleQueueResume(a, request, connection_id),
             .settings => self.replySettings(a, request.id),
             .model_select => self.handleModelSelect(a, request, connection_id),
             .effort => self.handleEffort(a, request, connection_id),
@@ -1242,7 +1253,6 @@ pub const SessionHost = struct {
             .attached = self.controller != null,
             .pending_permission = self.pending_permission,
             .queue_revision = queue.revision,
-            .queue_paused = queue.paused,
             .steering = @intCast(@min(queue.steering, std.math.maxInt(u32))),
             .follow_up = @intCast(@min(queue.follow_up, std.math.maxInt(u32))),
             .newest_id = queue.newest_id,
@@ -1829,17 +1839,6 @@ pub const SessionHost = struct {
         defer out.deinit();
         try out.ok(request.id);
         try out.field("text", entry.text);
-        return replyFrame(&out);
-    }
-
-    fn handleQueueResume(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
-        const epoch = request.u64Field("epoch") catch return errorReply(a, request.id, error.BadRequest);
-        self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
-        self.inbox.@"resume"();
-        var out = protocol.Out.init(a);
-        defer out.deinit();
-        try out.ok(request.id);
-        try out.field("revision", self.inbox.snapshot().revision);
         return replyFrame(&out);
     }
 

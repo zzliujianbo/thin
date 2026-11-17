@@ -224,22 +224,16 @@ fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, 
 
     var best: ?usize = null;
     var cut: usize = 1;
+    var older_content = false;
     while (cut <= max_cut) : (cut += 1) {
         // 把 messages[cut-1] 移出"保留部分"；受保护消息不算作被压缩的内容。
-        if (cut - 1 != protected_index) retained -|= messageTokens(messages[cut - 1]);
-        if (!safe[cut]) continue;
-
-        // An already present rolling summary alone is not enough work to justify
-        // another paid summary request.
-        // 中文：若前缀中只有旧的滚动摘要而没有实际内容，则不值得再花费一次摘要请求。
-        var older_content = false;
-        for (messages[0..cut], 0..) |message, i| {
-            if (i != protected_index and message.role != .context) {
-                older_content = true;
-                break;
-            }
+        if (cut - 1 != protected_index) {
+            retained -|= messageTokens(messages[cut - 1]);
+            // The prefix only grows as cut advances; track this once instead of
+            // rescanning every prefix on each candidate boundary.
+            older_content = older_content or messages[cut - 1].role != .context;
         }
-        if (!older_content) continue;
+        if (!safe[cut] or !older_content) continue;
         best = cut;
 
         // Plan from retained input only: output length belongs to the provider.

@@ -16,7 +16,7 @@ Contract under test (interactive session only; the headless fixture is separate)
     above the first composer row, with a blank separator above it. A saved
     result appears once in the transcript, never as a persistent footer; an
     empty/skipped result stays silent.
-  * The queued Memory suffix carries a count, never the primary S:/F: counters.
+  * The queued Memory suffix carries a count, never primary Steering/FollowUp queue labels.
   * The queued job's material is a fresh generation: it carries the committed
     fact and its version in `related`.
   * Leaving while Memory is active is bounded; the owned server observes the
@@ -435,7 +435,7 @@ def assert_footer(screen, queued):
     label = hint.split('|')[0].rstrip()
     assert memory_queued(label) == queued, \
         f'Memory footer {label!r} has incorrect queued count {queued}'
-    assert 'S:' not in hint and 'F:' not in hint, \
+    assert 'Steering:' not in hint and 'FollowUp:' not in hint, \
         f'Memory status leaked primary steering/follow-up counters: {hint!r}'
     return label
 

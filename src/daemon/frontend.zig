@@ -250,7 +250,6 @@ pub const Frontend = struct {
         .approve_fn = noApprove,
         .enqueue_fn = noEnqueue,
         .withdraw_fn = noWithdraw,
-        .queue_resume_fn = noEpoch,
         .manage_fn = noManage,
         .detach_fn = detach,
     };
