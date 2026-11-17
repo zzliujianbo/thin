@@ -252,6 +252,8 @@ const Copy = struct {
                 c.result.text = self.text(v.result.text);
                 break :blk .{ .tool_result = c };
             },
+            // The raw failure name is a wire slice; copy it with the event.
+            .compaction_failed => |v| .{ .compaction_failed = .{ .err = v.err, .name = self.text(v.name) } },
             // Terminal and Summary contain only fixed owned values; never
             // borrow from a decoded JSON arena or coalesce as a body delta.
             .memory_completed => |terminal| .{ .memory_completed = terminal },

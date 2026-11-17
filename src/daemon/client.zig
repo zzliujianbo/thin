@@ -127,7 +127,7 @@ fn dialStage(err: anyerror) AttachStage {
 }
 
 // ---------------------------------------------------------------------------
-// Wire errors -> the exact `anyerror` values `session_client.describe` knows.
+// Wire errors -> the exact `anyerror` values the frontend switches on.
 // ---------------------------------------------------------------------------
 
 fn wireError(code: protocol.ErrorCode) anyerror {

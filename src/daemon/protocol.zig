@@ -38,8 +38,8 @@ pub const max_name: usize = 1024;
 pub const max_events: u16 = 32;
 pub const max_previews = 16;
 
-/// Wire error codes. The client maps these to the exact `anyerror` values that
-/// `ui/session_client.describe` already classifies.
+/// Wire error codes. The client maps these to the exact `anyerror` values a
+/// frontend renders; the raw name travels beside the code for display.
 pub const ErrorCode = enum {
     bad_request,
     stale_control,

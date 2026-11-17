@@ -260,3 +260,15 @@ test "an unmapped error notice shows the raw name the owner reported" {
     try std.testing.expectEqualStrings("Busy", describeNotice(error.Busy, "").text);
     try std.testing.expectEqualStrings("RemoteFailure", describe(error.RemoteFailure));
 }
+
+test "owned compaction failure copies the raw name off the decoded buffer" {
+    const a = std.testing.allocator;
+    const source = try a.dupe(u8, "ContextTooLarge");
+    defer a.free(source);
+    var item = try ownEvent(a, 3, .{ .compaction_failed = .{ .err = error.RemoteFailure, .name = source } });
+    defer item.deinit();
+    // The item must own its bytes: reuse of the decoder buffer cannot rewrite it.
+    @memset(source, 'x');
+    try std.testing.expectEqualStrings("ContextTooLarge", item.event.compaction_failed.name);
+    try std.testing.expectEqual(error.RemoteFailure, item.event.compaction_failed.err);
+}
