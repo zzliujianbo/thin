@@ -319,19 +319,16 @@ pub const Manage = union(enum) {
     @"resume": []const u8,
     attach: struct { id: []const u8, takeover: bool = false },
     detach,
-    exit,
     close: struct { id: []const u8, force: bool = false },
 };
 
 /// Management result. `notice` is allocated with the allocator passed
 /// to `manage` and freed by `Outcome.deinit`. `switched` asks the TUI to clear
 /// the old display/approval/queue/input-history state and adopt the new epoch;
-/// `exit` asks the frontend to leave without touching the daemon session.
 pub const Outcome = struct {
     notice: ?[]u8 = null,
     saved_sessions: ?[]SavedSession = null,
     switched: bool = false,
-    exit: bool = false,
 
     pub fn deinit(self: *Outcome, a: std.mem.Allocator) void {
         if (self.notice) |value| a.free(value);

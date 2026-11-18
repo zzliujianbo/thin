@@ -104,7 +104,10 @@ def check(app):
         recovered=SshChild('/usr/bin/ssh',argv,ws.home,env,'recovered-client',ws.logs,True,100,30)
         case.children.append(recovered)
         recovered.pump_until(lambda:settled(recovered),'SSH admission recovered',20,case.model.check)
-        recovered.send_line('/exit')
+        recovered.send(b'\x04')
+        recovered.pump_until(lambda:b'Press Ctrl+D again to exit' in bytes(recovered.capture),
+                             'recovered exit prompt',20)
+        recovered.send(b'\x04')
         assert recovered.wait_exit('recovered connection exit',20)==0
         assert case.model.count()==1
         case.model.check()

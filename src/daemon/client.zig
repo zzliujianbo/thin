@@ -2359,7 +2359,6 @@ pub const Client = struct {
             .@"resume" => |id| self.manageResume(a, id),
             .attach => |args| self.manageAttach(args.id, args.takeover),
             .detach => self.manageDetach(),
-            .exit => .{ .exit = true },
             .close => |args| self.manageClose(args.id, args.force),
         };
     }

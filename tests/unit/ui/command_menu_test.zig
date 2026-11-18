@@ -23,7 +23,7 @@ test "slash suggestions preserve model login compact order and support local fuz
     const auth = suggestions("/lgn", 4, false);
     try std.testing.expectEqual(@as(usize, 1), auth.len);
     try std.testing.expectEqual(Command.auth, auth.commands[0]);
-    for ([_][]const u8{ "/new", "/attach", "/detach", "/exit" }) |query| {
+    for ([_][]const u8{ "/new", "/attach", "/detach" }) |query| {
         const found = suggestions(query, query.len, false);
         try std.testing.expect(found.len >= 1);
         // Subsequence matching may offer extra candidates; the exact command
@@ -63,7 +63,7 @@ test "resume is a remote root candidate and completes to its exact command" {
 }
 test "session commands are classified apart from local commands" {
     try std.testing.expect(!sessionOnly(.model) and !sessionOnly(.auth) and !sessionOnly(.compact) and !sessionOnly(.settings));
-    for ([_]Command{ .new_session, .attach, .detach, .close, .exit }) |command| try std.testing.expect(sessionOnly(command));
+    for ([_]Command{ .new_session, .attach, .detach, .close }) |command| try std.testing.expect(sessionOnly(command));
 }
 test "slash suggestions exclude arguments multiline prompts paste and mid-token cursor" {
     for ([_][]const u8{ "", "hello /", " /model", "/login key", "/model\n", "/unknown", "/../", "/compact now", "/压缩", "/compact1" }) |value|
@@ -198,7 +198,6 @@ test "slash selection wraps and dismissal lasts until an edit" {
     var menu: Menu = .{};
     const all = suggestions("/", 1, false);
     menu.move(false, all.len);
-    try std.testing.expectEqual(Command.exit, menu.choice(all).?);
     menu.move(true, all.len);
     try std.testing.expectEqual(Command.model, menu.choice(all).?);
     menu.move(true, all.len);

@@ -1358,7 +1358,7 @@ def case_detach_continues(app, base):
         client.send_line(DETACH_PROMPT)
         case.wait_prompt(DETACH_PROMPT)
         assert case.model.count(DETACH_PROMPT) == 1, 'expected exactly one gated request'
-        # Drop the front end by killing its process: not Ctrl-C, not /exit.
+        # Drop the front end by killing its process: not Ctrl-C, not a clean exit.
         client.kill()
         client.wait(10)
         assert case.model.count(DETACH_PROMPT) == 1

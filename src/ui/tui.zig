@@ -2457,9 +2457,8 @@ const Ui = struct {
         const is_new = std.mem.eql(u8, name, "/new");
         const is_attach = std.mem.eql(u8, name, "/attach");
         const is_detach = std.mem.eql(u8, name, "/detach");
-        const is_exit = std.mem.eql(u8, name, "/exit");
         const is_close = std.mem.eql(u8, name, "/close");
-        if (!(is_resume or is_new or is_attach or is_detach or is_exit or is_close)) return false;
+        if (!(is_resume or is_new or is_attach or is_detach or is_close)) return false;
         // The editor is wiped below; parse an owned copy so arguments stay valid.
         const owned = self.allocator.dupe(u8, trimmed) catch {
             self.wipeEditor();
@@ -2506,12 +2505,12 @@ const Ui = struct {
             self.applyManage(backend, .new_session);
             return true;
         }
-        if (is_detach or is_exit) {
+        if (is_detach) {
             if (rest.len != 0) {
-                self.notice = if (is_detach) "Usage: /detach" else "Usage: /exit";
+                self.notice = "Usage: /detach";
                 return true;
             }
-            self.applyManage(backend, if (is_detach) .detach else .exit);
+            self.applyManage(backend, .detach);
             return true;
         }
         var words: [4][]const u8 = undefined;
@@ -2655,7 +2654,6 @@ const Ui = struct {
     }
 
     fn acceptManage(self: *Ui, outcome: *session_client.Outcome, preserve_editor: bool) void {
-        const leaving = outcome.exit;
         if (outcome.saved_sessions) |sessions| {
             if (self.resume_pending) |pending| {
                 if (self.resumeContextCurrent(pending.epoch, pending.session_id, pending.launcher)) {
@@ -2703,7 +2701,6 @@ const Ui = struct {
         self.submitNewPrompt() catch |err| {
             self.notice = self.describeError(err);
         };
-        if (leaving) self.requestQuit();
         self.requestDraw();
     }
 
@@ -3016,7 +3013,7 @@ const Ui = struct {
                 notice = "Not configured: /login, then /model";
             }
         }
-        if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; /exit and reconnect";
+        if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; exit and reconnect";
         // Memory and background activity are rendered in the separate
         // activity row below, not mixed into the actionable notice line.
         if (notice.len == 0) if (state.pending_default_effort) |effort| {
@@ -4625,7 +4622,7 @@ const Ui = struct {
             break :blk synthetic.?;
         } else typed;
         // Session management resolves before steering: /attach, /detach,
-        // /exit and /close work while a task is busy and never enter
+        // and /close work while a task is busy and never enter
         // the model, Steering or FollowUp. Command mode is already a bash task.
         if (!self.command_mode and self.runManageText(command)) return;
         if (self.terminal_notice_pending != null) return;
@@ -4895,7 +4892,7 @@ const Ui = struct {
         }
         const snapshot = client.snapshot();
         if (!snapshot.available or self.remoteSnapshotSynchronizing(snapshot)) {
-            self.notice = if (snapshot.attached) "Synchronizing session; draft kept" else "Session unavailable; /exit and reconnect";
+            self.notice = if (snapshot.attached) "Synchronizing session; draft kept" else "Session unavailable; exit and reconnect";
             return false;
         }
         self.bridge.reset() catch {
@@ -8016,7 +8013,7 @@ fn sensitiveArguments(name: []const u8, rest: []const u8) bool {
     if (std.mem.eql(u8, name, "/model")) return !picker_module.manualName(args);
     if (std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/close"))
         return !sessionArgumentsValid(name, args);
-    // /login, /compact, /detach, /exit and unknown commands take no
+    // /login, /compact, /detach and unknown commands take no
     // arguments; non-empty text cannot be told apart from an accidental paste.
     return true;
 }

@@ -140,7 +140,7 @@ systemctl daemon-reload
 3. 会话发现：`~/.thin/session-index/<project-key>/<id>.json` 只作定位/状态摘要，可重建；权威仍是项目下 `.thin/sessions/<id>.session` 的 checkpoint 与固定 `.resume-lock`。
 4. 写权限：固定 lock inode + CAS 决定执行/保存权；锁文件不删除、不抢占。所有 Runtime 都必须持有租约；任何恢复（包括 TUI `/resume`）也不例外：禁用日志只关闭 checkpoint/日志发布，不等于允许同一会话出现第二个 Runtime。受理前若锁目录不可用，直接拒绝任务且不发起 HTTP；受理后的可选日志或保存失败只影响日志/持久化，不重放主任务。
 5. 恢复不重放：从 checkpoint 恢复不自动重放工具调用或推理请求；守护服务重启后中断会话标记为 interrupted，需要显式 `--attach` 或在 TUI 中使用 `/resume`。空 idle 会话若只有固定锁或空 discovery 元数据、没有 checkpoint，不视为已保存；存在 checkpoint 时保留私有定位记录。恢复的 history 异步到达，缺失恢复来源的错误保留原有分类。
-6. 会话命令（`--connect` 的 launcher）：目录在启动时固定，不再通过 slash 命令切换；`/detach` 不取消会话。命令为 `/attach [--takeover] <id>`、`/close [--force] <id>`、`/exit`。
+6. 会话命令（`--connect` 的 launcher）：目录在启动时固定，不再通过 slash 命令切换；`/detach` 不取消会话。命令为 `/attach [--takeover] <id>`、`/close [--force] <id>`。
    - `/close` 是否针对当前视图由 worker epoch + busy 原子判断；对非当前、经 owner 管理器停止的会话（前台自有或 daemon 自有）统一要求 `--force`，以避免“probe 之后又新起任务”的竞态。外部前台所有者需要先取得 controller，再原子关闭。
 7. 验收边界：
    - 隔离离线验收入口覆盖本节所述行为；完整 Debug 与 ReleaseSmall 的聚合结果以对应冻结源码上的验收证据为准。

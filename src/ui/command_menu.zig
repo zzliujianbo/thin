@@ -2,7 +2,7 @@
 const std = @import("std");
 const text = @import("text.zig");
 
-pub const Command = enum { model, auth, compact, settings, new_session, attach, detach, close, @"resume", exit };
+pub const Command = enum { model, auth, compact, settings, new_session, attach, detach, close, @"resume" };
 pub const Item = struct { command: Command, value: []const u8, arguments: []const u8 = "", description: []const u8 };
 pub const items = [_]Item{
     .{ .command = .model, .value = "/model", .arguments = "[exact-id|--refresh]", .description = "Select model" },
@@ -14,7 +14,6 @@ pub const items = [_]Item{
     .{ .command = .detach, .value = "/detach", .description = "Leave session view" },
     .{ .command = .close, .value = "/close", .arguments = "[--force] <id>", .description = "Close a session" },
     .{ .command = .@"resume", .value = "/resume", .arguments = "[id]", .description = "Resume saved session" },
-    .{ .command = .exit, .value = "/exit", .description = "Leave this frontend" },
 };
 
 /// Session management is only offered when a remote adapter is attached; the

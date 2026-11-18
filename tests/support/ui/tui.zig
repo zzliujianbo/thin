@@ -651,7 +651,6 @@ const FakeRemote = struct {
     manages: usize = 0,
     last_manage: ?std.meta.Tag(session_client.Manage) = null,
     manage_switched: bool = false,
-    manage_exit: bool = false,
     manage_failure: ?anyerror = null,
     saved_fixture: ?[]const session_client.SavedSession = null,
     submit_failure: ?anyerror = null,
@@ -771,7 +770,7 @@ const FakeRemote = struct {
         if (request == .saved_sessions) if (self.saved_fixture) |saved| return .{ .saved_sessions = try a.dupe(session_client.SavedSession, saved) };
         if (request == .@"resume") self.record(request.@"resume");
         if (self.manage_switched) self.snapshot.control_epoch +%= 1;
-        return .{ .switched = self.manage_switched, .exit = self.manage_exit };
+        return .{ .switched = self.manage_switched };
     }
     fn detachFn(ctx: *anyopaque) void {
         from(ctx).detaches += 1;
