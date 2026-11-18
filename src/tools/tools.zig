@@ -24,7 +24,7 @@ const background = @import("../core/background.zig");
 
 /// Foreground bash description. The background variant appends its own sentence
 /// so a child Tools without a service never advertises background capability.
-const bash_description = "Run bash in the startup project; cwd changes do not persist. Use command, or commands (1-20) for independent concurrent jobs; batches share cwd/env, return results in input order, and reject high-risk commands. High-risk single commands need explicit approval. timeout_ms defaults to 5 minutes per command; item timeout_ms overrides. Single-command output is captured up to 64 KiB and batch output is bounded at 10 KiB per command; both keep head and tail around an omission marker and mark truncation, and stdout_bytes is the real size. Bound large or binary output yourself with grep -c/-l/-o or head -c: head and tail limit lines, not bytes.";
+const bash_description = "Run bash in the startup project; cwd changes do not persist. Use command, or commands (1-20) for independent concurrent jobs; batches share cwd/env, return results in input order, and reject high-risk commands. High-risk single commands need explicit approval. timeout_ms defaults to 5 minutes per command; item timeout_ms overrides. Single-command output is captured up to 64 KiB shared by stdout and stderr, and batch output is bounded at 10 KiB per command; both keep head and tail around an omission marker and mark truncation, and stdout_bytes is the real size. Bound large or binary output yourself with grep -c/-l/-o or head -c: head and tail limit lines, not bytes.";
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -167,6 +167,13 @@ const batch_total_output_bytes = 200 * 1024;
 /// be megabytes long, and one such result would dominate the input budget for
 /// the rest of the session.
 const command_output_bytes = 64 * 1024;
+/// Still bounded per call, but one assistant response may issue several calls.
+/// Capture capacity is shared by stdout and stderr, so a batch keeps roughly
+/// half of this as visible output.
+const round_output_bytes = 128 * 1024;
+/// Every call keeps a tiny capture even after the round budget is spent, so its
+/// result can still report the real size and how to narrow it.
+const round_output_floor_bytes = 1024;
 
 pub const BashCommand = struct { command: []const u8, timeout_ms: ?u32 = null };
 /// bash 的解析结果。单命令用 command；批量用 commands。二者互斥，background
@@ -363,6 +370,8 @@ pub const Tools = struct {
     /// 由应用层传入的认证文件 realPath；与 Root.path 使用同一真实路径空间，
     /// 即使启动目录是 HOME 或 HOME 本身是别名，也不能通过模型文件工具泄露凭证。
     auth_path: ?[]const u8 = null,
+    /// Capture bytes already granted to this tool batch; see beginBatch.
+    granted_output_bytes: usize = 0,
     /// Explicit opt-in; no service means no image schema and no file access.
     image: ?image.Service = null,
     /// Optional instance-owned background registry. When present, Tools
@@ -530,7 +539,22 @@ pub const Tools = struct {
             .execute_fn = executePrepared,
             .preview_write_fn = previewWrite,
             .end_task_fn = endTask,
+            .begin_batch_fn = beginBatch,
         };
+    }
+
+    /// One assistant tool batch shares the round output budget, so several
+    /// commands cannot add up to the same flood a single command was capped for.
+    fn beginBatch(context_: *anyopaque) void {
+        const self: *Tools = @ptrCast(@alignCast(context_));
+        self.granted_output_bytes = 0;
+    }
+
+    fn takeOutput(self: *Tools, want: usize) usize {
+        const remaining = round_output_bytes -| self.granted_output_bytes;
+        const granted = @min(want, @max(remaining, round_output_floor_bytes));
+        self.granted_output_bytes +|= granted;
+        return @max(1, granted);
     }
 
     /// Instance-owned background health check at normal root end. Background
@@ -614,14 +638,14 @@ pub const Tools = struct {
         var truncated = false;
         var cleanup_failed = false;
         var next: usize = 0;
-        const output_bytes = @max(1, @min(batch_command_output_bytes, batch_total_output_bytes / b.commands.len));
+        const per_command = @max(1, @min(batch_command_output_bytes, batch_total_output_bytes / b.commands.len));
         while (next < b.commands.len) {
             var jobs: [batch_concurrency]BatchJob = undefined;
             const count = @min(batch_concurrency, b.commands.len - next);
             for (0..count) |i| {
                 const item = b.commands[next + i];
                 const timeout = item.timeout_ms orelse b.timeout_ms orelse self.config.limits.command_timeout_ms;
-                jobs[i] = BatchJob.init(self.root, self.environment, item.command, timeout, output_bytes, cancel);
+                jobs[i] = BatchJob.init(self.root, self.environment, item.command, timeout, self.takeOutput(per_command), cancel);
             }
             defer for (jobs[0..count]) |*job| job.deinit();
             var group: std.Io.Group = .init;
@@ -906,7 +930,7 @@ pub const Tools = struct {
                 // 超时、取消与输出上限都交给 process.run；返回的标记用于区分失败原因。
                 const result = try process.run(a, self.root.io, self.root.path, b.command, self.environment, .{
                     .timeout_ms = b.timeout_ms orelse self.config.limits.command_timeout_ms,
-                    .output_bytes = command_output_bytes,
+                    .output_bytes = self.takeOutput(command_output_bytes),
                     .term_grace_ms = cfg.Policy.cleanup_grace_ms,
                     .cleanup_timeout_ms = cfg.Policy.cleanup_timeout_ms,
                     .cwd_dir = self.root.dir,

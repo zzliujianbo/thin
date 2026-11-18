@@ -482,3 +482,42 @@ test "input budget skips a remembered rejected summary while the input still fit
     try std.testing.expectEqualStrings("first goal", runtime.messages()[4].blocks[0].text);
     try std.testing.expectEqualStrings("second goal", runtime.messages()[5].blocks[0].text);
 }
+test "compaction publishes the measured occupancy that triggered it" {
+    const old: [12500]u8 = @splat('x');
+    var config = configuration();
+    config.limits.low_price_input = true;
+    config.model.input_price_threshold = 10000;
+    var fake = Fake{ .config = &config };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+
+    const Capture = struct {
+        last_snapshot: ?u64 = null,
+        measured_before_compacting: ?u64 = null,
+        compacting: usize = 0,
+        fn emit(raw: ?*anyopaque, event: r.Event, _: *const p.Cancellation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (event) {
+                .context_snapshot => |snapshot| self.last_snapshot = snapshot.tokens,
+                .state => |phase| if (phase == .compacting) {
+                    self.compacting += 1;
+                    self.measured_before_compacting = self.last_snapshot;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture: Capture = .{};
+    runtime.host = .{ .context = &capture, .emit_fn = Capture.emit };
+    var cancel: p.Cancellation = .{};
+    const result = try runtime.run("new goal", &cancel);
+    try std.testing.expectEqual(r.Status.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), capture.compacting);
+    // The display value published for the decision is the measured occupancy
+    // that crossed the trigger, not the last provider-reported total.
+    // The seeded history has no provider report yet, so a zero here would be the
+    // stale reported value rather than the measured occupancy.
+    try std.testing.expect(capture.measured_before_compacting.? > 0);
+    try std.testing.expect(capture.measured_before_compacting.? >= c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
+}

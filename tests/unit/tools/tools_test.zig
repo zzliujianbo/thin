@@ -574,8 +574,12 @@ test "single bash command output is capped and reports the real size" {
     var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
     var cancel: p.Cancellation = .{};
 
+    const ex = tools.executor();
+    const begin = ex.begin_batch_fn.?;
+
     // A matched line in a large file can be megabytes long; one command must not
     // be able to dominate the input budget.
+    begin(ex.context);
     const result = try tools.execute(a, .{ .bash = .{ .command = "yes line | head -c 200000" } }, &cancel);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.truncated);
@@ -583,10 +587,13 @@ test "single bash command output is capped and reports the real size" {
     try std.testing.expectEqual(@as(i64, 200000), json.object.get("stdout_bytes").?.integer);
     try std.testing.expect(json.object.get("truncated").?.bool);
     const stdout = json.object.get("stdout").?.string;
-    try std.testing.expect(stdout.len <= 64 * 1024);
+    // The capture budget is shared by stdout and stderr, so one stream keeps
+    // half of the 64 KiB option.
+    try std.testing.expect(stdout.len <= 32 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, stdout, "[...]") != null);
 
     // Output under the budget stays complete and unmarked.
+    begin(ex.context);
     const small = try tools.execute(a, .{ .bash = .{ .command = "printf tiny" } }, &cancel);
     try std.testing.expect(!small.is_error);
     try std.testing.expect(!small.truncated);
@@ -610,8 +617,12 @@ test "blob-shaped bash output is condensed with facts and a narrowing hint" {
     var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
     var cancel: p.Cancellation = .{};
 
+    const ex = tools.executor();
+    const begin = ex.begin_batch_fn.?;
+
     // One enormous line: a head/tail pair would keep the least useful bytes, so
     // the result keeps a short head plus the real size and how to narrow it.
+    begin(ex.context);
     const blob = try tools.execute(a, .{ .bash = .{ .command = "head -c 200000 /dev/zero | tr '\\0' a" } }, &cancel);
     try std.testing.expect(!blob.is_error);
     try std.testing.expect(blob.truncated);
@@ -625,6 +636,7 @@ test "blob-shaped bash output is condensed with facts and a narrowing hint" {
 
     // Escape-heavy binary output is condensed the same way, even though its
     // lines are meaningless.
+    begin(ex.context);
     const binary = try tools.execute(a, .{ .bash = .{ .command = "head -c 200000 /dev/urandom" } }, &cancel);
     try std.testing.expect(!binary.is_error);
     const binary_json = try std.json.parseFromSliceLeaky(std.json.Value, a, binary.text, .{});
@@ -634,10 +646,51 @@ test "blob-shaped bash output is condensed with facts and a narrowing hint" {
     try std.testing.expect(binary_json.object.get("truncated").?.bool);
 
     // A complete single line under the cap is the caller's data: keep it whole.
+    begin(ex.context);
     const line = try tools.execute(a, .{ .bash = .{ .command = "head -c 20000 /dev/zero | tr '\\0' a" } }, &cancel);
     try std.testing.expect(!line.is_error);
     try std.testing.expect(!line.truncated);
     const line_json = try std.json.parseFromSliceLeaky(std.json.Value, a, line.text, .{});
     try std.testing.expectEqual(@as(usize, 20000), line_json.object.get("stdout").?.string.len);
     try std.testing.expect(!line_json.object.get("truncated").?.bool);
+}
+test "one tool batch shares the round output budget" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+
+    // Several calls in one response must not add up to the flood a single call
+    // is capped for, and the last one keeps a floor so it can still report size.
+    const ex = tools.executor();
+    const begin = ex.begin_batch_fn.?;
+    begin(ex.context);
+    var sizes: [3]usize = undefined;
+    for (&sizes) |*size| {
+        const result = try tools.execute(a, .{ .bash = .{ .command = "yes line | head -c 100000" } }, &cancel);
+        try std.testing.expect(result.truncated);
+        const json = try std.json.parseFromSliceLeaky(std.json.Value, a, result.text, .{});
+        try std.testing.expectEqual(@as(i64, 100000), json.object.get("stdout_bytes").?.integer);
+        size.* = json.object.get("stdout").?.string.len;
+    }
+    try std.testing.expect(sizes[0] <= 32 * 1024 and sizes[0] > 0);
+    try std.testing.expect(sizes[1] <= 32 * 1024 and sizes[1] > 0);
+    try std.testing.expect(sizes[0] + sizes[1] <= 64 * 1024);
+    try std.testing.expect(sizes[2] <= 512 and sizes[2] > 0);
+
+    // The next batch starts from a full budget again.
+    begin(ex.context);
+    const fresh = try tools.execute(a, .{ .bash = .{ .command = "yes line | head -c 100000" } }, &cancel);
+    const fresh_json = try std.json.parseFromSliceLeaky(std.json.Value, a, fresh.text, .{});
+    try std.testing.expect(fresh_json.object.get("stdout").?.string.len > 16 * 1024);
 }

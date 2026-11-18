@@ -86,6 +86,10 @@ pub const Executor = struct {
     /// Optional display-only pre-write snapshot. It must never create or alter
     /// the target and any failure degrades only the provisional UI.
     preview_write_fn: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, *const p.Cancellation) anyerror!?write_preview.Baseline = null,
+    /// Optional start-of-batch hook: called once per assistant tool batch (and
+    /// for a local command batch of one). Hosts reset per-batch accounting here,
+    /// such as the output budget shared by every call in the batch.
+    begin_batch_fn: ?*const fn (*anyopaque) void = null,
 };
 
 /// 权限询问。id 由 Runtime 递增分配，与 tool_started / tool_result 事件关联。
@@ -170,6 +174,8 @@ pub const Terminal = struct {
 
 /// Latest request's provider-reported total, not an estimate or cumulative bill.
 /// A fresh session is known zero; missing usage is unknown, never invented zero.
+/// The one exception is the snapshot published just before a compaction, which
+/// carries the measured occupancy that decided it.
 /// Only the owner calls contextSnapshot while running; consumers get values.
 pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true };
 
@@ -1736,6 +1742,14 @@ pub const Runtime = struct {
                 return context.inputBudgetError(self.config.*);
             }
         }
+        // Publish the measure that decided this compaction. The displayed value
+        // otherwise follows completed requests, so a tool result the provider has
+        // not counted yet would make the trigger look premature.
+        try self.emit(.{ .context_snapshot = .{
+            .tokens = std.math.cast(u64, measured) orelse std.math.maxInt(u64),
+            .limit = @intCast(self.config.model.context_tokens),
+            .known = true,
+        } }, cancel);
         const attempts = task.summary_attempts;
         self.compact(cancel, task, .automatic) catch |err| {
             // Cleanup failure is terminal even before a summary attempt. Never
@@ -1960,6 +1974,7 @@ pub const Runtime = struct {
     }
 
     fn executeBatch(self: *Runtime, blocks: []const p.Block, cancel: *p.Cancellation, task: *Task, kind: BatchKind) !void {
+        if (self.executor.begin_batch_fn) |begin| begin(self.executor.context);
         // 已处理到的块下标；errdefer 只为之后未处理的 call 补写结果。
         var next_block: usize = 0;
         // 执行已开始但结果尚未记录时，不得把分配/回填失败误写成“未执行”。

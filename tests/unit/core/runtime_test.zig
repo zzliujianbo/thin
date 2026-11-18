@@ -523,6 +523,11 @@ test "canceled context preserves only missing cancellation usage and remains per
 test "terminal counts executed tool calls and distinct edited files" {
     const Fake = struct {
         calls: usize = 0,
+        batches: usize = 0,
+        fn beginBatch(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+        }
         fn call(raw: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -555,12 +560,15 @@ test "terminal counts executed tool calls and distinct edited files" {
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
     config.limits.low_price_input = false;
     config.limits.compaction_enabled = false;
-    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute, .begin_batch_fn = Fake.beginBatch }, .{}, "");
     defer runtime.deinit();
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run("edit files", &cancel);
     try std.testing.expectEqual(Status.success, terminal.status);
     try std.testing.expectEqual(@as(u32, 5), terminal.tool_calls);
+    // One assistant message with five calls is one tool batch: per-batch
+    // accounting (the shared output budget) resets exactly once.
+    try std.testing.expectEqual(@as(usize, 1), fake.batches);
     // w1 and e1 touch a.zig; w2 touches b.zig; w3 failed; bash owns no file.
     try std.testing.expectEqual(@as(u32, 2), terminal.files_edited);
 }
