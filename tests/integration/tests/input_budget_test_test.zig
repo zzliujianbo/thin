@@ -377,3 +377,108 @@ test "input budget checkpoint loads history across changed current policies" {
         try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = unfrozen.system, .messages = unfrozen.messages, .tools = &.{} });
     }
 }
+test "input budget proves an impossible compaction before paying for a summary" {
+    const old: [12500]u8 = @splat('x');
+    var config = configuration();
+    config.limits.low_price_input = true;
+    // A budget of one token is smaller than the fixed prompt alone, so no
+    // retained tail can ever fit and no summary text could be accepted.
+    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + 1;
+    var fake = Fake{ .config = &config };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    try std.testing.expect(runtime.estimatedTokens() > c.inputBudget(config));
+    var cancel: p.Cancellation = .{};
+    const result = try runtime.run("new goal", &cancel);
+    try std.testing.expectEqual(r.Status.paused, result.status);
+    try std.testing.expectEqual(error.InputBudgetExceeded, result.detail.?);
+    // The proof happens before the request: not even the summary is sent.
+    try std.testing.expectEqual(@as(usize, 0), fake.summaries + fake.normal + fake.tools);
+    try std.testing.expectEqualStrings("old task", runtime.messages()[0].blocks[0].text);
+    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
+    try std.testing.expectEqualStrings("new goal", runtime.messages()[runtime.protected_index].blocks[0].text);
+}
+test "input budget refuses a manual compaction that cannot fit" {
+    const old: [12500]u8 = @splat('x');
+    var config = configuration();
+    config.limits.low_price_input = true;
+    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + 1;
+    var fake = Fake{ .config = &config };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    const before = runtime.messages();
+    var cancel: p.Cancellation = .{};
+    const result = try runtime.compactContext(&cancel);
+    try std.testing.expectEqual(r.Status.paused, result.status);
+    try std.testing.expectEqual(error.InputBudgetExceeded, result.detail.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.summaries);
+    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
+    try std.testing.expectEqualDeep(before, runtime.messages());
+}
+test "input budget does not pay twice for a rejected automatic summary" {
+    const old: [12500]u8 = @splat('x');
+    const long_summary: [25000]u8 = @splat('s');
+    var config = configuration();
+    config.limits.low_price_input = true;
+    var fake = Fake{ .config = &config, .summary_text = &long_summary };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    // Room for the fixed prompt plus the retained tail, but far less than the
+    // returned summary: the paid result is rejected after being sent.
+    const fixed = c.fixedTokens(runtime.system, runtime.executor.schemas);
+    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + @as(u32, @intCast(fixed + 1000));
+    var cancel: p.Cancellation = .{};
+    const first = try runtime.run("first goal", &cancel);
+    try std.testing.expectEqual(r.Status.paused, first.status);
+    try std.testing.expectEqual(error.InputBudgetSummaryFailed, first.detail.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
+    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
+    try std.testing.expectEqualStrings("first goal", runtime.messages()[runtime.protected_index].blocks[0].text);
+    // Same budget and a context that only grew: the same rejected summary must
+    // not be bought again, and the run reports the budget instead.
+    const second = try runtime.run("second goal", &cancel);
+    try std.testing.expectEqual(r.Status.paused, second.status);
+    try std.testing.expectEqual(error.InputBudgetExceeded, second.detail.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
+    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
+    try std.testing.expectEqualStrings("second goal", runtime.messages()[runtime.protected_index].blocks[0].text);
+}
+test "input budget skips a remembered rejected summary while the input still fits" {
+    const old: [12500]u8 = @splat('x');
+    const long_summary: [25000]u8 = @splat('s');
+    var config = configuration();
+    config.limits.low_price_input = true;
+    var fake = Fake{ .config = &config, .summary_text = &long_summary };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    // The budget admits the current input but the compaction trigger is already
+    // crossed: the summary is optional here, so a rejected one must not stop
+    // later turns or be paid for twice.
+    const seeded = runtime.estimatedTokens();
+    // 18% headroom absorbs the calibration the paid summary itself causes,
+    // while 80% of that budget still sits below the seeded context.
+    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + @as(u32, @intCast(seeded * 118 / 100));
+    try std.testing.expect(seeded > c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
+    var cancel: p.Cancellation = .{};
+    const first = try runtime.run("first goal", &cancel);
+    try std.testing.expectEqual(r.Status.paused, first.status);
+    try std.testing.expectEqual(error.InputBudgetSummaryFailed, first.detail.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
+    // The input still fits, so the next turn continues without another summary.
+    const second = try runtime.run("second goal", &cancel);
+    try std.testing.expectEqual(r.Status.success, second.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+    try std.testing.expectEqual(@as(usize, 1), fake.normal);
+    try std.testing.expectEqual(@as(usize, 0), fake.tools);
+    // Nothing was compacted: the old history and both goals are intact.
+    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
+    try std.testing.expectEqualStrings("first goal", runtime.messages()[4].blocks[0].text);
+    try std.testing.expectEqualStrings("second goal", runtime.messages()[5].blocks[0].text);
+}

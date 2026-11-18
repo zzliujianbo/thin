@@ -60,8 +60,13 @@ test "every runtime display event round-trips through the wire" {
         .{ .fallback = .responses },
         .{ .compacted = .{ .before = 100, .after = 10 } },
         .{ .compaction_failed = .{ .err = error.InputBudgetSummaryFailed } },
+        .{ .compaction_failed = .{ .err = error.InsufficientCompaction } },
+        .{ .compaction_failed = .{ .err = error.CompactionImpossible } },
+        .{ .compaction_failed = .{ .err = error.InvalidSummary } },
+        .{ .compaction_failed = .{ .err = error.SummaryRequestedTool } },
         .{ .compaction_skipped = .{ .reason = .recent } },
         .{ .compaction_skipped = .{ .reason = .limit } },
+        .{ .compaction_skipped = .{ .reason = .rejected } },
         .{ .finished = .{
             .status = .paused,
             .detail = error.InputBudgetExceeded,

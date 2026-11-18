@@ -13992,6 +13992,14 @@ test "compaction status and result are visible in the conversation" {
     }
     try std.testing.expect(failed);
 
+    try ui.applyEvent(.{ .state = .compacting }, false, true);
+    try ui.applyEvent(.{ .compaction_failed = .{ .err = error.CompactionImpossible } }, false, true);
+    var impossible = false;
+    for (ui.records.items) |record| {
+        if (std.mem.startsWith(u8, record.body.items, "Nothing can be compacted")) impossible = true;
+    }
+    try std.testing.expect(impossible);
+
     try ui.applyEvent(.{ .compaction_skipped = .{ .reason = .limit } }, false, true);
     var skipped = false;
     for (ui.records.items) |record| {

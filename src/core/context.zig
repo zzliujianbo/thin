@@ -204,6 +204,11 @@ pub const Plan = struct {
     protected_index: usize,
     /// 压缩前估算的 token 数，用于记录与对比。
     before_tokens: usize,
+    /// Smallest input any committed result could have: the fixed prompt plus
+    /// the shortest retained tail the planner may leave. Summary text is not
+    /// included, so it is a lower bound. Null when the caller built a plan by
+    /// hand; Runtime then skips the impossible-compaction proof.
+    minimum_tokens: ?usize = null,
 };
 
 /// Select an old closed prefix. The active user request is copied out of the
@@ -247,6 +252,10 @@ fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, 
     var best: ?usize = null;
     var cut: usize = 1;
     var older_content = false;
+    // Retained input shrinks as the cut advances, so the smallest candidate is
+    // the last one a commit could accept. Tracking it here is free and lets
+    // Runtime prove an impossible compaction before paying for a summary.
+    var min_retained: usize = std.math.maxInt(usize);
     while (cut <= max_cut) : (cut += 1) {
         // 把 messages[cut-1] 移出"保留部分"；受保护消息不算作被压缩的内容。
         if (cut - 1 != protected_index) {
@@ -257,12 +266,19 @@ fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, 
         }
         if (!safe[cut] or !older_content) continue;
         best = cut;
+        min_retained = @min(min_retained, retained);
 
         // Plan from retained input only: output length belongs to the provider.
         // Runtime validates the actual summary and resulting input before commit.
         if (mode == .automatic and estimator.tokens(retained) <= target) break;
     }
-    return .{ .cut = best orelse return error.NoCompactionCandidate, .protected_index = protected_index, .before_tokens = before };
+    const chosen = best orelse return error.NoCompactionCandidate;
+    return .{
+        .cut = chosen,
+        .protected_index = protected_index,
+        .before_tokens = before,
+        .minimum_tokens = estimator.tokens(min_retained),
+    };
 }
 
 /// 生成摘要请求的指令文本：要求模型只输出摘要，并把历史当作数据而非指令。

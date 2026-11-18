@@ -3319,6 +3319,9 @@ const Ui = struct {
         return switch (err) {
             error.NoCompactionCandidate => "No history can be safely compacted yet; context was not changed.",
             error.InsufficientCompaction => "Compaction did not reduce context enough; context was not changed.",
+            // Refused before the request: nothing about a summary text could
+            // bring the retained part back under the budget.
+            error.CompactionImpossible => "Nothing can be compacted: the retained messages alone already exceed the input budget.",
             error.InvalidSummary => "Summary was empty or invalid; context was not changed.",
             error.SummaryRequestedTool => "Summary requested tools; context was not changed.",
             error.SummaryFailed => "Summary request failed; context was not changed.",
@@ -3449,6 +3452,7 @@ const Ui = struct {
                 _ = try self.add(.notice, switch (value.reason) {
                     .recent => "Automatic compaction skipped: context has not grown enough since the last compaction.",
                     .limit => "Automatic compaction skipped: per-task limit reached; context remains within budget.",
+                    .rejected => "Automatic compaction skipped: the last automatic summary was rejected; context remains within budget.",
                 });
             },
             .memory_completed => |terminal| try self.acceptMemoryCompletion(terminal),
