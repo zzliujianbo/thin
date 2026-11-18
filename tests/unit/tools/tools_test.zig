@@ -594,3 +594,50 @@ test "single bash command output is capped and reports the real size" {
     try std.testing.expectEqualStrings("tiny", small_json.object.get("stdout").?.string);
     try std.testing.expect(!small_json.object.get("truncated").?.bool);
 }
+test "blob-shaped bash output is condensed with facts and a narrowing hint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+
+    // One enormous line: a head/tail pair would keep the least useful bytes, so
+    // the result keeps a short head plus the real size and how to narrow it.
+    const blob = try tools.execute(a, .{ .bash = .{ .command = "head -c 200000 /dev/zero | tr '\\0' a" } }, &cancel);
+    try std.testing.expect(!blob.is_error);
+    try std.testing.expect(blob.truncated);
+    const blob_json = try std.json.parseFromSliceLeaky(std.json.Value, a, blob.text, .{});
+    try std.testing.expectEqual(@as(i64, 200000), blob_json.object.get("stdout_bytes").?.integer);
+    const blob_out = blob_json.object.get("stdout").?.string;
+    try std.testing.expect(blob_out.len < 4096);
+    try std.testing.expect(std.mem.indexOf(u8, blob_out, "thin: 200000 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blob_out, "Narrow with grep -c/-o or head -c") != null);
+    try std.testing.expect(blob_json.object.get("truncated").?.bool);
+
+    // Escape-heavy binary output is condensed the same way, even though its
+    // lines are meaningless.
+    const binary = try tools.execute(a, .{ .bash = .{ .command = "head -c 200000 /dev/urandom" } }, &cancel);
+    try std.testing.expect(!binary.is_error);
+    const binary_json = try std.json.parseFromSliceLeaky(std.json.Value, a, binary.text, .{});
+    const binary_out = binary_json.object.get("stdout").?.string;
+    try std.testing.expect(binary_out.len < 4096);
+    try std.testing.expect(std.mem.indexOf(u8, binary_out, "binary-like") != null);
+    try std.testing.expect(binary_json.object.get("truncated").?.bool);
+
+    // A complete single line under the cap is the caller's data: keep it whole.
+    const line = try tools.execute(a, .{ .bash = .{ .command = "head -c 20000 /dev/zero | tr '\\0' a" } }, &cancel);
+    try std.testing.expect(!line.is_error);
+    try std.testing.expect(!line.truncated);
+    const line_json = try std.json.parseFromSliceLeaky(std.json.Value, a, line.text, .{});
+    try std.testing.expectEqual(@as(usize, 20000), line_json.object.get("stdout").?.string.len);
+    try std.testing.expect(!line_json.object.get("truncated").?.bool);
+}

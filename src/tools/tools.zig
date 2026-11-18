@@ -658,11 +658,16 @@ pub const Tools = struct {
                     }
                     failed = true;
                 } else if (job.result) |result| {
-                    try j.put(a, &item, "stdout", j.str(try a.dupe(u8, result.stdout)));
-                    try j.put(a, &item, "stderr", j.str(try a.dupe(u8, result.stderr)));
+                    const condensed_stdout = try condenseOutput(a, result.stdout, result.stdout_bytes, result.truncated);
+                    const condensed_stderr = try condenseOutput(a, result.stderr, result.stderr_bytes, result.truncated);
+                    const condensed = condensed_stdout.applied or condensed_stderr.applied;
+                    // The job arena dies before the batch is encoded, so the row
+                    // must own its text in the caller's arena.
+                    try j.put(a, &item, "stdout", j.str(try a.dupe(u8, condensed_stdout.text)));
+                    try j.put(a, &item, "stderr", j.str(try a.dupe(u8, condensed_stderr.text)));
                     try j.put(a, &item, "stdout_bytes", try j.number(result.stdout_bytes));
                     try j.put(a, &item, "stderr_bytes", try j.number(result.stderr_bytes));
-                    try j.put(a, &item, "truncated", .{ .bool = result.truncated });
+                    try j.put(a, &item, "truncated", .{ .bool = result.truncated or condensed });
                     try j.put(a, &item, "timed_out", .{ .bool = result.timed_out });
                     try j.put(a, &item, "canceled", .{ .bool = result.canceled });
                     try j.put(a, &item, "cleanup_failed", .{ .bool = result.cleanup_failed });
@@ -683,7 +688,7 @@ pub const Tools = struct {
                     failed = failed or command_failed;
                     timed_out = timed_out or result.timed_out;
                     canceled = canceled or result.canceled;
-                    truncated = truncated or result.truncated;
+                    truncated = truncated or result.truncated or condensed;
                     cleanup_failed = cleanup_failed or result.cleanup_failed;
                 } else {
                     try j.put(a, &item, "canceled", .{ .bool = true });
@@ -918,11 +923,14 @@ pub const Tools = struct {
 
                 // 输出以 UTF-8 转义表示：非法字节写成 \xHH，字面反斜杠加倍，模型可无歧义地解读。
                 try j.put(a, &value, "output_encoding", j.str("utf8; unsafe bytes escaped as \\xHH; literal backslashes doubled"));
-                try j.put(a, &value, "stdout", j.str(result.stdout));
-                try j.put(a, &value, "stderr", j.str(result.stderr));
+                const condensed_stdout = try condenseOutput(a, result.stdout, result.stdout_bytes, result.truncated);
+                const condensed_stderr = try condenseOutput(a, result.stderr, result.stderr_bytes, result.truncated);
+                const condensed = condensed_stdout.applied or condensed_stderr.applied;
+                try j.put(a, &value, "stdout", j.str(condensed_stdout.text));
+                try j.put(a, &value, "stderr", j.str(condensed_stderr.text));
                 try j.put(a, &value, "stdout_bytes", try j.number(result.stdout_bytes));
                 try j.put(a, &value, "stderr_bytes", try j.number(result.stderr_bytes));
-                try j.put(a, &value, "truncated", .{ .bool = result.truncated });
+                try j.put(a, &value, "truncated", .{ .bool = result.truncated or condensed });
                 try j.put(a, &value, "timed_out", .{ .bool = result.timed_out });
                 try j.put(a, &value, "canceled", .{ .bool = result.canceled });
                 try j.put(a, &value, "cleanup_failed", .{ .bool = result.cleanup_failed });
@@ -945,7 +953,7 @@ pub const Tools = struct {
                     .text = try j.encode(a, value),
                     .is_error = failed,
                     .canceled = result.canceled,
-                    .truncated = result.truncated,
+                    .truncated = result.truncated or condensed,
                     .cleanup_failed = result.cleanup_failed,
                 };
             },
@@ -1054,6 +1062,92 @@ pub const Tools = struct {
         };
     }
 };
+
+/// Blob-shaped command output is useless as context: one enormous line (a match
+/// inside a binary checkpoint, a minified record) can fill the capture budget
+/// with bytes the model cannot read. Keep a short, honest excerpt and state the
+/// real size and how to narrow the query instead.
+const condense_line_bytes = 8 * 1024;
+const condense_head_bytes = 2 * 1024;
+const condense_tail_bytes = 512;
+const condense_binary_percent = 30;
+
+const Condensed = struct { text: []const u8, applied: bool = false };
+
+/// One escaped token: "\\xHH", "\\\\", one multi-byte character, or one byte.
+fn escapedTokenLen(text: []const u8) usize {
+    const lead = text[0];
+    if (lead == '\\') {
+        if (text.len >= 4 and text[1] == 'x') return 4;
+        return @min(text.len, 2);
+    }
+    if (lead >= 0xC0 and lead < 0xF8) {
+        const want: usize = if (lead >= 0xF0) 4 else if (lead >= 0xE0) 3 else 2;
+        var step: usize = 1;
+        while (step < want and step < text.len and (text[step] & 0xC0) == 0x80) step += 1;
+        return step;
+    }
+    return 1;
+}
+
+/// Last token boundary at or before `want`, never inside an escape sequence or a
+/// multi-byte character.
+fn boundaryBefore(text: []const u8, want: usize) usize {
+    const limit = @min(want, text.len);
+    var offset: usize = 0;
+    var last: usize = 0;
+    while (offset < limit) {
+        const step = escapedTokenLen(text[offset..]);
+        if (offset + step > limit) break;
+        offset += step;
+        last = offset;
+    }
+    return last;
+}
+
+/// First token boundary at or after `want`.
+fn boundaryAfter(text: []const u8, want: usize) usize {
+    var offset: usize = 0;
+    while (offset < want and offset < text.len) offset += escapedTokenLen(text[offset..]);
+    return @min(offset, text.len);
+}
+
+fn condenseOutput(a: std.mem.Allocator, text: []const u8, total_bytes: u64, truncated: bool) !Condensed {
+    if (text.len <= condense_line_bytes) return .{ .text = text };
+    var lines: usize = 1;
+    var line_bytes: usize = 0;
+    var longest: usize = 0;
+    var escaped: usize = 0;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const step = escapedTokenLen(text[offset..]);
+        if (text[offset] == '\\') escaped += step;
+        if (text[offset] == '\n') {
+            lines += 1;
+            longest = @max(longest, line_bytes);
+            line_bytes = 0;
+        } else line_bytes += step;
+        offset += step;
+    }
+    longest = @max(longest, line_bytes);
+    const binary = escaped * 100 / text.len >= condense_binary_percent;
+    // Complete text-shaped output the caller asked for stays untouched; a capped
+    // result with many lines already reads as head + marker + tail.
+    if (!binary and !truncated) return .{ .text = text };
+    if (!binary and lines > 4) return .{ .text = text };
+
+    // A one-line blob is exactly where a fixed head/tail budget keeps the least
+    // useful bytes, so it gets only the head (plus facts) instead.
+    const head_bytes = condense_head_bytes;
+    const tail_bytes: usize = if (binary or lines > 4) 0 else condense_tail_bytes;
+    const head_end = boundaryBefore(text, head_bytes);
+    const tail_start = if (tail_bytes == 0) text.len else boundaryAfter(text, text.len -| tail_bytes);
+    const marker = if (binary)
+        try std.fmt.allocPrint(a, "\n[... thin: {d} bytes, {d} lines, binary-like; showing first {d} bytes. Narrow with grep -c/-o or head -c]\n", .{ total_bytes, lines, head_end })
+    else
+        try std.fmt.allocPrint(a, "\n[... thin: {d} bytes, {d} lines, longest line {d} bytes; showing first {d} and last {d} bytes. Narrow with grep -c/-o or head -c]\n", .{ total_bytes, lines, longest, head_end, text.len - tail_start });
+    return .{ .text = try std.mem.concat(a, u8, &.{ text[0..head_end], marker, text[tail_start..] }), .applied = true };
+}
 
 /// Small explicit environment, not a sandbox. HOME may still contain credentials
 /// readable by the same OS user. Always remove the configured credential name,
