@@ -88,16 +88,8 @@ CONTROLLER_TIMEOUT = 90
 
 DETACH_PROMPT = 'daemon-detach-prompt-marker'
 DETACH_ANSWER = 'daemon-detach-answer-marker'
-PAR_A_PROMPT = 'daemon-parallel-a-prompt'
-PAR_B_PROMPT = 'daemon-parallel-b-prompt'
-PAR_A_ANSWER = 'daemon-parallel-a-answer'
-PAR_B_ANSWER = 'daemon-parallel-b-answer'
 CONTROLLER_PROMPT = 'daemon-controller-prompt'
 CONTROLLER_ANSWER = 'daemon-controller-answer'
-FG_PROMPT = 'daemon-foreground-owner-prompt'
-FG_ANSWER = 'daemon-foreground-owner-answer'
-DB_PROMPT = 'daemon-created-prompt'
-DB_ANSWER = 'daemon-created-answer'
 APPROVAL_PROMPT = 'daemon-approval-prompt'
 APPROVAL_ANSWER = 'daemon-approval-answer'
 SERVICE_PROMPT = 'daemon-owned-service-prompt'
@@ -1020,22 +1012,6 @@ def wait_checkpoint(project, marker, timeout=45):
             return path
         time.sleep(0.05)
     raise AssertionError('checkpoint never contained %r' % marker)
-
-
-def lock_is_free(project, ident):
-    path = Path(project) / '.thin' / 'sessions' / (ident + '.resume-lock')
-    assert path.is_file(), 'checkpoint writer lock is missing'
-    fd = os.open(str(path), os.O_RDWR)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except OSError as error:
-            if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return False
-            raise
-    finally:
-        os.close(fd)
 
 
 def assert_private_sessions(project):
