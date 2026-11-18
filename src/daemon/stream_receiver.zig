@@ -344,6 +344,16 @@ pub const Receiver = struct {
         return self.count != 0;
     }
 
+    /// Remove the two validated initial frames after `copyInitial` consumers
+    /// have transferred their decoded form to the committed view. Later
+    /// ordered events stay queued for the normal stream pump.
+    pub fn discardInitial(self: *Receiver) !void {
+        for (0..2) |_| {
+            const frame = (try self.pop()) orelse return error.ProtocolError;
+            self.a.free(frame);
+        }
+    }
+
     /// Wait for the initial snapshot and baseline without removing either.
     /// The regular consumer must still process the original ordered frames.
     /// This uses one total deadline and the same cancellation/progress contract

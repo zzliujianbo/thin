@@ -1865,8 +1865,13 @@ pub const Client = struct {
         epoch: u64,
         stream: ?*StreamReceiver = null,
         project: ?[]u8 = null,
+        /// Validated snapshot/history view. Its owned cache, input history and
+        /// baseline items are transferred to the committed view on adopt.
+        prepared: ?*Client = null,
+        history_base: u64 = 0,
 
         fn deinit(self: *Candidate, a: std.mem.Allocator) void {
+            if (self.prepared) |prepared| prepared.deinit();
             if (self.stream) |stream| stream.deinit();
             if (self.project) |project| a.free(project);
             self.conn.close();
@@ -2017,27 +2022,48 @@ pub const Client = struct {
             .array => {},
             else => return error.ProtocolError,
         }
-        const scratch = try Client.init(self.a, self.io, null, self.mode, self.launcher, self.root);
-        defer scratch.deinit();
-        scratch.epoch = view.epoch;
-        scratch.session = view.session;
-        try scratch.adoptSnapshot(&snapshot);
-        try scratch.adoptHistory(&baseline, true);
-        view.project = try self.a.dupe(u8, project);
+        var scratch: ?*Client = try Client.init(self.a, self.io, null, self.mode, self.launcher, self.root);
+        defer if (scratch) |prepared| prepared.deinit();
+        scratch.?.epoch = view.epoch;
+        scratch.?.session = view.session;
+        try scratch.?.adoptSnapshot(&snapshot);
+        try scratch.?.adoptHistory(&baseline, true);
         try progressWait(@ptrCast(self));
         if (self.wait_cancel) |cancel| if (cancel.isRequested()) return error.Canceled;
         try view.stream.?.checkRunning();
+        // The same ordered frames were validated above. Consume them from the
+        // stream now; the committed view will use the transferred decoded
+        // snapshot/history instead of re-reading or re-parsing the wire.
+        try view.stream.?.discardInitial();
+        view.project = try self.a.dupe(u8, project);
+        view.history_base = base;
+        view.prepared = scratch;
+        scratch = null;
     }
 
     /// Commit one candidate: only now is the previous view released. Its socket
     /// EOF is what revokes the old controller epoch on the owner side.
     fn adoptView(self: *Client, view: *Candidate) void {
+        const prepared = view.prepared orelse {
+            // All product attach paths validate a candidate before adopting it.
+            std.debug.assert(false);
+            return;
+        };
         self.closeStream();
         self.stream = view.stream;
         self.stream_expected = view.stream != null;
-        self.cache_floor = 0;
         view.stream = null;
         self.clearPending();
+        self.pending.deinit(self.a);
+        self.pending = prepared.pending;
+        prepared.pending = .empty;
+        for (self.input_history.items) |text| self.a.free(text);
+        self.input_history.deinit(self.a);
+        self.input_history = prepared.input_history;
+        prepared.input_history = .empty;
+        self.cache = prepared.cache;
+        self.cache_floor = prepared.cache_floor;
+        if (prepared.pubcfg.notice) |notice| self.pubcfg.notice = notice;
         if (self.conn) |*previous| previous.close();
         self.conn = view.conn;
         self.session = view.session;
@@ -2045,11 +2071,12 @@ pub const Client = struct {
         self.view_project = view.project;
         view.project = null;
         self.epoch = view.epoch;
-        self.cursor = 0;
-        self.need_history = true;
+        self.cursor = view.history_base;
+        self.need_history = false;
+        self.initial_settings_loading = false;
         self.dirty = true;
-        // A different session identity invalidates every cached owner field.
-        self.cache = .{};
+        prepared.deinit();
+        view.prepared = null;
         self.rebuild();
     }
 

@@ -2697,6 +2697,11 @@ test "resume selects launcher project when attached to another project's same id
     try testing.expectEqualStrings(session_client.restored_notice, resumed.notice.?);
     try testing.expectEqualStrings(fixture.project, client.view_project.?);
     try testing.expectEqual(id, client.session.?);
+    // The validated baseline is committed with the view, so a resumed notice
+    // cannot be followed by a second failing history read.
+    try testing.expect(!client.need_history);
+    try testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try testing.expect(client.pending.items[0].history_replay);
     const create_result = create_task.await(io);
     create_pending = false;
     try create_result;
