@@ -269,7 +269,7 @@ const common_help =
     \\Bash risk checks include sensitive-target deletion or writes, device destruction,
     \\sensitive chmod/chown, remote script execution, and fork bombs.
     \\Static risk matches require explicit approval for that call.
-    \\The confirmation shows Y allow once / N deny; arrows choose, Enter confirms, Esc denies.
+    \\The confirmation defaults to Y allow once; arrows choose, Enter confirms, Esc denies.
     \\Typed or pasted text never authorizes; on denial nothing runs.
     \\--print cannot approve a command, so calls requiring approval are denied.
     \\--print returns the final committed visible answer with the same tool policy.

@@ -501,7 +501,7 @@ const Permission = struct {
     description: []const u8,
     clipped: bool,
     pasted: bool = false,
-    choice: ApprovalChoice = .deny,
+    choice: ApprovalChoice = .allow_once,
     /// Remote control epoch the approval was displayed in; 0 for local.
     epoch: u64 = 0,
 };

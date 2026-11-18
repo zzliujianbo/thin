@@ -1408,7 +1408,7 @@ fn approvalCancel(d: *Driver) !void {
     std.debug.print("APPROVAL_CANCEL_WAIT repeated_titles={d}\n", .{titles});
 
     // Standalone ESC: no following byte may mask the parser's 150ms expiry.
-    // Escape confirms the safe default Deny choice. The canonical denied tool
+    // Escape explicitly denies. The canonical denied tool
     // result is then returned to the model exactly once for its final response.
     start = d.used;
     try d.send("\x1b");
@@ -1489,8 +1489,11 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try d.send("\x1b[6~");
         try d.waitFrame(scrolled, "Y allow once");
         const denied = d.used;
+        try d.send("\x1b[C");
+        try d.waitFrame(denied, "\x1b[7m N deny ");
+        const answered = d.used;
         try d.send("\r");
-        try d.waitIdle(denied);
+        try d.waitIdle(answered);
         try checkApprovalMarker(init, project);
         return;
     }
@@ -1516,12 +1519,13 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
     // Both command preview and approval must belong to a completed new frame.
     try d.waitFrame(start, command);
     try d.waitFrame(start, "Y allow once");
-    // Approval is a modal selector. Deny is the safe default; allowing once
-    // requires a visible arrow-selected frame before Enter can authorize it.
-    if (!deny) {
+    // Allow once is the default. Deny/cancel paths explicitly move or abort.
+    if (deny) {
         const selected = d.used;
-        try d.send("\x1b[D");
-        try d.waitFrame(selected, "\x1b[7m Y allow once ");
+        try d.send("\x1b[C");
+        try d.waitFrame(selected, "\x1b[7m N deny ");
+    } else if (!cancel) {
+        try d.waitFrame(start, "\x1b[7m Y allow once ");
     }
     const answered = d.used;
     try d.send("\r");
@@ -1564,8 +1568,11 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try d.send("!rm -f .ssh/fixture-marker; touch batch-first\r!touch batch-tail\r");
         try d.waitFrame(batch, "Y allow once");
         const rejected = d.used;
+        try d.send("\x1b[C");
+        try d.waitFrame(rejected, "\x1b[7m N deny ");
+        const denied = d.used;
         try d.send("\r");
-        try d.waitIdle(rejected);
+        try d.waitIdle(denied);
         try d.quiet(150);
         // The asynchronous denial may redraw the SAME permission while its
         // receipt is pending. It must never create another permission or run
@@ -3171,11 +3178,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
                     }
                     if (!d.owned) return error.EarlyExit;
                 }
-                if (!settled) {
-                    const raw = d.output[start..d.used];
-                    std.debug.print("SETTINGS_UNKNOWN_TAIL={s}\n", .{raw[raw.len -| 2000..]});
-                    return error.VisibleTextTimeout;
-                }
+                if (!settled) return error.VisibleTextTimeout;
                 const after = try d.screen();
                 try check(std.mem.endsWith(u8, std.mem.trimEnd(u8, &before.grid[before.row], " "), ">"));
                 try check(std.mem.eql(u8, &before.grid[before.row], &after.grid[after.row]));

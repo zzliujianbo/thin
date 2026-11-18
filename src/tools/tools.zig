@@ -37,7 +37,7 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "write_file",
-        .description = "Atomically write a UTF-8 file inside the startup project. Parent directory must exist; overwrite=true is required to replace. Read before editing.",
+        .description = "Atomically write a UTF-8 file inside the startup project or under /tmp. Parent directory must exist; overwrite=true is required to replace. Read before editing.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"],"additionalProperties":false}
         ,
@@ -89,7 +89,7 @@ const image_schema: p.ToolSchema = .{
 const max_schemas = 7;
 const edit_schema: p.ToolSchema = .{
     .name = "edit_file",
-    .description = "Atomically replace exact unique text in an existing project file. All edits match the original text, must be non-overlapping, and are applied together. Read the file first.",
+    .description = "Atomically replace exact unique text in an existing project file or under /tmp. All edits match the original text, must be non-overlapping, and are applied together. Read the file first.",
     .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}
     ,
@@ -407,6 +407,11 @@ pub const Tools = struct {
         }
     }
 
+    const tmp_write_prefix = "/tmp/";
+    fn isTmpWritePath(path: []const u8) bool {
+        return std.mem.startsWith(u8, path, tmp_write_prefix) and path.len > tmp_write_prefix.len;
+    }
+
     /// Both preparation and direct execution use the same anchored path policy.
     fn checkFileAction(self: *Tools, a: std.mem.Allocator, action: Action) !void {
         const path = switch (action) {
@@ -426,6 +431,15 @@ pub const Tools = struct {
         const is_write = action == .write_file or action == .edit_file;
         const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
         defer a.free(absolute);
+        const inside_root = std.mem.eql(u8, absolute, self.root.path) or
+            (std.mem.startsWith(u8, absolute, self.root.path) and absolute.len > self.root.path.len and absolute[self.root.path.len] == '/');
+        if (is_write and isTmpWritePath(path) and !inside_root) {
+            // /tmp is the explicit external write sink. Rooted operations still
+            // reject '..', NUL, symlinks and non-regular targets.
+            try validatePath(path);
+            if (self.auth_path) |protected| if (std.mem.eql(u8, absolute, protected)) return error.ProtectedAuthFile;
+            return;
+        }
         const relative = try self.root.relative(path);
         // 会话记录可作为普通只读输入，但不允许文件工具篡改自己的留档。
         // 文本读取允许项目外路径；仍保留 OS 权限、NOFOLLOW、UTF-8 与大小限制。
@@ -818,7 +832,11 @@ pub const Tools = struct {
 
             .edit_file => |edit| {
                 const edit_limit: ?usize = null;
-                const before = try self.root.readBinaryGuarded(a, edit.path, edit_limit, self.textReadGuard());
+                var tmp_root: ?fs.Root = if (isTmpWritePath(edit.path)) try fs.Root.open(a, self.root.io, "/tmp") else null;
+                defer if (tmp_root) |*root| root.deinit();
+                const file_root = if (tmp_root) |*root| root else self.root;
+                const file_path = if (tmp_root != null) edit.path[tmp_write_prefix.len..] else edit.path;
+                const before = try file_root.readBinaryGuarded(a, file_path, edit_limit, self.textReadGuard());
                 defer a.free(before);
                 try fs.validateText(before);
                 const applied = try text_edit.applyObserved(a, before, edit.edits, edit_limit);
@@ -831,11 +849,11 @@ pub const Tools = struct {
                 errdefer a.free(encoded);
                 if (cancel.isRequested()) return error.Canceled;
                 // A best-effort stale check, not a cross-process CAS.
-                const current = try self.root.readBinaryGuarded(a, edit.path, edit_limit, self.textReadGuard());
+                const current = try file_root.readBinaryGuarded(a, file_path, edit_limit, self.textReadGuard());
                 defer a.free(current);
                 if (!std.mem.eql(u8, before, current)) return error.FileChanged;
                 if (cancel.isRequested()) return error.Canceled;
-                const changes = try self.root.writeObserved(edit.path, after, true);
+                const changes = try file_root.writeObserved(file_path, after, true);
                 return .{ .text = encoded, .file_stats = .{ .changes = changes orelse applied.changes } };
             },
 
@@ -845,8 +863,12 @@ pub const Tools = struct {
                 try j.put(a, &value, "written_bytes", try j.number(w.content.len));
                 const encoded = try j.encode(a, value);
                 errdefer a.free(encoded);
+                var tmp_root: ?fs.Root = if (isTmpWritePath(w.path)) try fs.Root.open(a, self.root.io, "/tmp") else null;
+                defer if (tmp_root) |*root| root.deinit();
+                const file_root = if (tmp_root) |*root| root else self.root;
+                const file_path = if (tmp_root != null) w.path[tmp_write_prefix.len..] else w.path;
                 // 原子写入以及“已存在需 overwrite=true”的检查由 Root.write 负责。
-                const changes = try self.root.writeObserved(w.path, w.content, w.overwrite);
+                const changes = try file_root.writeObserved(file_path, w.content, w.overwrite);
                 return .{ .text = encoded, .file_stats = .{ .changes = changes } };
             },
 

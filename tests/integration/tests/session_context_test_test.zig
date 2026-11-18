@@ -73,7 +73,8 @@ test "skill catalog is sorted metadata only and ignores other roots" {
     const schemas = tools.executor().schemas;
     const result = try tools.execute(a, .{ .read_file = .{ .path = path } }, &cancel);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "SECRET_BODY_A") != null);
-    try std.testing.expectError(error.OutsideRoot, tools.execute(a, .{ .write_file = .{ .path = path, .content = "denied", .overwrite = true } }, &cancel));
+    const outside = try std.fmt.allocPrint(a, "/outside-thin-session-{d}", .{std.c.getpid()});
+    try std.testing.expectError(error.OutsideRoot, tools.execute(a, .{ .write_file = .{ .path = outside, .content = "denied", .overwrite = true } }, &cancel));
     const after = tools.executor().schemas;
     try std.testing.expectEqual(schemas.len, after.len);
     for (schemas, after) |before, current| {

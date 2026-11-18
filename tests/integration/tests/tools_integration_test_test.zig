@@ -319,11 +319,24 @@ test "external text reads allow absolute and parent paths without opening write 
         try std.testing.expect(result.truncated and result.file_stats.?.partial);
         const direct = try tools.execute(temp, .{ .read_file = .{ .path = path, .offset = 2, .limit = 3 } }, &cancel);
         try std.testing.expectEqualStrings(result.text, direct.text);
-        const write_args = try std.json.Stringify.valueAlloc(temp, .{ .path = path, .content = "not written", .overwrite = true }, .{});
-        const parse_error: anyerror = if (std.fs.path.isAbsolute(path)) error.OutsideRoot else error.PathEscape;
-        const execute_error: anyerror = if (std.fs.path.isAbsolute(path)) error.OutsideRoot else error.InvalidPath;
-        try std.testing.expectError(parse_error, executor.prepare_fn(executor.context, temp, .{ .id = "write", .name = "write_file", .arguments = write_args }));
-        try std.testing.expectError(execute_error, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
+        if (std.mem.startsWith(u8, path, "/tmp/")) {
+            // /tmp is the explicit external write sink.
+            const written = try tools.execute(temp, .{ .write_file = .{ .path = path, .content = "tmp allowed", .overwrite = true } }, &cancel);
+            try std.testing.expect(!written.is_error);
+            const reread = try tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel);
+            try std.testing.expect(std.mem.indexOf(u8, j.string(j.get(try j.parse(temp, reread.text), "content")) orelse "", "tmp allowed") != null);
+            const edits = [_]@import("../tools/text_edit.zig").Edit{.{ .old_text = "tmp allowed", .new_text = "tmp edited" }};
+            const edited = try tools.execute(temp, .{ .edit_file = .{ .path = path, .edits = &edits } }, &cancel);
+            try std.testing.expect(!edited.is_error);
+            const edited_read = try tools.execute(temp, .{ .read_file = .{ .path = path } }, &cancel);
+            try std.testing.expect(std.mem.indexOf(u8, j.string(j.get(try j.parse(temp, edited_read.text), "content")) orelse "", "tmp edited") != null);
+        } else {
+            const write_args = try std.json.Stringify.valueAlloc(temp, .{ .path = path, .content = "not written", .overwrite = true }, .{});
+            const parse_error: anyerror = if (std.fs.path.isAbsolute(path)) error.OutsideRoot else error.PathEscape;
+            const execute_error: anyerror = if (std.fs.path.isAbsolute(path)) error.OutsideRoot else error.InvalidPath;
+            try std.testing.expectError(parse_error, executor.prepare_fn(executor.context, temp, .{ .id = "write", .name = "write_file", .arguments = write_args }));
+            try std.testing.expectError(execute_error, tools.execute(temp, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
+        }
     }
     const other = try tools.execute(temp, .{ .read_file = .{ .path = sibling } }, &cancel);
     try std.testing.expectEqualStrings("sibling\n", j.string(j.get(try j.parse(temp, other.text), "content")).?);

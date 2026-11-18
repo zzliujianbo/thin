@@ -1473,7 +1473,7 @@ def case_offline_approval(app, base):
             rows = [''.join(row) for row in attached.screen.grid]
             questions = [i for i, row in enumerate(rows)
                          if 'Y allow once' in row and 'N deny' in row]
-            assert len(questions) == 1, 'missing or changed default-deny approval'
+            assert len(questions) == 1, 'missing or changed default-allow approval'
             row = questions[0]
             assert row >= 3, 'approval preview outside screen'
             # This fixture's command fills the compact preview; these three

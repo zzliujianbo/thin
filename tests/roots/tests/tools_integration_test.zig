@@ -15,7 +15,7 @@ const configuration = cfg.Config{
     .model = .{ .name = "fake", .context_tokens = 32768 },
 };
 
-// 验证：写入 .thin 或 memory 目录被拒绝（UseMemoryTool），越界写入被拒绝（OutsideRoot），合法 memory 写入只生成待审批描述且不落盘。
+// 验证：写入 .thin 或 memory 目录被拒绝（UseMemoryTool），项目外写入被拒绝（OutsideRoot，/tmp 除外），合法 memory 写入只生成待审批描述且不落盘。
 
 // 验证：文件读取的 offset/limit 按字节计算但不切断 UTF-8 字符，bash 输出中的 UTF-8 保持完整。
 

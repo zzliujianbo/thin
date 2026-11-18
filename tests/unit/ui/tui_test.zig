@@ -5340,7 +5340,7 @@ test "inline approval preserves conversation and pages its plain preview" {
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(screen.visible("PREVIEW-4"));
     try std.testing.expect(!screen.visible("PREVIEW-1"));
-    try std.testing.expectEqual(@as(?ApprovalChoice, .deny), ui.displayed_permission_choice);
+    try std.testing.expectEqual(@as(?ApprovalChoice, .allow_once), ui.displayed_permission_choice);
 }
 test "large approval pages retain the first and last rows with fresh ACK" {
     const a = std.testing.allocator;
@@ -5447,8 +5447,8 @@ test "approval popup offers only one-shot allow or deny and text grants no autho
         try ui.draw();
         try std.testing.expect(std.mem.find(u8, ui.frame, "Y allow once") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "N deny") != null);
-        // Deny is the default, so its fixed-width segment owns the block.
-        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[7m N deny \x1b[0m") != null);
+        // Allow once is the default, so its fixed-width segment owns the block.
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[7m Y allow once \x1b[0m") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "TRUST") == null);
         ui.displayed_permission = ui.frame_permission;
         ui.displayed_permission_choice = ui.frame_permission_choice;
