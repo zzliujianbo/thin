@@ -24,7 +24,7 @@ const background = @import("../core/background.zig");
 
 /// Foreground bash description. The background variant appends its own sentence
 /// so a child Tools without a service never advertises background capability.
-const bash_description = "Run bash in the startup project; cwd changes do not persist. Use command, or commands (1-20) for independent concurrent jobs; batches share cwd/env, return results in input order, and reject high-risk commands. High-risk single commands need explicit approval. timeout_ms defaults to 5 minutes per command; item timeout_ms overrides. Single-command output is complete; batch output is bounded and marks truncation.";
+const bash_description = "Run bash in the startup project; cwd changes do not persist. Use command, or commands (1-20) for independent concurrent jobs; batches share cwd/env, return results in input order, and reject high-risk commands. High-risk single commands need explicit approval. timeout_ms defaults to 5 minutes per command; item timeout_ms overrides. Single-command output is captured up to 64 KiB and batch output is bounded at 10 KiB per command; both keep head and tail around an omission marker and mark truncation, and stdout_bytes is the real size. Bound large or binary output yourself with grep -c/-l/-o or head -c: head and tail limit lines, not bytes.";
 
 /// 暴露给模型的工具 schema 列表；顺序是对外契约（测试依赖 read_file 在 0、memory 在 3）。
 pub const schemas = [_]p.ToolSchema{
@@ -163,6 +163,10 @@ const max_batch_commands = 20;
 const batch_concurrency = 5;
 const batch_command_output_bytes = 10 * 1024;
 const batch_total_output_bytes = 200 * 1024;
+/// Single-command capture budget. A matched line in a large or binary file can
+/// be megabytes long, and one such result would dominate the input budget for
+/// the rest of the session.
+const command_output_bytes = 64 * 1024;
 
 pub const BashCommand = struct { command: []const u8, timeout_ms: ?u32 = null };
 /// bash 的解析结果。单命令用 command；批量用 commands。二者互斥，background
@@ -897,7 +901,7 @@ pub const Tools = struct {
                 // 超时、取消与输出上限都交给 process.run；返回的标记用于区分失败原因。
                 const result = try process.run(a, self.root.io, self.root.path, b.command, self.environment, .{
                     .timeout_ms = b.timeout_ms orelse self.config.limits.command_timeout_ms,
-                    .output_bytes = null,
+                    .output_bytes = command_output_bytes,
                     .term_grace_ms = cfg.Policy.cleanup_grace_ms,
                     .cleanup_timeout_ms = cfg.Policy.cleanup_timeout_ms,
                     .cwd_dir = self.root.dir,

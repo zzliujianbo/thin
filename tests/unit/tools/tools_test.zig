@@ -558,3 +558,39 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expectEqualStrings("ok", fg.object.get("stdout").?.string);
     try std.testing.expect(fg.object.get("id") == null);
 }
+test "single bash command output is capped and reports the real size" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buffer);
+    var root = try fs.Root.open(std.testing.allocator, std.testing.io, buffer[0..n]);
+    defer root.deinit();
+    const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = &env };
+    var cancel: p.Cancellation = .{};
+
+    // A matched line in a large file can be megabytes long; one command must not
+    // be able to dominate the input budget.
+    const result = try tools.execute(a, .{ .bash = .{ .command = "yes line | head -c 200000" } }, &cancel);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(result.truncated);
+    const json = try std.json.parseFromSliceLeaky(std.json.Value, a, result.text, .{});
+    try std.testing.expectEqual(@as(i64, 200000), json.object.get("stdout_bytes").?.integer);
+    try std.testing.expect(json.object.get("truncated").?.bool);
+    const stdout = json.object.get("stdout").?.string;
+    try std.testing.expect(stdout.len <= 64 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "[...]") != null);
+
+    // Output under the budget stays complete and unmarked.
+    const small = try tools.execute(a, .{ .bash = .{ .command = "printf tiny" } }, &cancel);
+    try std.testing.expect(!small.is_error);
+    try std.testing.expect(!small.truncated);
+    const small_json = try std.json.parseFromSliceLeaky(std.json.Value, a, small.text, .{});
+    try std.testing.expectEqualStrings("tiny", small_json.object.get("stdout").?.string);
+    try std.testing.expect(!small_json.object.get("truncated").?.bool);
+}
