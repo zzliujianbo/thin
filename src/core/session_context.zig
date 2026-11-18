@@ -19,6 +19,9 @@ pub const Snapshot = struct {
     cwd: []const u8,
     shell: []const u8,
     project_root: []const u8,
+    /// Stable session identity, display-only context metadata. Empty for
+    /// headless/startup paths that have not pinned an identity.
+    session_id: []const u8 = "",
     /// Platform of the running Thin binary, not a remote host or physical CPU probe.
     os: std.Target.Os.Tag = builtin.os.tag,
     arch: std.Target.Cpu.Arch = builtin.cpu.arch,
@@ -33,6 +36,7 @@ pub const Environment = struct {
     cwd: []const u8,
     shell: []const u8,
     project_root: []const u8,
+    session_id: []const u8 = "",
     os: std.Target.Os.Tag,
     arch: std.Target.Cpu.Arch,
 };
@@ -49,7 +53,14 @@ pub fn validateSnapshot(snap: Snapshot) !void {
     try requireField(snap.cwd, true);
     try requireField(snap.shell, false);
     try requireField(snap.project_root, true);
+    try requireSessionId(snap.session_id);
     if (snap.agents.len != 0 and !std.unicode.utf8ValidateSlice(snap.agents)) return error.InvalidSessionContext;
+}
+
+fn requireSessionId(value: []const u8) !void {
+    if (value.len == 0) return;
+    if (value.len != 32) return error.InvalidSessionContext;
+    for (value) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidSessionContext;
 }
 
 fn requireField(value: []const u8, absolute: bool) !void {
@@ -59,20 +70,22 @@ fn requireField(value: []const u8, absolute: bool) !void {
 }
 
 pub fn environmentOf(snap: Snapshot) Environment {
-    return .{ .cwd = snap.cwd, .shell = snap.shell, .project_root = snap.project_root, .os = snap.os, .arch = snap.arch };
+    return .{ .cwd = snap.cwd, .shell = snap.shell, .project_root = snap.project_root, .session_id = snap.session_id, .os = snap.os, .arch = snap.arch };
 }
 
 pub fn formatEnvironment(a: std.mem.Allocator, env: Environment, update: bool) ![]u8 {
     try requireField(env.cwd, true);
     try requireField(env.shell, false);
     try requireField(env.project_root, true);
+    try requireSessionId(env.session_id);
+    const header = if (update) "environment update" else "environment";
+    if (env.session_id.len != 0) {
+        return std.fmt.allocPrint(a, "{s}\nsession_id: {s}\ncwd: {s}\nshell: {s}\nproject_root: {s}\nos: {s}\narch: {s}\n", .{
+            header, env.session_id, env.cwd, env.shell, env.project_root, @tagName(env.os), @tagName(env.arch),
+        });
+    }
     return std.fmt.allocPrint(a, "{s}\ncwd: {s}\nshell: {s}\nproject_root: {s}\nos: {s}\narch: {s}\n", .{
-        if (update) "environment update" else "environment",
-        env.cwd,
-        env.shell,
-        env.project_root,
-        @tagName(env.os),
-        @tagName(env.arch),
+        header, env.cwd, env.shell, env.project_root, @tagName(env.os), @tagName(env.arch),
     });
 }
 
@@ -81,6 +94,11 @@ pub fn parseEnvironment(text: []const u8) ?Environment {
     const header = text[0..nl];
     if (!std.mem.eql(u8, header, "environment") and !std.mem.eql(u8, header, "environment update")) return null;
     var rest = text[nl + 1 ..];
+    var session_id: []const u8 = "";
+    if (std.mem.startsWith(u8, rest, "session_id: ")) {
+        session_id = oneField(&rest, "session_id: ") orelse return null;
+        requireSessionId(session_id) catch return null;
+    }
     const cwd = oneField(&rest, "cwd: ") orelse return null;
     const shell = oneField(&rest, "shell: ") orelse return null;
     const project_root = oneField(&rest, "project_root: ") orelse return null;
@@ -94,6 +112,7 @@ pub fn parseEnvironment(text: []const u8) ?Environment {
         .cwd = cwd,
         .shell = shell,
         .project_root = project_root,
+        .session_id = session_id,
         .os = std.meta.stringToEnum(std.Target.Os.Tag, os) orelse return null,
         .arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null,
     };
@@ -130,7 +149,14 @@ const Read = union(enum) {
 /// `home` is the user home directory, not the `.thin` directory itself.
 /// An empty home skips the global source. Allocations belong to `a`.
 pub fn load(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8, shell: []const u8) !Snapshot {
+    return loadWithSession(a, io, home, cwd, shell, "");
+}
+
+/// Load the preface with a stable display-only session identity. The identity
+/// is validated and copied with the rest of the snapshot.
+pub fn loadWithSession(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8, shell: []const u8, session_id: []const u8) !Snapshot {
     if (home.len != 0) try requireField(home, true);
+    try requireSessionId(session_id);
     const shell_text = shellName(shell);
     var opened = try fs.Root.open(a, io, cwd);
     const canonical_cwd = try a.dupe(u8, opened.path);
@@ -158,10 +184,13 @@ pub fn load(a: std.mem.Allocator, io: std.Io, home: []const u8, cwd: []const u8,
 
     const shell_copy = try a.dupe(u8, shell_text);
     errdefer a.free(shell_copy);
+    const id_copy = try a.dupe(u8, session_id);
+    errdefer a.free(id_copy);
     const snap = Snapshot{
         .cwd = canonical_cwd,
         .shell = shell_copy,
         .project_root = project_root,
+        .session_id = id_copy,
         .agents = formatted.items,
         .agents_text = raw.items,
         .truncated = false,

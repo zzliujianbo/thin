@@ -423,6 +423,44 @@ test "missing agents files are skipped and a directory without git uses cwd" {
     try std.testing.expectEqualStrings("bash", snap.shell);
     try std.testing.expect(std.mem.indexOf(u8, snap.agents, "PARENT_ONLY") == null);
 }
+test "session id is display context and old environment text stays readable" {
+    const a = std.testing.allocator;
+    const id = "0123456789abcdef0123456789abcdef";
+    var snap = baseSnap("");
+    snap.session_id = id;
+    const text = try session_context.formatEnvironment(a, session_context.environmentOf(snap), false);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "session_id: " ++ id ++ "\n") != null);
+    const parsed = session_context.parseEnvironment(text).?;
+    try std.testing.expectEqualStrings(id, parsed.session_id);
+
+    const old = "environment\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\nos: linux\narch: x86_64\n";
+    try std.testing.expectEqualStrings("", session_context.parseEnvironment(old).?.session_id);
+
+    snap.session_id = "not-a-session-id";
+    try std.testing.expectError(error.InvalidSessionContext, session_context.formatEnvironment(a, session_context.environmentOf(snap), false));
+    const invalid = "environment\nsession_id: not-a-session-id\ncwd: /proj/cwd\nshell: /bin/zsh\nproject_root: /proj\nos: linux\narch: x86_64\n";
+    try std.testing.expect(session_context.parseEnvironment(invalid) == null);
+}
+test "session id enters the model environment context once" {
+    var config = cfg.Config{
+        .limits = .{ .low_price_input = false },
+        .provider = .{ .base_url = "http://localhost" },
+        .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
+    };
+    const id = "0123456789abcdef0123456789abcdef";
+    var box = Box{ .snap = baseSnap("") };
+    box.snap.session_id = id;
+    var runtime = try openRuntime(&config, &box);
+    defer runtime.deinit();
+    var cancel = p.Cancellation{};
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("first", &cancel)).status);
+    const environment = indexOfText(runtime.messages(), "session_id: " ++ id).?;
+    try std.testing.expect(std.mem.startsWith(u8, textOf(runtime.messages()[environment]), "environment\n"));
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "environment\n"));
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("second", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 1), countPrefix(runtime.messages(), "environment\n"));
+}
 test "environment platform format roundtrip rejects old three field prefaces" {
     const a = std.testing.allocator;
     var snap = baseSnap("");
@@ -673,6 +711,8 @@ test "app wires agents discovery and appends when the working directory changes"
     defer a.free(project);
     const app = try App.init(a, io, &env, project, .{});
     defer app.deinit();
+    const pinned_id = "0123456789abcdef0123456789abcdef";
+    try app.pinSessionID(pinned_id.*);
     app.runtime.model = .{ .context = &stub_dummy, .call_fn = stubCall };
 
     var cancel = p.Cancellation{};

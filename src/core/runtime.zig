@@ -357,6 +357,7 @@ const AppliedPolicy = struct {
     cwd: []u8,
     shell: []u8,
     project_root: []u8,
+    session_id: []u8,
     os: std.Target.Os.Tag,
     arch: std.Target.Cpu.Arch,
     agents: []u8,
@@ -365,6 +366,7 @@ const AppliedPolicy = struct {
         a.free(self.cwd);
         a.free(self.shell);
         a.free(self.project_root);
+        a.free(self.session_id);
         a.free(self.agents);
     }
 
@@ -375,10 +377,13 @@ const AppliedPolicy = struct {
         errdefer a.free(shell);
         const project_root = try a.dupe(u8, snap.project_root);
         errdefer a.free(project_root);
+        const session_id = try a.dupe(u8, snap.session_id);
+        errdefer a.free(session_id);
         return .{
             .cwd = cwd,
             .shell = shell,
             .project_root = project_root,
+            .session_id = session_id,
             .os = snap.os,
             .arch = snap.arch,
             .agents = try a.dupe(u8, snap.agents),
@@ -389,6 +394,7 @@ const AppliedPolicy = struct {
         return std.mem.eql(u8, self.cwd, snap.cwd) and
             std.mem.eql(u8, self.shell, snap.shell) and
             std.mem.eql(u8, self.project_root, snap.project_root) and
+            std.mem.eql(u8, self.session_id, snap.session_id) and
             self.os == snap.os and self.arch == snap.arch and
             std.mem.eql(u8, self.agents, snap.agents);
     }
@@ -1166,6 +1172,7 @@ pub const Runtime = struct {
         return !std.mem.eql(u8, applied.cwd, snap.cwd) or
             !std.mem.eql(u8, applied.shell, snap.shell) or
             !std.mem.eql(u8, applied.project_root, snap.project_root) or
+            !std.mem.eql(u8, applied.session_id, snap.session_id) or
             applied.os != snap.os or applied.arch != snap.arch;
     }
 
@@ -1203,6 +1210,7 @@ pub const Runtime = struct {
             .cwd = applied.cwd,
             .shell = applied.shell,
             .project_root = applied.project_root,
+            .session_id = applied.session_id,
             .os = applied.os,
             .arch = applied.arch,
             .agents = applied.agents,

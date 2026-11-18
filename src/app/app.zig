@@ -583,7 +583,8 @@ pub const App = struct {
 
     fn loadSessionPolicy(ctx: *anyopaque, a: std.mem.Allocator) !session_context.Snapshot {
         const self: *App = @ptrCast(@alignCast(ctx));
-        return session_context.load(a, self.root.io, self.home_path, self.session_cwd, self.shell_name);
+        const session_id: []const u8 = if (self.client.session_id) |value| value[0..] else "";
+        return session_context.loadWithSession(a, self.root.io, self.home_path, self.session_cwd, self.shell_name, session_id);
     }
 
     /// Owner-only fixed-size publication; no allocation or disk wait after
