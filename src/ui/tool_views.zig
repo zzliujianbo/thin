@@ -129,6 +129,8 @@ pub const Views = struct {
         const entry = self.get(identity) orelse return null;
         if (!entry.ready) return null;
         var copy = entry.caption;
+        copy.name = if (entry.caption.name) |name| try a.dupe(u8, name) else null;
+        errdefer if (copy.name) |name| a.free(name);
         copy.label = try a.dupe(u8, entry.caption.label);
         // These are renderer-owned numeric offsets / a static allowlisted
         // reason, not additional owned allocations or borrowed argument text.

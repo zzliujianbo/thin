@@ -2316,6 +2316,26 @@ test "replayed history turns saved tool results into tool rows with their call c
     }
     try std.testing.expectEqual(@as(usize, 1), tools);
 }
+test "replayed image and unknown calls keep their names and targets" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.applying_history = true;
+    try ui.applyEvent(.{ .assistant_committed = &.{
+        .{ .tool_call = .{ .id = "img", .name = "read_image", .arguments = "{\"path\":\"shots/a.png\",\"question\":\"private\"}" } },
+        .{ .tool_call = .{ .id = "odd", .name = "frobnicate", .arguments = "{\"command\":\"ls\",\"token\":\"secret\"}" } },
+    } }, false, true);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 1, .name = "read_image", .result = .{ .text = "{}" } } }, false, true);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 2, .name = "frobnicate", .result = .{ .text = "{}" } } }, false, true);
+    ui.applying_history = false;
+    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqualStrings("✓ read_image shots/a.png", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("✓ frobnicate ls", ui.records.items[1].body.items);
+    try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "secret") == null);
+}
 test "memory markers use a cross and only the marker is tinted" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};

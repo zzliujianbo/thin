@@ -69,6 +69,8 @@ pub const WriteMarks = struct {
 pub const Caption = struct {
     kind: activity.Tool,
     label: []const u8,
+    /// Unknown tool's own bounded name; null means `activity.toolName(kind)`.
+    name: ?[]const u8 = null,
     write_marks: ?WriteMarks = null,
     /// Bounded, sanitized reason from shared tools. Owned by whoever set it, not
     /// by this caption; the row clips it again to the terminal width.
@@ -77,6 +79,7 @@ pub const Caption = struct {
 
     pub fn deinit(self: Caption, a: std.mem.Allocator) void {
         a.free(self.label);
+        if (self.name) |name| a.free(name);
     }
 };
 
@@ -88,13 +91,15 @@ pub const Caption = struct {
 pub fn fromToolView(a: std.mem.Allocator, name: []const u8, fields: @import("../core/tool_preview.zig").Snapshot) !Caption {
     const call = try shared.tools.Call.fromFields(a, name, fields);
     defer call.deinit(a);
-    if (call.detail == null) return .{ .kind = call.kind, .label = if (call.kind == .bash) try a.dupe(u8, "") else try singleLine(a, name, 512) };
+    if (call.detail == null and call.kind != .other) return .{ .kind = call.kind, .label = if (call.kind == .bash) try a.dupe(u8, "") else try singleLine(a, name, 512) };
     return fromCall(a, call);
 }
 
 /// Replace a preview with the prepared, value-owned background metadata.
 pub fn withBackground(a: std.mem.Allocator, value: Caption, display: @import("../core/background_status.zig").Caption) !Caption {
     var metadata = display;
+    const name = if (value.name) |display_name| try a.dupe(u8, display_name) else null;
+    errdefer if (name) |display_name| a.free(display_name);
     const label = if (metadata.action == .start) blk: {
         const command = if (metadata.command) |*cmd| cmd.slice() else "(command unavailable)";
         break :blk try std.fmt.allocPrint(a, "▶ {s}", .{command});
@@ -102,18 +107,24 @@ pub fn withBackground(a: std.mem.Allocator, value: Caption, display: @import("..
         const target = if (metadata.command) |*cmd| cmd.slice() else if (metadata.id) |*id| id.slice() else "";
         break :blk if (target.len == 0) try a.dupe(u8, @tagName(metadata.action)) else try std.fmt.allocPrint(a, "{s} {s}", .{ @tagName(metadata.action), target });
     };
-    return .{ .kind = value.kind, .label = label, .failure_reason = value.failure_reason, .display = display };
+    return .{ .kind = value.kind, .name = name, .label = label, .failure_reason = value.failure_reason, .display = display };
 }
 
 /// Terminal widths and labels adapt shared structured data; no JSON parsing here.
 pub fn fromCall(a: std.mem.Allocator, call: shared.tools.Call) !Caption {
     const kind = call.kind;
     if (call.display) |display| return withBackground(a, .{ .kind = kind, .label = "" }, display);
-    if (kind == .other) return .{ .kind = kind, .label = try a.dupe(u8, "tool") };
+    if (kind == .other) {
+        const source = call.name orelse "";
+        const name = try singleLine(a, if (source.len == 0) "tool" else source, 512);
+        errdefer a.free(name);
+        const label = if (call.detail) |detail| try singleLineImpl(a, detail, 512, call.truncated) else try a.dupe(u8, "");
+        return .{ .kind = kind, .name = name, .label = label };
+    }
     if (kind == .background) return .{ .kind = kind, .label = try a.dupe(u8, "background") };
     const unavailable = switch (kind) {
         .bash => "(command unavailable)",
-        .read, .write, .edit => "(file unavailable)",
+        .read, .write, .edit, .image => "(file unavailable)",
         .memory => "(operation unavailable)",
         .background, .other => unreachable,
     };
@@ -140,6 +151,8 @@ pub fn provisionalWrite(a: std.mem.Allocator, value: Caption, progress: @import(
 
 pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) !Caption {
     var marks: ?WriteMarks = null;
+    const name = if (value.name) |display_name| try a.dupe(u8, display_name) else null;
+    errdefer if (name) |display_name| a.free(display_name);
     const label = switch (value.kind) {
         .read => if (stats != null and stats.?.read != null)
             try std.fmt.allocPrint(a, "{s}  {d} lines{s}", .{ value.label, stats.?.read.?, if (stats.?.partial) " [partial]" else "" })
@@ -154,7 +167,7 @@ pub fn completed(a: std.mem.Allocator, value: Caption, stats: ?line_stats.File) 
         } else try std.fmt.allocPrint(a, "{s}  changes ?", .{value.label}),
         else => try a.dupe(u8, value.label),
     };
-    return .{ .kind = value.kind, .label = label, .write_marks = marks, .display = value.display };
+    return .{ .kind = value.kind, .name = name, .label = label, .write_marks = marks, .display = value.display };
 }
 
 fn decimalLength(value: u64) usize {
@@ -235,7 +248,7 @@ fn labelParts(name: []const u8, label: []const u8) LabelParts {
 /// tool name and command never shift. The glyph carries the outcome colour via
 /// the same prefix span used by the renderer.
 pub fn commandText(a: std.mem.Allocator, value: Caption, outcome: Outcome, indicator: []const u8) ![]const u8 {
-    const name = activity.toolName(value.kind);
+    const name = value.name orelse activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
     return std.fmt.allocPrint(a, "{s} {s}{s}{s}", .{
         if (outcome == .pending) indicator else statusGlyph(outcome),
@@ -283,7 +296,7 @@ pub fn taskSummaryLine(a: std.mem.Allocator, tool_calls: u32, files_edited: u32,
 /// their status glyph; pending callers supply the exact indicator they passed
 /// to `commandText` (a braille spinner or one space).
 pub fn commandPrefixLen(value: Caption, outcome: Outcome, indicator: []const u8) usize {
-    const name = activity.toolName(value.kind);
+    const name = value.name orelse activity.toolName(value.kind);
     const parts = labelParts(name, value.label);
     const slot = if (outcome == .pending) indicator else statusGlyph(outcome);
     return slot.len + 1 + name.len + parts.sep.len;

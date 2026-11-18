@@ -2844,8 +2844,11 @@ const Ui = struct {
         const observed = if (outcome == .success) try presentation.completed(self.allocator, effective, completion.file_stats) else blk: {
             const label = try self.allocator.dupe(u8, effective.label);
             errdefer self.allocator.free(label);
+            const name = if (effective.name) |display_name| try self.allocator.dupe(u8, display_name) else null;
+            errdefer if (name) |display_name| self.allocator.free(display_name);
             break :blk presentation.Caption{
                 .kind = effective.kind,
+                .name = name,
                 .label = label,
                 .display = effective.display,
                 .failure_reason = if (local) null else try shared.tools.failureReason(self.allocator, effective.kind, result),

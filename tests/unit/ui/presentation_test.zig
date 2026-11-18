@@ -54,8 +54,8 @@ test "normal preview captions show names until reliable typed fields arrive" {
     try std.testing.expect(target.write_marks == null);
     const hostile = try fromToolView(a, "unknown\x1b[2J\nname", .{});
     defer hostile.deinit(a);
-    try std.testing.expect(std.mem.findScalar(u8, hostile.label, '\x1b') == null);
-    try std.testing.expect(std.mem.findScalar(u8, hostile.label, '\n') == null);
+    try std.testing.expectEqualStrings("unknown\u{fffd}[2J name", hostile.name.?);
+    try std.testing.expectEqualStrings("", hostile.label);
     const body = try commandText(a, target, .pending, " ");
     defer a.free(body);
     const line = try commandLine(a, body, &.{.{ .start = 0, .end = body.len, .outcome = .pending, .label_start = commandPrefixLen(target, .pending, " ") }}, 80, null, null);
@@ -63,6 +63,47 @@ test "normal preview captions show names until reliable typed fields arrive" {
     try std.testing.expect(std.mem.find(u8, line, theme.reset ++ theme.muted ++ " " ++ theme.tool_name ++ " write_file " ++ theme.muted ++ "src/中文.zig") != null);
     try std.testing.expect(std.mem.find(u8, line, "⠋") == null);
     try std.testing.expect(std.mem.find(u8, line, "0ms") == null);
+}
+test "image and unknown tools keep their own row name and a bounded target" {
+    const a = std.testing.allocator;
+    const image_call = try shared.tools.Call.init(a, "read_image", "{\"path\":\"shots/wide.png\",\"question\":\"private question\"}");
+    defer image_call.deinit(a);
+    const image = try fromCall(a, image_call);
+    defer image.deinit(a);
+    try std.testing.expect(image.name == null);
+    try std.testing.expectEqualStrings("shots/wide.png", image.label);
+    const image_body = try commandText(a, image, .success, " ");
+    defer a.free(image_body);
+    try std.testing.expectEqualStrings("✓ read_image shots/wide.png", image_body);
+
+    const unknown_call = try shared.tools.Call.init(a, "frobnicate", "{\"command\":\"ls -la\",\"token\":\"secret\"}");
+    defer unknown_call.deinit(a);
+    const unknown = try fromCall(a, unknown_call);
+    defer unknown.deinit(a);
+    try std.testing.expectEqualStrings("frobnicate", unknown.name.?);
+    try std.testing.expectEqualStrings("ls -la", unknown.label);
+    const unknown_body = try commandText(a, unknown, .failed, " ");
+    defer a.free(unknown_body);
+    try std.testing.expectEqualStrings("✗ frobnicate ls -la", unknown_body);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_body, "secret") == null);
+
+    // A call whose arguments carry no shared target keeps only its own name.
+    const bare_call = try shared.tools.Call.init(a, "frobnicate", "{\"token\":\"secret\"}");
+    defer bare_call.deinit(a);
+    const bare = try fromCall(a, bare_call);
+    defer bare.deinit(a);
+    const bare_body = try commandText(a, bare, .success, " ");
+    defer a.free(bare_body);
+    try std.testing.expectEqualStrings("✓ frobnicate", bare_body);
+
+    // A saved result whose call name is missing keeps the generic row name.
+    const nameless_call = try shared.tools.Call.init(a, "", "");
+    defer nameless_call.deinit(a);
+    const nameless = try fromCall(a, nameless_call);
+    defer nameless.deinit(a);
+    const nameless_body = try commandText(a, nameless, .success, " ");
+    defer a.free(nameless_body);
+    try std.testing.expectEqualStrings("✓ tool", nameless_body);
 }
 test "failed rows keep the reason on its own bounded row" {
     const a = std.testing.allocator;

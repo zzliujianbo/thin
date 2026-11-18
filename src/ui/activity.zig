@@ -14,6 +14,7 @@ pub fn toolName(kind: Tool) []const u8 {
         .read => "read_file",
         .write => "write_file",
         .edit => "edit_file",
+        .image => "read_image",
         .background => "background",
         .other => "tool",
     };

@@ -43,6 +43,33 @@ test "typed tool fields keep unknown targets safe and preserve clipping provenan
     defer invalid.deinit(a);
     try std.testing.expect(invalid.detail == null);
 }
+test "image and unknown calls expose only their bounded display target" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(Kind.image, Kind.fromName("read_image"));
+    const image = try Call.init(a, "read_image", "{\"path\":\"shots/a.png\",\"question\":\"private question\"}");
+    defer image.deinit(a);
+    try std.testing.expectEqual(Kind.image, image.kind);
+    try std.testing.expectEqualStrings("shots/a.png", image.detail.?);
+    try std.testing.expect(image.name == null);
+    const unknown = try Call.init(a, "frobnicate", "{\"command\":\"ls\",\"token\":\"secret\"}");
+    defer unknown.deinit(a);
+    try std.testing.expectEqual(Kind.other, unknown.kind);
+    try std.testing.expectEqualStrings("frobnicate", unknown.name.?);
+    try std.testing.expectEqualStrings("ls", unknown.detail.?);
+    // Arbitrary argument values are never promoted to a caption.
+    const bare = try Call.init(a, "frobnicate", "{\"token\":\"secret\"}");
+    defer bare.deinit(a);
+    try std.testing.expect(bare.detail == null);
+    try std.testing.expectEqualStrings("frobnicate", bare.name.?);
+    const typed = try Call.fromFields(a, "frobnicate", .{ .path = .{ .text = "x/y.png" } });
+    defer typed.deinit(a);
+    try std.testing.expectEqualStrings("frobnicate", typed.name.?);
+    try std.testing.expectEqualStrings("x/y.png", typed.detail.?);
+    const hostile = try Call.init(a, "bad\x1b[2J\nname", "");
+    defer hostile.deinit(a);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.name.?, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, hostile.name.?, '\n') == null);
+}
 test "edit call exposes only its path in canonical and typed fields" {
     const a = std.testing.allocator;
     const call = try Call.init(a, "edit_file", "{\"path\":\"source.zig\",\"edits\":[{\"old_text\":\"private-old\",\"new_text\":\"private-new\"}]}");

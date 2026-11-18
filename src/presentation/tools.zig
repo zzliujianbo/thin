@@ -15,6 +15,7 @@ pub const Kind = enum {
     read,
     write,
     edit,
+    image,
     background,
     other,
     pub fn fromName(name: []const u8) Kind {
@@ -23,6 +24,7 @@ pub const Kind = enum {
         if (std.mem.eql(u8, name, "read_file")) return .read;
         if (std.mem.eql(u8, name, "write_file")) return .write;
         if (std.mem.eql(u8, name, "edit_file")) return .edit;
+        if (std.mem.eql(u8, name, "read_image")) return .image;
         if (std.mem.eql(u8, name, "background")) return .background;
         return .other;
     }
@@ -40,13 +42,15 @@ pub const Outcome = enum { pending, success, failed, canceled };
 /// unavailable(null)与实际空command/path不同。truncated不能冒充完整参数。
 pub const Call = struct {
     kind: Kind,
+    /// Unknown tools keep their own bounded name; null for known kinds.
+    name: ?[]const u8 = null,
     detail: ?[]const u8 = null,
     truncated: bool = false,
     display: ?@import("../core/background_status.zig").Caption = null,
 
     pub fn init(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !Call {
         const kind = Kind.fromName(name);
-        if (kind == .other) return .{ .kind = kind };
+        if (kind == .other) return unknownCall(a, name, arguments);
         if (arguments.len > 64 * 1024) return .{ .kind = kind };
         const parsed = std.json.parseFromSlice(std.json.Value, a, arguments, .{ .allocate = .alloc_if_needed, .max_value_len = 64 * 1024 }) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -97,7 +101,7 @@ pub const Call = struct {
     /// Missing fields remain unknown; no string repair or execution validation.
     pub fn fromFields(a: std.mem.Allocator, name: []const u8, fields: tool_preview.Snapshot) !Call {
         const kind = Kind.fromName(name);
-        if (kind == .other) return .{ .kind = kind };
+        if (kind == .other) return unknownFields(a, name, fields);
         if (kind == .background) return .{ .kind = kind };
         if (kind == .memory) {
             const action = fields.action orelse return .{ .kind = kind };
@@ -130,17 +134,57 @@ pub const Call = struct {
     }
 
     fn fromDetail(a: std.mem.Allocator, kind: Kind, bytes: []const u8) !Call {
-        const prefix = try clean.sanitizePrefix(a, bytes, 512);
-        for (prefix.text) |*byte| if (byte.* == '\n' or byte.* == '\t') {
-            byte.* = ' ';
-        };
-        return .{ .kind = kind, .detail = prefix.text, .truncated = prefix.truncated };
+        const detail = try bounded(a, bytes);
+        return .{ .kind = kind, .detail = detail.text, .truncated = detail.truncated };
     }
 
     pub fn deinit(self: Call, a: std.mem.Allocator) void {
+        if (self.name) |name| a.free(name);
         if (self.detail) |detail| a.free(detail);
     }
 };
+
+const Bounded = struct { text: []const u8, truncated: bool = false };
+
+fn bounded(a: std.mem.Allocator, bytes: []const u8) !Bounded {
+    const prefix = try clean.sanitizePrefix(a, bytes, 512);
+    for (prefix.text) |*byte| if (byte.* == '\n' or byte.* == '\t') {
+        byte.* = ' ';
+    };
+    return .{ .text = prefix.text, .truncated = prefix.truncated };
+}
+
+/// Unknown tools show their own bounded name and only a shared path/command
+/// preview field, never an arbitrary argument value.
+fn unknownCall(a: std.mem.Allocator, name: []const u8, arguments: []const u8) !Call {
+    const display = try bounded(a, name);
+    var call = Call{ .kind = .other, .name = display.text };
+    errdefer call.deinit(a);
+    if (arguments.len == 0 or arguments.len > 64 * 1024) return call;
+    const parsed = std.json.parseFromSlice(std.json.Value, a, arguments, .{ .allocate = .alloc_if_needed, .max_value_len = 64 * 1024 }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return call;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return call;
+    const value = parsed.value.object.get("command") orelse parsed.value.object.get("path") orelse return call;
+    if (value != .string) return call;
+    const detail = try bounded(a, value.string);
+    call.detail = detail.text;
+    call.truncated = detail.truncated;
+    return call;
+}
+
+fn unknownFields(a: std.mem.Allocator, name: []const u8, fields: tool_preview.Snapshot) !Call {
+    const display = try bounded(a, name);
+    var call = Call{ .kind = .other, .name = display.text };
+    errdefer call.deinit(a);
+    const field = fields.command orelse fields.path orelse return call;
+    const detail = try bounded(a, field.text);
+    call.detail = detail.text;
+    call.truncated = field.truncated or detail.truncated;
+    return call;
+}
 
 /// 数字原样保留 unknown/partial；失败/取消不能借数字声称操作已经完成。
 pub const Completion = struct {
