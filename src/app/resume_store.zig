@@ -92,6 +92,26 @@ pub fn list(root: *fs.Root, allocator: std.mem.Allocator) ![]Summary {
     return items.toOwnedSlice(allocator);
 }
 
+/// Mark an existing checkpoint as used now without touching its bytes. The
+/// listing reads this mtime as the session's last-use time; a missing
+/// checkpoint is not an error (a new session gets its first save timestamp).
+pub fn touch(root: *fs.Root, id: ids.Id) !void {
+    const fd = logs.openExistingDirectory(root) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer fs.closeFd(fd);
+    var buffer: [64]u8 = undefined;
+    const path = try name(&buffer, id, ".session");
+    const file_fd = fs.openAt(fd, path, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (file_fd < 0) return if (fs.errno() == .NOENT) {} else fs.osError();
+    defer fs.closeFd(file_fd);
+    const file = fs.fileFromFd(file_fd);
+    const stat = try file.stat(root.io);
+    if (stat.kind != .file) return error.UnsafeResumeFile;
+    if (std.c.futimens(file_fd, null) != 0) return fs.osError();
+}
+
 /// Fixed checkpoint names only. Do not relax the general file tool's UTF-8
 /// contract just to store authenticated binary framing.
 fn atomicWrite(root: *fs.Root, dir: c_int, path: [:0]const u8, bytes: []const u8, replace: bool) !void {

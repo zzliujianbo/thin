@@ -238,7 +238,7 @@ async function scenario(app, pty, kind) {
     await mkdir(home); await mkdir(project); await mkdir(join(home,'.thin'));
     await new Promise((resolve,reject) => { server.once('error',reject); server.listen(0,'127.0.0.1',resolve); });
     const url = `http://127.0.0.1:${server.address().port}/v1`;
-    await writeFile(join(home,'.thin/config.json'), JSON.stringify({memory:{auto:false},llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,request_timeout_ms:5000}}));
+    await writeFile(join(home,'.thin/config.json'), JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,request_timeout_ms:5000}}));
     if (redact) await writeFile(join(project,`secret-${key}.json`), JSON.stringify({secret:key, [key]:key}));
     if (kind === 'failure' || kind === 'failure-pty') { await mkdir(join(project,'.thin')); await writeFile(join(project,'.thin/sessions'),'occupied'); }
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:key,
@@ -296,7 +296,7 @@ async function scenario(app, pty, kind) {
         assert(row.event === 'diagnostic' && row.schema === 1, 'only diagnostics may follow finished');
         const d = row.data;
         assert(d && typeof d === 'object' && !Array.isArray(d), 'invalid diagnostic data');
-        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','protocol','route_hash','timeout_ms','http_status','model_failure','candidate_index','count','origin_turn','memory_job_id'];
+        const keys = ['stage','phase','span_id','elapsed_ms','result','error_name','protocol','route_hash','timeout_ms','http_status','model_failure'];
         assert(Object.keys(d).length === keys.length && keys.every(k => Object.hasOwn(d,k)), 'invalid diagnostic schema');
         assert(['observer','checkpoint','host_emit','finished_emit'].includes(d.stage), 'unexpected diagnostic stage');
         assert(['begin','end'].includes(d.phase) && Number.isSafeInteger(d.span_id) && d.span_id > 0, 'invalid diagnostic span');

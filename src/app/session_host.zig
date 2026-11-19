@@ -309,8 +309,6 @@ pub const SessionHost = struct {
     dispatch_retry_delay_ms: u64 = dispatch_retry_initial_ms,
     pending_terminal: ?struct { terminal: r.Terminal, json: []u8 } = null,
     next_seq: u64 = 1,
-    /// Rotate independent notification sources even with a one-entry live ring.
-    background_first: bool = false,
     /// Display-only identity for canonical user rows; never authority.
     next_user_id: u64 = 0,
 
@@ -440,27 +438,11 @@ pub const SessionHost = struct {
     /// The Session is the sole consumer and peek/take are owner-thread calls;
     /// no second producer touches the Runtime Bridge. On allocation failure or
     /// backpressure the queue head and stream sequence remain unchanged.
-    const MemoryAdmission = enum { admitted, empty, blocked, unavailable };
-
-    fn admitMemoryCompletion(self: *SessionHost, source: anytype) MemoryAdmission {
-        const terminal = source.peekMemoryCompletion() orelse return .empty;
-        const event: r.Event = .{ .memory_completed = terminal };
-        const json = protocol.encodeEventMeta(self.allocator, event, .{}) catch return .unavailable;
-        self.commitObserved(event, false, true, json) catch |err| {
-            self.allocator.free(json);
-            // Allocation failure retains the independently owned completion.
-            // Invalid sequence is a host invariant violation.
-            if (err != error.OutOfMemory) self.fatal = err;
-            return .unavailable;
-        };
-        const taken = source.takeMemoryCompletion();
-        std.debug.assert(taken != null);
-        return .admitted;
-    }
+    const Admission = enum { admitted, empty, unavailable };
 
     /// Retain the exact copied completion before retiring its source job.
     /// Another job may finish after peek; never take an unspecified head.
-    fn admitBackgroundCompletion(self: *SessionHost, source: anytype) MemoryAdmission {
+    fn admitBackgroundCompletion(self: *SessionHost, source: anytype) Admission {
         const terminal = source.peekBackgroundCompletion() orelse return .empty;
         const event: r.Event = .{ .background_completed = terminal };
         const json = protocol.encodeEventMeta(self.allocator, event, .{}) catch return .unavailable;
@@ -473,8 +455,8 @@ pub const SessionHost = struct {
         return .admitted;
     }
 
-    /// Drain the primary Bridge, finish the task, and only then publish a
-    /// bounded batch of Memory completions at the safe boundary before the next task.
+    /// Drain the primary Bridge, finish the task, and only then publish
+    /// bounded background completions at the safe boundary before the next task.
     pub fn pump(self: *SessionHost, now_ms: u64) void {
         self.pumpFrom(now_ms, &self.session);
     }
@@ -506,29 +488,9 @@ pub const SessionHost = struct {
         if (self.task == null and self.pending_terminal == null and self.pending_event == null) {
             var completed: usize = 0;
             while (completed < 64) : (completed += 1) {
-                // Rotate on each admission so a one-entry ring cannot starve
-                // either independent source across successive acknowledgements.
-                var admitted = false;
-                if (@hasDecl(@TypeOf(source.*), "peekBackgroundCompletion")) {
-                    if (self.background_first) {
-                        if (self.admitBackgroundCompletion(source) == .admitted) {
-                            self.background_first = false;
-                            admitted = true;
-                        } else if (self.admitMemoryCompletion(source) == .admitted) {
-                            self.background_first = true;
-                            admitted = true;
-                        }
-                    } else if (self.admitMemoryCompletion(source) == .admitted) {
-                        self.background_first = true;
-                        admitted = true;
-                    } else if (self.admitBackgroundCompletion(source) == .admitted) {
-                        self.background_first = false;
-                        admitted = true;
-                    }
-                } else {
-                    admitted = self.admitMemoryCompletion(source) == .admitted;
-                }
-                if (!admitted) break;
+                // A source without the optional sink admits nothing.
+                if (!@hasDecl(@TypeOf(source.*), "peekBackgroundCompletion")) break;
+                if (self.admitBackgroundCompletion(source) != .admitted) break;
             }
         }
         // A completed login may reload configuration only after the primary
@@ -706,7 +668,7 @@ pub const SessionHost = struct {
             },
             // UI-only completion: never changes the primary task, draft,
             // approval state or model-visible history.
-            .memory_completed, .background_completed => {},
+            .background_completed => {},
             .usage => |usage| {
                 if (self.context) |snapshot| {
                     const total = usage.value.total();
@@ -978,7 +940,6 @@ pub const SessionHost = struct {
     fn canonicalForHistory(event: r.Event) bool {
         return switch (event) {
             .user_committed, .assistant_committed, .tool_started, .tool_result, .compacted, .compaction_failed => true,
-            .memory_completed => false,
             else => false,
         };
     }
@@ -1262,7 +1223,6 @@ pub const SessionHost = struct {
             .model = state.model,
             .provider = if (state.provider) |provider| provider.slug() else null,
             .codex_login = self.codexView(),
-            .memory = state.memory,
             .background = state.background,
             .read_only = self.session.read_only,
             .truncated = self.fatal != null or self.reset_failed != null or self.history.evicted_through != 0 or self.partial_text.truncated or self.partial_reasoning.truncated,
@@ -1341,13 +1301,12 @@ pub const SessionHost = struct {
         queue_revision: u64,
         task: u64,
         codex: codex_login.View,
-        memory: @import("../core/memory_status.zig").View = .{},
         background: background_status.View = .{},
 
         pub fn eql(left: WatchStamp, right: WatchStamp) bool {
             // sequence is a coverage watermark, not a snapshot invalidation.
             return left.revision == right.revision and
-                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.memory, right.memory) and std.meta.eql(left.background, right.background);
+                left.queue_revision == right.queue_revision and left.task == right.task and std.meta.eql(left.codex, right.codex) and std.meta.eql(left.background, right.background);
         }
     };
 
@@ -1420,7 +1379,6 @@ pub const SessionHost = struct {
             .queue_revision = queue.revision,
             .task = if (self.task) |task_| task_.id else 0,
             .codex = self.codexView(),
-            .memory = state.memory,
             .background = state.background,
         };
     }
@@ -1925,8 +1883,6 @@ pub const SessionHost = struct {
         try out.field("proxy_address", state.proxy_address);
         try out.field("proxy_port", state.proxy_port);
         try encodeProxyModels(&out, state.proxy_models);
-        try out.field("memory_auto", state.memory_auto);
-        try protocol.encodeMemoryView(&out, state.memory);
         // Dynamic child rows belong to snapshots, not the settings reply.
         try out.field("global_settings_available", state.global_settings_available);
         try out.field("settings_notice", state.settings_notice);

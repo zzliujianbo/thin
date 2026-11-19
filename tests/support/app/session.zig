@@ -195,7 +195,7 @@ const MetadataPublicationFixture = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try writeSessionTestConfig(tmp.dir,
-            \\{"memory":{"auto":false},"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","api_key":"fake-owned-publication","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+            \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","api_key":"fake-owned-publication","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
         );
         var path: [4096]u8 = undefined;
         const home = path[0..try tmp.dir.realPath(io, &path)];

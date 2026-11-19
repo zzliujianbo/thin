@@ -197,7 +197,7 @@ def main(app):
             project.mkdir()
             runtime.mkdir(mode=0o700)
             # The local mock has no real price evidence; production defaults are unchanged.
-            config = {'memory': {'auto': False}, 'limits': {'low_price_input': False},
+            config = {'limits': {'low_price_input': False},
                       'llm': {'default': 'local/fixture-model',
                       'providers': {'local': {'kind': 'opencode_zen', 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                       'api_key_env': 'THIN_FIXTURE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}}
@@ -332,7 +332,7 @@ def trailing_home_connect(app, server):
         home, runtime = (Path(tmp) / name for name in ('home', 'r'))
         (home / '.thin').mkdir(parents=True)
         runtime.mkdir(mode=0o700)
-        config = {'memory': {'auto': False}, 'limits': {'low_price_input': False},
+        config = {'limits': {'low_price_input': False},
                   'llm': {'default': 'local/fixture-model',
                   'providers': {'local': {'kind': 'opencode_zen', 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                   'api_key_env': 'THIN_FIXTURE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}}

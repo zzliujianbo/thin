@@ -8,16 +8,12 @@ const thinking = @import("thinking.zig");
 const llm = @import("../llm/llm.zig");
 const context = @import("context.zig");
 const diagnostics = @import("diagnostics.zig");
-const knowledge = @import("knowledge.zig");
 
-/// Owner-thread callbacks. Retrieval returns allocator-owned borrowed reference
-/// bytes. Submission admits a copied capture before finished; it must not wait
-/// for auxiliary inference or retain borrowed capture bytes.
+/// Owner-thread callback. Retrieval returns allocator-owned reference bytes at
+/// task start; the host may decline by returning its own error.
 pub const MemoryHooks = struct {
     context: *anyopaque,
     retrieve_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror![]const u8,
-    submit_fn: *const fn (*anyopaque, *const knowledge.Capture, p.Protocol) void,
-    check_fn: ?*const fn (*anyopaque) bool = null,
 };
 const session_context = @import("session_context.zig");
 const checkpoint_mod = @import("checkpoint.zig");
@@ -40,11 +36,6 @@ pub const Execution = struct {
     truncated: bool = false,
     /// 进程组清理失败：会使 Runtime poisoned，之后拒绝继续运行。
     cleanup_failed: bool = false,
-    /// Automatic Memory evidence policy. False marks a result that must not
-    /// become a "verified tool fact" even when the call reports success.
-    /// Evaluated per result, not per name.
-    /// 中文：自动 Memory 证据策略；false 表示该成功结果不得作为已证实工具事实采集。
-    memory_evidence: bool = true,
     /// Optional measured file observations, copied by value across Host/Bridge.
     /// No content/authority; absent remains unknown, including synthetic errors.
     file_stats: ?@import("../util/line_stats.zig").File = null,
@@ -228,9 +219,6 @@ pub const Event = union(enum) {
     compaction_failed: struct { err: anyerror, name: []const u8 = "" },
     /// 自动压缩被增长保护或每任务上限跳过；旧历史保持不变。
     compaction_skipped: struct { reason: CompactionSkipReason },
-    /// Session-owned auxiliary completion, display only. Never a Runtime
-    /// task result, model message, or canonical Journal observation.
-    memory_completed: @import("memory_status.zig").Terminal,
     /// 本次 run 的终态，每个 run 恰好一条。
     finished: Terminal,
 };
@@ -435,10 +423,8 @@ pub const Runtime = struct {
     thinking_control: ?*ThinkingControl = null,
     /// 当前使用的模型描述。
     model: p.Model,
-    /// Independent auxiliary client: never part of checkpoint or primary accounting.
+    /// Task-start Memory retrieval; never part of checkpoint or primary accounting.
     memory_hooks: ?MemoryHooks = null,
-    /// Borrowed only during a prompt task; never accessed by tool worker jobs.
-    memory_capture: ?*knowledge.Capture = null,
     /// 工具执行器（宿主注入）。
     executor: Executor,
     /// 宿主回调（事件、授权）。
@@ -946,15 +932,6 @@ pub const Runtime = struct {
             .compact => "/compact",
         } });
 
-        // Independent of canonical history: compaction may free its arena while
-        // evidence from earlier rounds must remain alive. Wipe whole arena blocks.
-        var wiping = cfg.WipingAllocator{ .backing = self.allocator };
-        var material = std.heap.ArenaAllocator.init(wiping.allocator());
-        defer material.deinit();
-        var capture = knowledge.Capture{ .allocator = material.allocator() };
-        self.memory_capture = if (operation == .prompt and self.memory_hooks != null) &capture else null;
-        defer self.memory_capture = null;
-
         var task = Task{};
         defer task.deinitEdited(self.allocator);
 
@@ -992,15 +969,6 @@ pub const Runtime = struct {
             task.terminal.status = .canceled;
             task.terminal.detail = error.Canceled;
         }
-        if (task.terminal.status == .success) {
-            if (self.memory_capture) |completed| {
-                if (self.memory_hooks) |hooks| {
-                    var memory_span = diagnostics.Span.start(self.diagnostics, self.io, .{ .stage = .memory_submit });
-                    hooks.submit_fn(hooks.context, completed, self.selector.effective());
-                    memory_span.finish(.ok);
-                }
-            }
-        }
 
         // Exactly one terminal result per accepted run, including failures. A
         // disconnected host need not receive it, but the caller still gets it.
@@ -1017,7 +985,6 @@ pub const Runtime = struct {
     }
 
     fn commandInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
-        try self.checkMemorySafety();
         if (self.poisoned) return error.UnsafeToContinue;
         try checkCanceled(cancel);
         const input = std.mem.trimStart(u8, text, " \t\r\n");
@@ -1114,7 +1081,6 @@ pub const Runtime = struct {
     }
 
     fn compactManual(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
-        try self.checkMemorySafety();
         if (self.poisoned) return error.UnsafeToContinue;
         try checkCanceled(cancel);
 
@@ -1326,10 +1292,6 @@ pub const Runtime = struct {
         const a = scratch.allocator();
         const returned = hooks.retrieve_fn(hooks.context, a, query) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (err == error.CleanupFailed or err == error.UnsafeToContinue) {
-                self.poisoned = true;
-                return error.CleanupFailed;
-            }
             try self.appendMemoryReference(a, "Latest Memory unavailable; earlier snapshots are not current truth.");
             return;
         };
@@ -1407,7 +1369,6 @@ pub const Runtime = struct {
             resolved = true;
             defer entry.deinit();
             self.history.appendAssumeCapacity(message);
-            if (self.memory_capture) |capture| capture.add(.user, message.blocks[0].text);
             self.last_context_tokens = null;
             consumed = true;
             try self.emit(.{ .user_committed = .{ .id = entry.id, .text = message.blocks[0].text } }, cancel);
@@ -1417,14 +1378,7 @@ pub const Runtime = struct {
 
     /// 主循环：预检（必要时压缩）→ 调用模型 → stop 则提交返回，否则执行工具批次。
     /// 不变量：模型输出的每个 tool_call 在返回前都会有对应 tool_result（见 executeBatch 的 errdefer）。
-    fn checkMemorySafety(self: *Runtime) !void {
-        if (self.memory_hooks) |hooks| {
-            if (hooks.check_fn) |check| if (!check(hooks.context)) return error.UnsafeToContinue;
-        }
-    }
-
     fn runInner(self: *Runtime, text: []const u8, cancel: *p.Cancellation, task: *Task) !void {
-        try self.checkMemorySafety();
         // poisoned 后拒绝新输入，避免在不一致的历史上继续。
         if (self.poisoned) return error.UnsafeToContinue;
         try checkCanceled(cancel);
@@ -1434,7 +1388,6 @@ pub const Runtime = struct {
         if (std.mem.trim(u8, text, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(text)) return error.InvalidInput;
         // Failure here is reference unavailability, not a failed user task.
         try self.retrieveMemory(text);
-        if (self.memory_capture) |capture| capture.add(.user, text);
         // Stage the current input without allocating its bytes in the history
         // arena: rejected prompts must not accumulate unreachable copies.
         // run is synchronous; text and this block remain alive through preflight,
@@ -1509,11 +1462,6 @@ pub const Runtime = struct {
                     };
                 },
             };
-
-            // Refusal is a successful displayable response, not task evidence
-            // suitable for automatic learning. Suppress this entire task even
-            // if a later steering input gets an ordinary response.
-            if (response.refused) self.memory_capture = null;
 
             // 校验模型输出结构，不合法则本次 run 失败。
             try validateResponse(result_arena.allocator(), response, self.history.items);
@@ -2261,9 +2209,6 @@ pub const Runtime = struct {
         try self.history.append(a, .{ .role = .tool, .blocks = blocks });
         // Display-only counters: a failed append must never fail the turn.
         if (result.file_stats) |stats| if (stats.changes) |changes| self.recordToolStat(id, changes) catch {};
-        if (!result.is_error and !result.canceled and !result.truncated and !result.cleanup_failed and result.memory_evidence) {
-            if (self.memory_capture) |capture| capture.add(.tool, result.text);
-        }
         self.observer.notify(.{ .tool_completed = .{ .call_id = id, .result = result } });
     }
 

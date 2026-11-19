@@ -227,84 +227,6 @@
       "unit": true
     },
     {
-      "virtual": "src/app/memory_app_test.zig",
-      "production": null,
-      "support": "tests/roots/app/memory_app_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/app/memory_app_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/memory_client.zig",
-      "production": "src/app/memory_client.zig",
-      "support": "tests/support/app/memory_client.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/app/memory_client_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/memory_lifecycle_test.zig",
-      "production": null,
-      "support": "tests/roots/app/memory_lifecycle_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/app/memory_lifecycle_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": false
-    },
-    {
-      "virtual": "src/app/memory_notifications.zig",
-      "production": "src/app/memory_notifications.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/app/memory_notifications_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/memory_service.zig",
-      "production": "src/app/memory_service.zig",
-      "support": "tests/support/app/memory_service.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/app/memory_service_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
-      "virtual": "src/app/memory_service_test.zig",
-      "production": null,
-      "support": "tests/roots/app/memory_service_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/app/memory_service_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "app",
-      "unit": true
-    },
-    {
       "virtual": "src/app/model_directory.zig",
       "production": "src/app/model_directory.zig",
       "support": null,
@@ -465,12 +387,6 @@
         {
           "path": "tests/unit/app/session_test.zig",
           "container": []
-        },
-        {
-          "path": "tests/unit/app/session_Session_test.zig",
-          "container": [
-            "Session"
-          ]
         }
       ],
       "group": "app",
@@ -680,32 +596,6 @@
       "unit": true
     },
     {
-      "virtual": "src/core/knowledge.zig",
-      "production": "src/core/knowledge.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/core/knowledge_test.zig",
-          "container": []
-        }
-      ],
-      "group": "core",
-      "unit": true
-    },
-    {
-      "virtual": "src/core/knowledge_codec.zig",
-      "production": "src/core/knowledge_codec.zig",
-      "support": "tests/support/core/knowledge_codec.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/core/knowledge_codec_test.zig",
-          "container": []
-        }
-      ],
-      "group": "core",
-      "unit": true
-    },
-    {
       "virtual": "src/core/llm_config_test.zig",
       "production": null,
       "support": "tests/roots/core/llm_config_test.zig",
@@ -716,19 +606,6 @@
         }
       ],
       "group": "integration",
-      "unit": true
-    },
-    {
-      "virtual": "src/core/memory_status.zig",
-      "production": "src/core/memory_status.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/core/memory_status_test.zig",
-          "container": []
-        }
-      ],
-      "group": "fast",
       "unit": true
     },
     {
@@ -1237,20 +1114,6 @@
       "unit": true
     },
     {
-      "virtual": "src/memory_test_root.zig",
-      "production": null,
-      "support": "tests/roots/memory_test_root.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/memory_test_root_discovery.zig",
-          "container": [],
-          "role": "discovery"
-        }
-      ],
-      "group": "integration",
-      "unit": false
-    },
-    {
       "virtual": "src/platform/anonymous_input.zig",
       "production": "src/platform/anonymous_input.zig",
       "support": null,
@@ -1615,19 +1478,6 @@
       "fragments": [],
       "group": "ui",
       "unit": false
-    },
-    {
-      "virtual": "src/tests/automatic_memory_runtime_test.zig",
-      "production": null,
-      "support": "tests/roots/tests/automatic_memory_runtime_test.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/tests/automatic_memory_runtime_test_test.zig",
-          "container": []
-        }
-      ],
-      "group": "integration",
-      "unit": true
     },
     {
       "virtual": "src/tests/background_service_test.zig",

@@ -205,20 +205,6 @@ pub fn build(b: *std.Build) void {
     rendering.step.dependOn(&all.run.step);
     b.step("test-render", "Run rendering-related unit tests").dependOn(&runTest(b, rendering).step);
 
-    const memory_tests = b.addTest(.{
-        .use_llvm = platform_llvm,
-        .root_module = b.createModule(.{
-            .root_source_file = all.path(b, "src/memory_test_root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    memory_tests.step.dependOn(&all.run.step);
-    addNative(b, memory_tests.root_module);
-    const run_memory = runTest(b, memory_tests);
-    b.step("test-memory", "Run bounded automatic-memory offline regressions").dependOn(&run_memory.step);
-
     const http_tests = b.addTest(.{
         .use_llvm = platform_llvm,
         .root_module = b.createModule(.{
@@ -307,9 +293,6 @@ pub fn build(b: *std.Build) void {
     const run_streaming = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{"--streaming-only"});
     b.step("test-streaming", "Run focused streaming Markdown and history PTY acceptance").dependOn(&run_streaming.step);
 
-    const run_memory_app = fixture(b, "node", "tests/product/memory_auto_mock.mjs", &.{exe}, &.{});
-    b.step("test-memory-app", "Run owned loopback automatic-memory CLI lifecycle acceptance").dependOn(&run_memory_app.step);
-
     // Instance-owned background services: owned loopback plus a real PTY, so
     // cross-task keep-alive is proven in one App instance (--print exits must
     // clear every service, which is the correct headless semantic).
@@ -327,9 +310,6 @@ pub fn build(b: *std.Build) void {
     b.step("test-idle-enter", "Run owned idle prompt newline PTYs (requires Python 3)").dependOn(&run_idle_enter.step);
     const run_resume_menu = fixture(b, "python3", "tests/product/resume_menu_mock.py", &.{exe}, &.{});
     b.step("test-resume-menu", "Run owned saved-session menu and continuation PTYs").dependOn(&run_resume_menu.step);
-
-    const run_memory_background = fixture(b, "python3", "tests/product/memory_background_mock.py", &.{exe}, &.{});
-    b.step("test-memory-background", "Run owned PTY background Memory status and lifecycle acceptance").dependOn(&run_memory_background.step);
 
     const run_resize = fixture(b, "python3", "tests/product/resize_deferred_mock.py", &.{exe}, &.{});
     b.step("test-resize-deferred", "Run owned passive size/safety, ACK invalidation and stream-resume PTY checks (no auto repair)").dependOn(&run_resize.step);
@@ -395,8 +375,6 @@ pub fn build(b: *std.Build) void {
     } else test_all;
     full_prerequisites.dependOn(&workflow_tests.step);
     full_prerequisites.dependOn(&run_unit.step);
-    full_prerequisites.dependOn(&run_memory.step);
-    full_prerequisites.dependOn(&run_memory_app.step);
     full_prerequisites.dependOn(&run_background.step);
     if (target.result.os.tag == .linux) {
         full_prerequisites.dependOn(&run_subscription.step);
@@ -412,7 +390,6 @@ pub fn build(b: *std.Build) void {
     full_prerequisites.dependOn(&run_app.step);
     full_prerequisites.dependOn(&run_idle_enter.step);
     full_prerequisites.dependOn(&run_resume_menu.step);
-    full_prerequisites.dependOn(&run_memory_background.step);
     full_prerequisites.dependOn(&run_resize.step);
     full_prerequisites.dependOn(viewport_step);
     full_prerequisites.dependOn(&run_settings.step);
@@ -420,7 +397,7 @@ pub fn build(b: *std.Build) void {
     full_prerequisites.dependOn(&run_approval_cancel.step);
     full_prerequisites.dependOn(&run_tool_preview.step);
     full_prerequisites.dependOn(&run_queued.step);
-    for ([_]*std.Build.Step.Compile{ exe, unit, rendering, memory_tests, http_tests, proxy_tests, anthropic_tests, probes, pty_driver }) |artifact| configureStack(artifact);
+    for ([_]*std.Build.Step.Compile{ exe, unit, rendering, http_tests, proxy_tests, anthropic_tests, probes, pty_driver }) |artifact| configureStack(artifact);
 }
 
 const Composed = struct {

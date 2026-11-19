@@ -13,7 +13,6 @@ const plain =
 ;
 const Edit = struct { key: preference.Key, value: ?u32 };
 const main_edits = [_]Edit{
-    .{ .key = .memory_auto, .value = 0 },
     .{ .key = .compaction_enabled, .value = 0 },
     .{ .key = .command_timeout_ms, .value = 10000 },
     .{ .key = .request_timeout_ms, .value = 20000 },

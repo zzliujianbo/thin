@@ -71,7 +71,7 @@ fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protoc
         }
     };
     const source =
-        \\{"memory":{"auto":false},"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536,"output_tokens":8192}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536,"output_tokens":8192}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
     ;
     const document = try std.mem.replaceOwned(u8, a, source, "PRIMARY_PROTOCOL", @tagName(protocol));
     defer a.free(document);

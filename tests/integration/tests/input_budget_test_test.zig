@@ -24,7 +24,7 @@ test "input budget registry declarations roundtrip without persisting derived pr
         const encoded = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
         defer encoded.deinit();
         const limits = encoded.value.object.get("limits").?.object;
-        try std.testing.expectEqual(@as(usize, 4), limits.count());
+        try std.testing.expectEqual(@as(usize, 5), limits.count());
         inline for (@typeInfo(cfg.Limits).@"struct".field_names) |field| try std.testing.expect(limits.get(field) != null);
         inline for (.{ "input_margin_tokens", "max_input_tokens", "safety_tokens", "max_rounds" }) |retired| {
             try std.testing.expect(limits.get(retired) == null);

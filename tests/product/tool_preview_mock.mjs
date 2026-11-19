@@ -93,7 +93,7 @@ async function run(mode, url) {
   const home = join(base,mode,'home'), project = join(base,mode,'project');
   await mkdir(join(home,'.thin'),{recursive:true}); await mkdir(project,{recursive:true});
   const config = JSON.stringify({
-    memory:{auto:false},
+
     llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}},
     // Explicit opt-out: fixture has no external metadata/known input price.
     limits:{low_price_input:false,request_timeout_ms:20000,command_timeout_ms:3000},

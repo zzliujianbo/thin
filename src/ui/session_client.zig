@@ -254,9 +254,8 @@ const Copy = struct {
             },
             // The raw failure name is a wire slice; copy it with the event.
             .compaction_failed => |v| .{ .compaction_failed = .{ .err = v.err, .name = self.text(v.name) } },
-            // Terminal and Summary contain only fixed owned values; never
-            // borrow from a decoded JSON arena or coalesce as a body delta.
-            .memory_completed => |terminal| .{ .memory_completed = terminal },
+            // Terminal values stay fixed and owned; never borrow from a
+            // decoded JSON arena or coalesce as a body delta.
             .background_completed => |terminal| .{ .background_completed = terminal },
             .assistant_committed => |blocks| blk: {
                 const n = blocks.len;
@@ -288,7 +287,6 @@ pub const QueuePreview = struct {
 /// TUI copies what it keeps. No Runtime, socket or callback lives here.
 pub const Snapshot = struct {
     background: @import("../core/background_status.zig").View = .{},
-    memory: @import("../core/memory_status.zig").View = .{},
     available: bool = false,
     attached: bool = false,
     busy: bool = false,

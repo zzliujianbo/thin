@@ -17,13 +17,7 @@ test {
     _ = @import("tests/filesystem_portability_test.zig");
     _ = memory;
     _ = @import("core/diagnostics.zig");
-    _ = @import("core/knowledge.zig");
-    _ = @import("core/knowledge_codec.zig");
     _ = @import("tools/knowledge_store.zig");
-    _ = @import("app/memory_client.zig");
-    _ = @import("app/memory_service_test.zig");
-    _ = @import("app/memory_app_test.zig");
-    _ = @import("tests/automatic_memory_runtime_test.zig");
     _ = tools;
     _ = presentation;
     _ = daemon;

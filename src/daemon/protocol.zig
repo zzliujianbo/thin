@@ -24,7 +24,6 @@ const task = @import("../core/task.zig");
 const write_preview = @import("../core/write_preview.zig");
 const line_stats = @import("../util/line_stats.zig");
 const codex_login = @import("../core/codex_login.zig");
-const memory_status = @import("../core/memory_status.zig");
 const background = @import("../core/background_status.zig");
 
 /// Private daemon/worker IPC version. v4 adds typed background display data.
@@ -904,7 +903,6 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("ms", value.result.duration_ms);
             try encodeDisplayKey(&out, "key", value.display_key);
             try encodeCaption(&out, "display", value.result.display);
-            try out.field("mem_ev", value.result.memory_evidence);
             try encodeFileStats(&out, "opts", value.result.file_stats);
             if (value.local) try out.field("local", true);
         },
@@ -938,10 +936,6 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
         .background_completed => |terminal| {
             try out.field("t", "background_completed");
             try encodeBackgroundTerminal(&out, terminal);
-        },
-        .memory_completed => |terminal| {
-            try out.field("t", "memory_completed");
-            try encodeMemoryTerminalFields(&out, terminal);
         },
         .finished => |terminal| {
             try out.field("t", "finished");
@@ -1045,7 +1039,6 @@ pub const Snapshot = struct {
     model: []const u8 = "",
     provider: ?[]const u8 = null,
     codex_login: codex_login.View = .{},
-    memory: memory_status.View = .{},
     background: background.View = .{},
     read_only: bool = false,
     truncated: bool = false,
@@ -1099,7 +1092,6 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.field("code", snapshot.codex_login.userCode());
     try out.field("failure", if (snapshot.codex_login.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
     try out.endObject();
-    try encodeMemoryView(out, snapshot.memory);
     try out.beginObject("background");
     try out.field("active_count", snapshot.background.active_count);
     try out.endObject();
@@ -1108,46 +1100,6 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.beginArray("input_history");
     for (snapshot.input_history) |text| try out.stringElement(text);
     try out.endArray();
-    try out.endObject();
-}
-
-/// Memory summaries use the same fixed-size, single-line normalization on
-/// snapshots and events. Reject malformed owned values rather than emitting a
-/// wire frame that the client must reject (or slicing past the fixed buffer).
-fn validMemorySummary(summary: *const memory_status.Summary) bool {
-    if (summary.len > summary.buf.len) return false;
-    const text = summary.text();
-    if (!std.unicode.utf8ValidateSlice(text)) return false;
-    var normalized: memory_status.Summary = .{};
-    normalized.append(text);
-    return std.mem.eql(u8, normalized.text(), text);
-}
-
-fn encodeMemoryTerminalFields(out: *Out, terminal: memory_status.Terminal) !void {
-    if (!validMemorySummary(&terminal.summary)) return error.BadRequest;
-    try out.field("id", terminal.id);
-    try out.field("result", @tagName(terminal.result));
-    try out.field("failure", if (terminal.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
-    try out.field("saved_count", terminal.saved_count);
-    try out.field("summary", terminal.summary.text());
-}
-
-pub fn encodeMemoryView(out: *Out, view: memory_status.View) !void {
-    try out.beginObject("memory");
-    try out.field("enabled", view.enabled);
-    try out.field("revision", view.revision);
-    try out.field("queued_count", view.queued_count);
-    if (view.active) |active| {
-        try out.beginObject("active");
-        try out.field("id", active.id);
-        try out.field("phase", @tagName(active.phase));
-        try out.endObject();
-    } else try out.field("active", @as(?u8, null));
-    if (view.last_terminal) |terminal| {
-        try out.beginObject("last_terminal");
-        try encodeMemoryTerminalFields(out, terminal);
-        try out.endObject();
-    } else try out.field("last_terminal", @as(?u8, null));
     try out.endObject();
 }
 
@@ -1431,47 +1383,6 @@ fn decodeBackgroundTerminal(object: std.json.ObjectMap) !background.Terminal {
     return .{ .id = try decodeId(try requireText(object, "id")), .command = try decodeCommand(try requireText(object, "command")), .result = try requireEnum(background.Result, object, "result"), .duration_ms = try requireU64(object, "duration_ms"), .exit_code = exit_code, .signal = signal, .failure = failure };
 }
 
-/// Closed Memory terminal fields follow the snapshot decoder's exact policy:
-/// known enum names, an explicitly nullable failure, and a bounded summary
-/// which is already UTF-8 and unchanged by Summary's display sanitization.
-fn decodeMemoryTerminal(object: std.json.ObjectMap) !memory_status.Terminal {
-    var keys = object.iterator();
-    while (keys.next()) |entry| {
-        const key = entry.key_ptr.*;
-        var known = false;
-        for ([_][]const u8{ "t", "id", "result", "failure", "saved_count", "summary", "epoch", "seq", "disp_trunc", "canon_complete" }) |allowed| {
-            if (std.mem.eql(u8, key, allowed)) {
-                known = true;
-                break;
-            }
-        }
-        if (!known) return error.BadRequest;
-    }
-    // `seq` is appended by watchEvents; the other optional fields are the
-    // standard display envelope. Present metadata must not be null/mistyped.
-    if (object.contains("epoch")) _ = try requireU64(object, "epoch");
-    if (object.contains("seq")) _ = try requireU64(object, "seq");
-    if (object.contains("disp_trunc")) _ = try requireBool(object, "disp_trunc");
-    if (object.contains("canon_complete")) _ = try requireBool(object, "canon_complete");
-    const failure: ?memory_status.Failure = switch (try requireValue(object, "failure")) {
-        .null => null,
-        .string => |name| std.meta.stringToEnum(memory_status.Failure, name) orelse return error.BadRequest,
-        else => return error.BadRequest,
-    };
-    const text = try requireText(object, "summary");
-    var summary: memory_status.Summary = .{};
-    if (text.len > summary.buf.len or !std.unicode.utf8ValidateSlice(text)) return error.BadRequest;
-    summary.append(text);
-    if (!std.mem.eql(u8, summary.text(), text)) return error.BadRequest;
-    return .{
-        .id = try requireU64(object, "id"),
-        .result = try requireEnum(memory_status.Result, object, "result"),
-        .failure = failure,
-        .saved_count = try requireU32(object, "saved_count"),
-        .summary = summary,
-    };
-}
-
 /// Decode one encoded event into a borrowed `r.Event` plus the document that
 /// owns every slice. Blocks are allocated from the document arena, so text and
 /// blocks share one lifetime and an error path frees all of them. The client
@@ -1587,7 +1498,7 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
             .display_key = try decodeDisplayKey(object, "key"),
         } };
     } else if (std.mem.eql(u8, kind, "tool_result")) {
-        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "canceled", "trunc", "cleanup", "display", "mem_ev", "opts", "ms", "local", "epoch", "seq", "disp_trunc", "canon_complete" });
+        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "canceled", "trunc", "cleanup", "display", "opts", "ms", "local", "epoch", "seq", "disp_trunc", "canon_complete" });
         event = .{ .tool_result = .{
             .id = try requireU64(object, "id"),
             .name = try requireText(object, "name"),
@@ -1599,7 +1510,6 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
                 .truncated = try optionalBool(object, "trunc") orelse false,
                 .cleanup_failed = try optionalBool(object, "cleanup") orelse false,
                 .display = try decodeCaption(object),
-                .memory_evidence = try optionalBool(object, "mem_ev") orelse true,
                 .file_stats = try decodeFileStats(object, "opts"),
                 .duration_ms = try optionalU64(object, "ms"),
             },
@@ -1636,8 +1546,6 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
         event = .{ .assistant_committed = blocks };
     } else if (std.mem.eql(u8, kind, "background_completed")) {
         event = .{ .background_completed = try decodeBackgroundTerminal(object) };
-    } else if (std.mem.eql(u8, kind, "memory_completed")) {
-        event = .{ .memory_completed = try decodeMemoryTerminal(object) };
     } else if (std.mem.eql(u8, kind, "finished")) {
         event = .{ .finished = try decodeTerminalChecked(object) };
     } else return error.BadRequest;

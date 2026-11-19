@@ -31,9 +31,7 @@ const codex_login = @import("../core/codex_login.zig");
 const codex_oauth = @import("codex_oauth.zig");
 const codex_auth = @import("../core/codex_auth.zig");
 const p = @import("../core/protocol.zig");
-const memory_status = @import("../core/memory_status.zig");
 const background_status = @import("../core/background_status.zig");
-const MemoryNotifications = @import("memory_notifications.zig").Queue;
 
 const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
 const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
@@ -258,8 +256,6 @@ pub const Session = struct {
     settings_notice: ?[]const u8 = null,
     pending: ?std.json.Parsed(cfg.Config) = null,
     app: ?*App = null,
-    /// Heap-stable across Session moves and App/coordinator replacement.
-    memory_notifications: ?*MemoryNotifications = null,
     /// Independently owned replay remains available even without a usable route.
     loaded_checkpoint: ?std.json.Parsed(checkpoint.State) = null,
     loaded_selection: ?selections.Snapshot = null,
@@ -300,7 +296,6 @@ pub const Session = struct {
     metadata_notice: ?[]const u8 = null,
     /// Identity snapshot only: App publishes process-lifetime static notices.
     /// Never retain or inspect worker-owned mutable Runtime state here.
-    last_memory_view: @import("../core/memory_status.zig").View = .{},
     active_context_official: bool = false,
     display_origins: []bool = &.{},
     display_disabled: []bool = &.{},
@@ -367,6 +362,9 @@ pub const Session = struct {
             if (loaded) |value| value.deinit();
             loaded = null;
         }
+        // A successfully decoded checkpoint counts as used for `/resume`
+        // recency; a missing or invalid one is not promoted by a failed open.
+        if (options.resume_session) |source_id| resume_store.touch(&project_root, source_id) catch {};
         const auth_store = try Store.open(a, io, home);
         var self: Session = .{
             .allocator = a,
@@ -391,7 +389,6 @@ pub const Session = struct {
         lease = null;
         project_moved = true;
         errdefer self.deinit();
-        self.memory_notifications = try MemoryNotifications.create(a);
         self.loaded_checkpoint = loaded;
         loaded = null;
         self.loaded_selection = restored;
@@ -457,7 +454,6 @@ pub const Session = struct {
         const parsed = self.pending.?;
         self.pending = null;
         self.app = try self.prepareApp(parsed);
-        self.last_memory_view = self.app.?.memoryView();
         self.armInitialDefault();
         self.releaseLoadedHistory();
         self.initial_context = self.app.?.runtime.contextSnapshot();
@@ -553,7 +549,7 @@ pub const Session = struct {
             return err;
         };
         defer self.allocator.free(protected);
-        const candidate = try App.initConfiguredAnchoredAuthWithNotifications(self.allocator, self.io, self.environ, &self.project_root, protected, self.host, parsed, self.memory_notifications.?);
+        const candidate = try App.initConfiguredAnchoredAuth(self.allocator, self.io, self.environ, &self.project_root, protected, self.host, parsed);
         errdefer candidate.deinit();
         // Pin while the fresh journal still has zero counters. Imported sequence
         // numbers belong to the archive, not to a second pin operation.
@@ -577,29 +573,11 @@ pub const Session = struct {
         if (self.selected_alias) |alias| self.allocator.free(alias);
         if (self.global_config) |*global| cfg.release(global);
         if (self.app) |app| app.deinit();
-        // App teardown joins every producer before freeing the shared queue.
-        if (self.memory_notifications) |queue| queue.deinit();
         if (self.resume_lease) |*lease| lease.deinit();
         if (self.pending) |*pending| cfg.release(pending);
         self.store.deinit();
         self.project_root.deinit();
         self.* = undefined;
-    }
-
-    /// Peek is non-consuming; the remote host takes only after LiveRing accepts
-    /// this exact value. The Session has one consumer (local UI or remote host).
-    pub fn peekMemoryCompletion(self: *Session) ?memory_status.Terminal {
-        return if (self.memory_notifications) |queue| queue.peek() else null;
-    }
-
-    /// Returns an owned fixed value without allocating or touching a Job.
-    pub fn takeMemoryCompletion(self: *Session) ?memory_status.Terminal {
-        return if (self.memory_notifications) |queue| queue.take() else null;
-    }
-
-    fn takeMemoryCompletionCallback(raw: *anyopaque) ?memory_status.Terminal {
-        const self: *Session = @ptrCast(@alignCast(raw));
-        return self.takeMemoryCompletion();
     }
 
     pub fn backgroundView(self: *Session) background_status.View {
@@ -660,7 +638,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .take_memory_completion_fn = takeMemoryCompletionCallback, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
+        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -908,8 +886,6 @@ pub const Session = struct {
             // endpoint itself is never credential material.
             .proxy_address = if (self.global_config.?.value.proxy) |value| value.address else null,
             .proxy_port = if (self.global_config.?.value.proxy) |value| value.port else 0,
-            .memory_auto = config.memory.auto,
-            .memory = if (self.app) |app| app.memoryView() else .{},
             .background = self.backgroundView(),
             .global_settings_available = !self.read_only,
             .reasoning_effort = presentation.ReasoningEffort.fromName(config.model.reasoning_effort),
@@ -1026,7 +1002,6 @@ pub const Session = struct {
             self.pending = next;
             if (initial) |app| {
                 self.app = app;
-                self.last_memory_view = app.memoryView();
                 self.armInitialDefault();
                 self.initial_context = app.runtime.contextSnapshot();
                 self.releaseLoadedHistory();
@@ -1212,21 +1187,13 @@ pub const Session = struct {
         self.metadata_login_pending &= ~claim.mask;
     }
 
-    fn memoryViewChanged(self: *Session, view: @import("../core/memory_status.zig").View) bool {
-        const changed = !std.meta.eql(self.last_memory_view, view);
-        self.last_memory_view = view;
-        return changed;
-    }
-
     /// Owner polling never waits for network. Notice publication only dirties
     /// presentation; the active Runtime budget stays frozen until selection.
     fn pollModels(raw: *anyopaque, reported_idle: bool) bool {
         const self: *Session = @ptrCast(@alignCast(raw));
         const idle = reported_idle and !self.owner_task_active;
-        const memory_view = if (self.app) |app| app.memoryView() else @import("../core/memory_status.zig").View{};
-        const memory_changed = self.memoryViewChanged(memory_view);
         const login_changed = self.pollCodexLogin() catch false;
-        const default_changed = (self.completeInitialDefault(idle) catch false) or memory_changed or login_changed;
+        const default_changed = (self.completeInitialDefault(idle) catch false) or login_changed;
         if (self.metadata_job) |job| {
             official_pending: {
                 if (job.future) |*future| {
@@ -1844,7 +1811,6 @@ pub const Session = struct {
             self.pending = null;
             if (initial) |value| {
                 self.app = value;
-                self.last_memory_view = value.memoryView();
             } else {
                 self.pending = owned;
                 consumed = true;
@@ -1941,7 +1907,6 @@ pub const Session = struct {
             if (self.pending) |*old| cfg.release(old);
             self.pending = null;
             self.app = value;
-            self.last_memory_view = value.memoryView();
             self.armInitialDefault();
             if (id) |service| self.active_revision = self.credential_revisions[@intCast(@backingInt(service))] else self.active_custom_revision = self.custom_credential_revision;
             self.initial_context = value.runtime.contextSnapshot();

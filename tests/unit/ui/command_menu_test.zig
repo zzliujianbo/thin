@@ -80,6 +80,9 @@ test "command rows are bounded clipped and mark the selection" {
         a.free(rendered.lines);
     }
     try std.testing.expectEqual(@as(usize, 8), rendered.lines.len);
+    try std.testing.expectEqual(@as(usize, 0), rendered.start);
+    try std.testing.expectEqual(@as(usize, 2 + "/model [exact-id|--refresh]".len), labelBytes(.model));
+    try std.testing.expectEqual(@as(usize, 2 + "/login".len), labelBytes(.auth));
     try std.testing.expect(rendered.can_confirm);
     try std.testing.expectEqual(@as(usize, 1), rendered.selected_line.?);
     try std.testing.expect(std.mem.indexOf(u8, rendered.lines[1], "> ") != null);

@@ -127,7 +127,7 @@ async function proxyFixture(name, url, configured) {
   await mkdir(project, {recursive:true});
   const address = '127.0.0.1', port = 8888, models = [proxyModels.existing];
   const config = JSON.stringify({
-    memory:{auto:false},
+
     llm:{default:'local/fixture-model', providers:{
       local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{
         'fixture-model':{protocol:'chat', context_tokens:32768},
@@ -158,7 +158,7 @@ async function fixture(name, url) {
   await mkdir(join(home, '.thin'), {recursive:true});
   await mkdir(project, {recursive:true});
   const config = JSON.stringify({
-    memory:{auto:false},
+
     llm:{default:'local/fixture-model', providers:{local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{
       'fixture-model':{protocol:'chat', context_tokens:32768},
     }},
@@ -189,7 +189,7 @@ async function unchanged(f) {
 const limitsDefaults = {
   command_timeout_ms:300000, low_price_input:true,
   request_timeout_ms:300000, compaction_enabled:true,
-  show_reported_usage:true,
+  show_reported_usage:false,
 };
 
 async function values(f, low) {

@@ -83,17 +83,26 @@ fn composerKind(view: *const regular.Screen, model: []const u8, effort: []const 
     const line = &view.grid[view.row];
     const text = line[0..view.col];
     for (line[view.col..]) |byte| if (byte != ' ') return .none;
-    if (text.len < model.len + 5 or text[0] != '(' or
+    if (text.len < model.len + 4 or text[0] != '(' or
         !std.mem.eql(u8, text[1..][0..model.len], model) or
-        text[model.len + 1] != ' ' or !std.mem.endsWith(u8, text, "> ")) return .none;
-    const close = std.mem.indexOfScalarPos(u8, text, model.len + 2, ')') orelse return .none;
-    var reported = text[model.len + 2 .. close];
-    if (low_price) {
-        if (!std.mem.startsWith(u8, reported, "L")) return .none;
-        reported = reported[1..];
+        !std.mem.endsWith(u8, text, "> ")) return .none;
+    // The provider report is hidden by default, which closes the model
+    // parentheses right after the name; the price marker then moves outside.
+    const close = std.mem.indexOfScalarPos(u8, text, model.len + 1, ')') orelse return .none;
+    const reported_hidden = close == model.len + 1;
+    if (!reported_hidden) {
+        if (text[model.len + 1] != ' ') return .none;
+        var reported = text[model.len + 2 .. close];
+        if (low_price) {
+            if (!std.mem.startsWith(u8, reported, "L")) return .none;
+            reported = reported[1..];
+        }
+        if (!normalLabel(reported, false)) return .none;
     }
-    if (!normalLabel(reported, false)) return .none;
-    const value = text[close + 1 .. text.len - 2];
+    var value = text[close + 1 .. text.len - 2];
+    // With the report hidden, an active low-price marker sits outside the
+    // parentheses, immediately before the estimate or effort level.
+    if (reported_hidden and low_price and std.mem.startsWith(u8, value, "L")) value = value[1..];
     if (value.len != 0) {
         if (std.mem.eql(u8, value, effort)) return .effort;
         if (!normalLabel(value, false)) return .none;
@@ -1185,7 +1194,7 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
     try settingsScreen(d, a, &.{ "> Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model" }, &.{ "Output limit", "Task timeout" });
-    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model", "Auto memory", "Proxy", "Reported usage" });
+    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model", "Proxy", "Reported usage" });
     try settingsValueGate(d, a, project, "opened");
     try settingsValueOpen(d, a, "Auto compaction"); // Boolean toggle, no numeric picker.
     try settingsScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
@@ -2089,6 +2098,17 @@ fn frameSelfCheck() !void {
     const marked = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
     try check(composerKind(marked, "fixture-model", "low", true) == .normal);
     try check(composerKind(marked, "fixture-model", "low", false) == .none);
+    // Hiding the report closes the model parentheses and moves L outside.
+    try selfCapture(d, &.{prefix ++ "(fixture-model)9.0%> " ++ suffix});
+    const hidden = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+    try check(composerKind(hidden, "fixture-model", "low", false) == .normal);
+    try selfCapture(d, &.{prefix ++ "(fixture-model)L9.0%> " ++ suffix});
+    const hidden_marked = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+    try check(composerKind(hidden_marked, "fixture-model", "low", true) == .normal);
+    try check(composerKind(hidden_marked, "fixture-model", "low", false) == .none);
+    try selfCapture(d, &.{prefix ++ "(fixture-model)Llow> " ++ suffix});
+    const hidden_effort = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
+    try check(composerKind(hidden_effort, "fixture-model", "low", true) == .effort);
     try selfCapture(d, &.{prefix ++ "(fixture-model L9.0%)low> " ++ suffix});
     const marked_effort = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
     try check(composerKind(marked_effort, "fixture-model", "low", true) == .effort);
@@ -2515,7 +2535,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitIdle(start);
         start = d.used;
         try d.send("/comp");
-        try d.waitFrame(start, "/compact  Compact conversation");
+        try d.waitFrame(start, "/compact");
         start = d.used;
         try d.send("\r");
         try d.waitText(start, "Context compacted:");
@@ -2532,9 +2552,11 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     } else if (std.mem.eql(u8, mode, "menu-navigation")) {
         // Offline only: no message or credential is submitted. Every navigation
         // waits for a complete owned frame before a subsequent confirmation.
+        try d.waitIdle(0);
         var start = d.used;
         try d.send("/");
         try d.waitFrame(start, "/login");
+        try d.quiet(40);
         try d.checkMenu("/model", "%> /");
         start = d.used;
         const commands = try d.screen();
@@ -2967,6 +2989,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(std.mem.indexOf(u8, raw, "Markdown complexity limit") == null);
         try check(std.mem.indexOf(u8, raw, "Streaming") == null);
     } else if (std.mem.eql(u8, mode, "tool-icons")) {
+        try d.waitIdle(0);
         const start = d.used;
         // Startup already shows configured high on idle text, not the marker.
         try check(std.mem.indexOf(u8, d.output[0..start], "(\x1b[38;5;75mfixture-model\x1b[0m\x1b[1m \x1b[38;5;245m0.0%") != null);

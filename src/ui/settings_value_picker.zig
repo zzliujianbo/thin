@@ -25,7 +25,7 @@ pub const Picker = struct {
 
     pub fn init(key: Key, current: ?u32, limits: cfg.Limits) Picker {
         var result: Picker = .{ .key = key, .current = current, .limits = limits };
-        if (key == .compaction_enabled or key == .memory_auto or key == .show_reported_usage) return result; // Boolean stays in the parent.
+        if (key == .compaction_enabled or key == .show_reported_usage) return result; // Boolean stays in the parent.
         const presets: []const u32 = &.{ 30000, 60000, 300000, 900000, 3600000 };
         for (presets) |n| {
             result.validate(n) catch continue;
@@ -116,7 +116,7 @@ pub const Picker = struct {
         return n;
     }
     fn validate(self: Picker, n: ?u32) !void {
-        if (self.key == .compaction_enabled or self.key == .memory_auto or self.key == .show_reported_usage) return error.InvalidKey;
+        if (self.key == .compaction_enabled or self.key == .show_reported_usage) return error.InvalidKey;
         const value = n orelse return error.InvalidValue;
         if (value == 0) return error.InvalidValue;
     }
@@ -157,7 +157,7 @@ pub fn rows(a: std.mem.Allocator, menu: provider.Picker, self: Picker, columns: 
     const valid = if (self.editing) blk: {
         _ = self.parsedInput() catch break :blk false;
         break :blk self.isCustom(selected);
-    } else if (self.isCustom(selected)) self.key != .compaction_enabled and self.key != .memory_auto and self.key != .show_reported_usage else blk: {
+    } else if (self.isCustom(selected)) self.key != .compaction_enabled and self.key != .show_reported_usage else blk: {
         _ = self.chosen(selected) catch break :blk false;
         break :blk true;
     };

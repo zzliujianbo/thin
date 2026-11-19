@@ -134,7 +134,7 @@ zig build test-presentation -Dplatform-tests-only=true --summary all
 - 文件系统 focused 根：Debug 和 ReleaseSmall 各 203/203 通过。
 - presentation：Debug 和 ReleaseSmall 各 213/213 通过。
 - Python 构建边界与 runner 清理回归：6/6 通过。
-- Linux x86_64 focused 根交叉生成/链接 ELF；完整 unit 根及 memory 根语义编译通过，**未执行 Linux 测试**。
+- Linux x86_64 focused 根交叉生成/链接 ELF；完整 unit 根语义编译通过，**未执行 Linux 测试**。
 - Darwin arm64 focused 根交叉生成/链接 Mach-O，**未原生执行，也不代表 macOS 14 最低版本已验收**。
 
 P1a 当时只迁移通用文件/锁调用；`daemon/unix.zig`、registry 的其余后端现已在后续代码中实现，验证状态见当前落地状态。完整 Linux 运行回归是后续合并门槛，交叉编译不能替代。
@@ -166,7 +166,7 @@ P1a 当时只迁移通用文件/锁调用；`daemon/unix.zig`、registry 的其�
 
 上一轮在单元测试通过后按约定停止；用户随后明确授权继续 **Intel Mac CLI/TUI 端到端验证**。该端到端阶段不涉及 Apple Silicon、SSH、常驻 daemon、安装、推送或合并；后续安装与推送授权独立记录于 P3。
 
-复用现有 `test-app`（含 CLI Chat/Responses、工具/审批、中文/流式/窗口变化及真实 checkpoint 恢复）、`test-memory-app`、`test-memory-background`、`test-background`。不运行依赖 daemon 的 resume-menu，也不为本轮引入 tmux/额外探针。所有应用只用独占 HOME/项目/XDG 与本地 loopback 模拟服务、伪凭据；不调用付费 API。
+复用现有 `test-app`（含 CLI Chat/Responses、工具/审批、中文/流式/窗口变化及真实 checkpoint 恢复）、`test-background`。不运行依赖 daemon 的 resume-menu，也不为本轮引入 tmux/额外探针。所有应用只用独占 HOME/项目/XDG 与本地 loopback 模拟服务、伪凭据；不调用付费 API。
 
 现有 PTY 夹具在 Darwin 由驱动/controller 持有 session，Thin 使用独立 foreground 进程组，使退出后仍可在原 slave 严格核对恢复（不重开终端伪造默认状态）；仅归一化已验证的 PENDIN/FWASWRITTEN。后台存活/退出用 kill(pid, 0) 与有界本机 ps 联合观察，僵尸/查询不确定不算已回收；成功必须同时证明 PID 消失及服务 loopback 连接被拒绝，fixture lease 保底只在成功断言之后或失败清理时使用。
 
@@ -180,12 +180,10 @@ P1a 当时只迁移通用文件/锁调用；`daemon/unix.zig`、registry 的其�
 | 既有验收入口 | Debug | ReleaseSmall | 实际覆盖证据 |
 | --- | --- | --- | --- |
 | `app_mock.mjs`（`test-app`，不加子集参数） | 通过 | 通过 | 每模式 93 条 PASS 标签（含夹具自检）；CLI Chat/Responses、工具/取消、真实 PTY、selection restore、完整 Chat/Responses checkpoint 恢复 |
-| `memory_auto_mock.mjs`（`test-memory-app`） | 通过 | 通过 | 每模式 primary=7、helper=5；先答后辅助、drain、保存/检索、Off、日志、无旧 jobs、interrupt |
-| `memory_background_mock.py`（`test-memory-background`） | 通过 | 通过 | 每模式 3 个独占 PTY，primary=7、helper=7；运行中下一轮输入、FIFO、已保存事实、退出取消及原 slave 恢复 |
 | `background_mock.py`（`test-background`） | 通过 | 通过 | 每模式 CLI 6 个并发真实 loopback 服务及退出回收；单 TUI 跨两任务保持同一服务、显式 stop、退出及原 slave 恢复 |
 | 完整单元回归（当时的 root；现使用 `test-unit-full` 组合入口） | 1903 通过 / 9 跳过 / 0 失败 | 1903 通过 / 9 跳过 / 0 失败 | 包含本轮系统别名与 nofollow 回归；9 项为 Linux 专属 |
 
-本机产物及日志目录：`/tmp/thin-macos-e2e.30XEQI`（临时证据，不是仓库产物）。最终文件为 `app-{debug,small}.log`、`memory-cli-{debug,small}.log`、`memory-tui-{debug,small}.log`、`background-{debug,small}.log`、`unit-{debug,small}.log`，产品与驱动在 `bin/`。完整 unit 根编译后直接运行，避免构建协议掩盖崩溃进度；Linux 最终语义检查见 `linux-semantic.log`。
+本机产物及日志目录：`/tmp/thin-macos-e2e.30XEQI`（临时证据，不是仓库产物）。最终文件为 `app-{debug,small}.log`、`background-{debug,small}.log`、`unit-{debug,small}.log`，产品与驱动在 `bin/`。完整 unit 根编译后直接运行，避免构建协议掩盖崩溃进度；Linux 最终语义检查见 `linux-semantic.log`。
 
 复跑使用上述既有脚本与同模式产品/PTY 驱动，`TMPDIR=/tmp`；app 入口必须不带 `--selection-restore-only` 等子集开关。全部为私有配置与 loopback HTTP/真实 PTY，不以这些结果宣称真实提供方、外网 TLS/代理或生产压力已验证。本轮验收至此结束。
 

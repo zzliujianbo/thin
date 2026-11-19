@@ -35,7 +35,6 @@ const unix = @import("unix.zig");
 const StreamReceiver = @import("stream_receiver.zig").Receiver;
 const remote_action = @import("../ui/remote_action.zig");
 const codex_login = @import("../core/codex_login.zig");
-const memory_status = @import("../core/memory_status.zig");
 
 const Io = std.Io;
 const Registry = registry.Registry;
@@ -220,58 +219,6 @@ fn decodeBackgroundView(value: std.json.Value) !@import("../core/background_stat
     return .{ .active_count = std.math.cast(usize, count) orelse return error.ProtocolError };
 }
 
-fn decodeMemoryView(value: std.json.Value) !memory_status.View {
-    const obj = switch (value) {
-        .object => |v| v,
-        else => return error.ProtocolError,
-    };
-    if (obj.count() != 5) return error.ProtocolError;
-    var result: memory_status.View = .{
-        .enabled = valueBool(obj.get("enabled") orelse return error.ProtocolError) orelse return error.ProtocolError,
-        .revision = valueU64(obj.get("revision") orelse return error.ProtocolError) orelse return error.ProtocolError,
-        .queued_count = valueU64(obj.get("queued_count") orelse return error.ProtocolError) orelse return error.ProtocolError,
-    };
-    result.active = switch (obj.get("active") orelse return error.ProtocolError) {
-        .null => null,
-        .object => |active| blk: {
-            if (active.count() != 2) return error.ProtocolError;
-            const phase = switch (active.get("phase") orelse return error.ProtocolError) {
-                .string => |s| std.meta.stringToEnum(memory_status.Phase, s) orelse return error.ProtocolError,
-                else => return error.ProtocolError,
-            };
-            break :blk .{ .id = valueU64(active.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .phase = phase };
-        },
-        else => return error.ProtocolError,
-    };
-    result.last_terminal = switch (obj.get("last_terminal") orelse return error.ProtocolError) {
-        .null => null,
-        .object => |terminal| blk: {
-            if (terminal.count() != 5) return error.ProtocolError;
-            const outcome = switch (terminal.get("result") orelse return error.ProtocolError) {
-                .string => |s| std.meta.stringToEnum(memory_status.Result, s) orelse return error.ProtocolError,
-                else => return error.ProtocolError,
-            };
-            const failure: ?memory_status.Failure = switch (terminal.get("failure") orelse return error.ProtocolError) {
-                .null => null,
-                .string => |s| std.meta.stringToEnum(memory_status.Failure, s) orelse return error.ProtocolError,
-                else => return error.ProtocolError,
-            };
-            const saved_count = std.math.cast(u32, valueU64(terminal.get("saved_count") orelse return error.ProtocolError) orelse return error.ProtocolError) orelse return error.ProtocolError;
-            var summary: memory_status.Summary = .{};
-            const text = switch (terminal.get("summary") orelse return error.ProtocolError) {
-                .string => |s| s,
-                else => return error.ProtocolError,
-            };
-            if (text.len > summary.buf.len or !std.unicode.utf8ValidateSlice(text)) return error.ProtocolError;
-            summary.append(text);
-            if (!std.mem.eql(u8, summary.text(), text)) return error.ProtocolError;
-            break :blk .{ .id = valueU64(terminal.get("id") orelse return error.ProtocolError) orelse return error.ProtocolError, .result = outcome, .failure = failure, .saved_count = saved_count, .summary = summary };
-        },
-        else => return error.ProtocolError,
-    };
-    return result;
-}
-
 fn valueBool(value: std.json.Value) ?bool {
     return switch (value) {
         .bool => |b| b,
@@ -345,7 +292,6 @@ const max_label_bytes = 64;
 
 const SnapshotCache = struct {
     background: @import("../core/background_status.zig").View = .{},
-    memory: memory_status.View = .{},
     valid: bool = false,
     codex_login: codex_login.View = .{},
     busy: bool = false,
@@ -393,7 +339,6 @@ const Pub = struct {
     read_only: bool = false,
     low_price_enabled: bool = true,
     low_price_active: bool = false,
-    memory_auto: bool = true,
     image_enabled: bool = false,
     image_model: ?[]const u8 = null,
     /// Public proxy state: whether the owner has a proxy allowlist, the exact
@@ -843,7 +788,6 @@ pub const Client = struct {
             .newest_id = if (cache.valid) cache.newest_id else null,
             .newest_bytes = if (cache.valid) cache.newest_bytes else 0,
             .previews = previews,
-            .memory = cache.memory,
             .background = cache.background,
             .input_history = recalled,
         };
@@ -856,7 +800,6 @@ pub const Client = struct {
         const cache = &self.cache;
         var state: tui.Connection.State = baseState();
         state.codex_login = cache.codex_login;
-        state.memory = cache.memory;
         state.background = cache.background;
         state.available = cfg.available and (self.conn != null or self.control != null);
         state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
@@ -882,7 +825,6 @@ pub const Client = struct {
         state.image_enabled = cfg.image_enabled;
         state.image_models = try cloneModels(arena, cfg.image_models);
         state.image_model = if (cfg.image_model) |name| try arena.dupe(u8, name) else null;
-        state.memory_auto = cfg.memory_auto;
         state.proxy_configured = cfg.proxy_configured;
         state.proxy_address = if (cfg.proxy_address) |address| try arena.dupe(u8, address) else null;
         state.proxy_port = cfg.proxy_port;
@@ -1054,7 +996,6 @@ pub const Client = struct {
             }
         };
         cache.valid = true;
-        cache.memory = try decodeMemoryView(object.get("memory") orelse return error.ProtocolError);
         cache.background = try decodeBackgroundView(object.get("background") orelse return error.ProtocolError);
         if (object.get("codex_login")) |value| {
             const login_view = switch (value) {
@@ -1154,7 +1095,6 @@ pub const Client = struct {
         }
         if (cache.codex_login.status == .succeeded and
             (self.cache.codex_login.status != .succeeded or self.cache.codex_login.generation != cache.codex_login.generation)) self.dirty = true;
-        if (!std.meta.eql(self.cache.memory, cache.memory)) self.dirty = true;
         if (!std.meta.eql(self.cache.background, cache.background)) self.dirty = true;
         self.cache = cache;
         adopted = true;
@@ -1244,7 +1184,6 @@ pub const Client = struct {
         // `low_price_input_enabled` is the configured global switch.
         next.low_price_active = read.flag(view, "low_price_input", false);
         next.low_price_enabled = read.flag(view, "low_price_input_enabled", next.low_price_active);
-        next.memory_auto = read.flag(view, "memory_auto", true);
         next.image_enabled = read.flag(view, "image_enabled", false);
         next.image_model = read.text(view, "image_model");
         next.proxy_configured = read.flag(view, "proxy_configured", false);
@@ -2423,7 +2362,10 @@ pub const Client = struct {
         var record = try reg.resolve(self.a, id, self.launcher);
         if (record) |*found| {
             defer registry.freeRecord(self.a, found);
-            if (try self.attachRecorded(found, id, false)) return .{ .switched = true, .notice = notice };
+            if (try self.attachRecorded(found, id, false)) {
+                self.markSessionUsed(found.project, id);
+                return .{ .switched = true, .notice = notice };
+            }
         }
         if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
         try self.resumeSession(self.launcher, id);
@@ -2458,7 +2400,10 @@ pub const Client = struct {
             self.a.free(notice);
             return err;
         };
-        if (attached) return .{ .switched = true, .notice = notice };
+        if (attached) {
+            self.markSessionUsed(found.project, id);
+            return .{ .switched = true, .notice = notice };
+        }
         self.a.free(notice);
         if (!hasCheckpoint(self.a, self.io, found.project, id)) return error.SessionNotFound;
         const project = try self.a.dupe(u8, found.project);
@@ -2503,6 +2448,7 @@ pub const Client = struct {
             const session: ids.Id = raw[0..32].*;
             if (!ids.valid(session) or !std.mem.eql(u8, &session, &id)) return error.ProtocolError;
             try self.joinWorker(endpoint, id, false, project);
+            self.markSessionUsed(project, id);
             return;
         }
         // Local mode owns the restored worker and publishes its locator.
@@ -2513,6 +2459,15 @@ pub const Client = struct {
             }
             return err;
         };
+        self.markSessionUsed(record.project, id);
+    }
+
+    /// Best-effort recency stamp for the `/resume` picker. A failed touch never
+    /// changes attach/resume authorization or the current view.
+    fn markSessionUsed(self: *Client, project: []const u8, id: ids.Id) void {
+        var root = fs.Root.open(self.a, self.io, project) catch return;
+        defer root.deinit();
+        resume_store.touch(&root, id) catch {};
     }
 
     fn manageAttach(self: *Client, id_text: []const u8, takeover: bool) !session_client.Outcome {

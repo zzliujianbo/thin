@@ -184,7 +184,7 @@ async function run(mode) {
     await new Promise((res,rej) => { server.once('error',rej); server.listen(0,'127.0.0.1',res); });
     const url = `http://127.0.0.1:${server.address().port}/v1`;
     const config = JSON.stringify({
-      memory:{auto:false},
+
       llm:{default:'owned/fixture-model',providers:{owned:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:65536}}}}},
       limits:{low_price_input:false,request_timeout_ms:30000,command_timeout_ms:45000},
     },null,2)+'\n';

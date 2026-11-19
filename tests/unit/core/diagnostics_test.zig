@@ -12,7 +12,7 @@ test "diagnostic span pairs and cancellation is idempotent" {
         }
     };
     var capture: Capture = .{};
-    var span = Span.start(.{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next }, std.testing.io, .{ .stage = .memory_finalize });
+    var span = Span.start(.{ .context = &capture, .emit_fn = Capture.emit, .next_fn = Capture.next }, std.testing.io, .{ .stage = .observer });
     span.fail(error.Canceled);
     span.finish(.ok);
     try std.testing.expectEqual(@as(usize, 2), capture.count);

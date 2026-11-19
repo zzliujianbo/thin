@@ -22,54 +22,6 @@ test "global defaults distinguish machine prefixes from summarized or assistant 
     try std.testing.expect(hasConversationData(&.{summary}));
     try std.testing.expect(hasConversationData(&.{ machine, .{ .role = .assistant, .blocks = &.{.{ .text = "saved reply" }} } }));
 }
-test "session completions survive activation and every owner replacement" {
-    var fixture = try SessionTestFixture.init();
-    defer fixture.deinit();
-    var session = try fixture.open(.{});
-    defer session.deinit();
-    try std.testing.expect(session.app == null);
-    const queue = session.memory_notifications.?;
-    const connection = session.connection();
-    try connection.configure("fake-notification-key");
-    var app = session.app.?;
-    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
-    var incomplete: @import("../core/knowledge.zig").Capture = .{ .allocator = std.testing.allocator, .incomplete = true };
-    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
-    try std.testing.expectEqual(@as(u64, 1), session.peekMemoryCompletion().?.id);
-    try std.testing.expectEqual(@as(u64, 1), session.peekMemoryCompletion().?.id);
-
-    var declaration = app.config.value;
-    declaration.limits.request_timeout_ms += 1;
-    var settings = try app.prepareSettings(declaration, &fixture.env);
-    defer settings.deinit();
-    try std.testing.expect(settings.replace_memory);
-    app.installSettings(&settings);
-    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
-    app.memory_coordinator.next_id = 10;
-    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
-
-    const candidate_config = try cfg.clone(std.testing.allocator, app.config.value);
-    const replacement = try app.prepareConnection(candidate_config, &fixture.env);
-    app.installConnection(replacement);
-    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
-    app.memory_coordinator.next_id = 20;
-    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
-
-    // A new App binds the same heap-stable queue before the old App is freed.
-    const next = try session.prepareApp(try cfg.clone(std.testing.allocator, app.config.value));
-    session.app = next;
-    app.deinit();
-    app = next;
-    try std.testing.expect(app.memory_coordinator.notification_queue == queue);
-    app.memory_coordinator.next_id = 30;
-    try std.testing.expectError(error.IncompleteCapture, app.memory_coordinator.enqueueCopy(&incomplete, .chat, .{}));
-    try std.testing.expectEqual(@as(u64, 1), connection.takeMemoryCompletion().?.id);
-    for ([_]u64{ 11, 21, 31 }) |id| {
-        try std.testing.expectEqual(id, session.peekMemoryCompletion().?.id);
-        try std.testing.expectEqual(id, session.takeMemoryCompletion().?.id);
-    }
-    try std.testing.expect(session.takeMemoryCompletion() == null);
-}
 test "session title fallback and resume follow successful checkpoints" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
@@ -2614,22 +2566,13 @@ test "proxy refresh switches helper routes while primary client and history stay
     const session_id = app.client.session_id;
     const messages = app.runtime.messages().len;
     const image_before = app.image_client.?;
-    const memory_before = app.memory_coordinator;
     try std.testing.expect(image_before.transport.proxy_url == null);
-    // The memory coordinator owns an independent extractor route.
-    try std.testing.expect(memory_before.extractor != null);
-    try std.testing.expect(memory_before.extractor.?.transport != null);
-    try std.testing.expect(memory_before.extractor.?.transport.?.proxy_http == null);
 
     try proxyToggle(&session, "aux/native/raw", true);
     // The auxiliary owner is replaced, even when its own route did not change.
     try std.testing.expect(app.image_client.? != image_before);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
-    // The extractor keeps its own primary-model route.
-    const memory_after = app.memory_coordinator;
-    try std.testing.expect(memory_after != memory_before);
     try std.testing.expectEqual(@as(usize, 2), session.global_config.?.value.proxy.?.models.len);
-    try std.testing.expect(memory_after.extractor.?.transport.?.proxy_http == null);
     // The primary transport, auth, model, session and history never move.
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expectEqual(session_id, app.client.session_id);
@@ -2646,11 +2589,8 @@ test "proxy refresh switches helper routes while primary client and history stay
 
     // Removing the membership leaves the image route direct.
     try proxyToggle(&session, "aux/native/raw", false);
-    const memory_direct = app.memory_coordinator;
-    try std.testing.expect(memory_direct != memory_after);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
     try std.testing.expectEqual(@as(usize, 1), session.global_config.?.value.proxy.?.models.len);
-    try std.testing.expect(memory_direct.extractor.?.transport.?.proxy_http == null);
     // A membership for an unrelated model still does not route image calls.
     try proxyToggle(&session, "aux/native/raw", true);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
@@ -2660,25 +2600,19 @@ test "proxy refresh switches helper routes while primary client and history stay
     const current = session.connection().current();
     try std.testing.expectEqual(@as(usize, 3), current.proxy_models.len);
 
-    // The extractor's coordinator config carries the latest allowlist too, so an
-    // explicit primary membership proxies only that helper transport.
     try proxyToggle(&session, "main/chat", true);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 4), session.connection().current().proxy_models.len);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
     try std.testing.expect(app.client.proxy_http == null);
 
     // An ordinary preference save must not revoke the already installed helper
     // routes or republish a primary client. The rebuilt memory coordinator must
     // keep the latest list rather than reverting to the frozen proxy config.
     const image_now = app.image_client.?;
-    const memory_now = app.memory_coordinator;
     const connection = session.connection();
     try connection.preference_fn.?(connection.context, .compaction_enabled, 0);
     try std.testing.expect(app.image_client.? == image_now);
-    try std.testing.expect(app.memory_coordinator != memory_now);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 4), session.global_config.?.value.proxy.?.models.len);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);
@@ -2686,11 +2620,9 @@ test "proxy refresh switches helper routes while primary client and history stay
     try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
     try std.testing.expectEqualStrings("chat", app.config.value.model.name);
     try std.testing.expect(!app.config.value.limits.compaction_enabled);
-    const memory_before_display_toggle = app.memory_coordinator;
     try connection.preference_fn.?(connection.context, .show_reported_usage, 0);
     try std.testing.expect(!app.config.value.limits.show_reported_usage);
     try std.testing.expect(app.image_client.? == image_now);
-    try std.testing.expect(app.memory_coordinator == memory_before_display_toggle);
     try std.testing.expectEqual(@as(usize, 4), session.global_config.?.value.proxy.?.models.len);
 
     const persisted = try readSessionConfigBytes(fixture.tmp.dir);
@@ -2777,7 +2709,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
     try proxyToggle(&session, "main/chat", true);
     try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.image_client.?.transport.proxy_url.?);
-    try std.testing.expectEqualStrings("http://127.0.0.1:18080", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
 
     const saved = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(saved);
@@ -2800,7 +2731,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectEqual(@as(usize, 4), state.proxy_models.len);
     // Auxiliary owners follow the new endpoint with the same exact members.
     try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.image_client.?.transport.proxy_url.?);
-    try std.testing.expectEqualStrings("http://[2001:db8::5]:8443", app.memory_coordinator.extractor.?.transport.?.proxy_http.?.proxy_url.?);
     try std.testing.expectEqual(@as(usize, 4), session.global_config.?.value.proxy.?.models.len);
 
     // The primary client, auth, identity and history never move; its frozen
@@ -2847,7 +2777,6 @@ test "proxy endpoint save keeps members and moves only independent helpers" {
     try std.testing.expectEqual(@as(u16, 0), state.proxy_port);
     try std.testing.expectEqual(@as(usize, 0), state.proxy_models.len);
     try std.testing.expect(app.image_client.?.transport.proxy_url == null);
-    try std.testing.expect(app.memory_coordinator.extractor.?.transport.?.proxy_http == null);
     try std.testing.expect(app.client.authorization.ptr == auth);
     try std.testing.expect(app.client.config == &app.config.value);
     try std.testing.expectEqual(messages, app.runtime.messages().len);

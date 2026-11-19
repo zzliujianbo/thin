@@ -186,8 +186,6 @@ pub const Journal = struct {
                     .stage = v.stage,
                     .phase = v.phase,
                     .span_id = v.span_id,
-                    .origin_turn = if (v.origin) |origin| origin.turn else null,
-                    .memory_job_id = v.memory_job_id,
                     .elapsed_ms = v.elapsed_ms,
                     .result = v.result,
                     .error_name = v.error_name,
@@ -196,8 +194,6 @@ pub const Journal = struct {
                     .timeout_ms = v.timeout_ms,
                     .http_status = v.http_status,
                     .model_failure = v.model_failure,
-                    .candidate_index = v.candidate_index,
-                    .count = v.count,
                 }, .dropped_total = event.dropped_total }, .{}, &writer.writer) catch return error.OutOfMemory;
                 try self.writeRecord(writer.written());
             },
@@ -411,15 +407,6 @@ pub const Journal = struct {
         return .{ .context = self, .emit_fn = diagnosticEmit, .next_fn = diagnosticNext };
     }
 
-    /// Capture on the Runtime owner thread before the originating turn finishes.
-    pub fn memoryDiagnosticSink(self: *Journal) diagnostics.Sink {
-        std.debug.assert(std.c.pthread_mutex_lock(&self.producer_mutex) == .SUCCESS);
-        defer std.debug.assert(std.c.pthread_mutex_unlock(&self.producer_mutex) == .SUCCESS);
-        var sink = self.diagnosticSink();
-        sink.origin = .{ .turn = self.turn, .began_ms = self.began_ms };
-        return sink;
-    }
-
     fn diagnosticActive(self: *Journal) bool {
         return self.diagnostic_ready.load(.acquire) and self.failure() == null;
     }
@@ -457,13 +444,12 @@ pub const Journal = struct {
             self.fail(err);
             return;
         };
-        const origin = record_.origin orelse diagnostics.Origin{ .turn = self.turn, .began_ms = self.began_ms };
         self.enqueueItem(.{ .diagnostic = .{
             .record = record_,
             .seq = next,
-            .turn = origin.turn,
+            .turn = self.turn,
             .timestamp_ms = std.Io.Clock.real.now(self.root.io).toMilliseconds(),
-            .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() -| origin.began_ms),
+            .elapsed_ms = @max(0, std.Io.Clock.awake.now(self.root.io).toMilliseconds() -| self.began_ms),
             .dropped_total = self.diagnostic_dropped.load(.monotonic),
         } }) catch |err| {
             self.fail(err);
@@ -540,9 +526,9 @@ pub const Journal = struct {
                 .text => |v| try self.firstResponse(a, "text", v.len),
                 .reasoning => |v| try self.firstResponse(a, "reasoning", v.len),
                 .tool_preview => |v| try self.firstResponse(a, "tool_preview", v.arguments.len),
-                // Ephemeral display snapshots and owner-only Memory notices
+                // Ephemeral display snapshots and owner-only background notices
                 // are not canonical archive or diagnostic records.
-                .tool_views, .tool_view, .memory_completed, .background_completed => {},
+                .tool_views, .tool_view, .background_completed => {},
                 .state => |v| {
                     if (v == .calling_model or v == .compacting) self.first = false;
                     try self.record(a, "state", .{ .state = v });

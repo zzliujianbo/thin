@@ -463,7 +463,8 @@ pub const PromptActivity = struct {
     /// not merely the global toggle, and never inferred from latest usage.
     low_price_input: bool = false,
     /// Show the provider-reported total inside the model parentheses. The
-    /// estimate remains visible when this is false.
+    /// estimate remains visible when this is false. Product callers always pass
+    /// the configured flag, whose default is off.
     show_reported_usage: bool = true,
     /// The composer is in explicit local-command mode. The `!` marker replaces
     /// the ordinary `>` and is rendered with its own color.

@@ -153,13 +153,6 @@ fn run(init: std.process.Init) !u8 {
         const terminal = try job.result();
 
         if (terminal.status == .success) {
-            // The primary result is frozen. A later SIGINT cancels auxiliary
-            // work; stdout remains cancellable and may be only partly delivered.
-            var auxiliary_cancel: p.Cancellation = .{};
-            if (interrupt.signal() != 0) {
-                auxiliary_cancel.cancel();
-                interrupt.clear();
-            }
             // 提示信息走 stderr，保证 stdout 只包含模型的回答内容。
             if (console.fallback) try output(init.io, .stderr(), "thin: Responses explicitly unsupported; using Chat for this process.\n");
             if (console.denied > 0) try output(init.io, .stderr(), "thin: tool calls were denied by the host.\n");
@@ -176,52 +169,16 @@ fn run(init: std.process.Init) !u8 {
             };
             var out_complete = false;
             AnswerOutput.write(init.io, safe, console.clipped, &out_complete) catch |err| {
-                // Only a complete answer is auxiliary cancellation; backpressure remains an interrupted output.
+                // Only a complete answer cancelled by a foreground signal is a
+                // clean stop; backpressure remains an interrupted output.
                 if (err != error.Canceled or interrupt.signal() == 0 or !out_complete) return err;
-                auxiliary_cancel.cancel();
                 interrupt.clear();
-                app.memory_coordinator.cancelAndJoin();
                 app.journal.flush();
                 reportLogFailure(init.io, app);
-                output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n") catch {};
                 return 0;
             };
-            const Drain = struct {
-                app: *App,
-                cancel: *p.Cancellation,
-                done: std.atomic.Value(bool) = .init(false),
-                fn run(self: *@This()) void {
-                    defer self.done.store(true, .release);
-                    self.app.drainMemory(self.cancel);
-                }
-            };
-            var drain = Drain{ .app = app, .cancel = &auxiliary_cancel };
-            var drain_future = std.Io.concurrent(init.io, Drain.run, .{&drain}) catch {
-                auxiliary_cancel.cancel();
-                app.memory_coordinator.cancelAndJoin();
-                app.journal.flush();
-                reportLogFailure(init.io, app);
-                output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n") catch {};
-                return 0;
-            };
-            defer drain_future.await(init.io);
-            while (!drain.done.load(.acquire)) {
-                if (interrupt.signal() != 0) {
-                    auxiliary_cancel.cancel();
-                    interrupt.clear();
-                }
-                std.Io.sleep(init.io, .fromMilliseconds(5), .awake) catch auxiliary_cancel.cancel();
-            }
-            drain_future.await(init.io);
             app.journal.flush();
             reportLogFailure(init.io, app);
-            const memory_terminal = app.memoryView().last_terminal;
-            if (auxiliary_cancel.isRequested() or app.memory_coordinator.failure.load(.acquire) != 0 or
-                (memory_terminal != null and (memory_terminal.?.result == .failed or memory_terminal.?.result == .uncertain or memory_terminal.?.result == .canceled)))
-            {
-                try output(init.io, .stderr(), "thin: auxiliary Memory finalization did not succeed; no automatic replay will occur.\n");
-            }
-            // 辅助 Memory 取消只影响辅助状态，不改写已完成主任务的成功退出码。
             return 0;
         }
 

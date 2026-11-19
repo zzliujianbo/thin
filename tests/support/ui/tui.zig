@@ -1,16 +1,20 @@
 const FixtureConnection = struct {
     fn current(_: *anyopaque) Connection.State {
-        return .{ .runtime = null, .model = "fixture", .base_url = "http://localhost/fixture" };
+        return .{ .runtime = null, .model = "fixture", .base_url = "http://localhost/fixture", .limits = layouts_show_report };
     }
 
     fn configuredCurrent(_: *anyopaque) Connection.State {
-        return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "http://localhost/fixture" };
+        return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "http://localhost/fixture", .limits = layouts_show_report };
     }
 
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.FixtureNotConfigured;
     }
 };
+
+/// Composer layout assertions are written against the reported slot. The
+/// user-facing default is off and is covered by the Reported usage toggle test.
+const layouts_show_report: core_config.Limits = .{ .show_reported_usage = true };
 
 fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
@@ -442,7 +446,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_address = self.proxy_address, .proxy_port = self.proxy_port, .proxy_models = self.proxy_list[0..self.proxy_len] };
+        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_address = self.proxy_address, .proxy_port = self.proxy_port, .proxy_models = self.proxy_list[0..self.proxy_len], .limits = layouts_show_report };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;
@@ -520,7 +524,6 @@ const PreferenceFixture = struct {
         if (self.fail) return error.SaveFailed;
         switch (key_) {
             .compaction_enabled => self.state.limits.compaction_enabled = value.? == 1,
-            .memory_auto => self.state.memory_auto = value.? == 1,
             .command_timeout_ms => self.state.limits.command_timeout_ms = value.?,
             .request_timeout_ms => self.state.limits.request_timeout_ms = value.?,
             .show_reported_usage => self.state.limits.show_reported_usage = value.? == 1,
@@ -563,7 +566,7 @@ const AuthFixture = struct {
 
     fn current(ctx: *anyopaque) Connection.State {
         const self: *AuthFixture = @ptrCast(@alignCast(ctx));
-        return .{ .runtime = if (self.configured) self.runtime else null, .available = self.configured and self.available_after_save, .model = "fixture-model", .base_url = "http://localhost/fixture", .initial_context = self.initial_context };
+        return .{ .runtime = if (self.configured) self.runtime else null, .available = self.configured and self.available_after_save, .model = "fixture-model", .base_url = "http://localhost/fixture", .initial_context = self.initial_context, .limits = layouts_show_report };
     }
 
     fn configure(ctx: *anyopaque, key_bytes: []const u8) !void {

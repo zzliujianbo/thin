@@ -1,6 +1,6 @@
 test "boolean preferences never offer confirmable numeric values" {
     const a = std.testing.allocator;
-    for ([_]Key{ .compaction_enabled, .memory_auto }) |key| {
+    for ([_]Key{ .compaction_enabled, .show_reported_usage }) |key| {
         var picker = Picker.init(key, 1, .{});
         try std.testing.expectEqual(@as(usize, 0), picker.values_len);
         const rendered = try rows(a, .{}, picker, 80, 3);

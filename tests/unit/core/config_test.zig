@@ -48,41 +48,6 @@ test "runtime-only config clones retain derived maps but cannot write disk" {
     try std.testing.expectError(error.MissingRegistry, writeDisk(copied.value, &out.writer));
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
-test "memory auto strict defaults sparse disk and roundtrip" {
-    const a = std.testing.allocator;
-    inline for (.{ "", ",\"memory\":{}", ",\"memory\":{\"auto\":true}", ",\"memory\":{\"auto\":false}" }, 0..) |suffix, index| {
-        var parsed = try parse(a, image_test_prefix ++ suffix ++ "}");
-        defer release(&parsed);
-        try std.testing.expectEqual(index != 3, parsed.value.memory.auto);
-        var copied = try clone(a, parsed.value);
-        defer release(&copied);
-        try std.testing.expectEqualDeep(parsed.value.memory, copied.value.memory);
-        var out: std.Io.Writer.Allocating = .init(a);
-        defer out.deinit();
-        try writeDisk(copied.value, &out.writer);
-        var tree = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
-        defer tree.deinit();
-        try std.testing.expectEqual(index == 3, tree.value.object.contains("memory"));
-        if (tree.value.object.get("memory")) |memory| {
-            try std.testing.expectEqual(@as(usize, 1), memory.object.count());
-            try std.testing.expect(!memory.object.get("auto").?.bool);
-        }
-        var again = try parse(a, out.written());
-        defer release(&again);
-        try std.testing.expectEqualDeep(parsed.value.memory, again.value.memory);
-    }
-    inline for (.{ "null", "true", "0", "\"auto\"", "[]", "{\"auto\":null}", "{\"auto\":0}", "{\"auto\":\"true\"}", "{\"auto\":[]}", "{\"auto\":{}}" }) |bad| {
-        try std.testing.expectError(error.UnexpectedToken, parse(a, image_test_prefix ++ ",\"memory\":" ++ bad ++ "}"));
-    }
-    inline for (.{ "enabled", "reviewer", "model", "Auto" }) |field| {
-        try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"memory\":{\"" ++ field ++ "\":true}}"));
-    }
-    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"memory\":{\"auto\":true,\"auto\":false}}"));
-    try std.testing.expectError(error.DuplicateField, parse(a, image_test_prefix ++ ",\"memory\":{},\"memory\":{}}"));
-}
-test "memory config allocation failures release parse clone and disk candidates" {
-    try checkConfigAllocationFailures(memoryAllocationCase);
-}
 test "current config round trips and rejects unknown root fields" {
     const a = std.testing.allocator;
     var parsed = try parse(a, image_test_prefix ++ "}");
@@ -96,7 +61,8 @@ test "current config round trips and rejects unknown root fields" {
     var again = try parse(a, out.written());
     defer release(&again);
     try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
-    try std.testing.expectEqualDeep(parsed.value.memory, again.value.memory);
+    // The retired automatic-memory root is an unknown field, not migrated.
+    try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"memory\":{\"auto\":false}}"));
     inline for (.{ "{}", "{\"enabled\":false}", "{\"enabled\":true}", "null" }) |value| {
         try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"retired\":" ++ value ++ "}"));
     }

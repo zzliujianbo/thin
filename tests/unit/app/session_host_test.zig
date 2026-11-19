@@ -386,18 +386,18 @@ test "background completion retains exact id across backpressure and acknowledge
     host.allocator = failing.allocator();
     const allocation = host.admitBackgroundCompletion(&source);
     host.allocator = a;
-    try std.testing.expectEqual(SessionHost.MemoryAdmission.unavailable, allocation);
+    try std.testing.expectEqual(SessionHost.Admission.unavailable, allocation);
     try std.testing.expect(source.taken == null and source.first_pending and source.second_pending);
     try std.testing.expectEqual(@as(u64, 1), host.next_seq);
     var ring_failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     host.events.allocator = ring_failing.allocator();
     const ring_allocation = host.admitBackgroundCompletion(&source);
     host.events.allocator = a;
-    try std.testing.expectEqual(SessionHost.MemoryAdmission.unavailable, ring_allocation);
+    try std.testing.expectEqual(SessionHost.Admission.unavailable, ring_allocation);
     try std.testing.expect(source.taken == null and source.first_pending and source.second_pending);
     try std.testing.expectEqual(@as(u64, 1), host.next_seq);
     source.switch_on_peek = true;
-    try std.testing.expectEqual(SessionHost.MemoryAdmission.admitted, host.admitBackgroundCompletion(&source));
+    try std.testing.expectEqual(SessionHost.Admission.admitted, host.admitBackgroundCompletion(&source));
     const taken = source.taken.?;
     try std.testing.expectEqualStrings("first", taken.slice());
     try std.testing.expect(source.head_at_take_was_second);
@@ -413,181 +413,12 @@ test "background completion retains exact id across backpressure and acknowledge
     try std.testing.expectError(error.StaleControl, host.watchAcknowledge(2, page.through));
     _ = try host.watchAcknowledge(1, page.through);
     try std.testing.expectEqual(@as(usize, 0), host.events.items.items.len);
-    try std.testing.expectEqual(SessionHost.MemoryAdmission.admitted, host.admitBackgroundCompletion(&source));
+    try std.testing.expectEqual(SessionHost.Admission.admitted, host.admitBackgroundCompletion(&source));
     try std.testing.expectEqualStrings("second", source.taken.?.slice());
     try std.testing.expect(!source.second_pending);
     const second_page = (try host.watchEvents(a, 1, 1, page.through)).?;
     defer a.free(second_page.frame);
     try std.testing.expect(std.mem.indexOf(u8, second_page.frame, "\"command\":\"two\"") != null);
-}
-test "memory completions remain ordered in one watch page without affecting primary state" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [4096]u8 = undefined;
-    const n = try tmp.dir.realPath(io, &path_buffer);
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("HOME", path_buffer[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
-    defer host.deinit();
-    host.controller = .{ .epoch = 1, .connection = 7 };
-    host.phase = .calling_model;
-    host.last_terminal = .{ .status = .paused, .detail = error.RoundLimit };
-    host.setPending(44, "bash", "approval detail");
-    host.observe(.{ .text = "partial body" }, false, true);
-    host.observe(.{ .reasoning = "partial reasoning" }, false, true);
-    const prior_seq = host.next_seq - 1;
-    try host.watchOffered(1, prior_seq);
-    try std.testing.expectEqual(prior_seq, try host.watchResume(1, prior_seq));
-    const history_count = host.history.items.items.len;
-    const model_count: ?usize = if (host.session.app) |app| app.runtime.messages().len else null;
-
-    // A joined fixture job lets reapTask exercise its real finished ordering
-    // without a worker or network. The host owns both allocations on all paths.
-    const job = try a.create(task.Job);
-    const prompt = a.dupe(u8, "") catch |err| {
-        a.destroy(job);
-        return err;
-    };
-    job.* = .{ .runtime = undefined, .cancel = &host.cancel, .prompt = prompt };
-    host.task = .{ .job = job, .future = undefined, .joined = true, .id = 91, .kind = .prompt, .prompt = prompt };
-    const memory = @import("../core/memory_status.zig");
-    var first: memory.Terminal = .{ .id = 0, .result = .saved, .saved_count = 1 };
-    first.summary.append("first");
-    var second: memory.Terminal = .{ .id = 0, .result = .failed, .failure = .storage };
-    second.summary.append("second");
-    const values = [_]memory.Terminal{ first, second };
-    var source: MemoryQueueFixture = .{ .values = &values };
-    host.pumpFrom(0, &source);
-    // Neither queued completion can interrupt the active assistant draft.
-    try std.testing.expectEqual(@as(usize, 0), source.cursor);
-    try std.testing.expectEqualStrings("partial body", host.partial_text.buf.items);
-    try std.testing.expectEqualStrings("partial reasoning", host.partial_reasoning.buf.items);
-    try std.testing.expectEqual(@as(?r.State, .calling_model), host.phase);
-    try std.testing.expectEqual(r.Status.paused, host.last_terminal.?.status);
-    try std.testing.expectEqual(@as(u64, 91), host.task.?.id);
-    try std.testing.expectEqual(@as(?u64, 44), host.pending_permission);
-    const queue = host.inbox.snapshot();
-    var previews: [protocol.max_previews]protocol.QueuePreview = undefined;
-    try std.testing.expect(host.snapshotFor(7, &queue, &previews).busy);
-    try std.testing.expect((try host.watchEvents(a, 1, 1, prior_seq)) == null);
-    // Now the actual reaper publishes the primary terminal before both FIFO
-    // results, and a single watch poll still returns every ordered result.
-    job.terminal = .{ .status = .success };
-    job.done.store(true, .release);
-    host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 2), source.cursor);
-    const page = (try host.watchEvents(a, 1, 1, prior_seq)).?;
-    defer a.free(page.frame);
-    var doc = try std.json.parseFromSlice(std.json.Value, a, page.frame, .{});
-    defer doc.deinit();
-    const rows = doc.value.object.get("events").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), rows.len);
-    try std.testing.expectEqualStrings("finished", rows[0].object.get("t").?.string);
-    try std.testing.expectEqualStrings("memory_completed", rows[1].object.get("t").?.string);
-    try std.testing.expectEqualStrings("memory_completed", rows[2].object.get("t").?.string);
-    try std.testing.expectEqualStrings("first", rows[1].object.get("summary").?.string);
-    try std.testing.expectEqualStrings("second", rows[2].object.get("summary").?.string);
-    for (rows, 0..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(prior_seq + i + 1)), row.object.get("seq").?.integer);
-    try std.testing.expectEqual(@as(i64, 0), rows[1].object.get("id").?.integer);
-    try std.testing.expectEqual(@as(i64, 0), rows[2].object.get("id").?.integer);
-    try std.testing.expect(!SessionHost.canonicalForHistory(.{ .memory_completed = first }));
-    // The primary finished row is retained as usual; neither Memory row is.
-    try std.testing.expectEqual(history_count + 1, host.history.items.items.len);
-    if (model_count) |count| try std.testing.expectEqual(count, host.session.app.?.runtime.messages().len);
-    try std.testing.expect(host.task == null);
-    try std.testing.expectEqual(r.Status.success, host.last_terminal.?.status);
-    try std.testing.expectEqual(prior_seq, try host.watchResume(1, prior_seq));
-
-    // Defense in depth: admission itself never mutates drafts or approvals,
-    // even if a caller supplies preexisting state at an idle boundary.
-    try host.partial_text.append("retained body");
-    try host.partial_reasoning.append("retained reasoning");
-    host.setPending(45, "bash", "retained permission");
-    var another: MemoryQueueFixture = .{ .values = values[0..1] };
-    try std.testing.expectEqual(SessionHost.MemoryAdmission.admitted, host.admitMemoryCompletion(&another));
-    try std.testing.expectEqualStrings("retained body", host.partial_text.buf.items);
-    try std.testing.expectEqualStrings("retained reasoning", host.partial_reasoning.buf.items);
-    try std.testing.expectEqual(@as(?u64, 45), host.pending_permission);
-    try std.testing.expectEqualStrings("retained permission", host.pending_desc.?);
-    try std.testing.expectEqual(r.Status.success, host.last_terminal.?.status);
-    try std.testing.expectEqual(history_count + 1, host.history.items.items.len);
-    try std.testing.expectEqual(prior_seq, try host.watchResume(1, prior_seq));
-    try std.testing.expect(host.fatal == null);
-}
-test "memory completion retains FIFO head on encoding or ring allocation OOM" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [4096]u8 = undefined;
-    const n = try tmp.dir.realPath(io, &path_buffer);
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("HOME", path_buffer[0..n]);
-    const host = try SessionHost.init(a, io, &env, .{ .project = path_buffer[0..n], .id = try ids.generate(io), .owner = .foreground });
-    defer host.deinit();
-    host.controller = .{ .epoch = 1, .connection = 7 };
-    const memory = @import("../core/memory_status.zig");
-    const values = [_]memory.Terminal{ .{ .id = 0, .result = .saved }, .{ .id = 0, .result = .skipped } };
-    var source: MemoryQueueFixture = .{ .values = &values };
-
-    var encode_oom = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    host.allocator = encode_oom.allocator();
-    host.pumpFrom(0, &source);
-    host.allocator = a;
-    try std.testing.expectEqual(@as(usize, 0), source.cursor);
-    try std.testing.expectEqual(@as(u64, 1), host.next_seq);
-    try std.testing.expect(host.fatal == null);
-
-    var ring_oom = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    host.events.allocator = ring_oom.allocator();
-    host.pumpFrom(0, &source);
-    host.events.allocator = a;
-    try std.testing.expectEqual(@as(usize, 0), source.cursor);
-    try std.testing.expectEqual(@as(u64, 1), host.next_seq);
-    try std.testing.expect(host.fatal == null);
-
-    host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 2), source.cursor);
-    try std.testing.expectEqual(@as(u64, 3), host.next_seq);
-    host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 2), source.cursor);
-    try std.testing.expectEqual(@as(u64, 3), host.next_seq);
-    try std.testing.expect(host.fatal == null);
-    const first_page = (try host.watchEvents(a, 1, 1, 0)).?;
-    defer a.free(first_page.frame);
-    try std.testing.expectEqual(@as(u64, 2), first_page.through);
-    var first_doc = try parseJson(a, first_page.frame);
-    defer first_doc.deinit();
-    const completions = first_doc.value.object.get("events").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), completions.len);
-    try std.testing.expectEqualStrings("saved", completions[0].object.get("result").?.string);
-    try std.testing.expectEqualStrings("skipped", completions[1].object.get("result").?.string);
-    try host.watchOffered(1, first_page.through);
-    try std.testing.expectEqual(@as(u64, 1), try host.watchResume(1, 1));
-    // Prove only the first completion. The second must remain available to a
-    // reconnect, even though both were offered together on the first page.
-    _ = try host.watchAcknowledge(1, 1);
-    host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 2), source.cursor);
-    try std.testing.expectEqual(@as(u64, 3), host.next_seq);
-    try std.testing.expectEqual(@as(u64, 1), try host.watchResume(1, 1));
-    const second_page = (try host.watchEvents(a, 1, 1, 1)).?;
-    defer a.free(second_page.frame);
-    try std.testing.expect(std.mem.indexOf(u8, second_page.frame, "\"result\":\"skipped\"") != null);
-    try std.testing.expectEqual(@as(u64, 2), second_page.through);
-    try host.watchOffered(1, 2);
-    _ = try host.watchAcknowledge(1, 2);
-    host.pumpFrom(0, &source);
-    try std.testing.expectEqual(@as(usize, 0), host.events.items.items.len);
-    try std.testing.expectEqual(@as(u64, 3), host.next_seq);
-    try std.testing.expectError(error.InvalidSequence, host.watchResume(1, 1));
-    try std.testing.expectEqual(@as(u64, 2), try host.watchResume(1, 2));
-    try std.testing.expect((try host.watchEvents(a, 1, 1, 2)) == null);
-    try std.testing.expect(host.fatal == null);
 }
 test "idle refresh publishes restored context after login without requests" {
     const Spy = struct {

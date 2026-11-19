@@ -100,8 +100,9 @@ pub const Limits = struct {
     request_timeout_ms: u32 = 300000,
     /// Disable only automatic compaction; manual /compact and hard preflight remain.
     compaction_enabled: bool = true,
-    /// Show the provider-reported context total beside the model in the composer.
-    show_reported_usage: bool = true,
+    /// Hidden by default; only an explicit true shows the provider-reported
+    /// context total inside the model parentheses.
+    show_reported_usage: bool = false,
 };
 
 /// Compare policy-relevant limits. The reported-usage toggle is presentation-only
@@ -266,16 +267,11 @@ pub const ImageConfig = struct {
     model: ?[]const u8 = null,
 };
 
-pub const MemoryConfig = struct {
-    auto: bool = true,
-};
-
 /// Owned application configuration. Disk input requires llm declarations;
 /// registry may be absent only for a pure in-memory Runtime snapshot.
 pub const Config = struct {
     proxy: ?ProxyConfig = null,
     image: ImageConfig = .{},
-    memory: MemoryConfig = .{},
     registry: ?Registry = null,
     selected_provider: ?[]const u8 = null,
     selection_pending: bool = false,
@@ -432,7 +428,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
     const root = try object(tree.value);
     var keys = root.iterator();
     while (keys.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image") and !std.mem.eql(u8, entry.key_ptr.*, "memory")) return error.UnknownField;
+        if (!std.mem.eql(u8, entry.key_ptr.*, "llm") and !std.mem.eql(u8, entry.key_ptr.*, "limits") and !std.mem.eql(u8, entry.key_ptr.*, "proxy") and !std.mem.eql(u8, entry.key_ptr.*, "image")) return error.UnknownField;
     }
     const llm_value = root.get("llm") orelse return error.MissingField;
     var result: Config = blk: {
@@ -477,8 +473,7 @@ fn parseDisk(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(C
         const context: u32 = 32768;
         const proxy = if (root.get("proxy")) |v| if (v == .null) null else try decode(ProxyConfig, a, v) else null;
         const image = if (root.get("image")) |v| try decode(ImageConfig, a, v) else ImageConfig{};
-        const memory = if (root.get("memory")) |v| try decode(MemoryConfig, a, v) else MemoryConfig{};
-        break :blk .{ .proxy = proxy, .image = image, .memory = memory, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
+        break :blk .{ .proxy = proxy, .image = image, .registry = registry, .selected_provider = selection.provider, .selection_pending = true, .provider = chosen.connection, .model = .{ .name = selection.model, .context_tokens = context }, .limits = limits };
     };
     if (isCodexProvider(result.provider) and result.model.protocol == .auto) result.model.protocol = .responses;
     try validate(result);
@@ -540,10 +535,6 @@ pub fn writeDisk(config: Config, writer: *std.Io.Writer) !void {
         if (config.imageActive()) {
             try s.objectField("image");
             try s.write(config.image);
-        }
-        if (!config.memory.auto) {
-            try s.objectField("memory");
-            try s.write(config.memory);
         }
         try s.endObject();
     }

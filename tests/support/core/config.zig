@@ -79,25 +79,6 @@ fn rejectedDecisionSection(a: std.mem.Allocator) !void {
     }
 }
 
-fn memoryAllocationCase(a: std.mem.Allocator) !void {
-    inline for (.{ "{}", "{\"auto\":false}" }) |memory| {
-        var parsed = try parse(a, image_test_prefix ++ ",\"memory\":" ++ memory ++ "}");
-        defer release(&parsed);
-        var copied = try clone(a, parsed.value);
-        defer release(&copied);
-        try std.testing.expectEqualDeep(parsed.value.memory, copied.value.memory);
-        var out: std.Io.Writer.Allocating = .init(a);
-        defer out.deinit();
-        writeDisk(copied.value, &out.writer) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            else => return err,
-        };
-        var again = try parse(a, out.written());
-        defer release(&again);
-        try std.testing.expectEqualDeep(copied.value.memory, again.value.memory);
-    }
-}
-
 fn checkConfigAllocationFailures(comptime case: anytype) !void {
     const Stable = struct {
         fn run(a: std.mem.Allocator) !void {

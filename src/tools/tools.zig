@@ -96,12 +96,10 @@ const edit_schema: p.ToolSchema = .{
 };
 const schema_choices = 2;
 
-fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime background_on: bool) [max_schemas]p.ToolSchema {
+fn buildSchemas(comptime image_on: bool, comptime background_on: bool) [max_schemas]p.ToolSchema {
     var result: [max_schemas]p.ToolSchema = undefined;
     var count: usize = 0;
     for (&schemas, 0..) |schema, i| {
-        // Preserve read/write/bash/memory order; only memory is conditional.
-        if (i == 3 and !memory_on) continue;
         if (i == 2 and background_on) {
             // Same name and index, but the parameters expose the optional
             // background dimension and the description explains startup-only
@@ -131,20 +129,20 @@ fn buildSchemas(comptime image_on: bool, comptime memory_on: bool, comptime back
 // a rebind never invalidates a previously handed-out schema slice.
 const schema_table = blk: {
     @setEvalBranchQuota(160000);
-    var table: [schema_choices][schema_choices][schema_choices][max_schemas]p.ToolSchema = undefined;
-    for (0..schema_choices) |background_on| for (0..schema_choices) |image_on| for (0..schema_choices) |memory_on| {
-        table[background_on][image_on][memory_on] = buildSchemas(image_on == 1, memory_on == 1, background_on == 1);
+    var table: [schema_choices][schema_choices][max_schemas]p.ToolSchema = undefined;
+    for (0..schema_choices) |background_on| for (0..schema_choices) |image_on| {
+        table[background_on][image_on] = buildSchemas(image_on == 1, background_on == 1);
     };
     break :blk table;
 };
 
-fn schemaCount(image_on: bool, memory_on: bool, background_on: bool) usize {
-    return 5 + @as(usize, @intFromBool(image_on)) + @as(usize, @intFromBool(background_on)) - @as(usize, @intFromBool(!memory_on));
+fn schemaCount(image_on: bool, background_on: bool) usize {
+    return 5 + @as(usize, @intFromBool(image_on)) + @as(usize, @intFromBool(background_on));
 }
 
-fn schemasWith(image_on: bool, memory_on: bool, background_on: bool) []const p.ToolSchema {
-    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(background_on)][@intFromBool(image_on)][@intFromBool(memory_on)];
-    return set[0..schemaCount(image_on, memory_on, background_on)];
+fn schemasWith(image_on: bool, background_on: bool) []const p.ToolSchema {
+    const set: *const [max_schemas]p.ToolSchema = &schema_table[@intFromBool(background_on)][@intFromBool(image_on)];
+    return set[0..schemaCount(image_on, background_on)];
 }
 
 pub const ReadImage = struct { path: []const u8, question: []const u8 = image.default_question };
@@ -377,8 +375,6 @@ pub const Tools = struct {
     /// Optional instance-owned background registry. When present, Tools
     /// exposes bash background=true and the management tool.
     background: ?background.Service = null,
-    /// False hides the memory schema and rejects forged memory calls (child Tools).
-    allow_memory: bool = true,
     fn backgroundActive(self: *Tools) bool {
         return self.background != null;
     }
@@ -407,7 +403,6 @@ pub const Tools = struct {
                 if (b.background and !self.backgroundActive()) return error.BackgroundDisabled;
             },
             .background => if (!self.backgroundActive()) return error.BackgroundDisabled,
-            .memory => if (!self.allow_memory) return error.MemoryDisabled,
             else => {},
         }
     }
@@ -534,7 +529,7 @@ pub const Tools = struct {
     pub fn executor(self: *Tools) runtime.Executor {
         return .{
             .context = self,
-            .schemas = schemasWith(self.image != null, self.allow_memory, self.backgroundActive()),
+            .schemas = schemasWith(self.image != null, self.backgroundActive()),
             .prepare_fn = prepare,
             .execute_fn = executePrepared,
             .preview_write_fn = previewWrite,
@@ -751,16 +746,12 @@ pub const Tools = struct {
             .canceled = canceled and !cleanup_failed,
             .truncated = truncated,
             .cleanup_failed = cleanup_failed,
-            .memory_evidence = false,
         };
     }
 
     /// 解析并做路径校验，生成待授权的 Prepared；此阶段不产生任何副作用。
     fn prepare(context_: *anyopaque, a: std.mem.Allocator, call: p.ToolCall) !runtime.Prepared {
         const self: *Tools = @ptrCast(@alignCast(context_));
-        // Names the model was never offered must not become executable actions.
-        // Reject before parsing or allocating anything.
-        if (!self.allow_memory and std.mem.eql(u8, call.name, "memory")) return error.MemoryDisabled;
         // Pure availability boundary: a child Tools (parent channel) and any
         // Tools without a registry must reject the management tool before parse.
         if (isBackgroundManaged(call.name) and !self.backgroundActive()) return error.BackgroundDisabled;
@@ -1082,7 +1073,6 @@ pub const Tools = struct {
             .canceled = canceled,
             .truncated = result.truncated,
             .cleanup_failed = cleanup,
-            .memory_evidence = false,
         };
     }
 };

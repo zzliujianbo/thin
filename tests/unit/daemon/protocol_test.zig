@@ -47,7 +47,6 @@ test "every runtime display event round-trips through the wire" {
                 .canceled = true,
                 .truncated = true,
                 .cleanup_failed = true,
-                .memory_evidence = false,
                 .file_stats = .{ .read = 40, .partial = true, .changes = .{ .modified = 1, .added = 2, .removed = 3 } },
                 .duration_ms = high,
             },
@@ -343,7 +342,7 @@ test "terminal events require complete usage and keep tool timing and keys" {
     const json =
         "{\"t\":\"tool_result\",\"id\":9,\"name\":\"bash\",\"v\":\"done\",\"is_error\":false,\"canceled\":false," ++
         "\"trunc\":false,\"cleanup\":false,\"ms\":18446744073709551615," ++
-        "\"key\":{\"gen\":18446744073709551615,\"idx\":2},\"display\":null,\"mem_ev\":true,\"opts\":null}";
+        "\"key\":{\"gen\":18446744073709551615,\"idx\":2},\"display\":null,\"opts\":null}";
     var decoded = try decodeEvent(a, json);
     defer decoded.deinit();
     const result = decoded.event.tool_result;
@@ -679,74 +678,6 @@ test "wire error codes keep unsupported distinct from internal" {
     try std.testing.expectEqual(.unsupported, errorCode(error.Unsupported));
     // Everything unlisted still falls back to the internal category.
     try std.testing.expectEqual(.internal, errorCode(error.CleanupFailed));
-}
-test "memory completion wire roundtrip owns bounded terminal values and full u64" {
-    const a = std.testing.allocator;
-    var terminal: memory_status.Terminal = .{ .id = std.math.maxInt(u64), .result = .failed, .failure = .storage, .saved_count = std.math.maxInt(u32) };
-    terminal.summary.append("中文 · saved");
-    const wire = try encodeEventMeta(a, .{ .memory_completed = terminal }, .{ .epoch = std.math.maxInt(u64) });
-    defer a.free(wire);
-    var decoded = try decodeEvent(a, wire);
-    const owned = decoded.event.memory_completed;
-    try std.testing.expectEqual(std.math.maxInt(u64), decoded.epoch);
-    decoded.deinit();
-    try std.testing.expectEqual(terminal.id, owned.id);
-    try std.testing.expectEqual(terminal.result, owned.result);
-    try std.testing.expectEqual(terminal.failure, owned.failure);
-    try std.testing.expectEqual(terminal.saved_count, owned.saved_count);
-    try std.testing.expectEqualStrings(terminal.summary.text(), owned.summary.text());
-
-    // Exact capacity and a multi-byte ending remain lossless.
-    var boundary: memory_status.Terminal = .{ .id = 9007199254740993, .result = .saved };
-    const ascii: [253]u8 = @splat('x');
-    boundary.summary.append(&ascii);
-    boundary.summary.append("中"); // separate entries need a four-byte separator
-    try std.testing.expectEqual(@as(usize, 253), boundary.summary.text().len);
-    var full: memory_status.Terminal = .{ .id = boundary.id, .result = .saved };
-    var text: [256]u8 = @splat('x');
-    @memcpy(text[253..256], "中");
-    full.summary.append(&text);
-    const full_wire = try encodeEvent(a, .{ .memory_completed = full });
-    defer a.free(full_wire);
-    var full_decoded = try decodeEvent(a, full_wire);
-    defer full_decoded.deinit();
-    try std.testing.expectEqual(@as(usize, 256), full_decoded.event.memory_completed.summary.text().len);
-    try std.testing.expectEqualStrings(&text, full_decoded.event.memory_completed.summary.text());
-}
-test "memory completion rejects missing unknown malformed and unsafe fields" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{
-        "{\"t\":\"memory_completed\",\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\",\"extra\":1}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"unknown\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"failed\",\"failure\":\"unknown\",\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":false,\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":\"1\",\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":18446744073709551616,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":4294967296,\"summary\":\"\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"bad\\u001b\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"a\\nb\"}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\",\"seq\":null}",
-        "{\"t\":\"memory_completed\",\"id\":1,\"id\":2,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}",
-    }) |json| try std.testing.expectError(error.BadRequest, decodeEvent(a, json));
-    const too_long: [257]u8 = @splat('x');
-    const wire = try std.fmt.allocPrint(a, "{{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"{s}\"}}", .{&too_long});
-    defer a.free(wire);
-    try std.testing.expectError(error.BadRequest, decodeEvent(a, wire));
-    try std.testing.expectError(error.BadRequest, decodeEvent(a, "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"saved\",\"failure\":null,\"saved_count\":0,\"summary\":\"\xff\"}"));
-}
-test "memory completion decode preserves allocation failure" {
-    const Scenario = struct {
-        fn run(a: std.mem.Allocator) !void {
-            var decoded = try decodeEvent(a, "{\"t\":\"memory_completed\",\"id\":1,\"result\":\"skipped\",\"failure\":null,\"saved_count\":0,\"summary\":\"\"}");
-            defer decoded.deinit();
-        }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 test "wire error codes classify configuration rejections as invalid input" {
     const cases = [_]anyerror{

@@ -55,20 +55,6 @@ fn waitThinkingFlag(host: *SessionHost, flag: *std.atomic.Value(bool), pump: boo
     }
 }
 
-const MemoryQueueFixture = struct {
-    values: []const @import("../core/memory_status.zig").Terminal,
-    cursor: usize = 0,
-
-    fn peekMemoryCompletion(self: *MemoryQueueFixture) ?@import("../core/memory_status.zig").Terminal {
-        return if (self.cursor < self.values.len) self.values[self.cursor] else null;
-    }
-    fn takeMemoryCompletion(self: *MemoryQueueFixture) ?@import("../core/memory_status.zig").Terminal {
-        const value = self.peekMemoryCompletion() orelse return null;
-        self.cursor += 1;
-        return value;
-    }
-};
-
 const BackgroundFixture = struct {
     first: background_status.Terminal,
     second: background_status.Terminal,

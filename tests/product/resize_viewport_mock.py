@@ -143,7 +143,7 @@ def run(app, wrap=False, local_command=False):
             home, project = root / 'home', root / 'project'
             (home / '.thin').mkdir(parents=True)
             project.mkdir()
-            config = {'memory': {'auto': False}, 'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{httpd.server_port}/v1', 'api_key_env': 'THIN_VIEW_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False}}
+            config = {'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{httpd.server_port}/v1', 'api_key_env': 'THIN_VIEW_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False}}
             cfg = home / '.thin/config.json'
             cfg.write_text(json.dumps(config))
             cfg.chmod(0o600)

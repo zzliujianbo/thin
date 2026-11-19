@@ -157,31 +157,6 @@ test "background completion and tool caption are copied by value" {
     @memset(&caption.command.?.bytes, 'x');
     try std.testing.expectEqualStrings("sleep 1", view.event.tool_view.display.?.command.?.slice());
 }
-test "memory completion owns its summary and is a text coalescing barrier" {
-    const a = std.testing.allocator;
-    const memory = @import("../core/memory_status.zig");
-    var terminal: memory.Terminal = .{ .id = 0, .result = .saved, .saved_count = 1 };
-    terminal.summary.append("owned 中文");
-    var before = try ownEvent(a, 1, .{ .text = "before" });
-    defer before.deinit();
-    var item = try ownEvent(a, 1, .{ .memory_completed = terminal });
-    defer item.deinit();
-    var after = try ownEvent(a, 1, .{ .text = "after" });
-    defer after.deinit();
-    before.delivery_epoch = 1;
-    before.delivery_sequence = 1;
-    item.delivery_epoch = 1;
-    item.delivery_sequence = 2;
-    after.delivery_epoch = 1;
-    after.delivery_sequence = 3;
-    @memset(&terminal.summary.buf, 'x');
-    try std.testing.expectEqualStrings("owned 中文", item.event.memory_completed.summary.text());
-    try std.testing.expect(!try before.appendText(&item, max_item_bytes));
-    try std.testing.expect(!try item.appendText(&after, max_item_bytes));
-    try std.testing.expect(!try before.appendText(&after, max_item_bytes));
-    try std.testing.expectEqualStrings("before", before.event.text);
-    try std.testing.expectEqual(@as(u64, 2), item.delivery_sequence);
-}
 test "owned events deep-copy text and drop local inbox pointers" {
     const a = std.testing.allocator;
     var description = [_]u8{ 'd', 'e', 's', 'c' };

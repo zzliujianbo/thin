@@ -1,9 +1,9 @@
-fn schemasFor(image_on: bool, memory_on: bool, background_on: bool) []const p.ToolSchema {
-    return schemasWith(image_on, memory_on, background_on);
+fn schemasFor(image_on: bool, background_on: bool) []const p.ToolSchema {
+    return schemasWith(image_on, background_on);
 }
 
 fn schemasForServices(enabled: bool) []const p.ToolSchema {
-    return schemasFor(enabled, true, false);
+    return schemasFor(enabled, false);
 }
 
 const FakeBackground = struct {

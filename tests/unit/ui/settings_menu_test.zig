@@ -1,18 +1,14 @@
-test "settings expose eight preference rows" {
-    try std.testing.expectEqual(@as(usize, 8), count);
-    try std.testing.expectEqualStrings("Auto memory", label(5));
-    try std.testing.expectEqualStrings("on", value(.{}, 5));
-    try std.testing.expectEqualStrings("off", value(.{ .memory_auto = false }, 5));
-    try std.testing.expectEqual(@as(?Key, .memory_auto), preferenceKey(5));
-    try std.testing.expectEqualStrings("Proxy", label(6));
-    try std.testing.expectEqual(@as(?Key, null), preferenceKey(6));
-    try std.testing.expectEqualStrings("Not configured", value(.{}, 6));
-    try std.testing.expectEqualStrings("", value(.{ .proxy_address = "127.0.0.1", .proxy_port = 3128, .proxy_model_count = 2 }, 6));
-    try std.testing.expectEqualStrings("Reported usage", label(7));
-    try std.testing.expectEqualStrings("on", value(.{}, 7));
-    try std.testing.expectEqualStrings("off", value(.{ .limits = .{ .show_reported_usage = false } }, 7));
-    try std.testing.expectEqual(@as(?Key, .show_reported_usage), preferenceKey(7));
-    try std.testing.expectEqualStrings("", label(8));
+test "settings expose seven preference rows" {
+    try std.testing.expectEqual(@as(usize, 7), count);
+    try std.testing.expectEqualStrings("Proxy", label(5));
+    try std.testing.expectEqual(@as(?Key, null), preferenceKey(5));
+    try std.testing.expectEqualStrings("Not configured", value(.{}, 5));
+    try std.testing.expectEqualStrings("", value(.{ .proxy_address = "127.0.0.1", .proxy_port = 3128, .proxy_model_count = 2 }, 5));
+    try std.testing.expectEqualStrings("Reported usage", label(6));
+    try std.testing.expectEqualStrings("off", value(.{}, 6));
+    try std.testing.expectEqualStrings("on", value(.{ .limits = .{ .show_reported_usage = true } }, 6));
+    try std.testing.expectEqual(@as(?Key, .show_reported_usage), preferenceKey(6));
+    try std.testing.expectEqualStrings("", label(7));
     try std.testing.expectEqualStrings("Off", value(.{}, 4));
     try std.testing.expectEqualStrings("login/deepseek-flash", value(.{ .image_enabled = true, .image_model = "login/deepseek-flash" }, 4));
     try std.testing.expectEqualStrings("on", value(.{}, 0));
@@ -24,38 +20,37 @@ test "settings expose eight preference rows" {
     try std.testing.expectEqual(@as(?Key, .command_timeout_ms), preferenceKey(2));
     try std.testing.expectEqual(@as(?Key, .request_timeout_ms), preferenceKey(3));
     try std.testing.expectEqual(@as(?Key, null), preferenceKey(4));
-    try std.testing.expectEqual(@as(?Key, .memory_auto), preferenceKey(5));
     try std.testing.expect(std.mem.find(u8, description(0), "unknown") != null);
     try std.testing.expect(std.mem.find(u8, description(1), "compaction") != null);
-    try std.testing.expect(std.mem.find(u8, description(6), "proxy") != null);
-    try std.testing.expect(std.mem.find(u8, description(7), "provider-reported") != null);
+    try std.testing.expect(std.mem.find(u8, description(5), "proxy") != null);
+    try std.testing.expect(std.mem.find(u8, description(6), "provider-reported") != null);
 }
 test "Proxy root row shows host:port and opens on its static label" {
     const a = std.testing.allocator;
-    try std.testing.expectEqualStrings("Proxy", label(6));
+    try std.testing.expectEqualStrings("Proxy", label(5));
     const configured: Snapshot = .{ .proxy_configured = true, .proxy_address = "10.0.0.1", .proxy_port = 8080, .proxy_model_count = 3 };
     for (0..90) |columns| {
-        const rendered = try rows(a, .{ .selected = 6 }, configured, columns, 1);
+        const rendered = try rows(a, .{ .selected = 5 }, configured, columns, 1);
         defer freeRows(a, rendered);
         // Opening the child menu never requires the (unsaved) value to fit.
-        try std.testing.expectEqual(columns >= 2 + label(6).len, rendered.can_confirm);
+        try std.testing.expectEqual(columns >= 2 + label(5).len, rendered.can_confirm);
         try std.testing.expect(text.width(rendered.lines[0]) <= columns);
     }
-    const counted = try rows(a, .{ .selected = 6 }, configured, 80, 1);
+    const counted = try rows(a, .{ .selected = 5 }, configured, 80, 1);
     defer freeRows(a, counted);
     try std.testing.expect(std.mem.find(u8, counted.lines[0], "10.0.0.1:8080") != null);
-    const v6 = try rows(a, .{ .selected = 6 }, .{ .proxy_configured = true, .proxy_address = "::1", .proxy_port = 3128 }, 80, 1);
+    const v6 = try rows(a, .{ .selected = 5 }, .{ .proxy_configured = true, .proxy_address = "::1", .proxy_port = 3128 }, 80, 1);
     defer freeRows(a, v6);
     try std.testing.expect(std.mem.find(u8, v6.lines[0], "[::1]:3128") != null);
-    const empty = try rows(a, .{ .selected = 6 }, .{}, 80, 1);
+    const empty = try rows(a, .{ .selected = 5 }, .{}, 80, 1);
     defer freeRows(a, empty);
     try std.testing.expect(std.mem.find(u8, empty.lines[0], "Not configured") != null);
     // A long endpoint is clipped, but the label still opens the child editor.
     const long: [253]u8 = @splat('a');
-    const clipped = try rows(a, .{ .selected = 6 }, .{ .proxy_configured = true, .proxy_address = &long, .proxy_port = 65535 }, 12, 1);
+    const clipped = try rows(a, .{ .selected = 5 }, .{ .proxy_configured = true, .proxy_address = &long, .proxy_port = 65535 }, 12, 1);
     defer freeRows(a, clipped);
     try std.testing.expect(clipped.can_confirm and text.width(clipped.lines[0]) <= 12);
-    const pasted = try rows(a, .{ .selected = 6, .pasted = true }, .{}, 80, 3);
+    const pasted = try rows(a, .{ .selected = 5, .pasted = true }, .{}, 80, 3);
     defer freeRows(a, pasted);
     try std.testing.expect(!pasted.can_confirm);
 }

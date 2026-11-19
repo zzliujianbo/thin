@@ -202,3 +202,39 @@ test "resume store ignores arbitrary legacy markers and permission bits at load"
     const stat = try tmp.dir.statFile(root.io, ".thin/sessions/" ++ test_id ++ ".session", .{});
     try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
 }
+
+test "touch marks a checkpoint as used without rewriting its bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const second: ids.Id = "fedcba9876543210fedcba9876543210".*;
+    var first = try Lease.create(&root, test_id);
+    defer first.deinit();
+    try first.save(&root, "first-bytes");
+    var other = try Lease.create(&root, second);
+    defer other.deinit();
+    try other.save(&root, "second-bytes");
+    const older = [2]std.c.timespec{ .{ .sec = 10, .nsec = 0 }, .{ .sec = 10, .nsec = 0 } };
+    const newer = [2]std.c.timespec{ .{ .sec = 20, .nsec = 0 }, .{ .sec = 20, .nsec = 0 } };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(first.directory_fd, test_id ++ ".session", &older, 0));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(first.directory_fd, second ++ ".session", &newer, 0));
+    const before = try list(&root, a);
+    defer a.free(before);
+    try std.testing.expectEqualSlices(u8, &second, &before[0].id);
+
+    // Use alone promotes the older checkpoint; content stays byte-identical.
+    try touch(&root, test_id);
+    const after = try list(&root, a);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(u8, &test_id, &after[0].id);
+    const bytes = try first.load(&root);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("first-bytes", bytes);
+
+    // A missing checkpoint is not created by a use stamp.
+    const missing: ids.Id = "00112233445566778899aabbccddeeff".*;
+    try touch(&root, missing);
+    try std.testing.expect(fs.openAt(first.directory_fd, missing ++ ".session", .{ .NOFOLLOW = true, .CLOEXEC = true }, 0) < 0);
+}

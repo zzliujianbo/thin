@@ -156,7 +156,7 @@ SERVICE_MARKER = 'daemon-svc.marker'
 _VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
                r'xhigh|max|\?))')
 _IDLE_COMPOSER = re.compile(
-    r'^(?:> |(?:\([^)]*\) )?' + _VALUE_SLOT + r'> )$')
+    r'^(?:> |(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?> )$')
 
 
 class Screen:
@@ -634,14 +634,14 @@ def assert_screen_idle_contract():
         return screen
 
     # Floating tail: the composer row is written above the physical bottom.
-    assert state(['(fixture-model) 0.0%> '], 0).idle(), 'floating configured composer'
+    assert state(['(fixture-model)0.0%> '], 0).idle(), 'floating configured composer'
     assert state(['> '], 0).idle(), 'floating unconfigured composer'
-    assert state(['(fixture-model) L1.6%> '], 0).idle(), 'low-price composer'
-    assert state(['(fixture-model) high> '], 0).idle(), 'effort confirmation composer'
+    assert state(['(fixture-model)L1.6%> '], 0).idle(), 'low-price composer'
+    assert state(['(fixture-model)high> '], 0).idle(), 'effort confirmation composer'
     # Bottom placement keeps working.
-    assert state([''] * 7 + ['(fixture-model) 0.0%> '], 7).idle(), 'bottom composer'
+    assert state([''] * 7 + ['(fixture-model)0.0%> '], 7).idle(), 'bottom composer'
     # A stale completed prompt above a busy cursor row is not idle.
-    assert not state(['> ', '(fixture-model) 0.0% '], 1).idle(), 'stale prompt above busy'
+    assert not state(['> ', '(fixture-model)0.0% '], 1).idle(), 'stale prompt above busy'
     # Modal editor lines, approval choices, body rows and drafts never imply idle.
     assert not state(['Search> '], 0).idle(), 'search line'
     assert not state(['Settings> '], 0).idle(), 'settings line'
@@ -650,7 +650,7 @@ def assert_screen_idle_contract():
     assert not state(['API key> '], 0).idle(), 'secret line'
     assert not state([' Y allow once   N deny '], 0).idle(), 'approval choice row'
     assert not state(['rm -rf protected-owned-dir >'], 0).idle(), 'body row ending in >'
-    assert not state(['(fixture-model) 0.0%> draft'], 0).idle(), 'filled composer'
+    assert not state(['(fixture-model)0.0%> draft'], 0).idle(), 'filled composer'
 
 
 def write_config(home, url, limits=None):
@@ -661,7 +661,6 @@ def write_config(home, url, limits=None):
         'command_timeout_ms': 10000,
     }
     config = {
-        'memory': {'auto': False},
         'llm': {'default': 'owned/' + MODEL, 'providers': {'owned': {
             'base_url': url,
             'api_key': KEY,

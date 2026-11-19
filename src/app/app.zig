@@ -17,9 +17,7 @@ const model_resolver = @import("model_resolver.zig");
 const image = @import("../core/image.zig");
 const ImageClient = @import("image_client.zig").Client;
 const image_setup = @import("image_setup.zig");
-const knowledge = @import("../core/knowledge.zig");
-const MemoryCoordinator = @import("memory_service.zig").Coordinator;
-const MemoryNotifications = @import("memory_notifications.zig").Queue;
+const knowledge_store = @import("../tools/knowledge_store.zig");
 const background_service = @import("background_service.zig");
 const BackgroundService = background_service.BackgroundService;
 
@@ -76,7 +74,6 @@ pub const App = struct {
     /// Stable source owner shared by Codex clients and their clones.
     codex_manager: ?*CodexManager = null,
     image_client: ?*ImageClient = null,
-    memory_coordinator: *MemoryCoordinator,
     /// Instance-owned background command registry. This is the only owner: it
     /// survives connection/settings replacement and every executor rebind only
     /// republishes its service value. Its deps are published once, after the
@@ -135,21 +132,16 @@ pub const App = struct {
     /// Duplicate an already anchored project; never re-open its replaceable
     /// pathname during activation. parsed is consumed on success AND failure.
     pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, null, host, parsed, null);
+        return initConfiguredRoot(a, io, environ, root.path, root, null, host, parsed);
     }
 
     /// Delayed activation must retain the Auth Store's startup pathname in the
     /// SAME lexical namespace as root, not rediscover a replaced HOME path.
     pub fn initConfiguredAnchoredAuth(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed, null);
+        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed);
     }
 
-    /// Session queue must be bound before initial core snapshot failures.
-    pub fn initConfiguredAnchoredAuthWithNotifications(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config), queue: ?*MemoryNotifications) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed, queue);
-    }
-
-    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config), queue: ?*MemoryNotifications) !*App {
+    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (owned.value.selection_pending) return error.DefaultModelUnavailable;
@@ -226,10 +218,6 @@ pub const App = struct {
         errdefer if (self.image_client) |client| destroyImageClient(client);
         self.executor.image = self.imageService();
 
-        self.memory_coordinator = try self.createMemoryCoordinator(self.config.value, environ);
-        errdefer self.memory_coordinator.deinit();
-        self.memory_coordinator.bindNotifications(queue);
-        self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
         // Only small core is frozen into the initial prefix. Task-local memory
         // is read afresh through bounded hooks, never an ever-growing index.
         var snapshot_wiping: cfg.WipingAllocator = .{ .backing = a };
@@ -237,34 +225,20 @@ pub const App = struct {
         reader.wait_for_lock = false;
         const snapshot = reader.coreSnapshot(snapshot_wiping.allocator()) catch |err| blk: {
             if (err != error.Busy) return err;
-            self.memory_coordinator.reportFailure(err);
             break :blk try snapshot_wiping.allocator().dupe(u8, "");
         };
         defer snapshot_wiping.allocator().free(snapshot);
         // Explicit/local legacy core is untrusted too. Never freeze a known
         // credential into the primary prefix before task retrieval can screen it.
-        const safe_snapshot = if (self.journal.containsSecret(snapshot)) blk: {
-            self.memory_coordinator.reportFailure(error.SensitiveMemoryMaterial);
-            break :blk "";
-        } else snapshot;
+        const safe_snapshot = if (self.journal.containsSecret(snapshot)) "" else snapshot;
         self.runtime = try r.Runtime.init(a, io, &self.config.value, self.client.model(), self.executor.executor(), host, safe_snapshot);
         self.runtime.thinking_control = &self.thinking_control;
         self.runtime.diagnostics = self.journal.diagnosticSink();
         self.runtime.session_loader = .{ .context = self, .load_fn = loadSessionPolicy };
         self.runtime.observer = self.journal.observer();
-        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory, .submit_fn = submitMemory, .check_fn = memorySafe };
+        self.runtime.memory_hooks = .{ .context = self, .retrieve_fn = retrieveMemory };
         self.recordSelection();
         return self;
-    }
-
-    /// A Session binds its heap-stable completion queue before any Memory job.
-    /// Standalone Apps intentionally leave the optional sink unset.
-    pub fn bindMemoryNotifications(self: *App, queue: *MemoryNotifications) void {
-        self.memory_coordinator.bindNotifications(queue);
-    }
-
-    pub fn memoryView(self: *const App) @import("../core/memory_status.zig").View {
-        return self.memory_coordinator.view();
     }
 
     pub fn backgroundView(self: *App) @import("../core/background_status.zig").View {
@@ -279,41 +253,19 @@ pub const App = struct {
         self.background.takeCompletion(id);
     }
 
-    pub fn drainMemory(self: *App, cancel: *const @import("../core/protocol.zig").Cancellation) void {
-        self.memory_coordinator.drain(cancel);
-    }
-
-    fn memorySafe(raw: *anyopaque) bool {
-        const self: *App = @ptrCast(@alignCast(raw));
-        return !self.memory_coordinator.isPoisoned();
-    }
-
+    /// Read the task-start reference straight from the project store. A
+    /// contention failure is a visible decline, never a primary task failure.
     fn retrieveMemory(raw: *anyopaque, a: std.mem.Allocator, query: []const u8) ![]const u8 {
         const self: *App = @ptrCast(@alignCast(raw));
-        return self.memory_coordinator.retrieve(a, query) catch |err| {
-            self.memory_coordinator.reportFailure(err);
-            return err;
-        };
-    }
-
-    fn submitMemory(raw: *anyopaque, capture: *const knowledge.Capture, protocol: @import("../core/protocol.zig").Protocol) void {
-        const self: *App = @ptrCast(@alignCast(raw));
-        if (!self.config.value.memory.auto) return;
-        var wiping: cfg.WipingAllocator = .{ .backing = self.allocator };
-        var arena = std.heap.ArenaAllocator.init(wiping.allocator());
-        defer arena.deinit();
-        var filtered: knowledge.Capture = .{ .allocator = arena.allocator(), .omitted_sources = capture.omitted_sources };
-        for (capture.sources.items) |source| {
-            if (self.journal.containsSecret(source.text)) {
-                filtered.omitted_sources +|= 1;
-                continue;
-            }
-            filtered.add(source.kind, source.text);
+        var store = self.memory;
+        store.wait_for_lock = false;
+        var repository = knowledge_store.Repository.init(&store);
+        const reference = try repository.retrieve(a, query);
+        if (self.journal.containsSecret(reference)) {
+            a.free(reference);
+            return error.SensitiveMemoryMaterial;
         }
-        if (capture.incomplete) filtered.incomplete = true;
-        // enqueueCopy owns admission diagnostics, failure state and the single
-        // completion; reporting it again would create a duplicate notice.
-        _ = self.memory_coordinator.enqueueCopy(&filtered, protocol, self.journal.memoryDiagnosticSink()) catch {};
+        return reference;
     }
 
     fn imageService(self: *App) ?image.Service {
@@ -357,14 +309,6 @@ pub const App = struct {
         return http.Client.initWithEnv(self.allocator, self.root.io, config, key, environ);
     }
 
-    fn createMemoryCoordinator(self: *App, config: cfg.Config, environ: *const std.process.Environ.Map) !*MemoryCoordinator {
-        const needs_source = config.memory.auto and isCodex(config);
-        const source: ?codex_auth.CredentialSource = if (needs_source) try self.ensureCodexSource(environ) else null;
-        const coordinator = try MemoryCoordinator.createWithCodexSource(self.allocator, self.root.io, &self.root, config, environ, source);
-        coordinator.secret_guard = .{ .context = &self.journal, .contains_fn = journalContainsSecret };
-        return coordinator;
-    }
-
     fn journalContainsSecret(raw: *anyopaque, text: []const u8) bool {
         const journal: *Journal = @ptrCast(@alignCast(raw));
         return journal.containsSecret(text);
@@ -374,14 +318,11 @@ pub const App = struct {
     pub const SettingsReplacement = struct {
         config: ?std.json.Parsed(cfg.Config) = null,
         replace_image: bool,
-        replace_memory: bool = false,
-        memory_coordinator: ?*MemoryCoordinator = null,
         changes_tools: bool,
         image_client: ?*ImageClient = null,
         prefix: ?r.Runtime.ToolPrefix = null,
 
         pub fn deinit(self: *SettingsReplacement) void {
-            if (self.memory_coordinator) |owner| owner.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             if (self.prefix) |*prefix| prefix.deinit();
             if (self.config) |*config| cfg.release(config);
@@ -396,7 +337,7 @@ pub const App = struct {
 
     pub fn prepareSettingsRefresh(self: *App, declaration: cfg.Config, environ: *const std.process.Environ.Map, refresh: SettingsRefresh) !SettingsReplacement {
         if (self.runtime.busy.load(.acquire)) return error.Busy;
-        if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
+        if (self.runtime.poisoned) return error.UnsafeToContinue;
         if (self.image_client) |client| if (client.isPoisoned()) return error.UnsafeToContinue;
         // Only image-model edits, shared request deadlines or an explicit
         // proxy reselect replace the auxiliary owner. Primary transport and
@@ -413,18 +354,6 @@ pub const App = struct {
         };
         errdefer result.deinit();
         result.config = try @import("settings_selection.zig").activeClone(self.allocator, self.runtime.effectiveConfig(), declaration);
-        result.replace_memory = proxy_refresh or self.config.value.memory.auto != declaration.memory.auto or
-            !cfg.policyLimitsEqual(self.config.value.limits, declaration.limits);
-        if (result.replace_memory) {
-            // The coordinator owns an independent extractor client, so it follows
-            // the latest proxy allowlist even when the active config keeps its
-            // frozen proxy. This local borrow is valid only for the call; create()
-            // clones it, and later ordinary rebuilds reuse the same declaration
-            // list instead of reverting to the frozen route.
-            var memory_config = result.config.?.value;
-            memory_config.proxy = declaration.proxy;
-            result.memory_coordinator = try self.createMemoryCoordinator(memory_config, environ);
-        }
         if (result.replace_image) {
             try rememberConfiguredKeys(&self.journal, declaration, environ);
             result.image_client = try image_setup.create(self.allocator, self.root.io, declaration, environ);
@@ -436,11 +365,9 @@ pub const App = struct {
         return result;
     }
 
-    /// Called only after settings save; joins the replaced Memory owner.
+    /// Called only after settings save.
     pub fn installSettings(self: *App, replacement: *SettingsReplacement) void {
         std.debug.assert(!self.runtime.busy.load(.acquire));
-        if (replacement.replace_memory) self.memory_coordinator.cancelAndJoin();
-        const memory_poisoned = self.memory_coordinator.isPoisoned();
         self.thinking_control.clear();
         var previous_config = self.config;
         self.config = replacement.config.?;
@@ -459,19 +386,11 @@ pub const App = struct {
             self.image_client = replacement.image_client;
             replacement.image_client = null;
         }
-        if (replacement.replace_memory) {
-            replacement.memory_coordinator.?.bindNotifications(self.memory_coordinator.notification_queue);
-            self.memory_coordinator.deinit();
-            self.memory_coordinator = replacement.memory_coordinator.?;
-            self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
-            replacement.memory_coordinator = null;
-        }
         self.executor.image = self.imageService();
         // Rebinding republishes the same instance-owned registry; running jobs
         // keep their frozen cwd/environment and are never touched here.
         self.executor.background = self.background.service();
         self.runtime.executor = self.executor.executor();
-        if (memory_poisoned) self.runtime.poisoned = true;
         // Schema edits affect future estimates, not the latest server-reported
         // primary usage (including fresh-session zero or genuinely unknown).
     }
@@ -483,13 +402,11 @@ pub const App = struct {
         config: std.json.Parsed(cfg.Config),
         client: http.Client,
         image_client: ?*ImageClient = null,
-        memory_coordinator: *MemoryCoordinator,
         plan: r.Runtime.SelectionPlan,
 
         pub fn deinit(self: *ConnectionReplacement) void {
             const a = self.owner.allocator;
             self.client.deinit();
-            self.memory_coordinator.deinit();
             if (self.image_client) |client| destroyImageClient(client);
             cfg.release(&self.config);
             a.destroy(self);
@@ -501,7 +418,7 @@ pub const App = struct {
     pub fn prepareConnection(self: *App, parsed: std.json.Parsed(cfg.Config), environ: *const std.process.Environ.Map) !*ConnectionReplacement {
         var owned = parsed;
         errdefer cfg.release(&owned);
-        if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
+        if (self.runtime.poisoned) return error.UnsafeToContinue;
         const plan = try self.runtime.planSelection(owned.value, true);
         if (!cfg.policyLimitsEqual(owned.value.limits, self.runtime.effectiveConfig().limits)) return error.ConnectionLimitsChanged;
         const key = if (isCodex(owned.value)) blk: {
@@ -523,15 +440,12 @@ pub const App = struct {
         errdefer replacement.client.deinit();
         replacement.image_client = try image_setup.create(self.allocator, self.root.io, replacement.config.value, environ);
         errdefer if (replacement.image_client) |client| destroyImageClient(client);
-        replacement.memory_coordinator = try self.createMemoryCoordinator(replacement.config.value, environ);
         return replacement;
     }
 
-    /// Publish the saved connection after canceling and joining the old Memory owner.
+    /// Publish the saved connection.
     pub fn installConnection(self: *App, replacement: *ConnectionReplacement) void {
         std.debug.assert(replacement.owner == self);
-        self.memory_coordinator.cancelAndJoin();
-        const memory_poisoned = self.memory_coordinator.isPoisoned();
         self.runtime.applySelection(replacement.plan);
         self.thinking_control.clear();
         var previous = self.config;
@@ -543,10 +457,6 @@ pub const App = struct {
         self.runtime.config = &self.config.value;
         self.executor.config = &self.config.value;
         self.runtime.model = self.client.model();
-        replacement.memory_coordinator.bindNotifications(self.memory_coordinator.notification_queue);
-        self.memory_coordinator.deinit();
-        self.memory_coordinator = replacement.memory_coordinator;
-        self.memory_coordinator.bindDiagnostics(self.journal.diagnosticSink());
         if (self.image_client) |client| destroyImageClient(client);
         self.image_client = replacement.image_client;
         self.executor.image = self.imageService();
@@ -554,7 +464,6 @@ pub const App = struct {
         // services keep their startup cwd/environment and cleanup policy.
         self.executor.background = self.background.service();
         self.runtime.executor = self.executor.executor();
-        if (memory_poisoned) self.runtime.poisoned = true;
         self.recordSelection();
         self.allocator.destroy(replacement);
         cfg.release(&previous);
@@ -600,7 +509,6 @@ pub const App = struct {
     pub fn close(self: *App) !void {
         const a = self.allocator;
         var cleanup_error: ?anyerror = null;
-        self.memory_coordinator.cancelAndJoin();
         self.runtime.deinit();
         // The foreground task is joined above. Only then
         // notify every background service to cancel and join the whole set, so
@@ -608,9 +516,6 @@ pub const App = struct {
         self.background.close() catch |err| {
             cleanup_error = err;
         };
-        // Interactive exit/model replacement cancels immediately. Headless
-        // success explicitly drains with signal handling before destruction.
-        self.memory_coordinator.deinit();
         if (self.image_client) |client| destroyImageClient(client);
         self.journal.deinit();
         self.client.deinit();

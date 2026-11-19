@@ -62,7 +62,7 @@ CSI = re.compile(rb'\x1b\[([0-9;?]*)([@-~])')
 _VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
                r'xhigh|max|\?))')
 _IDLE_COMPOSER = re.compile(
-    r'^(?:> |(?:\([^)]*\) )?' + _VALUE_SLOT + r'> )$')
+    r'^(?:> |(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?> )$')
 
 
 class Screen:
@@ -641,7 +641,6 @@ def pty_plan(owned, state):
 def write_config(home, url):
     (home / '.thin').mkdir(parents=True, exist_ok=True)
     config = {
-        'memory': {'auto': False},
         'llm': {'default': 'owned/' + MODEL, 'providers': {'owned': {
             'base_url': url,
             'api_key': KEY,

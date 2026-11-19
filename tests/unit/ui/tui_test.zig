@@ -86,48 +86,6 @@ test "stable pending pulses preserve native history and tail" {
         try std.testing.expectEqual(screen.rows - 1, screen.row + ui.tail_cursor_rows_up);
     }
 }
-test "memory footer stays adjacent to wrapped composer after ACK" {
-    const Fixture = struct {
-        fn current(_: *anyopaque) Connection.State {
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } } };
-        }
-    };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection.current_fn = Fixture.current;
-    ui.size = .{ .columns = 30, .rows = 12 };
-    _ = try ui.add(.assistant, "body");
-    _ = try ui.editor.insert("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL");
-    var screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 30, .rows = 12 };
-    try ui.draw();
-    try screen.replay(ui.frame);
-    try std.testing.expect(ui.frame_composer_rows > 1);
-    const composer_top = screen.rows - ui.frame_composer_rows;
-    try std.testing.expect(composer_top + 1 < screen.rows);
-    try std.testing.expect(screen.grid[composer_top + 1][0] != ' ');
-    const status_row = screen.rows - ui.frame_composer_rows - 1;
-    // The screen fixture maps each non-ASCII code point to one '~' cell.
-    try std.testing.expectEqualStrings("memory: 1", std.mem.trimEnd(u8, screen.grid[status_row][0..30], " "));
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const expected_status = "memory: 1";
-    try std.testing.expectEqualStrings(expected_status, try ui.activityLine(arena.allocator(), ui.connection.current()));
-    try std.testing.expectEqual(status_row + 1, try rowStartingWith(&screen, "(fixture "));
-    try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, screen.grid[status_row - 1][0..30], " "));
-    try std.testing.expectEqual(@as(usize, 1), screen.count("memory: "));
-    testAcknowledgeFullFrame(&ui);
-    const history = screen.history_len;
-    const records = ui.records.items.len;
-    try ui.draw();
-    try screen.replay(ui.frame);
-    testAcknowledgeFullFrame(&ui);
-    try std.testing.expectEqual(history, screen.history_len);
-    try std.testing.expectEqual(records, ui.records.items.len);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("memory: "));
-}
 test "long combined warning stays adjacent across acknowledged command menu cycles and wrapped input" {
     for ([_]usize{ 80, 120 }) |columns| {
         var cancel: p.Cancellation = .{};
@@ -2335,32 +2293,6 @@ test "replayed image and unknown calls keep their names and targets" {
     try std.testing.expectEqualStrings("✓ read_image shots/a.png", ui.records.items[0].body.items);
     try std.testing.expectEqualStrings("✓ frobnicate ls", ui.records.items[1].body.items);
     try std.testing.expect(std.mem.indexOf(u8, ui.records.items[1].body.items, "secret") == null);
-}
-test "memory markers use a cross and only the marker is tinted" {
-    const a = std.testing.allocator;
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    var saved: memory_status.Terminal = .{ .id = 1, .result = .saved, .saved_count = 1 };
-    saved.summary.append("preference");
-    try ui.acceptMemoryCompletion(saved);
-    const ok_row = &ui.records.items[0];
-    try std.testing.expectEqual(NoticeLevel.success, ok_row.notice_level);
-    try std.testing.expectEqual(@as(usize, "memory: \u{2713}".len), ok_row.notice_marker_len);
-    try ok_row.layout(a, 40);
-    try std.testing.expect(std.mem.find(u8, ok_row.lines[0], theme.success ++ "memory: \u{2713}" ++ theme.reset ++ theme.muted) != null);
-    try std.testing.expect(std.mem.find(u8, ok_row.lines[0], " preference") != null);
-
-    try ui.acceptMemoryCompletion(.{ .id = 2, .result = .failed, .failure = .storage });
-    const bad_row = &ui.records.items[1];
-    try std.testing.expectEqual(NoticeLevel.failure, bad_row.notice_level);
-    try std.testing.expectEqual(@as(usize, "memory: \u{2717}".len), bad_row.notice_marker_len);
-    try std.testing.expect(std.mem.startsWith(u8, bad_row.body.items, "memory: \u{2717}"));
-    try bad_row.layout(a, 40);
-    try std.testing.expect(std.mem.find(u8, bad_row.lines[0], theme.failure ++ "memory: \u{2717}" ++ theme.reset ++ theme.muted) != null);
-    try std.testing.expect(std.mem.find(u8, bad_row.lines[0], "failed") == null);
 }
 test "failed tool rows keep the bounded reason while the target clips" {
     const a = std.testing.allocator;
@@ -5954,7 +5886,7 @@ test "green checked candidates preserve full multibyte IDs and configured label 
     for (0..170) |i| @memcpy(name[i * 3 ..][0..3], "模");
     const value = try std.fmt.allocPrint(a, "> ✓ {s}", .{name});
     defer a.free(value);
-    try putCandidateLine(&out.writer, a, 1, value, 400, theme.accent, true);
+    try putCandidateLine(&out.writer, a, 1, value, 400, theme.accent, true, null);
     try std.testing.expect(std.mem.find(u8, out.written(), name) != null);
     try std.testing.expect(std.mem.find(u8, out.written(), theme.success ++ "✓" ++ theme.accent) != null);
     var cancel: p.Cancellation = .{};
@@ -6301,44 +6233,7 @@ test "settings TUI custom seconds stages equivalent milliseconds" {
     try std.testing.expectEqual(@as(u32, 123456), fixture.state.limits.command_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
-test "Auto memory root toggles only after fresh ACK without overlays and preserves failed save" {
-    try text.initLocale();
-    var fixture: PreferenceFixture = .{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection = fixture.connection();
-    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
-    ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
-    try ui.draw();
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r\r", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(!fixture.state.memory_auto);
-    try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
-    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 5);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    fixture.fail = true;
-    try ui.parser.feed("\r\r", sink);
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
-    try std.testing.expect(!fixture.state.memory_auto);
-    try std.testing.expect(ui.settings_value_picker == null and !ui.settingsModelOpen());
-    fixture.fail = false;
-    try ui.draw();
-    testAcknowledgeFullFrame(&ui);
-    try ui.parser.feed("\r", sink);
-    try std.testing.expect(fixture.state.memory_auto);
-    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
-}
-test "Reported usage root toggles and hides only the reported composer value" {
+test "Reported usage is off by default and the root toggle shows only the reported value" {
     try text.initLocale();
     var fixture: PreferenceFixture = .{};
     fixture.state.initial_context = .{ .tokens = 48_300, .limit = 100_000, .estimated = 88_600 };
@@ -6349,23 +6244,28 @@ test "Reported usage root toggles and hides only the reported composer value" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try ui.draw();
+    var idle: @import("../tests/regular_screen.zig").Screen = .{};
+    try idle.replay(ui.frame);
+    try std.testing.expect(idle.visible("(unchanged-primary)88.6%>"));
+    try std.testing.expect(!idle.visible("48.3%"));
+    testAcknowledgeFullFrame(&ui);
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 7;
+    ui.settings_menu.selected = 6;
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(!fixture.state.limits.show_reported_usage);
-    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 7);
+    try std.testing.expect(fixture.state.limits.show_reported_usage);
+    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 6);
     ui.closeSettingsMenu();
     try std.testing.expect(!ui.settings_open);
     try ui.draw();
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("(unchanged-primary)88.6%>"));
-    try std.testing.expect(!screen.visible("(unchanged-primary 48.3%)"));
+    try std.testing.expect(screen.visible("(unchanged-primary 48.3%)88.6%>"));
     testAcknowledgeFullFrame(&ui);
 }
 test "settings numeric child consumes ACK before failed save and preserves parent" {
@@ -6750,50 +6650,12 @@ test "metadata success publishes one transcript notice from an owner transition"
     try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
     try std.testing.expectEqualStrings("", try ui.hint(std.testing.allocator, ui.connection.current()));
 }
-test "memory notice owner poll dirties UI without replacing foreground notice" {
-    const Fixture = struct {
-        view: @import("../core/memory_status.zig").View = .{},
-        changed: bool = false,
-        fn current(raw: *anyopaque) Connection.State {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return .{ .runtime = null, .model = "fixture", .base_url = "", .memory = self.view };
-        }
-        fn poll(raw: *anyopaque, _: bool) bool {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const changed = self.changed;
-            self.changed = false;
-            return changed;
-        }
-    };
-    var fixture: Fixture = .{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection.context = &fixture;
-    ui.connection.current_fn = Fixture.current;
-    ui.connection.poll_models_fn = Fixture.poll;
-    ui.notice = "Foreground error";
-    inline for (.{ true, false }) |enabled| {
-        fixture.view = .{ .enabled = enabled, .active = if (enabled) .{ .id = 1, .phase = .extracting } else null };
-        fixture.changed = true;
-        ui.dirty = false;
-        ui.pollMetadata();
-        try std.testing.expect(ui.dirty);
-        try std.testing.expectEqualStrings("Foreground error", ui.notice);
-        ui.dirty = false;
-        ui.pollMetadata();
-        try std.testing.expect(!ui.dirty); // Identical snapshot is not a transition.
-    }
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-}
-test "background and memory indicators stay static while idle" {
+test "background indicators stay static while idle" {
     const Fixture = struct {
         count: usize = 1,
         fn current(raw: *anyopaque) Connection.State {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = self.count }, .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } } };
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = self.count } };
         }
     };
     var fixture: Fixture = .{};
@@ -6811,7 +6673,6 @@ test "background and memory indicators stay static while idle" {
     ui.animate();
     try std.testing.expect(!ui.dirty);
     const first = try ui.activityLine(arena.allocator(), Fixture.current(&fixture));
-    try std.testing.expect(std.mem.indexOf(u8, first, "memory: 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "background: 1") != null);
     fixture.count = 3;
     const multiple = try ui.activityLine(arena.allocator(), Fixture.current(&fixture));
@@ -6893,111 +6754,10 @@ test "background completion is admitted before exact-id retirement" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(second.lines[0]));
     testAcknowledgeFullFrame(&ui);
 }
-test "memory active and queued own the neutral activity row and terminals stay in conversation" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var state = ui.connection.current();
-    // Idle foreground: static counts, no point matrix.
-    state.memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .extracting } };
-    try std.testing.expectEqualStrings("memory: 1", try ui.activityLine(arena.allocator(), state));
-    state.memory.queued_count = 2;
-    try std.testing.expectEqualStrings("memory: 1 +2", try ui.activityLine(arena.allocator(), state));
-    state.memory.active = null;
-    try std.testing.expectEqualStrings("memory: +2", try ui.activityLine(arena.allocator(), state));
-    state.memory.queued_count = 0;
-    state.memory.last_terminal = .{ .id = 1, .result = .saved, .saved_count = 2 };
-    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), state));
-    state.memory = .{ .enabled = false, .active = .{ .id = 1, .phase = .saving }, .queued_count = 3 };
-    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), state));
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-
-    var saved: memory_status.Terminal = .{ .id = 7, .result = .saved, .saved_count = 2 };
-    saved.summary.append("偏好中文\n下一行\x1b]unsafe\x07");
-    try ui.acceptMemoryCompletion(saved);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    const saved_row = ui.records.items[0];
-    try std.testing.expectEqual(NoticeLevel.success, saved_row.notice_level);
-    try std.testing.expect(saved_row.single_row);
-    const expected_saved = try std.fmt.allocPrint(arena.allocator(), "memory: \u{2713} {s}", .{saved.summary.text()});
-    try std.testing.expectEqualStrings(expected_saved, saved_row.body.items);
-    try std.testing.expect(std.mem.find(u8, saved_row.body.items, "saved") == null);
-    try std.testing.expect(std.mem.find(u8, saved_row.body.items, "(2)") == null);
-    try std.testing.expect(std.mem.find(u8, saved_row.body.items, "偏好中文 下一行") != null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, saved_row.body.items, '\x1b') == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, saved_row.body.items, '\n') == null);
-    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), state));
-
-    for ([_]memory_status.Terminal{
-        .{ .id = 8, .result = .failed, .failure = .storage },
-        .{ .id = 9, .result = .uncertain, .failure = .unavailable },
-    }) |terminal| {
-        try ui.acceptMemoryCompletion(terminal);
-        const row = ui.records.items[ui.records.items.len - 1];
-        try std.testing.expectEqual(NoticeLevel.failure, row.notice_level);
-        try std.testing.expect(!row.single_row);
-        try std.testing.expect(std.mem.startsWith(u8, row.body.items, "memory: "));
-        try std.testing.expect(std.mem.count(u8, row.body.items, "\\u{2713}") == 0);
-    }
-    try ui.acceptMemoryCompletion(.{ .id = 10, .result = .failed, .failure = .cleanup });
-    try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[ui.records.items.len - 1].notice_level);
-    try ui.acceptMemoryCompletion(.{ .id = 13, .result = .failed, .failure = .storage, .saved_count = 1 });
-    const partial = ui.records.items[ui.records.items.len - 1];
-    try std.testing.expectEqual(NoticeLevel.failure, partial.notice_level);
-    try std.testing.expect(!partial.single_row);
-    try std.testing.expect(std.mem.count(u8, partial.body.items, "\\u{2713}") == 0);
-    try ui.acceptMemoryCompletion(.{ .id = 11, .result = .canceled, .failure = .canceled });
-    try std.testing.expectEqual(NoticeLevel.plain, ui.records.items[ui.records.items.len - 1].notice_level);
-    const before_skipped = ui.records.items.len;
-    try ui.acceptMemoryCompletion(.{ .id = 12, .result = .skipped });
-    try std.testing.expectEqual(before_skipped, ui.records.items.len);
-}
-
-test "memory activity stays static while the foreground is idle" {
-    const Fixture = struct {
-        active: bool = true,
-        fn current(raw: *anyopaque) Connection.State {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = if (self.active)
-                .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } }
-            else
-                .{} };
-        }
-    };
-    var fixture: Fixture = .{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection.context = &fixture;
-    ui.connection.current_fn = Fixture.current;
-    try std.testing.expect(!ui.busy);
-    ui.clock_ms = 40;
-    ui.dirty = false;
-    ui.animate();
-    try std.testing.expect(!ui.dirty);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const state = ui.connection.current();
-    try std.testing.expectEqualStrings("memory: 1", try ui.activityLine(arena.allocator(), state));
-    ui.clock_ms = 160;
-    try std.testing.expectEqualStrings("memory: 1", try ui.activityLine(arena.allocator(), state));
-    fixture.active = false;
-    ui.dirty = false;
-    ui.animate();
-    try std.testing.expect(!ui.dirty);
-    try std.testing.expectEqualStrings("", try ui.activityLine(arena.allocator(), ui.connection.current()));
-}
-
-test "idle memory and background activity stays static with queued preview" {
+test "idle background activity stays static with queued preview" {
     const Fixture = struct {
         fn current(_: *anyopaque) Connection.State {
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = 1 }, .memory = .{ .enabled = true, .active = .{ .id = 1, .phase = .saving } } };
+            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .background = .{ .active_count = 1 } };
         }
     };
     var cancel: p.Cancellation = .{};
@@ -7011,7 +6771,6 @@ test "idle memory and background activity stays static with queued preview" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const line = try ui.activityLine(arena.allocator(), ui.connection.current());
-    try std.testing.expect(std.mem.indexOf(u8, line, "memory: 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "background: 1") != null);
     for (1..3) |tick| {
         ui.dirty = false;
@@ -7037,156 +6796,6 @@ test "idle memory and background activity stays static with queued preview" {
     try std.testing.expect(ui.dirty);
 }
 
-test "memory saved notice is one clipped physical row at the real width" {
-    const fixture_text = "memory: \u{2713} 已保存偏好：中文与emoji \u{1F600} 混排的长摘要不会换行";
-    const Geometry = struct {
-        fn check(record: *Record, columns: usize) !void {
-            const text_module = @import("text.zig");
-            try record.layout(std.testing.allocator, columns);
-            try std.testing.expectEqual(@as(usize, 1), record.lines.len);
-            const line = record.lines[0];
-            try std.testing.expectEqual(columns, record.columns);
-            try std.testing.expect(text_module.styledWidth(line) <= columns);
-            try std.testing.expect(std.mem.startsWith(u8, line, theme.reset));
-            // Whole clusters only: clipping never leaves a broken UTF-8 tail.
-            try std.testing.expect(std.unicode.utf8ValidateSlice(line));
-        }
-    };
-    var record = Record{ .kind = .notice, .single_row = true, .notice_level = .plain };
-    defer record.deinit(std.testing.allocator);
-    try record.body.appendSlice(std.testing.allocator, fixture_text);
-    try Geometry.check(&record, 40);
-    try std.testing.expect(std.mem.find(u8, record.lines[0], "...") != null);
-    // The retained body, not a pre-cut copy, is what a new width re-derives.
-    const wide = try std.testing.allocator.dupe(u8, record.lines[0]);
-    defer std.testing.allocator.free(wide);
-    try Geometry.check(&record, 12);
-    try std.testing.expect(!std.mem.eql(u8, wide, record.lines[0]));
-    // A width that fits nothing still stays inside one row without overrun.
-    try Geometry.check(&record, 1);
-    // Warning and failure rows keep their original tone when they opt in.
-    record.notice_level = .warning;
-    try Geometry.check(&record, 20);
-    try std.testing.expect(std.mem.find(u8, record.lines[0], theme.caution) != null);
-}
-test "memory saved notices stay one row across a passive resize and new delivery" {
-    const Fixture = struct {
-        next: ?memory_status.Terminal = null,
-        fn current(_: *anyopaque) Connection.State {
-            return .{ .runtime = null, .available = true, .model = "fixture", .base_url = "", .memory = .{ .enabled = true, .active = .{ .id = 7, .phase = .saving } } };
-        }
-        fn take(raw: *anyopaque) ?memory_status.Terminal {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const value = self.next;
-            self.next = null;
-            return value;
-        }
-    };
-    var fixture: Fixture = .{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection.context = &fixture;
-    ui.connection.current_fn = Fixture.current;
-    ui.connection.take_memory_completion_fn = Fixture.take;
-    ui.size = .{ .columns = 24, .rows = 12 };
-    var saved: memory_status.Terminal = .{ .id = 5, .result = .saved };
-    saved.summary.append("first-long-summary 中文与emoji \u{1F600} 超出可见列宽");
-    fixture.next = saved;
-    ui.pollMemoryCompletion();
-    const first_id = ui.records.items[0].id;
-    const text_module = @import("text.zig");
-    var first_screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 24, .rows = 12 };
-    try ui.draw();
-    const first = &ui.records.items[ui.record_index.get(first_id).?];
-    try std.testing.expect(first.single_row);
-    try std.testing.expectEqual(@as(usize, 1), first.lines.len);
-    try std.testing.expectEqual(@as(usize, 23), first.columns);
-    try std.testing.expect(text_module.styledWidth(first.lines[0]) <= 23);
-    try std.testing.expect(std.mem.find(u8, first.lines[0], "...") != null);
-    try first_screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), first_screen.count("memory: ~"));
-    testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(ui.records.items[ui.record_index.get(first_id).?].output);
-    try std.testing.expect(ui.records.items[ui.record_index.get(first_id).?].delivery_complete);
-    const before = ui.records.items.len;
-
-    ui.resize(.{ .columns = 12, .rows = 12 });
-    try std.testing.expect(ui.resize_waiting);
-    ui.clock_ms = 80;
-    ui.animate();
-    try std.testing.expect(ui.resize_waiting);
-    try std.testing.expect(!ui.drawReady());
-    try std.testing.expectEqual(@as(usize, 0), ui.frame.len);
-    try std.testing.expectEqual(before, ui.records.items.len);
-
-    var next: memory_status.Terminal = .{ .id = 6, .result = .saved };
-    next.summary.append("second-long-summary 中文与emoji \u{1F600} 超出可见列宽");
-    fixture.next = next;
-    ui.pollMemoryCompletion();
-    try std.testing.expect(!ui.resize_waiting);
-    try std.testing.expectEqual(before + 1, ui.records.items.len);
-    const second_id = ui.records.items[ui.records.items.len - 1].id;
-    try std.testing.expect(first_id != second_id);
-    try ui.draw();
-    const second = &ui.records.items[ui.record_index.get(second_id).?];
-    try std.testing.expect(second.single_row);
-    try std.testing.expectEqual(@as(usize, 1), second.lines.len);
-    try std.testing.expectEqual(@as(usize, 11), second.columns);
-    try std.testing.expect(text_module.styledWidth(second.lines[0]) <= 11);
-    try std.testing.expect(std.mem.find(u8, second.lines[0], "...") != null);
-    // The screen fixture cannot emulate terminal reflow: inspect each geometry
-    // separately, and assert the new frame never replays the retired first row.
-    try std.testing.expect(std.mem.find(u8, ui.frame, "first-long") == null);
-    var second_screen: @import("../tests/regular_screen.zig").Screen = .{ .columns = 12, .rows = 12 };
-    try second_screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), second_screen.count("..."));
-    try std.testing.expectEqual(@as(usize, 0), second_screen.count("first"));
-    testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(ui.records.items[ui.record_index.get(second_id).?].output);
-    try std.testing.expect(ui.records.items[ui.record_index.get(second_id).?].delivery_complete);
-}
-test "memory completion delivery is per delivered value and never clears a foreground error" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.notice = "Foreground error";
-    // A real second delivery is a second notification even when the owner reuses
-    // a job id; only the source queue/delivery layer proves one delivery.
-    try ui.acceptMemoryCompletion(.{ .id = 0, .result = .failed, .failure = .storage });
-    try ui.acceptMemoryCompletion(.{ .id = 0, .result = .failed, .failure = .storage });
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqualStrings("Foreground error", ui.notice);
-
-    const Probe = struct {
-        value: ?memory_status.Terminal,
-        fn take(raw: *anyopaque) ?memory_status.Terminal {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const value = self.value;
-            self.value = null;
-            return value;
-        }
-    };
-    var probe = Probe{ .value = .{ .id = 21, .result = .saved, .saved_count = 1 } };
-    ui.connection.context = &probe;
-    ui.connection.take_memory_completion_fn = Probe.take;
-    ui.pollMemoryCompletion();
-    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
-    // A repeated poll with no queued value publishes no duplicate.
-    ui.pollMemoryCompletion();
-    try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
-    // A value already popped but not yet displayable retries without taking
-    // another value and without touching the foreground error.
-    ui.memory_completion_pending = .{ .id = 22, .result = .uncertain, .failure = .unavailable };
-    ui.pollMemoryCompletion();
-    try std.testing.expectEqual(@as(usize, 4), ui.records.items.len);
-    try std.testing.expect(ui.memory_completion_pending == null);
-    try std.testing.expectEqualStrings("Foreground error", ui.notice);
-}
 test "notice body OOM publishes no partial record and preserves foreground notice" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -7222,56 +6831,6 @@ test "notice body OOM publishes no partial record and preserves foreground notic
     try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[before].notice_level);
     try std.testing.expectEqualStrings("new warning", ui.records.items[before].body.items);
     try std.testing.expectEqualStrings(foreground, ui.notice);
-}
-test "local memory OOM keeps one pending value then clears and takes the next" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    const Probe = struct {
-        value: ?memory_status.Terminal,
-        fn take(raw: *anyopaque) ?memory_status.Terminal {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const value = self.value;
-            self.value = null;
-            return value;
-        }
-    };
-    var probe = Probe{ .value = .{ .id = 31, .result = .saved, .saved_count = 1 } };
-    ui.connection.context = &probe;
-    ui.connection.take_memory_completion_fn = Probe.take;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    ui.allocator = failing.allocator();
-    ui.memory_completion_pending = .{ .id = 30, .result = .failed, .failure = .storage };
-    ui.pollMemoryCompletion();
-    try std.testing.expect(ui.memory_completion_pending != null);
-    // The source value is not consumed while the fixed pending slot is stuck.
-    try std.testing.expect(probe.value != null);
-    ui.allocator = std.testing.allocator;
-    ui.pollMemoryCompletion();
-    try std.testing.expect(ui.memory_completion_pending == null);
-    try std.testing.expect(probe.value == null);
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
-    try std.testing.expectEqual(NoticeLevel.success, ui.records.items[1].notice_level);
-}
-test "remote memory notice binds a record receipt and skipped binds metadata" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    try ui.applyEvent(.{ .memory_completed = .{ .id = 41, .result = .saved, .saved_count = 2 } }, false, true);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    const receipt = ui.delivery_receipt.?;
-    try std.testing.expectEqual(ui.records.items[0].id, receipt.id);
-    try std.testing.expect(!receipt.source);
-    ui.delivery_receipt = null;
-    try ui.applyEvent(.{ .memory_completed = .{ .id = 42, .result = .skipped } }, false, true);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqual(@as(u64, 0), ui.delivery_receipt.?.id);
-    try std.testing.expect(!ui.delivery_receipt.?.source);
 }
 test "complete publishes a failed terminal once and keeps it out of the footer" {
     var cancel: p.Cancellation = .{};
@@ -7541,34 +7100,6 @@ test "wrapped composer idle LF debt first obtains a single row fresh ACK" {
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-}
-test "memory terminal is conversation-only and never replaces foreground errors" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    var runtime: r.Runtime = undefined;
-    var state = ui.connection.current();
-    state.runtime = &runtime;
-    state.memory = .{ .enabled = true, .last_terminal = .{ .id = 1, .result = .uncertain } };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    ui.clock_ms = 100;
-    // Historical terminal state is never replayed into the footer.
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
-    ui.notice = "Foreground error";
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
-    ui.notice = "Ready";
-    ui.clock_ms = 999_999;
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
-    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
-    try ui.acceptMemoryCompletion(.{ .id = 2, .result = .uncertain, .failure = .unavailable });
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
-    try std.testing.expectEqualStrings("", try ui.hint(arena.allocator(), state));
-    try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
-    try std.testing.expect(ui.inbox.snapshot().newest_id == null);
 }
 test "authentication terminal detail is red in conversation and absent from the footer" {
     var cancel: p.Cancellation = .{};
@@ -7957,7 +7488,11 @@ test "slash menu shows model login compact with arguments and descriptions but n
     try std.testing.expect(std.mem.find(u8, ui.frame, "Commands") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/model") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Configure provider") != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/model [exact-id|--refresh]  Select model") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/model [exact-id|--refresh]") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Select model") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "> /model [exact-id|--refresh]" ++ theme.muted ++ "  Select model" ++ theme.reset) != null);
+    // The description is never part of the accented command token.
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "  Select model") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "/compact") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Compact conversation") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Type to filter; Tab complete") == null);
@@ -9047,7 +8582,8 @@ test "compact slash menu requires acknowledged choice then joins a summary-only 
     try std.testing.expect(ui.future == null);
     try ui.parser.feed("/co", sink);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "/compact  Compact conversation") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "/compact") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Compact conversation") != null);
     try ui.parser.feed("\r", sink); // Built but not ACKed: no action.
     try std.testing.expect(ui.future == null);
     ui.frame_offset = 1;
@@ -9295,7 +8831,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     // Settings-root draft: the child must never destroy it.
     _ = try ui.editor.insert("draft");
     try ui.draw();
@@ -9374,7 +8910,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.escape);
     try std.testing.expect(!ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 6), ui.settings_menu.selected);
+    try std.testing.expectEqual(@as(usize, 5), ui.settings_menu.selected);
     try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
 }
 test "proxy picker owns its query while the parent submenu stays marked" {
@@ -9392,7 +8928,7 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9437,7 +8973,7 @@ test "settings proxy submenu reports a missing endpoint instead of stalling" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9499,7 +9035,7 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     // Root 6 -> second level -> Address, prefilled empty when nothing is set.
@@ -9590,7 +9126,7 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9634,7 +9170,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -14144,4 +13680,15 @@ test "command prompt uses the bang marker and accent color" {
     defer rendered.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("(fixture ?%)! ", rendered.plain);
     try std.testing.expect(std.mem.find(u8, rendered.styled, theme.accent ++ "!") != null);
+}
+
+test "slash candidate emphasis tints only the command token" {
+    const a = std.testing.allocator;
+    try text.initLocale();
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    const line = "> /model [exact-id|--refresh]  Select model";
+    try putCandidateLine(&out.writer, a, 0, line, 80, theme.accent, false, 2 + "/model [exact-id|--refresh]".len);
+    try std.testing.expect(std.mem.find(u8, out.written(), theme.accent ++ "> /model [exact-id|--refresh]" ++ theme.muted ++ "  Select model" ++ theme.reset) != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), theme.accent ++ "  Select model") == null);
 }

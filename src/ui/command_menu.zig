@@ -34,6 +34,14 @@ pub fn info(command: Command) Item {
     return items[@backingInt(command)];
 }
 
+/// Bytes occupied by the command token and its optional argument synopsis,
+/// including the two-cell selection prefix. Used to tint only that part of a
+/// selected candidate row; the description keeps the muted tone.
+pub fn labelBytes(command: Command) usize {
+    const item = info(command);
+    return 2 + item.value.len + if (item.arguments.len != 0) 1 + item.arguments.len else 0;
+}
+
 /// Only a single slash token at the beginning of the editor is a command.
 /// Pasted text and a cursor inside the token never open the menu.
 pub fn suggestions(value: []const u8, cursor: usize, pasted: bool) Matches {
@@ -57,6 +65,9 @@ pub const Rows = struct {
     lines: []const []const u8,
     selected_line: ?usize = null,
     can_confirm: bool = false,
+    /// Index of the first rendered candidate; `labelBytes` turns it into the
+    /// per-row command tint boundary without another allocation.
+    start: usize = 0,
 };
 
 /// Only candidate rows, capped at ten and `max_rows`; each row is clipped
@@ -99,6 +110,7 @@ pub fn rows(a: std.mem.Allocator, matches: Matches, selected: usize, columns: us
         .lines = try lines.toOwnedSlice(a),
         .selected_line = if (count != 0) selected_ - start else null,
         .can_confirm = count != 0 and columns >= 2 + text.width(info(matches.commands[selected_]).value),
+        .start = start,
     };
 }
 

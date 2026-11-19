@@ -8,7 +8,7 @@ pub const Key = @import("../core/settings.zig").Key;
 pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
     "Low-price input", "Auto compaction", "Command timeout", "Request timeout",
-    "Image model",     "Auto memory",     "Proxy",           "Reported usage",
+    "Image model",     "Proxy",           "Reported usage",
 };
 /// Bounded endpoint text buffer: host/port, [IPv6]:port or a borrowed address.
 pub const endpoint_buffer_bytes = cfg.max_proxy_endpoint_bytes + 8;
@@ -16,7 +16,6 @@ pub const count = labels.len;
 pub const Snapshot = struct {
     low_price_input_enabled: bool = true,
     image_enabled: bool = false,
-    memory_auto: bool = true,
     image_model: ?[]const u8 = null,
     /// Owner-published proxy host/port state; never inferred from the model list.
     proxy_configured: bool = false,
@@ -32,8 +31,7 @@ pub fn preferenceKey(selected: usize) ?Key {
         1 => .compaction_enabled,
         2 => .command_timeout_ms,
         3 => .request_timeout_ms,
-        5 => .memory_auto,
-        7 => .show_reported_usage,
+        6 => .show_reported_usage,
         else => null,
     };
 }
@@ -54,10 +52,9 @@ pub fn value(state: Snapshot, selected: usize) []const u8 {
         0 => if (state.low_price_input_enabled) "on" else "off",
         4 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
         // rows formats the exact endpoint text; empty means "formatted there".
-        6 => if (state.proxy_address == null) "Not configured" else "",
+        5 => if (state.proxy_address == null) "Not configured" else "",
         1 => if (state.limits.compaction_enabled) "on" else "off",
-        5 => if (state.memory_auto) "on" else "off",
-        7 => if (state.limits.show_reported_usage) "on" else "off",
+        6 => if (state.limits.show_reported_usage) "on" else "off",
         2, 3 => "s",
         else => "",
     };
@@ -69,9 +66,8 @@ pub fn description(selected: usize) []const u8 {
         2 => "Command timeout in s (up to 3 decimals).",
         3 => "All inference requests in s (up to 3 decimals).",
         4 => "Read images through a separate helper returning text. Off unless explicitly selected.",
-        5 => "Automatically extract and maintain useful memory. On by default.",
-        6 => "Configure the proxy address and exact model routes. A new session applies it.",
-        7 => "Show the provider-reported usage inside the model parentheses.",
+        5 => "Configure the proxy address and exact model routes. A new session applies it.",
+        6 => "Show the provider-reported usage inside the model parentheses.",
         else => "",
     };
 }
@@ -104,13 +100,13 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, state: Snapshot, columns: usize, m
     for (start..start + visible) |index| {
         var buffer: [32]u8 = undefined;
         var endpoint: [endpoint_buffer_bytes]u8 = undefined;
-        const v = if (index == 6) try formatEndpoint(&endpoint, state) else try renderedValue(state, index, &buffer);
+        const v = if (index == 5) try formatEndpoint(&endpoint, state) else try renderedValue(state, index, &buffer);
         const gap = label_width - text.width(label(index));
         const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  {s}", .{ if (index == selected) "> " else "  ", label(index), padding[0..gap], v });
         defer a.free(raw);
         // Image/Proxy only open a submenu; their current value is not being
         // saved. All saving root rows keep the full check.
-        if (index == selected) complete = if (index == 4 or index == 6)
+        if (index == selected) complete = if (index == 4 or index == 5)
             2 + text.width(label(index)) <= columns
         else
             text.width(raw) <= columns;

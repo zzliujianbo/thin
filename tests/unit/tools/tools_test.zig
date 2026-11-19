@@ -50,7 +50,6 @@ test "bash batch returns ordered bounded results and rejects high-risk batches" 
     const result = try tools.execute(a, .{ .bash = .{ .commands = &commands } }, &cancel);
     try std.testing.expect(result.is_error);
     try std.testing.expect(!result.canceled);
-    try std.testing.expect(!result.memory_evidence);
     const json = try std.json.parseFromSliceLeaky(std.json.Value, a, result.text, .{});
     const rows = json.object.get("commands").?.array.items;
     try std.testing.expectEqual(@as(usize, 6), rows.len);
@@ -384,8 +383,8 @@ test "image tool strict arguments schemas guards and bounded text output" {
 }
 test "background schema is appended last and old schemas keep indexes" {
     {
-        const off = schemasFor(true, true, false);
-        const on = schemasFor(true, true, true);
+        const off = schemasFor(true, false);
+        const on = schemasFor(true, true);
         try std.testing.expectEqual(@as(usize, 6), off.len);
         try std.testing.expectEqual(@as(usize, 7), on.len);
         try std.testing.expectEqualStrings("read_image", off[4].name);
@@ -406,7 +405,7 @@ test "background schema is appended last and old schemas keep indexes" {
         }
     }
     // The management tool stays appended after the ordinary schemas.
-    const root_only = schemasFor(true, true, true);
+    const root_only = schemasFor(true, true);
     try std.testing.expectEqual(@as(usize, 7), root_only.len);
     try std.testing.expectEqualStrings("background", root_only[5].name);
 }
@@ -502,7 +501,6 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expectEqual(@as(u32, cfg.Policy.cleanup_grace_ms), fake.last_grace_ms);
     try std.testing.expectEqual(@as(u32, cfg.Policy.cleanup_timeout_ms), fake.last_cleanup_ms);
     try std.testing.expectEqualStrings(fake.start_text, started.text);
-    try std.testing.expect(!started.memory_evidence);
     try std.testing.expect(!started.is_error);
 
     // Explicit timeout_ms bounds only the startup wait, just like the default.
@@ -522,7 +520,6 @@ test "background capability is root-only approved and never re-encoded" {
     try std.testing.expectEqualStrings(fake.control_text, stopped.text);
     try std.testing.expect(!stopped.canceled);
     try std.testing.expect(!stopped.is_error);
-    try std.testing.expect(!stopped.memory_evidence);
     try std.testing.expect(fake.last_query.action == .stop);
 
     // A cleanup failure is returned verbatim and poisons; no re-encoding.

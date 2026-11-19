@@ -35,7 +35,6 @@ const presentation = @import("presentation.zig");
 const shared = @import("../presentation.zig");
 const bridge_module = @import("bridge.zig");
 const session_client = @import("session_client.zig");
-const memory_status = @import("../core/memory_status.zig");
 const background_status = @import("../core/background_status.zig");
 const remote_action = @import("remote_action.zig");
 const Io = std.Io;
@@ -90,9 +89,9 @@ const Record = struct {
     /// Notice-only tone; all other kinds render exactly as before.
     notice_level: NoticeLevel = .plain,
     /// One physical display row: the body is clipped to the real screen width
-    /// with an ellipsis instead of wrapping. Only compact confirmations (the
-    /// Memory saved result) opt in; every other notice keeps paragraph
-    /// rendering so no real failure text is ever cut away.
+    /// with an ellipsis instead of wrapping. Only compact confirmations opt in;
+    /// every other notice keeps paragraph rendering so no real failure text is
+    /// ever cut away.
     single_row: bool = false,
     /// Leading status marker bytes that keep their own colour.
     /// Zero colours the whole row with the notice severity.
@@ -538,9 +537,6 @@ pub const Connection = struct {
     /// Explicit metadata refresh and bounded owner polling, separate from LLM jobs.
     refresh_models_fn: ?*const fn (*anyopaque) anyerror!void = null,
     poll_models_fn: ?*const fn (*anyopaque, bool) bool = null,
-    /// Local foreground only: pop one delivered Memory terminal. The owner
-    /// returns it exactly once; remote sessions deliver through display events.
-    take_memory_completion_fn: ?*const fn (*anyopaque) ?memory_status.Terminal = null,
     peek_background_fn: ?*const fn (*anyopaque) ?background_status.Terminal = null,
     take_background_fn: ?*const fn (*anyopaque, background_status.Id) void = null,
     /// Local foreground task lifecycle. The owner marks its own shared
@@ -601,8 +597,6 @@ pub const Connection = struct {
         image_enabled: bool = false,
         image_models: []const core_config.Model = &.{},
         image_model: ?[]const u8 = null,
-        memory_auto: bool = true,
-        memory: @import("../core/memory_status.zig").View = .{},
         background: background_status.View = .{},
         /// Owner-published proxy host/port availability; never inferred or guessed.
         proxy_configured: bool = false,
@@ -628,13 +622,6 @@ pub const Connection = struct {
 
     pub fn current(self: Connection) State {
         return self.current_fn(self.context);
-    }
-
-    /// Pop one Memory terminal from the local owner queue. Remote sessions
-    /// never use this callback; they deliver the same value as an event.
-    pub fn takeMemoryCompletion(self: Connection) ?memory_status.Terminal {
-        const callback = self.take_memory_completion_fn orelse return null;
-        return callback(self.context);
     }
 
     pub fn peekBackground(self: Connection) ?background_status.Terminal {
@@ -1070,9 +1057,6 @@ const Ui = struct {
     settings_error_seen: ?anyerror = null,
     log_error_seen: ?anyerror = null,
     settings_notice_seen: ?u64 = null,
-    /// Exact Memory terminal popped locally whose transcript publication
-    /// failed. One fixed value, retried before taking any new source value.
-    memory_completion_pending: ?memory_status.Terminal = null,
     /// A local foreground task was announced to the owner and its joined
     /// release is still owed. Exactly one release follows one begin.
     task_owned: bool = false,
@@ -2391,7 +2375,6 @@ const Ui = struct {
         self.settings_error_seen = null;
         self.log_error_seen = null;
         self.settings_notice_seen = null;
-        self.memory_completion_pending = null;
         self.terminal_notice_pending = null;
         self.terminal_alias = "";
         self.notice_alias_hash = null;
@@ -3017,8 +3000,8 @@ const Ui = struct {
             }
         }
         if (notice.len == 0 and self.remote() != null and !state.available) notice = "Daemon connection unavailable; exit and reconnect";
-        // Memory and background activity are rendered in the separate
-        // activity row below, not mixed into the actionable notice line.
+        // Background activity is rendered in the separate activity row below,
+        // not mixed into the actionable notice line.
         if (notice.len == 0) if (state.pending_default_effort) |effort| {
             notice = try std.fmt.allocPrint(a, "Default thinking: {s}; awaiting model capabilities", .{effort.name() orelse "unknown"});
         };
@@ -3036,7 +3019,7 @@ const Ui = struct {
         return notice;
     }
 
-    /// Activity row: memory then background, immediately above the composer.
+    /// Activity row: background activity, immediately above the composer.
     /// The spinner is a foreground cue; when the foreground is idle, only
     /// static counts remain.
     fn activityLine(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
@@ -3045,23 +3028,6 @@ const Ui = struct {
         const spinner = activity.spinner(self.clock_ms);
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(a);
-        if (state.memory.enabled and (state.memory.active != null or state.memory.queued_count != 0)) {
-            if (foreground) {
-                const part = if (state.memory.queued_count != 0)
-                    try std.fmt.allocPrint(a, "memory: {s} +{d}", .{ spinner, state.memory.queued_count })
-                else
-                    try std.fmt.allocPrint(a, "memory: {s}", .{spinner});
-                try parts.append(a, part);
-            } else if (state.memory.active != null) {
-                const part = if (state.memory.queued_count != 0)
-                    try std.fmt.allocPrint(a, "memory: 1 +{d}", .{state.memory.queued_count})
-                else
-                    try a.dupe(u8, "memory: 1");
-                try parts.append(a, part);
-            } else {
-                try parts.append(a, try std.fmt.allocPrint(a, "memory: +{d}", .{state.memory.queued_count}));
-            }
-        }
         if (state.background.active_count != 0) {
             if (foreground) {
                 const part = if (state.background.active_count > 1)
@@ -3253,7 +3219,7 @@ const Ui = struct {
                 reasoning = true;
                 source = v.len != 0;
             },
-            .memory_completed, .background_completed => {
+            .background_completed => {
                 // A completed background result owns its appended row, not a
                 // stream source. A silent skipped result is a metadata fence.
                 source = false;
@@ -3454,7 +3420,6 @@ const Ui = struct {
                     .rejected => "Automatic compaction skipped: the last automatic summary was rejected; context remains within budget.",
                 });
             },
-            .memory_completed => |terminal| try self.acceptMemoryCompletion(terminal),
             .background_completed => |terminal| try self.appendBackgroundCompletion(terminal),
             // 这些事件对 UI 没有需要展示的内容。
             .finished => {},
@@ -3719,7 +3684,7 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
-        const parent: usize = if (self.settings_model_picker == .image) 4 else if (self.anyProxyOpen()) 6 else 1;
+        const parent: usize = if (self.settings_model_picker == .image) 4 else if (self.anyProxyOpen()) 5 else 1;
         if (self.settingsModelOpen()) self.wipeEditor();
         if (self.proxyEditorBorrowed()) self.endProxyEditor();
         self.displayed_picker_fingerprint = null;
@@ -3741,7 +3706,6 @@ const Ui = struct {
     fn settingsValueTitle(key_: preference.Key) []const u8 {
         return switch (key_) {
             .compaction_enabled => "Auto compaction",
-            .memory_auto => "Auto memory",
             .command_timeout_ms => "Command timeout (s)",
             .request_timeout_ms => "All inference request timeout (s)",
             .show_reported_usage => "Reported usage",
@@ -3750,7 +3714,6 @@ const Ui = struct {
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
         const current: ?u32 = switch (key_) {
             .compaction_enabled => @intFromBool(state.limits.compaction_enabled),
-            .memory_auto => @intFromBool(state.memory_auto),
             .command_timeout_ms => state.limits.command_timeout_ms,
             .request_timeout_ms => state.limits.request_timeout_ms,
             .show_reported_usage => @intFromBool(state.limits.show_reported_usage),
@@ -4201,7 +4164,7 @@ const Ui = struct {
                     self.notice = "Ready";
                     return;
                 }
-                if (!self.settingsQueryOpen() and self.settings_menu.selected == 6) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 5) {
                     self.backToProxySubmenu(0);
                     return;
                 }
@@ -4209,8 +4172,6 @@ const Ui = struct {
                     if (settings_menu_module.preferenceKey(self.settings_menu.selected)) |key_| {
                         if (key_ == .compaction_enabled) {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.compaction_enabled));
-                        } else if (key_ == .memory_auto) {
-                            _ = self.savePreference(key_, @intFromBool(!state.memory_auto));
                         } else if (key_ == .show_reported_usage) {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.show_reported_usage));
                         } else self.openSettingsValue(key_, state);
@@ -5874,64 +5835,6 @@ const Ui = struct {
         self.records.items[index].notice_level = level;
     }
 
-    /// Memory terminal wording. Skipped is deliberately silent. The leading
-    /// marker carries the outcome (`✓` saved, `✗` failed or uncertain) and is the
-    /// only tinted part; the summary after it stays muted. A failed or uncertain
-    /// result that still saved some entries keeps that fact instead of pretending
-    /// to be a success.
-    fn formatMemoryTerminal(terminal: memory_status.Terminal, buffer: []u8) ?struct { level: NoticeLevel, text: []const u8, marker_len: usize } {
-        if (terminal.result == .skipped) return null;
-        const label: []const u8 = switch (terminal.result) {
-            .saved => "memory: \u{2713}",
-            .failed, .uncertain => "memory: \u{2717}",
-            .canceled => "memory: canceled",
-            .skipped => return null,
-        };
-        const level: NoticeLevel = switch (terminal.result) {
-            .saved => .success,
-            .canceled => .plain,
-            .failed, .uncertain => .failure,
-            .skipped => unreachable,
-        };
-        // Only the marker is tinted; cancellation stays an uncoloured sentence.
-        const marker_len: usize = switch (terminal.result) {
-            .saved, .failed, .uncertain => label.len,
-            .canceled => 0,
-            .skipped => unreachable,
-        };
-        const summary = terminal.summary.text();
-        const value_text = if (terminal.result == .saved)
-            if (summary.len == 0)
-                label
-            else
-                std.fmt.bufPrint(buffer, "{s} {s}", .{ label, summary }) catch return null
-        else if (terminal.saved_count != 0 and summary.len != 0)
-            std.fmt.bufPrint(buffer, "{s} saved ({d}) - {s}", .{ label, terminal.saved_count, summary }) catch return null
-        else if (terminal.saved_count != 0)
-            std.fmt.bufPrint(buffer, "{s} saved ({d})", .{ label, terminal.saved_count }) catch return null
-        else
-            label;
-        return .{ .level = level, .text = value_text, .marker_len = marker_len };
-    }
-
-    fn appendMemoryCompletion(self: *Ui, terminal: memory_status.Terminal) !void {
-        var buffer: [640]u8 = undefined;
-        const formatted = formatMemoryTerminal(terminal, &buffer) orelse return;
-        const index = try self.addRecord(.notice, formatted.text);
-        self.records.items[index].notice_level = formatted.level;
-        self.records.items[index].notice_marker_len = formatted.marker_len;
-        // Only the saved confirmation is guaranteed one physical row. Failure,
-        // uncertainty and cancellation keep the ordinary paragraph rendering so
-        // nothing real becomes invisible on a narrow screen.
-        self.records.items[index].single_row = terminal.result == .saved;
-    }
-
-    /// Remote delivery is fallible on purpose: the caller keeps the source
-    /// sequence unacknowledged when the row was not really appended.
-    fn acceptMemoryCompletion(self: *Ui, terminal: memory_status.Terminal) !void {
-        try self.appendMemoryCompletion(terminal);
-    }
-
     /// Background terminal rows are UI-only. Keep the result and failure
     /// classification ahead of the potentially long command when clipped.
     fn appendBackgroundCompletion(self: *Ui, terminal: background_status.Terminal) !void {
@@ -5967,7 +5870,7 @@ const Ui = struct {
     /// Peek is non-consuming: admission must succeed before the exact source
     /// id is retired. Remote completions arrive only through the live stream.
     fn pollBackgroundCompletion(self: *Ui) void {
-        if (!self.memorySafePoint() or self.remote() != null or self.connection.take_background_fn == null) return;
+        if (!self.appendSafePoint() or self.remote() != null or self.connection.take_background_fn == null) return;
         var batch: usize = 0;
         while (batch < 8) : (batch += 1) {
             const terminal = self.connection.peekBackground() orelse return;
@@ -5995,35 +5898,11 @@ const Ui = struct {
         joined(self.connection.context);
     }
 
-    /// Memory completion is appended only at the idle point the host proxy
-    /// guarantees (after a task was reaped, before the next dispatch). The
-    /// body stream and its delivery order are never interrupted, and no UI
-    /// FIFO of pending results is built.
-    fn memorySafePoint(self: *const Ui) bool {
+    /// Owner-published notices are appended only at the host-proxy idle point
+    /// (after a task was reaped, before the next dispatch). The body stream and
+    /// its delivery order are never interrupted.
+    fn appendSafePoint(self: *const Ui) bool {
         return !self.busy and self.future == null and self.draft == null and self.reasoning == null;
-    }
-
-    /// Local foreground delivery is a source-queue pop, so repeated polls with
-    /// no value are naturally silent. Failed UI publication keeps the exact
-    /// value in fixed retry slots and stops taking more values until it lands.
-    fn pollMemoryCompletion(self: *Ui) void {
-        if (!self.memorySafePoint()) return;
-        if (self.memory_completion_pending) |terminal| {
-            self.appendMemoryCompletion(terminal) catch return;
-            self.memory_completion_pending = null;
-            self.requestDraw();
-        }
-        if (self.remote() != null) return;
-        const callback = self.connection.take_memory_completion_fn orelse return;
-        var batch: usize = 0;
-        while (batch < 8) : (batch += 1) {
-            const terminal = (callback(self.connection.context)) orelse return;
-            self.appendMemoryCompletion(terminal) catch {
-                self.memory_completion_pending = terminal;
-                return;
-            };
-            self.requestDraw();
-        }
     }
 
     /// A persistent capability warning stays in the neutral footer; every
@@ -6094,7 +5973,7 @@ const Ui = struct {
     }
 
     fn retryTerminalNotice(self: *Ui) void {
-        if (!self.memorySafePoint()) return;
+        if (!self.appendSafePoint()) return;
         const pending = self.terminal_notice_pending orelse return;
         if (!self.publishTerminalNotice(pending)) return;
         self.terminal_notice_pending = null;
@@ -6167,7 +6046,7 @@ const Ui = struct {
             // A real earlier publication, not a snapshot, owns this exact twin.
             self.notice_alias_hash = self_hash;
             self.notice_alias_pending = null;
-        } else if (self.memorySafePoint()) {
+        } else if (self.appendSafePoint()) {
             if (self.notice_alias_pending) |pending| {
                 const level: NoticeLevel = if (self_restored) .plain else pending.level;
                 if (self.tryAppendNotice(level, self.notice)) {
@@ -6468,8 +6347,8 @@ const Ui = struct {
             !self.settings_open and !self.provider_open and self.model_picker == null;
     }
 
-    /// Only a foreground task animates. Background memory/background activity
-    /// is rendered as static counts while the composer is idle.
+    /// Only a foreground task animates. Background activity is rendered as
+    /// static counts while the composer is idle.
     fn animationActive(self: *const Ui) bool {
         return self.workingOnTask();
     }
@@ -6517,7 +6396,6 @@ const Ui = struct {
             // Both local and remote output share the bounded event budget;
             // buffered remote deltas must not wait one terminal tick apiece.
             try self.pumpDisplay();
-            self.pollMemoryCompletion();
             self.pollBackgroundCompletion();
 
             // acquire 与 worker 的 release 配对，确保读到任务结果。
@@ -7584,7 +7462,6 @@ const Ui = struct {
             .low_price_input_enabled = state.low_price_input_enabled,
             .image_enabled = state.image_enabled,
             .image_model = state.image_model,
-            .memory_auto = state.memory_auto,
             .proxy_configured = state.proxy_configured,
             .proxy_address = state.proxy_address,
             .proxy_port = state.proxy_port,
@@ -7628,6 +7505,9 @@ const Ui = struct {
         const codex_popup = [_][]const u8{ corecodex.verification_url, if (codex_code.len != 0) codex_code else "Waiting for device code...", "Esc cancels" };
         const popup_lines: []const []const u8 = if (self.codex_open) &codex_popup else if (modal_text != null and self.stop_open) queue_lines.items else if (modal_text != null and self.permission != null) preview else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (self.resume_picker != null) resume_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
         const selected_line = if (self.codex_open or self.stop_open or self.permission != null) @as(?usize, null) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else if (self.resume_picker != null) resume_rows.selected_line else menu_rows.selected_line;
+        // Slash candidates tint only the command token; the description stays
+        // muted. Other candidate popups keep their existing full-row tone.
+        const command_popup = menu_visible and !self.codex_open and !(modal_text != null and (self.stop_open or self.permission != null));
         const checked_mask: u16 = if (self.stop_open) 0 else if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
         const popup_gap: usize = @intFromBool(popup_lines.len != 0 and modal_text == null);
         const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
@@ -7828,10 +7708,14 @@ const Ui = struct {
             // Shared provider palette for root, provider and model candidates.
             for (0..popup_span) |line| {
                 const tone = if (selected_line == line) theme.accent else theme.muted;
+                const emphasis: ?usize = if (command_popup)
+                    command_menu_module.labelBytes(self.command_matches.commands[menu_rows.start + line])
+                else
+                    null;
                 if (self.permission != null and !self.stop_open) {
                     try putStyled(writer, 1 + content_body_rows + line, popup_lines[line]);
                 } else {
-                    try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0);
+                    try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0, emphasis);
                 }
             }
             if (popup_span == popup_lines.len) {
@@ -8078,7 +7962,7 @@ fn putStyled(writer: *Io.Writer, row: usize, line: []const u8) !void {
 /// 按终端列宽截断一行后输出：先清理控制字符，再按字素簇累计显示宽度，超出列宽即停止。
 /// Menu input prefixes are highlighted; typed text and secret masks stay in
 /// the terminal default color. Clip/sanitize before adding trusted styles.
-fn putCandidateLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, value: []const u8, columns: usize, tone: []const u8, checked: bool) !void {
+fn putCandidateLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, value: []const u8, columns: usize, tone: []const u8, checked: bool, emphasis: ?usize) !void {
     // Candidate modules already bound display cells and sanitize identifiers.
     // Do not reapply the generic 512-byte caption cap after adding the prefix:
     // that could hide a previously authorized multi-byte identifier suffix.
@@ -8086,7 +7970,11 @@ fn putCandidateLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, value:
     defer a.free(buffer);
     const safe = buffer[0..fittingBytes(buffer, columns)];
     const glyph = "✓";
-    const styled = if (checked and safe.len >= 2 + glyph.len and std.mem.eql(u8, safe[2..][0..glyph.len], glyph))
+    const styled = if (emphasis) |end| blk: {
+        // Slash candidates tint only the command label; descriptions stay muted.
+        const boundary = @min(end, safe.len);
+        break :blk try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ tone, safe[0..boundary], theme.muted, safe[boundary..], theme.reset });
+    } else if (checked and safe.len >= 2 + glyph.len and std.mem.eql(u8, safe[2..][0..glyph.len], glyph))
         try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}", .{ tone, safe[0..2], theme.success, glyph, tone, safe[2 + glyph.len ..], theme.reset })
     else
         try std.fmt.allocPrint(a, "{s}{s}{s}", .{ tone, safe, theme.reset });

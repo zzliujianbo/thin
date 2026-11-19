@@ -105,7 +105,7 @@ test "App ignores retired memory layout and preserves its artifacts" {
     var config_store = try @import("auth_store.zig").Store.open(a, io, home);
     defer config_store.deinit();
     try config_store.root.writeMode(cfg.file_name,
-        \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat"}}}}},"memory":{"auto":false}}
+        \\{"llm":{"default":"fixture/fake","providers":{"fixture":{"base_url":"http://unused.invalid","api_key":"fake-review-key","models":{"fake":{"context_tokens":32768,"protocol":"chat"}}}}}}
     , false, 0o600);
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
     const project = try std.fs.path.join(a, &.{ home, "project" });
@@ -199,38 +199,4 @@ test "App protects actual configuration behind HOME and file symlinks" {
             }
         }
     }
-}
-test "App submit rejection emits one completion and keeps the primary runtime usable" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [4096]u8 = undefined;
-    var root = try fs.Root.open(a, io, buffer[0..try tmp.dir.realPath(io, &buffer)]);
-    defer root.deinit();
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("HOME", root.path);
-    const fixture =
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"http://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"context_tokens":32768,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
-    ;
-    var parsed = try cfg.parse(a, fixture);
-    model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &.{}) catch |err| {
-        cfg.release(&parsed);
-        return err;
-    };
-    const queue = try MemoryNotifications.create(a);
-    defer queue.deinit();
-    const app = try App.initConfiguredAnchoredAuth(a, io, &env, &root, "/unused/private/config.json", .{}, parsed);
-    defer app.deinit();
-    app.bindMemoryNotifications(queue);
-    var capture: knowledge.Capture = .{ .allocator = a, .incomplete = true };
-    App.submitMemory(app, &capture, .chat);
-    try std.testing.expectEqual(@as(u16, @intFromError(error.IncompleteCapture)), app.memory_coordinator.failure.load(.acquire));
-    const completion = queue.take().?;
-    try std.testing.expectEqual(@as(u64, 1), completion.id);
-    try std.testing.expectEqual(@import("../core/memory_status.zig").Result.failed, completion.result);
-    try std.testing.expect(queue.take() == null);
-    try std.testing.expect(!app.runtime.poisoned);
-    try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }

@@ -1,14 +1,16 @@
 //! Classified local reference records. Metadata is constructed by the host only.
 const std = @import("std");
 const mem = @import("memory.zig");
-const knowledge = @import("../core/knowledge.zig");
 const fs = @import("../platform/filesystem.zig");
-pub const Apply = enum { created, updated, unchanged, skipped };
+
+/// On-disk V3 category tags. The automatic extractor is gone; this enum only
+/// decodes records it left behind, while new writes are plain memory topics.
+const Category = enum { preferences, project, environment, solutions, pitfalls };
 const Record = struct {
     schema: u8 = 3,
     source: []const u8,
     created_ms: u64,
-    category: knowledge.Category,
+    category: Category,
     topic: []const u8,
     content: []const u8,
 };
@@ -21,63 +23,6 @@ pub const Repository = struct {
     pub fn init(store: *mem.Store) Repository {
         return .{ .store = store };
     }
-    pub fn apply(self: *Repository, a: std.mem.Allocator, material: knowledge.Material, candidate: knowledge.Candidate) !Apply {
-        try mem.validTopic(candidate.topic);
-        if (candidate.topic.len > 40 or candidate.topic[candidate.topic.len - 1] == '-' or std.mem.indexOf(u8, candidate.topic, "--") != null) return error.InvalidMemoryCandidate;
-        try fs.validateText(candidate.content);
-        if (!validId(material.id)) return error.InvalidMaterial;
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const temp = arena.allocator();
-        const key = try std.fmt.allocPrint(temp, "{s}-{s}", .{ @tagName(candidate.category), candidate.topic });
-        const normalized = std.mem.trim(u8, candidate.content, " \t\r\n");
-        if (normalized.len == 0) return error.InvalidMemoryCandidate;
-        const baseline = relatedContent(material.related, candidate.category, candidate.topic);
-        const old = self.store.read(temp, key) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (old) |entry| {
-            const record = decode(temp, key, entry.content) catch |err| switch (err) {
-                error.InvalidKnowledgeRecord => return .skipped,
-                else => return err,
-            } orelse return .skipped;
-            if (std.mem.eql(u8, record.content, normalized)) return .unchanged;
-            // Auto correction is allowed only if the stored fact is still the
-            // exact content the extractor saw. A manual/other write wins.
-            const base = baseline orelse return .skipped;
-            if (!std.mem.eql(u8, record.content, base)) return .skipped;
-            _ = self.store.compareAndReplace(temp, key, entry.content, try self.encodeEntry(temp, material, candidate, normalized)) catch |err| switch (err) {
-                error.ContentChanged, error.FileNotFound => return .skipped,
-                else => return err,
-            };
-            return .updated;
-        }
-        // No current file. If related saw a topic that is now gone, do not
-        // resurrect it; otherwise create.
-        if (baseline != null) return .skipped;
-        _ = self.store.create(temp, key, try self.encodeEntry(temp, material, candidate, normalized)) catch |err| switch (err) {
-            error.PathAlreadyExists => return .skipped,
-            else => return err,
-        };
-        return .created;
-    }
-
-    fn encodeEntry(self: *Repository, a: std.mem.Allocator, material: knowledge.Material, candidate: knowledge.Candidate, normalized: []const u8) ![]u8 {
-        _ = self;
-        const record: Record = .{
-            .source = material.id,
-            .created_ms = material.created_ms,
-            .category = candidate.category,
-            .topic = candidate.topic,
-            .content = normalized,
-        };
-        const json = try std.json.Stringify.valueAlloc(a, record, .{});
-        var preview_len = @min(@as(usize, 256), std.mem.findScalar(u8, normalized, '\n') orelse normalized.len);
-        while (preview_len < normalized.len and preview_len > 0 and normalized[preview_len] & 0xc0 == 0x80) preview_len -= 1;
-        return std.fmt.allocPrint(a, "{s}: {s} {s}{s}{s}\n", .{ @tagName(candidate.category), candidate.topic, normalized[0..preview_len], marker, json });
-    }
-
     /// Public read semantic: V3 records return their content, manual raw
     /// topics return their raw body, and legacy v1/v2 records are invisible.
     /// Corrupt V3 records remain errors instead of leaking framing bytes.
@@ -95,32 +40,7 @@ pub const Repository = struct {
         return a.dupe(u8, entry.content);
     }
 
-    pub fn related(self: *Repository, a: std.mem.Allocator, query: []const u8, now_ms: u64) ![]const knowledge.Related {
-        _ = now_ms;
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const temp = arena.allocator();
-        const hits = try self.collect(temp, query);
-        var out: std.ArrayList(knowledge.Related) = .empty;
-        errdefer {
-            for (out.items) |entry| {
-                a.free(entry.topic);
-                a.free(entry.content);
-            }
-            out.deinit(a);
-        }
-        for (hits) |hit| {
-            const r = hit.record orelse continue;
-            const topic = try a.dupe(u8, r.topic);
-            errdefer a.free(topic);
-            const content = try a.dupe(u8, hit.body);
-            errdefer a.free(content);
-            try out.append(a, .{ .category = r.category, .topic = topic, .content = content });
-        }
-        return out.toOwnedSlice(a);
-    }
-    pub fn retrieve(self: *Repository, a: std.mem.Allocator, query: []const u8, now_ms: u64) ![]u8 {
-        _ = now_ms;
+    pub fn retrieve(self: *Repository, a: std.mem.Allocator, query: []const u8) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const temp = arena.allocator();
@@ -220,12 +140,6 @@ fn decode(a: std.mem.Allocator, key: []const u8, text: []const u8) !?Record {
 }
 fn isLegacy(text: []const u8) bool {
     return std.mem.find(u8, text, marker_v2) != null or std.mem.find(u8, text, marker_v1) != null;
-}
-fn relatedContent(related: []const knowledge.Related, category: knowledge.Category, topic: []const u8) ?[]const u8 {
-    for (related) |r| {
-        if (r.category == category and std.mem.eql(u8, r.topic, topic)) return r.content;
-    }
-    return null;
 }
 fn score(query: []const u8, key: []const u8, body: []const u8) usize {
     var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n,.;:!?/\\-_");

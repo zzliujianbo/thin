@@ -53,9 +53,9 @@ ROWS = 24
 _VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
                r'xhigh|max|\?))')
 _IDLE_COMPOSER = re.compile(
-    r'^(?:> |(?:\([^)]*\) )?' + _VALUE_SLOT + r'> )$')
+    r'^(?:> |(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?> )$')
 SPINNER_CHARS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-_BUSY_COMPOSER = re.compile(r'^(?:\([^)]*\) )?' + _VALUE_SLOT + r'[' + SPINNER_CHARS + r'] $')
+_BUSY_COMPOSER = re.compile(r'^(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?[' + SPINNER_CHARS + r'] $')
 
 
 def bootstrap_composer(screen, ready_seen):
@@ -194,11 +194,11 @@ def screen_oracle_selfcheck():
     screen.feed(b'\r' + '⠋'.encode() + b' \x1b[1B\r\x1b[2C')
     assert not bootstrap_composer(screen, False)
     for spinner in SPINNER_CHARS:
-        assert _BUSY_COMPOSER.fullmatch('(fixture-model) 0.0%' + spinner + ' ')
-    assert not _BUSY_COMPOSER.fullmatch('(fixture-model) 0.0%  ')
+        assert _BUSY_COMPOSER.fullmatch('(fixture-model)0.0%' + spinner + ' ')
+    assert not _BUSY_COMPOSER.fullmatch('(fixture-model)0.0%  ')
     draft = 'stream-proof'
-    busy = '(fixture-model) 0.0%⠋ '
-    idle = '(fixture-model) 0.0%> '
+    busy = '(fixture-model)0.0%⠋ '
+    idle = '(fixture-model)0.0%> '
     assert _pending_composer_echo(busy + draft, draft, True, False, True)
     assert _pending_composer_echo(idle + draft, draft, True, False, True)
     assert not _pending_composer_echo(busy + draft, draft, True, True, True)
@@ -263,7 +263,7 @@ def run(app, width, batched):
         assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
-        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
+        config = {'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
         config_path = home / '.thin/config.json'
         config_bytes = json.dumps(config).encode()
         config_path.write_bytes(config_bytes)
@@ -566,7 +566,7 @@ def first_entry(app, origin, width, auto, response='normal'):
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
         runtime.mkdir(mode=0o700)
-        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model',
+        config = {'llm': {'default': 'local/fixture-model',
                   'providers': {'local': {'base_url': 'http://127.0.0.1:1/v1',
                   'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model':
                   {'protocol': 'chat', 'context_tokens': 32768}}}}},
@@ -841,7 +841,7 @@ def streaming(app, line_count):
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
         runtime.mkdir(mode=0o700)
-        config = {'memory': {'auto': False}, 'llm': {'default': 'local/fixture-model',
+        config = {'llm': {'default': 'local/fixture-model',
                   'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                   'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model':
                   {'protocol': 'chat', 'context_tokens': 32768}}}}},
@@ -920,7 +920,7 @@ def streaming(app, line_count):
                             assert not line[caret:].strip(), 'text after composer caret'
                             assert not any(''.join(row).strip() for row in screen.grid[screen.row + 1:]), 'content below composer'
                             idle = screen.idle(clear_below=True)
-                            selected = line[:caret].startswith('(fixture-model) ')
+                            selected = line[:caret].startswith('(fixture-model)')
                             bootstrap = bootstrap_composer(screen, ready_seen)
                             user_rows = [row for row in screen.history + [
                                 ''.join(r) for i, r in enumerate(screen.grid) if i != screen.row
@@ -970,7 +970,7 @@ def streaming(app, line_count):
 
         try:
             pump(lambda: ready_seen and not in_frame and screen.idle(clear_below=True)
-                 and screen.editor_tail().startswith('(fixture-model) '))
+                 and screen.editor_tail().startswith('(fixture-model)'))
             assert screen.row < ROWS - 1, 'startup jumped to bottom'
             start = len(frames)
             submitted = True
