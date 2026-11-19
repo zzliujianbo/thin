@@ -865,13 +865,13 @@ pub const Runtime = struct {
         edited_files: std.StringHashMapUnmanaged(void) = .empty,
         /// Possible paid summary attempts, including transport throws before usage.
         summary_attempts: u64 = 0,
-        /// Whether a no-candidate notice was already shown for this task.
-        compaction_skipped_notified: bool = false,
+        /// Whether this task already explained a skipped or impossible
+        /// compaction. One notice is enough per task.
+        compact_notice_sent: bool = false,
         /// Successful automatic compactions this task, and the post-summary
         /// estimate used for the growth guard.
         auto_compactions: u8 = 0,
         auto_after_tokens: usize = 0,
-        auto_skip_notified: bool = false,
         /// 累计的用量与终态，run 结束时返回。
         terminal: Terminal = .{ .status = .success },
 
@@ -1689,6 +1689,40 @@ pub const Runtime = struct {
         if (result.calls != 0) try self.emit(.{ .usage = .{ .purpose = purpose, .protocol = self.selector.effective(), .value = usage } }, cancel);
     }
 
+    /// What to do about the context before this request: pass, skip and say
+    /// why, refuse an input that no longer fits, or try one summary.
+    const CompactionDecision = union(enum) { pass, skip: CompactionSkipReason, over_budget, attempt };
+
+    fn compactionDecision(self: *Runtime, task: *const Task, measured: usize, estimated: usize, budget: usize) CompactionDecision {
+        if (measured < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) return .pass;
+        // Over the hard budget the run always tries a summary first, even when
+        // the growth proxy still looks comfortable; refusing there is what made
+        // a nearly full session fail without compacting.
+        const over = measured > budget;
+        if (task.auto_compactions >= max_auto_compactions) {
+            if (over) return .attempt;
+            return .{ .skip = .limit };
+        }
+        // Beyond the cap, an input already over the hard budget still needs an
+        // emergency summary; otherwise a barely useful repeat is not worth it.
+        if (task.auto_compactions != 0 and !over and
+            measured < task.auto_after_tokens +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
+            return .{ .skip = .recent };
+        // A previous automatic summary in this session was paid for and then
+        // rejected. With the same budget and a context that has not shrunk,
+        // another attempt can only buy the same result.
+        if (self.failed_auto_summary) |failed| {
+            if (failed.budget != budget) {
+                // A changed budget makes the remembered rejection stale.
+                self.failed_auto_summary = null;
+            } else if (estimated >= failed.before) {
+                if (over) return .over_budget;
+                return .{ .skip = .rejected };
+            }
+        }
+        return .attempt;
+    }
+
     /// 发起模型调用前检查上下文是否超过压缩阈值，超过则尝试压缩。
     fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
         try context.validateInputPolicy(self.config.*);
@@ -1703,44 +1737,17 @@ pub const Runtime = struct {
         // Over the hard budget the run always tries a summary first, even when
         // the growth proxy still looks comfortable; refusing here is what made
         // a 72%-full session fail without compacting.
-        if (measured <= budget and measured < context.threshold(budget, cfg.Policy.compaction_trigger_percent)) return;
-        const cap_reached = task.auto_compactions >= max_auto_compactions;
-        if (cap_reached and measured <= budget) {
-            if (!task.auto_skip_notified) {
-                task.auto_skip_notified = true;
-                try self.emit(.{ .compaction_skipped = .{ .reason = .limit } }, cancel);
-            }
-            return;
-        }
-        // Beyond the soft cap, an input already over the hard budget still
-        // needs an emergency summary. Refusing here would fail a long task
-        // that is otherwise still making progress.
-        if (task.auto_compactions != 0 and measured <= budget and
-            measured < task.auto_after_tokens +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
-        {
-            if (!task.auto_skip_notified) {
-                task.auto_skip_notified = true;
-                try self.emit(.{ .compaction_skipped = .{ .reason = .recent } }, cancel);
-            }
-            return;
-        }
-        // A previous automatic summary in this session was paid for and then
-        // rejected. With the same budget and a context that has not shrunk,
-        // another attempt can only buy the same result: skip it instead of
-        // spending a request, and fall back to the budget only when the input
-        // itself no longer fits.
-        if (self.failed_auto_summary) |failed| {
-            if (failed.budget != budget) {
-                // A changed budget makes the remembered rejection stale.
-                self.failed_auto_summary = null;
-            } else if (estimated >= failed.before) {
-                if (!task.auto_skip_notified) {
-                    task.auto_skip_notified = true;
-                    try self.emit(.{ .compaction_skipped = .{ .reason = .rejected } }, cancel);
+        switch (self.compactionDecision(task, measured, estimated, budget)) {
+            .pass => return,
+            .skip => |reason| {
+                if (!task.compact_notice_sent) {
+                    task.compact_notice_sent = true;
+                    try self.emit(.{ .compaction_skipped = .{ .reason = reason } }, cancel);
                 }
-                if (measured <= budget) return;
-                return context.inputBudgetError(self.config.*);
-            }
+                return;
+            },
+            .over_budget => return context.inputBudgetError(self.config.*),
+            .attempt => {},
         }
         // Publish the measure that decided this compaction. The displayed value
         // otherwise follows completed requests, so a tool result the provider has
@@ -1775,8 +1782,8 @@ pub const Runtime = struct {
             if (err == error.NoCompactionCandidate and current <= budget) {
                 // Surface the condition once per task instead of retrying a
                 // summary that has no safe prefix on every model round.
-                if (!task.compaction_skipped_notified) {
-                    task.compaction_skipped_notified = true;
+                if (!task.compact_notice_sent) {
+                    task.compact_notice_sent = true;
                     try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 }
                 return;
