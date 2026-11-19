@@ -14,7 +14,7 @@ const preference = effort => JSON.stringify({version:1,reasoning_effort:effort})
 // Seed the declaration writer's non-null implementation defaults explicitly so
 // global saves can retain strict whole-document equality, not loose subsets.
 const limitDefaults = {
-  command_timeout_ms:300000, compaction_enabled:true,
+  command_timeout_ms:300000, compaction_enabled:true, show_reported_usage:true,
 };
 
 export async function settingsRegressions({app,pty,execute,send}) {

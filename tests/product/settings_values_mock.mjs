@@ -93,7 +93,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
           output_tokens:8192,reasoning:{format:'standard',map:{off:'none',high:'high'}}}}),
       }},
       limits:{command_timeout_ms:123456,low_price_input:false,
-        request_timeout_ms:10000,compaction_enabled:true},
+        request_timeout_ms:10000,compaction_enabled:true,show_reported_usage:true},
     };
     previousBytes = JSON.stringify(expected);
     await writeFile(configPath,previousBytes,{mode:0o600});

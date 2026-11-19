@@ -11,6 +11,7 @@ pub fn activeClone(a: std.mem.Allocator, active: cfg.Config, declaration: cfg.Co
     candidate.memory = declaration.memory;
     candidate.limits.low_price_input = declaration.limits.low_price_input;
     candidate.limits.compaction_enabled = declaration.limits.compaction_enabled;
+    candidate.limits.show_reported_usage = declaration.limits.show_reported_usage;
     candidate.limits.command_timeout_ms = declaration.limits.command_timeout_ms;
     candidate.limits.request_timeout_ms = declaration.limits.request_timeout_ms;
     // A frozen active/pending selection may have different budget constraints

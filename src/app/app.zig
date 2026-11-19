@@ -414,7 +414,7 @@ pub const App = struct {
         errdefer result.deinit();
         result.config = try @import("settings_selection.zig").activeClone(self.allocator, self.runtime.effectiveConfig(), declaration);
         result.replace_memory = proxy_refresh or self.config.value.memory.auto != declaration.memory.auto or
-            !std.meta.eql(self.config.value.limits, declaration.limits);
+            !cfg.policyLimitsEqual(self.config.value.limits, declaration.limits);
         if (result.replace_memory) {
             // The coordinator owns an independent extractor client, so it follows
             // the latest proxy allowlist even when the active config keeps its
@@ -503,7 +503,7 @@ pub const App = struct {
         errdefer cfg.release(&owned);
         if (self.runtime.poisoned or self.memory_coordinator.isPoisoned()) return error.UnsafeToContinue;
         const plan = try self.runtime.planSelection(owned.value, true);
-        if (!std.meta.eql(owned.value.limits, self.runtime.effectiveConfig().limits)) return error.ConnectionLimitsChanged;
+        if (!cfg.policyLimitsEqual(owned.value.limits, self.runtime.effectiveConfig().limits)) return error.ConnectionLimitsChanged;
         const key = if (isCodex(owned.value)) blk: {
             if (owned.value.provider.codex_oauth == null) return error.ApiKeyNotFound;
             break :blk try self.allocator.alloc(u8, 0);

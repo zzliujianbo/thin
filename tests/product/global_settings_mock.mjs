@@ -189,6 +189,7 @@ async function unchanged(f) {
 const limitsDefaults = {
   command_timeout_ms:300000, low_price_input:true,
   request_timeout_ms:300000, compaction_enabled:true,
+  show_reported_usage:true,
 };
 
 async function values(f, low) {

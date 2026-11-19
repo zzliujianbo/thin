@@ -2964,6 +2964,9 @@ fn parseLimits(value: std.json.Value, base: core_config.Limits) core_config.Limi
     if (object.get("compaction_enabled")) |entry| {
         if (valueBool(entry)) |flag| limits.compaction_enabled = flag;
     }
+    if (object.get("show_reported_usage")) |entry| {
+        if (valueBool(entry)) |flag| limits.show_reported_usage = flag;
+    }
     return limits;
 }
 

@@ -8,7 +8,7 @@ pub const Key = @import("../core/settings.zig").Key;
 pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
     "Low-price input", "Auto compaction", "Command timeout", "Request timeout",
-    "Image model",     "Auto memory",     "Proxy",
+    "Image model",     "Auto memory",     "Proxy",           "Reported usage",
 };
 /// Bounded endpoint text buffer: host/port, [IPv6]:port or a borrowed address.
 pub const endpoint_buffer_bytes = cfg.max_proxy_endpoint_bytes + 8;
@@ -33,6 +33,7 @@ pub fn preferenceKey(selected: usize) ?Key {
         2 => .command_timeout_ms,
         3 => .request_timeout_ms,
         5 => .memory_auto,
+        7 => .show_reported_usage,
         else => null,
     };
 }
@@ -56,6 +57,7 @@ pub fn value(state: Snapshot, selected: usize) []const u8 {
         6 => if (state.proxy_address == null) "Not configured" else "",
         1 => if (state.limits.compaction_enabled) "on" else "off",
         5 => if (state.memory_auto) "on" else "off",
+        7 => if (state.limits.show_reported_usage) "on" else "off",
         2, 3 => "s",
         else => "",
     };
@@ -69,6 +71,7 @@ pub fn description(selected: usize) []const u8 {
         4 => "Read images through a separate helper returning text. Off unless explicitly selected.",
         5 => "Automatically extract and maintain useful memory. On by default.",
         6 => "Configure the proxy address and exact model routes. A new session applies it.",
+        7 => "Show the provider-reported usage inside the model parentheses.",
         else => "",
     };
 }

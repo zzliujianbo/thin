@@ -115,7 +115,7 @@ test "memory footer stays adjacent to wrapped composer after ACK" {
     defer arena.deinit();
     const expected_status = "memory: 1";
     try std.testing.expectEqualStrings(expected_status, try ui.activityLine(arena.allocator(), ui.connection.current()));
-    try std.testing.expectEqual(status_row + 1, try rowStartingWith(&screen, "(fixture) "));
+    try std.testing.expectEqual(status_row + 1, try rowStartingWith(&screen, "(fixture "));
     try std.testing.expectEqualStrings("", std.mem.trimEnd(u8, screen.grid[status_row - 1][0..30], " "));
     try std.testing.expectEqual(@as(usize, 1), screen.count("memory: "));
     testAcknowledgeFullFrame(&ui);
@@ -160,8 +160,8 @@ test "long combined warning stays adjacent across acknowledged command menu cycl
             try std.testing.expect(ui.commandMenuVisible());
             try std.testing.expectEqual(@as(usize, 0), screen.count("Could not save thinking option"));
             try std.testing.expectEqual(@as(usize, 0), screen.count("Saved thinking level not applied"));
-            try std.testing.expectEqual(screen.rows - ui.frame_composer_rows, try rowStartingWith(&screen, "(fixture-old) "));
-            try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture-old) "));
+            try std.testing.expectEqual(screen.rows - ui.frame_composer_rows, try rowStartingWith(&screen, "(fixture-old "));
+            try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture-old "));
             try std.testing.expectEqual(screen.rows - 1, screen.row + ui.frame_cursor_rows_up);
             testAcknowledgeFullFrame(&ui);
             if (cycle == 0) {
@@ -271,7 +271,7 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
         defer prompt_arena.deinit();
         const prompt_layout = try ui.prepareComposer(prompt_arena.allocator(), ui.connection.current(), ui.size.columns -| 1);
         const expected_prompts: usize = 3 + @as(usize, @intFromBool(prompt_layout.layout.first_row == 0));
-        try std.testing.expectEqual(expected_prompts, screen.count("?%>"));
+        try std.testing.expectEqual(expected_prompts, screen.count("?%)>"));
         testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
         try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
@@ -289,7 +289,7 @@ test "idle Enter releases exactly one native row and redraw keeps the live draft
             try screen.replay(ui.frame);
             testAcknowledgeFullFrame(&ui);
             try std.testing.expectEqual(expected_history, screen.history_len);
-            try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
+            try std.testing.expectEqual(@as(usize, 4), screen.count("?%)>"));
         }
         try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
         // A subsequent ordinary nonempty Enter still follows submit, not the
@@ -324,7 +324,7 @@ test "idle Enter bounded stages retain more than one frame of line requests" {
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(u16, 0), ui.idle_breaks);
     try std.testing.expectEqual(old_history + 300, screen.history_len);
-    try std.testing.expectEqual(@as(usize, 301), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 301), screen.count("?%)>"));
 }
 test "idle Enter rejects paste queue permission and undrained bridge provenance" {
     var cancel: p.Cancellation = .{};
@@ -427,7 +427,7 @@ test "idle Enter does not release an acknowledged draft erased in the same read 
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(@as(usize, 0), screen.count("deleted-draft"));
-    try std.testing.expectEqual(@as(usize, 2), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 2), screen.count("?%)>"));
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try ui.parser.feed("/", sink);
     try ui.draw();
@@ -708,14 +708,14 @@ test "idle Enter acknowledged prompts survive a command popup without duplicatio
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(old_history, screen.history_len);
-    try std.testing.expectEqual(@as(usize, 4), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 4), screen.count("?%)>"));
     // Releasing this restored bottom-anchored tail keeps every prompt once.
     try Ui.key(&ui, .enter);
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
     try std.testing.expectEqual(old_history + 1, screen.history_len);
-    try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 5), screen.count("?%)>"));
     try ui.parser.feed("/", sink);
     try ui.draw();
     try screen.replay(ui.frame);
@@ -725,7 +725,7 @@ test "idle Enter acknowledged prompts survive a command popup without duplicatio
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expectEqual(@as(usize, 5), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 5), screen.count("?%)>"));
 }
 test "idle Enter keeps a newly published diagnostic visible across redraws" {
     var cancel: p.Cancellation = .{};
@@ -782,7 +782,7 @@ test "idle notice survives acknowledgement of an already staged prompt frame" {
         try std.testing.expect(!ui.compact_composer);
         try std.testing.expect(screen.visible("staged-idle-diagnostic"));
         try std.testing.expectEqual(@as(usize, 1), screen.count("staged-idle-diagnostic"));
-        try std.testing.expectEqual(@as(usize, 2), screen.count("?%>"));
+        try std.testing.expectEqual(@as(usize, 2), screen.count("?%)>"));
     }
 }
 test "idle Enter resize at every frame byte never replays or drops CRLF" {
@@ -1703,7 +1703,7 @@ test "natural idle prompts menus and long output retain native flow" {
         try screen.replay(ui.frame);
         testAcknowledgeFullFrame(&ui);
         try std.testing.expect(screen.row >= row);
-        try std.testing.expectEqual(cycle + 2, screen.count("?%>"));
+        try std.testing.expectEqual(cycle + 2, screen.count("?%)>"));
         const before_menu = screen.history_len + screen.row;
         try ui.parser.feed("/model", sink);
         try ui.draw();
@@ -1715,7 +1715,7 @@ test "natural idle prompts menus and long output retain native flow" {
         try ui.draw();
         try screen.replay(ui.frame);
         testAcknowledgeFullFrame(&ui);
-        try std.testing.expectEqual(cycle + 2, screen.count("?%>"));
+        try std.testing.expectEqual(cycle + 2, screen.count("?%)>"));
         try std.testing.expectEqual(before_menu, screen.history_len + screen.row);
         row = screen.row;
         for (0..2) |_| {
@@ -1723,7 +1723,7 @@ test "natural idle prompts menus and long output retain native flow" {
             try screen.replay(ui.frame);
             testAcknowledgeFullFrame(&ui);
             try std.testing.expectEqual(row, screen.row);
-            try std.testing.expectEqual(cycle + 2, screen.count("?%>"));
+            try std.testing.expectEqual(cycle + 2, screen.count("?%)>"));
         }
     }
     var body: Io.Writer.Allocating = .init(a);
@@ -1847,7 +1847,7 @@ test "repeated bare command menus preserve three idle releases" {
     try std.testing.expect(ui.compact_composer);
     try std.testing.expect(ui.menu_history != null and ui.menu_history.?.above.len >= 3);
     const endpoint = screen.history_len + screen.row;
-    const prompt_count = screen.count("?%>");
+    const prompt_count = screen.count("?%)>");
     try std.testing.expectEqual(@as(usize, 4), prompt_count);
     for (0..3) |_| {
         try ui.parser.feed("/", sink);
@@ -1860,7 +1860,7 @@ test "repeated bare command menus preserve three idle releases" {
         try screen.replay(ui.frame);
         testAcknowledgeFullFrame(&ui);
         try std.testing.expectEqual(endpoint, screen.history_len + screen.row);
-        try std.testing.expectEqual(prompt_count, screen.count("?%>"));
+        try std.testing.expectEqual(prompt_count, screen.count("?%)>"));
         try std.testing.expectEqual(@as(usize, 0), ui.tail_menu_extra);
     }
 }
@@ -2220,7 +2220,7 @@ test "natural exit preserves a canonical gap at the scrollback boundary" {
     try std.testing.expectEqualSlices(u8, &protected, &screen.history[0]);
     try std.testing.expectEqual((try Locate.row(&screen, "boundary-A079")) + 2, try Locate.row(&screen, "boundary-B000"));
     try std.testing.expectEqual(@as(usize, 1), screen.count("boundary-hint"));
-    try std.testing.expectEqual(@as(usize, 0), screen.count("?%>"));
+    try std.testing.expectEqual(@as(usize, 0), screen.count("?%)>"));
     try std.testing.expectEqual(try Locate.row(&screen, "boundary-hint"), screen.history_len + screen.row);
     // Terminal restore emits CRLF after the cleanup; the shell follows it.
     try screen.replay("\r\nboundary-shell");
@@ -3201,7 +3201,7 @@ test "file captions are contiguous but separated from final prose and percent co
     // bold prefix and its reset before editor text.
     const color_frame = try std.mem.replaceOwned(u8, std.testing.allocator, ui.frame, "\x1b[1m", "");
     defer std.testing.allocator.free(color_frame);
-    try std.testing.expect(std.mem.find(u8, color_frame, "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ ") " ++ theme.failure ++ "50.0%" ++ theme.reset ++ ">" ++ theme.reset ++ " ") != null);
+    try std.testing.expect(std.mem.find(u8, color_frame, "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ " " ++ theme.muted ++ "50.0%" ++ theme.reset ++ ")>" ++ theme.reset ++ " ") != null);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay(ui.frame);
     try std.testing.expect(!screen.visible("Final answer") and screen.visible("final-body-marker"));
@@ -4313,39 +4313,42 @@ test "composer displays startup zero and latest actual usage or unknown without 
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     ui.display.seed(.{ .tokens = 0, .limit = 1000000 });
-    const green_prompt = "(" ++ theme.reset ++ "\x1b[1mfixture" ++ theme.reset ++ "\x1b[1m) " ++ theme.success;
-    const prompt_end = theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " ";
+    const model_prompt = "(" ++ theme.reset ++ "fixture" ++ theme.reset ++ " ";
+    const marker_end = ">" ++ theme.reset ++ " ";
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, green_prompt ++ "0.0%" ++ prompt_end) != null);
+    const seeded = try std.mem.replaceOwned(u8, std.testing.allocator, ui.frame, "\x1b[1m", "");
+    defer std.testing.allocator.free(seeded);
+    const seeded_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}0.0%{s}){s}", .{ model_prompt, theme.muted, theme.reset, marker_end });
+    defer std.testing.allocator.free(seeded_expected);
+    try std.testing.expect(std.mem.find(u8, seeded, seeded_expected) != null);
     testAcknowledgeFullFrame(&ui);
     const Case = struct {
         purpose: p.Purpose,
         usage: p.Usage,
-        prefix: ?[]const u8 = null,
-        estimate: ?[]const u8 = null,
-        muted: ?[]const u8 = null,
+        reported: []const u8,
+        estimate: ?[]const u8,
     };
     const host = bridge.host();
     for ([_]Case{
-        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = green_prompt ++ "1.3%" ++ prompt_end },
-        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = green_prompt ++ "0.1%" ++ prompt_end },
-        // Unknown report: the estimate stays primary, the report is muted.
-        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .estimate = "0.1%", .muted = "?%" },
-        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = green_prompt ++ "0.0%" ++ prompt_end },
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .reported = "1.3%", .estimate = "1.3%" },
+        .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .reported = "0.1%", .estimate = "0.1%" },
+        // Unknown report stays visible as a muted ?% before the estimate.
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .reported = "?%", .estimate = "0.1%" },
+        .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .reported = "0.0%", .estimate = null },
     }) |case| {
         try host.emit_fn(host.context, .{ .usage = .{ .purpose = case.purpose, .protocol = .chat, .value = case.usage } }, &cancel);
         var item = bridge.pop().?;
         try ui.event(item);
         item.deinit();
         try ui.draw();
-        if (case.prefix) |prefix| {
-            try std.testing.expect(std.mem.find(u8, ui.frame, prefix) != null);
-        } else {
-            try std.testing.expect(std.mem.find(u8, ui.frame, case.estimate.?) != null);
-            const muted_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ theme.muted, case.muted.? });
-            defer std.testing.allocator.free(muted_expected);
-            try std.testing.expect(std.mem.find(u8, ui.frame, muted_expected) != null);
-        }
+        const color_frame = try std.mem.replaceOwned(u8, std.testing.allocator, ui.frame, "\x1b[1m", "");
+        defer std.testing.allocator.free(color_frame);
+        const expected = if (case.estimate) |estimate|
+            try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}{s}){s}{s}{s}{s}", .{ model_prompt, theme.muted, case.reported, theme.reset, theme.success, estimate, theme.reset, marker_end })
+        else
+            try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}{s}){s}", .{ model_prompt, theme.muted, case.reported, theme.reset, marker_end });
+        defer std.testing.allocator.free(expected);
+        try std.testing.expect(std.mem.find(u8, color_frame, expected) != null);
         testAcknowledgeFullFrame(&ui);
     }
 }
@@ -4754,7 +4757,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     _ = try ui.editor.insert("input-default");
     // Idle startup, without any delta or mutable Runtime reads.
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ "\x1b[1m) " ++ theme.reset ++ "\x1b[1m?%" ++ theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.high)) ++ "fixture" ++ theme.reset ++ "\x1b[1m " ++ theme.muted ++ "?%" ++ theme.reset ++ "\x1b[1m)>" ++ theme.reset ++ " input-default") != null);
     testAcknowledgeFullFrame(&ui);
     ui.mode = .calling_model;
     ui.display.reset();
@@ -4762,7 +4765,7 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     for ([_]u64{ 1100, 3100, 9100 }) |now| {
         ui.clock_ms = now;
         try ui.draw();
-        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[(now / 80) % theme.command_pulse.len], activity.spinner(now), theme.reset });
+        const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m){s}{s}{s} input-default", .{ theme.reset, theme.command_pulse[(now / 80) % theme.command_pulse.len], activity.spinner(now), theme.reset });
         defer std.testing.allocator.free(marker);
         try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
         // Waiting for the first token keeps the static effort colour: only the
@@ -4807,11 +4810,11 @@ test "configured effort colors idle prefix before reasoning but never the busy m
     ui.mode = null;
     owner.effort = .low;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ "\x1b[1m) " ++ theme.reset ++ "\x1b[1m?%" ++ theme.reset ++ "\x1b[1m>" ++ theme.reset ++ " input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "(" ++ (comptime theme.effortColor(.low)) ++ "fixture" ++ theme.reset ++ "\x1b[1m " ++ theme.muted ++ "?%" ++ theme.reset ++ "\x1b[1m)>" ++ theme.reset ++ " input-default") != null);
     testAcknowledgeFullFrame(&ui);
     owner.effort = .unspecified;
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(fixture) ?%>" ++ theme.reset ++ " input-default") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(" ++ theme.reset ++ "\x1b[1mfixture" ++ theme.reset ++ "\x1b[1m " ++ theme.muted ++ "?%" ++ theme.reset ++ "\x1b[1m)>" ++ theme.reset ++ " input-default") != null);
     testAcknowledgeFullFrame(&ui);
 }
 test "composer frame keeps context occupancy colors static while model and spinner animate" {
@@ -4822,14 +4825,23 @@ test "composer frame keeps context occupancy colors static while model and spinn
             defer bridge.deinit();
             var ui = fixtureUi(&bridge, &cancel);
             defer ui.deinit();
-            ui.display.observe(.{ .context_snapshot = .{ .tokens = tokens, .limit = 100 } }, 0);
+            ui.display.observe(.{ .context_snapshot = .{ .tokens = tokens, .limit = 100, .estimated = tokens } }, 0);
             if (busy) ui.mode = .calling_model;
             ui.clock_ms = 80;
             _ = try ui.editor.insert("default-input");
             try ui.draw();
-            const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%{s}\x1b[1m{s}{s}{s} default-input", .{ if (tokens == 0) theme.success else if (tokens == 25) "\x1b[38;5;220m" else theme.failure, tokens, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", theme.reset });
+            const color = if (tokens == 25) "\x1b[38;5;220m" else theme.failure;
+            const expected = if (tokens == 0)
+                try std.fmt.allocPrint(std.testing.allocator, "{s}0.0%{s}\x1b[1m){s}{s}{s} default-input", .{ theme.muted, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", theme.reset })
+            else
+                try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m){s}{d}.0%{s}\x1b[1m{s}{s}{s} default-input", .{ theme.reset, color, tokens, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", theme.reset });
             defer std.testing.allocator.free(expected);
             try std.testing.expect(std.mem.find(u8, ui.frame, expected) != null);
+            if (tokens != 0) {
+                const reported = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}.0%", .{ theme.muted, tokens });
+                defer std.testing.allocator.free(reported);
+                try std.testing.expect(std.mem.find(u8, ui.frame, reported) != null);
+            }
             testAcknowledgeFullFrame(&ui);
         }
     }
@@ -4880,15 +4892,14 @@ test "composer reflects owner low price policy without reading runtime configura
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
         try ui.parser.feed("typed", sink);
         try ui.draw();
-        const prefix = if (enabled) theme.success ++ "L3.1%" ++ theme.reset else theme.success ++ "3.1%" ++ theme.reset;
+        const prefix = if (enabled) theme.success ++ "L" else theme.muted ++ "3.1%";
         try std.testing.expect(std.mem.find(u8, ui.frame, prefix) != null);
-        try std.testing.expectEqual(enabled, std.mem.find(u8, ui.frame, "L3.1%") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "L ") == null);
         try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
         try std.testing.expectEqual(@as(usize, 5), ui.editor.cursor);
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try screen.replay(ui.frame);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], if (enabled) ") L3.1%> typed" else ") 3.1%> typed") != null);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], if (enabled) " L3.1%)> typed" else " 3.1%)> typed") != null);
     }
 }
 test "model only default color prompt has no headers cache or status and preserves cursor" {
@@ -4904,10 +4915,10 @@ test "model only default color prompt has no headers cache or status and preserv
     try std.testing.expect(std.mem.find(u8, ui.frame, "thin |") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tools trusted") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, ".thin/sessions") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(fixture) ?%>" ++ theme.reset ++ " hello    你") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(" ++ theme.reset ++ "\x1b[1mfixture" ++ theme.reset ++ "\x1b[1m " ++ theme.muted ++ "?%" ++ theme.reset ++ "\x1b[1m)>" ++ theme.reset ++ " hello    你") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "90.0%") == null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "(fixture)") == null);
-    const decoration = "(fixture) ?%> ";
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.accent ++ "(fixture") == null);
+    const decoration = "(fixture ?%)> ";
     const position = try std.fmt.allocPrint(std.testing.allocator, "\r\x1b[{d}C" ++ terminal_module.sync_end ++ "\x1b[?25h", .{text.width(decoration) + text.width("hello    你")});
     defer std.testing.allocator.free(position);
     try std.testing.expect(std.mem.endsWith(u8, ui.frame, position));
@@ -4931,7 +4942,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     for ([_][]const u8{ "TPS:", "TTFT:", "tokens in:", "summary in:", "cost:", "loading", "Completed", "calling_model" }) |removed| try std.testing.expect(std.mem.find(u8, ui.frame, removed) == null);
     const pulse = theme.command_pulse[(ui.clock_ms / 80) % theme.command_pulse.len];
     const icon = activity.spinner(ui.clock_ms);
-    const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m{s}{s}{s} typed-default-color", .{ theme.reset, pulse, icon, theme.reset });
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "{s}\x1b[1m){s}{s}{s} typed-default-color", .{ theme.reset, pulse, icon, theme.reset });
     defer std.testing.allocator.free(marker);
     try std.testing.expect(std.mem.find(u8, ui.frame, marker) != null);
     const palette = theme.modelPalette(ui.display.view(ui.clock_ms).rate_band);
@@ -4946,7 +4957,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     for (screen.grid[0..screen.rows]) |row| warning_count += std.mem.count(u8, &row, warning);
     try std.testing.expectEqual(@as(usize, 1), warning_count);
     for (screen.grid[screen.rows - 3]) |byte| try std.testing.expectEqual(@as(u8, ' '), byte);
-    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.rows - 1], "(fixture) ?%~ typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.rows - 1], "(fixture ?%)~ typed-default-color") != null);
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 680;
@@ -4962,7 +4973,7 @@ test "single composer hides statistics and completion and uses flow and exact br
     ui.notice = "Completed"; // Even old application success notices cannot add a row.
     ui.last_terminal = .{ .status = .success, .usage = .{ .normal_calls = 1, .normal = .{ .input_tokens = 10562, .output_tokens = 873, .cached_input_tokens = 9600 } } };
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(fixture) ?%>" ++ theme.reset ++ " typed-default-color") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[1m(" ++ theme.reset ++ "\x1b[1mfixture" ++ theme.reset ++ "\x1b[1m " ++ theme.muted ++ "?%" ++ theme.reset ++ "\x1b[1m)>" ++ theme.reset ++ " typed-default-color") != null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "Completed") == null);
     try std.testing.expect(std.mem.find(u8, ui.frame, "tokens in:") == null);
     testAcknowledgeFullFrame(&ui);
@@ -4987,14 +4998,14 @@ test "flow model prefix wraps long editor suffix without changing raw cursor byt
     // The cursor is on the first wrapped composer row, not the frame's last row.
     try std.testing.expectEqual(screen.rows - 1 - ui.frame_cursor_rows_up, screen.row);
     const first_row = screen.row - first_composer.layout.cursor_row;
-    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[first_row], "(fixture) ?%~ x"));
+    try std.testing.expect(std.mem.startsWith(u8, &screen.grid[first_row], "(fixture ?%)~ x"));
     const first_absolute_row = first_composer.layout.first_row + first_composer.layout.cursor_row;
     try std.testing.expectEqual((if (first_absolute_row == 0) text.width(first_composer.decoration.plain) else 0) + first_composer.layout.cursor_column, screen.col);
     // With no body above it, the composer is preceded only by the fixture's real
     // notice: no reserved blank row and no second composer.
     if (first_row > 0) {
         try std.testing.expect(std.mem.find(u8, &screen.grid[first_row - 1], "Not configured") != null);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[first_row - 1], "?%>") == null);
+        try std.testing.expect(std.mem.find(u8, &screen.grid[first_row - 1], "?%)>") == null);
     }
     try std.testing.expectEqualStrings(&raw, ui.editor.bytes.items);
     testAcknowledgeFullFrame(&ui);
@@ -5765,7 +5776,7 @@ test "model selection and late default completion flash the actual logical level
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try ui.draw();
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("fixture-next) medium"));
+    try std.testing.expect(screen.visible("fixture-next 1.5%)medium"));
     testAcknowledgeFullFrame(&ui);
     fixture.effort = .unspecified;
     fixture.levels = .{};
@@ -5782,7 +5793,7 @@ test "model selection and late default completion flash the actual logical level
     try ui.draw();
     try std.testing.expectEqual(shared.ReasoningEffort.low, ui.display.reasoning_effort);
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("fixture-late) low"));
+    try std.testing.expect(screen.visible("fixture-late 1.5%)low"));
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 5199;
     ui.pollMetadata(); // No changed metadata must not restart the deadline.
@@ -5791,7 +5802,7 @@ test "model selection and late default completion flash the actual logical level
     try ui.draw();
     try std.testing.expectEqual(@as(u64, 5200), ui.effort_flash.?.until_ms);
     try screen.replay(ui.frame);
-    try std.testing.expect(screen.visible("fixture-late) low"));
+    try std.testing.expect(screen.visible("fixture-late 1.5%)low"));
     testAcknowledgeFullFrame(&ui);
     ui.clock_ms = 5200;
     ui.expireEffortFlash();
@@ -6326,6 +6337,36 @@ test "Auto memory root toggles only after fresh ACK without overlays and preserv
     try ui.parser.feed("\r", sink);
     try std.testing.expect(fixture.state.memory_auto);
     try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+}
+test "Reported usage root toggles and hides only the reported composer value" {
+    try text.initLocale();
+    var fixture: PreferenceFixture = .{};
+    fixture.state.initial_context = .{ .tokens = 48_300, .limit = 100_000, .estimated = 88_600 };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    ui.openSettingsMenu();
+    ui.settings_menu.selected = 7;
+    try ui.draw();
+    try ui.parser.feed("\r", sink);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\r\r", sink);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expect(!fixture.state.limits.show_reported_usage);
+    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 7);
+    ui.closeSettingsMenu();
+    try std.testing.expect(!ui.settings_open);
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("(unchanged-primary)88.6%>"));
+    try std.testing.expect(!screen.visible("(unchanged-primary 48.3%)"));
+    testAcknowledgeFullFrame(&ui);
 }
 test "settings numeric child consumes ACK before failed save and preserves parent" {
     try text.initLocale();
@@ -7425,7 +7466,7 @@ test "wrapped composer cursor is ACK owned across sparse redraws" {
     try std.testing.expect(ui.frame_sparse);
     try screen.replay(ui.frame);
     try std.testing.expectEqual(screen.rows - 1, screen.row);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture)"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture"));
     try std.testing.expectEqualStrings(raw, ui.editor.bytes.items);
     testAcknowledgeFullFrame(&ui);
 }
@@ -7815,7 +7856,7 @@ test "effort confirmation expires after five seconds and repeated switches resta
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(screen.visible("fixture-old) 3.1%"));
+    try std.testing.expect(screen.visible("fixture-old 3.1%"));
     try std.testing.expect(ui.effort_flash == null);
 
     ui.clock_ms = 1000;
@@ -7825,12 +7866,12 @@ test "effort confirmation expires after five seconds and repeated switches resta
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(screen.visible("fixture-old) high"));
+    try std.testing.expect(screen.visible("fixture-old 3.1%)high"));
     try std.testing.expectEqualDeep(context, ui.display.context);
     // The composer and its real notice occupy a short bottom tail.
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     try std.testing.expectEqual(@as(usize, 2), ui.frame_height);
-    try std.testing.expectEqual(text.width("(fixture-old) high> "), screen.col);
+    try std.testing.expectEqual(text.width("(fixture-old 3.1% high> "), screen.col);
 
     ui.clock_ms = 2500;
     ui.cycleEffort(); // high -> max, now expires at 7500 instead.
@@ -7849,7 +7890,7 @@ test "effort confirmation expires after five seconds and repeated switches resta
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(screen.visible("fixture-old) max"));
+    try std.testing.expect(screen.visible("fixture-old 3.1%)max"));
 
     ui.display.context = .{ .tokens = 2000, .limit = fixture.limit };
     ui.clock_ms = 7500;
@@ -7858,7 +7899,7 @@ test "effort confirmation expires after five seconds and repeated switches resta
     try ui.draw();
     try screen.replay(ui.frame);
     testAcknowledgeFullFrame(&ui);
-    try std.testing.expect(screen.visible("fixture-old) 6.1%"));
+    try std.testing.expect(screen.visible("fixture-old 6.1%"));
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     ui.cycleEffort();
     try std.testing.expect(ui.effort_flash == null);
@@ -8695,14 +8736,14 @@ test "selection guards paste secret busy joined future poison and rollback" {
     try ui.draw();
     var effort_screen: @import("../tests/regular_screen.zig").Screen = .{};
     try effort_screen.replay(ui.frame);
-    try std.testing.expect(effort_screen.visible("(fixture-next) minimal> "));
+    try std.testing.expect(effort_screen.visible("(fixture-next 1.5%)minimal> "));
     testAcknowledgeFullFrame(&ui);
     // 5 秒后自动恢复为上下文百分比。
     ui.clock_ms = 5001;
     ui.expireEffortFlash();
     try ui.draw();
     try effort_screen.replay(ui.frame);
-    try std.testing.expect(effort_screen.visible("(fixture-next) 1.5%> "));
+    try std.testing.expect(effort_screen.visible("(fixture-next 1.5%)> "));
     testAcknowledgeFullFrame(&ui);
     ui.busy = true;
     try ui.parser.feed("\x1b[Z/model busy-id\r", sink);
@@ -14101,6 +14142,6 @@ test "command composer submits the hidden bang as a command task" {
 test "command prompt uses the bang marker and accent color" {
     const rendered = try presentation.prompt(std.testing.allocator, "fixture", null, 79, .{ .command = true });
     defer rendered.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("(fixture) ?%! ", rendered.plain);
+    try std.testing.expectEqualStrings("(fixture ?%)! ", rendered.plain);
     try std.testing.expect(std.mem.find(u8, rendered.styled, theme.accent ++ "!") != null);
 }

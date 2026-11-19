@@ -49,9 +49,9 @@ fn expectLongWarningAdjacent(screen: *const @import("../tests/regular_screen.zig
     try std.testing.expectEqualStrings(clipped, std.mem.trimEnd(u8, screen.grid[status_row][0..columns], " "));
     // The one-shot action result is now a conversation row, not footer text.
     try std.testing.expectEqual(@as(usize, 1), screen.count("Could not save thinking option"));
-    const composer_row = try rowStartingWith(screen, "(fixture-old) ");
+    const composer_row = try rowStartingWith(screen, "(fixture-old ");
     try std.testing.expectEqual(status_row + 1, composer_row);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture-old) "));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("(fixture-old "));
 }
 
 fn idleEnterAllocationScenario(a: std.mem.Allocator) !void {
@@ -523,6 +523,7 @@ const PreferenceFixture = struct {
             .memory_auto => self.state.memory_auto = value.? == 1,
             .command_timeout_ms => self.state.limits.command_timeout_ms = value.?,
             .request_timeout_ms => self.state.limits.request_timeout_ms = value.?,
+            .show_reported_usage => self.state.limits.show_reported_usage = value.? == 1,
         }
     }
     fn connection(self: *@This()) Connection {

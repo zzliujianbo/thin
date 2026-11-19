@@ -1225,6 +1225,8 @@ test "limits decode the request and task budgets with the strict u32 rule" {
     const decoded = try Decoder.limits("{\"request_timeout_ms\":10000,\"command_timeout_ms\":123456}", base);
     try std.testing.expectEqual(@as(u32, 10_000), decoded.request_timeout_ms);
     try std.testing.expectEqual(@as(u32, 123_456), decoded.command_timeout_ms);
+    const hidden = try Decoder.limits("{\"show_reported_usage\":false}", base);
+    try std.testing.expect(!hidden.show_reported_usage);
 
     // A larger configured pair is decoded exactly, not clamped by the base.
     const raised = try Decoder.limits("{\"request_timeout_ms\":60000,\"command_timeout_ms\":900000}", base);

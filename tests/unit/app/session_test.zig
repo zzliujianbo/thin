@@ -5,6 +5,14 @@ test "metadata notice TTL only expires complete refresh successes" {
         try std.testing.expectEqual(@as(u16, 0), metadataNoticeTtl(notice));
     }
 }
+test "display-only reported usage does not count as a policy limit change" {
+    const current: cfg.Limits = .{};
+    var declared = current;
+    declared.show_reported_usage = false;
+    try std.testing.expect(cfg.policyLimitsEqual(current, declared));
+    declared.request_timeout_ms += 1;
+    try std.testing.expect(!cfg.policyLimitsEqual(current, declared));
+}
 test "global defaults distinguish machine prefixes from summarized or assistant history" {
     const Message = @import("../core/protocol.zig").Message;
     const context = @import("../core/context.zig");
@@ -2678,6 +2686,12 @@ test "proxy refresh switches helper routes while primary client and history stay
     try std.testing.expectEqual(@as(usize, 1), app.config.value.proxy.?.models.len);
     try std.testing.expectEqualStrings("chat", app.config.value.model.name);
     try std.testing.expect(!app.config.value.limits.compaction_enabled);
+    const memory_before_display_toggle = app.memory_coordinator;
+    try connection.preference_fn.?(connection.context, .show_reported_usage, 0);
+    try std.testing.expect(!app.config.value.limits.show_reported_usage);
+    try std.testing.expect(app.image_client.? == image_now);
+    try std.testing.expect(app.memory_coordinator == memory_before_display_toggle);
+    try std.testing.expectEqual(@as(usize, 4), session.global_config.?.value.proxy.?.models.len);
 
     const persisted = try readSessionConfigBytes(fixture.tmp.dir);
     defer a.free(persisted);
@@ -2686,6 +2700,7 @@ test "proxy refresh switches helper routes while primary client and history stay
     try std.testing.expectEqual(@as(usize, 4), parsed.value.proxy.?.models.len);
     try std.testing.expectEqualStrings("img/deepseek-flash", parsed.value.proxy.?.models[2]);
     try std.testing.expectEqualStrings("main/chat", parsed.value.proxy.?.models[3]);
+    try std.testing.expect(!parsed.value.limits.show_reported_usage);
 }
 test "proxy membership CAS conflict rolls back declaration and helper ownership" {
     const a = std.testing.allocator;

@@ -2017,7 +2017,7 @@ test "snapshot receipt query is read-only and reports known accepted rejected un
     try std.testing.expect(std.mem.indexOf(u8, bad, "\"ok\":false") != null);
     try std.testing.expect(host.task == null);
 }
-test "settings reply publishes only the four user limits and never internal cleanup policy" {
+test "settings reply publishes only the five user limits and never internal cleanup policy" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2038,7 +2038,7 @@ test "settings reply publishes only the four user limits and never internal clea
         var fake = FakeLimitsView{
             .prev_fn = host.connection.current_fn,
             .prev_context = host.connection.context,
-            .limits = .{ .command_timeout_ms = 4_000, .request_timeout_ms = 12_000, .low_price_input = false, .compaction_enabled = false },
+            .limits = .{ .command_timeout_ms = 4_000, .request_timeout_ms = 12_000, .low_price_input = false, .compaction_enabled = false, .show_reported_usage = false },
         };
         defer {
             host.connection.current_fn = fake.prev_fn;
@@ -2053,9 +2053,10 @@ test "settings reply publishes only the four user limits and never internal clea
         var doc = try parseJson(a, frame);
         defer doc.deinit();
         const limits = doc.value.object.get("limits").?.object;
-        try std.testing.expectEqual(@as(usize, 4), limits.count());
+        try std.testing.expectEqual(@as(usize, 5), limits.count());
         try std.testing.expect(!limits.get("low_price_input").?.bool);
         try std.testing.expect(!limits.get("compaction_enabled").?.bool);
+        try std.testing.expect(!limits.get("show_reported_usage").?.bool);
         try std.testing.expect(limits.get("cleanup_grace_ms") == null);
         try std.testing.expect(limits.get("cleanup_timeout_ms") == null);
     }

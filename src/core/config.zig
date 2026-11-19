@@ -100,7 +100,17 @@ pub const Limits = struct {
     request_timeout_ms: u32 = 300000,
     /// Disable only automatic compaction; manual /compact and hard preflight remain.
     compaction_enabled: bool = true,
+    /// Show the provider-reported context total beside the model in the composer.
+    show_reported_usage: bool = true,
 };
+
+/// Compare policy-relevant limits. The reported-usage toggle is presentation-only
+/// and must not invalidate a prepared connection or rebuild helper owners.
+pub fn policyLimitsEqual(a: Limits, b: Limits) bool {
+    var normalized = a;
+    normalized.show_reported_usage = b.show_reported_usage;
+    return std.meta.eql(normalized, b);
+}
 
 /// Sparse user declarations under llm.providers.<alias>.models.<raw-id>.
 pub const ModelPatch = struct {

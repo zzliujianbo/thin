@@ -462,6 +462,9 @@ pub const PromptActivity = struct {
     /// Owner says tiered-price protection is active for the selected model;
     /// not merely the global toggle, and never inferred from latest usage.
     low_price_input: bool = false,
+    /// Show the provider-reported total inside the model parentheses. The
+    /// estimate remains visible when this is false.
+    show_reported_usage: bool = true,
     /// The composer is in explicit local-command mode. The `!` marker replaces
     /// the ordinary `>` and is rendered with its own color.
     command: bool = false,
@@ -502,67 +505,83 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
         return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     }
     const label_ctx = try contextLabel(a, snapshot);
-    const value = if (motion.effort_flash) |level| try a.dupe(u8, level.name() orelse "?") else label_ctx.text;
-    if (motion.effort_flash != null) a.free(label_ctx.text);
+    defer a.free(label_ctx.reported);
+    defer if (label_ctx.estimate.len != 0) a.free(label_ctx.estimate);
+    const value = if (motion.effort_flash) |level|
+        try a.dupe(u8, level.name() orelse "?")
+    else
+        try a.dupe(u8, label_ctx.estimate);
     defer a.free(value);
-    // Byte offset of the muted provider-reported part inside `value`.
-    const muted_at = if (motion.effort_flash != null) value.len else label_ctx.muted_from;
-    const percentage = try std.fmt.allocPrint(a, "{s}{s}", .{ if (motion.low_price_input) "L" else "", value });
-    defer a.free(percentage);
+    // The provider-reported value stays inside the model parentheses; the
+    // estimate (or a transient effort level) follows the closing parenthesis
+    // immediately, with no separator space. Hiding the report leaves the
+    // model parentheses and the coloured value; the price marker moves outside.
+    const show_reported = motion.show_reported_usage;
+    const low = if (motion.low_price_input and (show_reported or value.len != 0)) "L" else "";
     const marker = if (motion.busy) activity.spinner(motion.now_ms) else if (motion.command) "!" else ">";
     const reserve: usize = @min(@as(usize, 24), columns / 3);
-    const room: usize = columns -| (reserve + 5 + text.width(percentage));
+    const inside_width = if (show_reported) 1 + low.len + label_ctx.reported.len else 0;
+    const outside_width = if (show_reported) value.len else low.len + value.len;
+    const room: usize = columns -| (reserve + 4 + inside_width + outside_width);
     const label = try singleLine(a, model, if (columns < 12) 0 else room);
     defer a.free(label);
-    const percent_only = columns >= 12 and label.len == 0 and text.width(percentage) + 2 + reserve <= columns;
-    const plain = if (label.len != 0)
-        try std.fmt.allocPrint(a, "({s}) {s}{s} ", .{ label, percentage, marker })
+    const percent_width = if (show_reported) 4 + low.len + label_ctx.reported.len + value.len else 2 + low.len + value.len;
+    const percent_only = columns >= 12 and label.len == 0 and percent_width + reserve <= columns;
+    const plain = if (label.len != 0 and show_reported)
+        try std.fmt.allocPrint(a, "({s} {s}{s}){s}{s} ", .{ label, low, label_ctx.reported, value, marker })
+    else if (label.len != 0)
+        try std.fmt.allocPrint(a, "({s}){s}{s}{s} ", .{ label, low, value, marker })
+    else if (percent_only and show_reported)
+        try std.fmt.allocPrint(a, "({s}{s}){s}{s} ", .{ low, label_ctx.reported, value, marker })
     else if (percent_only)
-        try std.fmt.allocPrint(a, "{s}{s} ", .{ percentage, marker })
+        try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ low, value, marker })
     else
         try std.fmt.allocPrint(a, "{s} ", .{marker});
     errdefer a.free(plain);
+    if (label.len == 0 and !percent_only and !motion.busy and !motion.command)
+        return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     const idle_color = theme.effortColor(motion.reasoning_effort);
     const slot_flow = motion.busy and motion.effort_flash != null;
-    // The slot colour follows whichever value it shows first: the estimate.
+    // The occupancy colour follows the estimate when present, otherwise the
+    // reported value that remains inside the model parentheses.
     const context_color = theme.contextColor(if (snapshot) |current|
         shared.state.estimateRatio(current) orelse shared.state.contextRatio(current)
     else
         null);
     const slot_color = if (motion.effort_flash != null) idle_color else context_color;
-    const styled_model = label.len != 0 and (motion.streaming or !std.mem.eql(u8, idle_color, theme.reset));
-    const styled_slot = slot_flow or muted_at < value.len or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
-    if (!motion.busy and !motion.command and ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     const palette = theme.modelPalette(motion.rate_band);
     var ordinal: usize = 0;
     if (label.len != 0 or percent_only) {
+        const parenthesized = show_reported or label.len != 0;
+        if (parenthesized) try out.writer.writeAll("(");
         if (label.len != 0) {
-            try out.writer.writeAll("(");
             if (motion.streaming) {
                 try flowText(&out.writer, label, palette, motion.phase, &ordinal);
                 try out.writer.writeAll(theme.reset);
             } else try out.writer.print("{s}{s}{s}", .{ idle_color, label, theme.reset });
-            try out.writer.writeAll(") ");
+            if (show_reported) try out.writer.writeAll(" ");
             ordinal += 1;
         }
-        // A transient effort flash keeps its own styling, but must never turn
-        // the policy marker into a TPS animation or a reasoning-level color.
-        const separate_marker = motion.low_price_input and motion.effort_flash != null;
-        if (separate_marker) {
+        if (show_reported) {
+            if (low.len != 0) {
+                try out.writer.print("{s}L{s}", .{ context_color, theme.reset });
+                ordinal += 1;
+            }
+            try out.writer.print("{s}{s}{s}", .{ theme.muted, label_ctx.reported, theme.reset });
+        }
+        if (parenthesized) try out.writer.writeAll(")");
+        if (!show_reported and low.len != 0) {
             try out.writer.print("{s}L{s}", .{ context_color, theme.reset });
             ordinal += 1;
         }
-        const slot = if (separate_marker) value else percentage;
-        const slot_muted_at = if (separate_marker) muted_at else muted_at + (percentage.len - value.len);
-        if (slot_flow) {
-            try flowText(&out.writer, slot, palette, motion.phase, &ordinal);
-            try out.writer.writeAll(theme.reset);
-        } else if (slot_muted_at < slot.len) {
-            // Estimate in the occupancy colour, provider-reported value muted.
-            try out.writer.print("{s}{s}{s}{s}{s}{s}", .{ slot_color, slot[0..slot_muted_at], theme.reset, theme.muted, slot[slot_muted_at..], theme.reset });
-        } else try out.writer.print("{s}{s}{s}", .{ slot_color, slot, theme.reset });
+        if (value.len != 0) {
+            if (slot_flow) {
+                try flowText(&out.writer, value, palette, motion.phase, &ordinal);
+                try out.writer.writeAll(theme.reset);
+            } else try out.writer.print("{s}{s}{s}", .{ slot_color, value, theme.reset });
+        }
     }
     if (motion.busy) {
         try out.writer.print("{s}{s}{s} ", .{ activeIndicatorColor(motion.now_ms), marker, theme.reset });
@@ -582,8 +601,9 @@ fn flowText(writer: *std.Io.Writer, bytes: []const u8, palette: []const []const 
     }
 }
 
-/// One percentage text plus where its muted tail starts (`text.len` when none).
-const ContextLabel = struct { text: []const u8, muted_from: usize };
+/// Provider-reported occupancy (always present, muted after the model) and the
+/// next-request estimate when one is available.
+const ContextLabel = struct { reported: []const u8, estimate: []const u8 };
 
 fn ratioText(a: std.mem.Allocator, ratio: ?u128, tokens: u64, limit: u64) ![]const u8 {
     const permille = ratio orelse return a.dupe(u8, "?%");
@@ -591,27 +611,21 @@ fn ratioText(a: std.mem.Allocator, ratio: ?u128, tokens: u64, limit: u64) ![]con
     return std.fmt.allocPrint(a, "{d}.{d}%", .{ permille / 10, permille % 10 });
 }
 
-/// Next-request occupancy first, then the last provider-reported value muted when
-/// the two disagree. Capacity unknown is ?%, not 0%; overflow-safe shared
-/// arithmetic never wraps an overfull context.
+/// The reported value is always available as ?% when unknown; the estimate is
+/// empty when unavailable. Overflow-safe shared arithmetic never wraps an
+/// overfull context.
 fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot) !ContextLabel {
-    const current = snapshot orelse {
-        const unknown = try a.dupe(u8, "?%");
-        return .{ .text = unknown, .muted_from = unknown.len };
+    const current = snapshot orelse return .{
+        .reported = try a.dupe(u8, "?%"),
+        .estimate = "",
     };
-    const estimate = shared.state.estimateRatio(current);
-    if (estimate == null) {
-        const label = try ratioText(a, shared.state.contextRatio(current), current.tokens, current.limit);
-        return .{ .text = label, .muted_from = label.len };
-    }
-    const primary = try ratioText(a, estimate, current.estimated, current.limit);
-    errdefer a.free(primary);
-    const secondary = try ratioText(a, shared.state.contextRatio(current), current.tokens, current.limit);
-    defer a.free(secondary);
-    if (std.mem.eql(u8, primary, secondary)) return .{ .text = primary, .muted_from = primary.len };
-    const label = try std.fmt.allocPrint(a, "{s} {s}", .{ primary, secondary });
-    a.free(primary);
-    return .{ .text = label, .muted_from = label.len - secondary.len };
+    const reported = try ratioText(a, shared.state.contextRatio(current), current.tokens, current.limit);
+    errdefer a.free(reported);
+    const estimate = if (shared.state.estimateRatio(current)) |ratio|
+        try ratioText(a, ratio, current.estimated, current.limit)
+    else
+        "";
+    return .{ .reported = reported, .estimate = estimate };
 }
 
 // Test-only: the visible text of a rendered row, with renderer-owned SGR removed.

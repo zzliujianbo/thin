@@ -1945,6 +1945,7 @@ pub const SessionHost = struct {
         try out.field("low_price_input", state.limits.low_price_input);
         try out.field("request_timeout_ms", state.limits.request_timeout_ms);
         try out.field("compaction_enabled", state.limits.compaction_enabled);
+        try out.field("show_reported_usage", state.limits.show_reported_usage);
         try out.endObject();
 
         try out.beginArray("effort_levels");

@@ -6,6 +6,7 @@ pub const Key = enum {
     memory_auto,
     command_timeout_ms,
     request_timeout_ms,
+    show_reported_usage,
 };
 
 /// Validate a shallow candidate before publishing even its scalar fields.
@@ -25,6 +26,11 @@ pub fn apply(config: *cfg.Config, key: Key, value: ?u32) !void {
         },
         .command_timeout_ms => candidate.limits.command_timeout_ms = value orelse return error.InvalidLimit,
         .request_timeout_ms => candidate.limits.request_timeout_ms = value orelse return error.InvalidLimit,
+        .show_reported_usage => {
+            const enabled = value orelse return error.InvalidLimit;
+            if (enabled > 1) return error.InvalidLimit;
+            candidate.limits.show_reported_usage = enabled == 1;
+        },
     }
     try cfg.validate(candidate);
     config.* = candidate;

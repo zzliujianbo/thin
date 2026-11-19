@@ -1,5 +1,5 @@
-test "settings expose seven preference rows" {
-    try std.testing.expectEqual(@as(usize, 7), count);
+test "settings expose eight preference rows" {
+    try std.testing.expectEqual(@as(usize, 8), count);
     try std.testing.expectEqualStrings("Auto memory", label(5));
     try std.testing.expectEqualStrings("on", value(.{}, 5));
     try std.testing.expectEqualStrings("off", value(.{ .memory_auto = false }, 5));
@@ -8,7 +8,11 @@ test "settings expose seven preference rows" {
     try std.testing.expectEqual(@as(?Key, null), preferenceKey(6));
     try std.testing.expectEqualStrings("Not configured", value(.{}, 6));
     try std.testing.expectEqualStrings("", value(.{ .proxy_address = "127.0.0.1", .proxy_port = 3128, .proxy_model_count = 2 }, 6));
-    try std.testing.expectEqualStrings("", label(7));
+    try std.testing.expectEqualStrings("Reported usage", label(7));
+    try std.testing.expectEqualStrings("on", value(.{}, 7));
+    try std.testing.expectEqualStrings("off", value(.{ .limits = .{ .show_reported_usage = false } }, 7));
+    try std.testing.expectEqual(@as(?Key, .show_reported_usage), preferenceKey(7));
+    try std.testing.expectEqualStrings("", label(8));
     try std.testing.expectEqualStrings("Off", value(.{}, 4));
     try std.testing.expectEqualStrings("login/deepseek-flash", value(.{ .image_enabled = true, .image_model = "login/deepseek-flash" }, 4));
     try std.testing.expectEqualStrings("on", value(.{}, 0));
@@ -24,6 +28,7 @@ test "settings expose seven preference rows" {
     try std.testing.expect(std.mem.find(u8, description(0), "unknown") != null);
     try std.testing.expect(std.mem.find(u8, description(1), "compaction") != null);
     try std.testing.expect(std.mem.find(u8, description(6), "proxy") != null);
+    try std.testing.expect(std.mem.find(u8, description(7), "provider-reported") != null);
 }
 test "Proxy root row shows host:port and opens on its static label" {
     const a = std.testing.allocator;

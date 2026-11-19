@@ -21,6 +21,7 @@ const FIRST_FOUR = ['read_file','write_file','bash','memory'];
 const defaults = {
   command_timeout_ms:300000, low_price_input:false,
   request_timeout_ms:10000, compaction_enabled:true,
+  show_reported_usage:true,
 };
 // Same 1x1 PNG container as tools/image_file.zig, independently repair/verify
 // chunk CRCs. Exact bytes are compared after decoding the received data URL.

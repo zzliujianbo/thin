@@ -3744,6 +3744,7 @@ const Ui = struct {
             .memory_auto => "Auto memory",
             .command_timeout_ms => "Command timeout (s)",
             .request_timeout_ms => "All inference request timeout (s)",
+            .show_reported_usage => "Reported usage",
         };
     }
     fn openSettingsValue(self: *Ui, key_: preference.Key, state: Connection.State) void {
@@ -3752,6 +3753,7 @@ const Ui = struct {
             .memory_auto => @intFromBool(state.memory_auto),
             .command_timeout_ms => state.limits.command_timeout_ms,
             .request_timeout_ms => state.limits.request_timeout_ms,
+            .show_reported_usage => @intFromBool(state.limits.show_reported_usage),
         };
         self.settings_return_selected = self.settings_menu.selected;
         self.settings_value_picker = settings_value_module.Picker.init(key_, current, state.limits);
@@ -4209,6 +4211,8 @@ const Ui = struct {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.compaction_enabled));
                         } else if (key_ == .memory_auto) {
                             _ = self.savePreference(key_, @intFromBool(!state.memory_auto));
+                        } else if (key_ == .show_reported_usage) {
+                            _ = self.savePreference(key_, @intFromBool(!state.limits.show_reported_usage));
                         } else self.openSettingsValue(key_, state);
                         return;
                     }
@@ -7055,7 +7059,7 @@ const Ui = struct {
         // is owned by the fast animation slot, one step per painted frame.
         const streaming = view.streaming and working;
         const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .command = self.command_mode });
+        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .show_reported_usage = state.limits.show_reported_usage, .command = self.command_mode });
         // Modal authorization/secret layouts stay fixed. Idle LF debt first
         // obtains a single-row composer ACK even if a newer long draft arrived.
         const limit: usize = if (self.permission != null or self.stop_open or self.idle_breaks != 0) 1 else @min(composer_layout.max_rows, @max(1, self.size.rows -| 5));
@@ -7301,7 +7305,7 @@ const Ui = struct {
             // Only the prompt, never that now-deleted draft, becomes history.
             const view = self.display.view(self.clock_ms);
             const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .command = self.command_mode });
+            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .show_reported_usage = state.limits.show_reported_usage, .command = self.command_mode });
             idle_prompt = try std.fmt.allocPrint(a, "{s}{s}\x1b[K", .{ decoration.styled, theme.reset });
             try writer.writeAll(idle_prompt);
             // Entry is the ACKed composer's bottom row, not the tail's top.
