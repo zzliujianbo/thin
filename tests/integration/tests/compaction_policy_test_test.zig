@@ -231,7 +231,8 @@ test "compaction policy summary must be nonempty stop text and never executes to
         const before = runtime.messages();
         var cancel: p.Cancellation = .{};
         const result = try runtime.compactContext(&cancel);
-        try std.testing.expectEqual(r.Status.failed, result.status);
+        // A summary-only failure pauses the session instead of failing it.
+        try std.testing.expectEqual(r.Status.paused, result.status);
         try std.testing.expectEqual(if (fault == .empty or fault == .whitespace) error.InvalidSummary else error.SummaryRequestedTool, result.detail.?);
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(usize, 0), fake.normal);

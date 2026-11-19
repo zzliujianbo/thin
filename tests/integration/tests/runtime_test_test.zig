@@ -947,7 +947,7 @@ test "summary tool calls are never executed and failure preserves history" {
     var cancel = p.Cancellation{};
     const terminal = try runtime.run("Do the task", &cancel);
     try std.testing.expectEqual(r.Status.paused, terminal.status);
-    try std.testing.expectEqual(error.InputBudgetSummaryFailed, terminal.detail.?);
+    try std.testing.expectEqual(error.SummaryRequestedTool, terminal.detail.?);
     try std.testing.expectEqual(@as(u32, 1), fake.summary_calls);
     try std.testing.expect(fake.failed_summary_preserved);
     try std.testing.expectEqual(@as(u32, 0), fake.compactions);
@@ -1297,13 +1297,15 @@ test "manual compaction canceled or failed summary preserves canonical history a
         const tokens = runtime.estimatedTokens();
         if (mode == 3) cancel.cancel();
         const terminal = try runtime.compactContext(&cancel);
-        try std.testing.expectEqual(if (mode == 0 or mode == 3) r.Status.canceled else r.Status.failed, terminal.status);
+        try std.testing.expectEqual(if (mode == 0 or mode == 3) r.Status.canceled else r.Status.paused, terminal.status);
         try std.testing.expectEqual(@as(u32, if (mode == 3) 0 else 1), fake.summary_calls);
         try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
         try std.testing.expectEqual(@as(u32, 0), fake.executions);
         try std.testing.expectEqual(@as(u32, 0), fake.compactions);
         try std.testing.expectEqual(@as(u32, 1), fake.terminals);
-        try std.testing.expect(fake.compaction_error != null);
+        // A canceled compaction emits no failure notice; the display settles
+        // the progress row from the terminal instead.
+        if (mode == 0 or mode == 3) try std.testing.expect(fake.compaction_error == null) else try std.testing.expect(fake.compaction_error != null);
         try std.testing.expect(before.ptr == runtime.messages().ptr);
         try std.testing.expectEqualDeep(before, runtime.messages());
         try std.testing.expectEqual(tokens, runtime.estimatedTokens());

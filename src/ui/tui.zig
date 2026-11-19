@@ -3451,7 +3451,6 @@ const Ui = struct {
                 self.compaction_active = false;
                 _ = try self.add(.notice, switch (value.reason) {
                     .recent => "Automatic compaction skipped: context has not grown enough since the last compaction.",
-                    .limit => "Automatic compaction skipped: per-task limit reached; context remains within budget.",
                     .rejected => "Automatic compaction skipped: the last automatic summary was rejected; context remains within budget.",
                 });
             },

@@ -181,11 +181,17 @@ pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true
 
 pub fn inputBudgetPause(detail: ?anyerror) bool {
     const err = detail orelse return false;
-    return err == error.InputBudgetExceeded or err == error.UnknownInputPriceThreshold or err == error.InputBudgetSummaryFailed;
+    // Compaction-only errors belong here too: the run stopped because of the
+    // input policy, not because the conversation itself failed.
+    return switch (err) {
+        error.InputBudgetExceeded, error.UnknownInputPriceThreshold => true,
+        error.InsufficientCompaction, error.InvalidSummary, error.SummaryRequestedTool, error.SummaryFailed => true,
+        else => false,
+    };
 }
 
 /// 发给宿主的运行时事件，按发生顺序同步送达 Host.emit_fn。
-pub const CompactionSkipReason = enum { recent, limit, rejected };
+pub const CompactionSkipReason = enum { recent, rejected };
 
 pub const Event = union(enum) {
     background_completed: @import("background_status.zig").Terminal,
@@ -417,7 +423,6 @@ pub fn isLocalCommand(id: []const u8) bool {
 pub const local_command_note = "Program-generated bash call for the user's explicit !command; not LLM reasoning or a model response.";
 
 /// Agent loop; owner serializes selection and worker execution.
-const max_auto_compactions: u8 = 2;
 const auto_compaction_growth_divisor: usize = 20;
 
 pub const Runtime = struct {
@@ -868,10 +873,10 @@ pub const Runtime = struct {
         /// Whether this task already explained a skipped or impossible
         /// compaction. One notice is enough per task.
         compact_notice_sent: bool = false,
-        /// Successful automatic compactions this task, and the post-summary
-        /// estimate used for the growth guard.
-        auto_compactions: u8 = 0,
-        auto_after_tokens: usize = 0,
+        /// Estimate right after this task's last successful automatic summary.
+        /// Another summary waits until the context grows past it by 5% of the
+        /// budget; null means no compaction happened in this task yet.
+        auto_floor: ?usize = null,
         /// 累计的用量与终态，run 结束时返回。
         terminal: Terminal = .{ .status = .success },
 
@@ -1069,7 +1074,10 @@ pub const Runtime = struct {
     }
 
     fn compactInner(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+        const attempts = task.summary_attempts;
         self.compactManual(cancel, task) catch |err| {
+            if (err == error.CleanupFailed or self.poisoned) return error.CleanupFailed;
+            if (err == error.Canceled or err == error.RoundLimit or err == error.HostDisconnected or err == error.OutputLimitReached) return err;
             // The plan proved no result could fit: nothing was sent, so report
             // the budget condition the user can act on instead of a summary
             // failure that never happened.
@@ -1089,6 +1097,12 @@ pub const Runtime = struct {
                 return;
             }
             try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
+            // A failure after the summary request went out is a summary failure,
+            // whatever the transport reported: the same rule as preflight.
+            if (task.summary_attempts != attempts) return switch (err) {
+                error.InsufficientCompaction, error.InvalidSummary, error.SummaryRequestedTool, error.SummaryFailed => err,
+                else => error.SummaryFailed,
+            };
             return err;
         };
     }
@@ -1699,15 +1713,6 @@ pub const Runtime = struct {
         // the growth proxy still looks comfortable; refusing there is what made
         // a nearly full session fail without compacting.
         const over = measured > budget;
-        if (task.auto_compactions >= max_auto_compactions) {
-            if (over) return .attempt;
-            return .{ .skip = .limit };
-        }
-        // Beyond the cap, an input already over the hard budget still needs an
-        // emergency summary; otherwise a barely useful repeat is not worth it.
-        if (task.auto_compactions != 0 and !over and
-            measured < task.auto_after_tokens +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
-            return .{ .skip = .recent };
         // A previous automatic summary in this session was paid for and then
         // rejected. With the same budget and a context that has not shrunk,
         // another attempt can only buy the same result.
@@ -1719,6 +1724,13 @@ pub const Runtime = struct {
                 if (over) return .over_budget;
                 return .{ .skip = .rejected };
             }
+        }
+        // A just-finished summary only pays off once the context has grown
+        // again; otherwise a task that cannot reach the target would summarize
+        // on every round. Over the hard budget an emergency summary is allowed.
+        if (task.auto_floor) |floor| {
+            if (!over and measured < floor +| @max(@as(usize, 1), budget / auto_compaction_growth_divisor))
+                return .{ .skip = .recent };
         }
         return .attempt;
     }
@@ -1770,11 +1782,17 @@ pub const Runtime = struct {
             // than a failure of a request that never happened.
             if (err == error.CompactionImpossible) return context.inputBudgetError(self.config.*);
             if (task.summary_attempts != attempts) {
-                // A failed paid compaction under the opt-in cost policy must not
-                // fall through to normal inference or another automatic summary.
+                // A failed paid compaction must not fall through to normal
+                // inference or another automatic summary.
                 try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 try checkCanceled(cancel);
-                return error.InputBudgetSummaryFailed;
+                // Only a rejected result is "this budget cannot work"; a
+                // transport or server failure says nothing about the budget.
+                if (err == error.InsufficientCompaction) self.failed_auto_summary = .{ .before = estimated, .budget = budget };
+                return switch (err) {
+                    error.InsufficientCompaction, error.InvalidSummary, error.SummaryRequestedTool, error.SummaryFailed => err,
+                    else => error.SummaryFailed,
+                };
             }
             // Same anchored measure as preflight: a failed summary may continue
             // only when the real prompt still fits the hard budget.
@@ -1793,6 +1811,8 @@ pub const Runtime = struct {
             // only if that old input still fits the hard input budget.
             if (current > budget) return context.inputBudgetError(self.config.*);
         };
+        // A committed compaction proves this budget can be summarized.
+        self.failed_auto_summary = null;
     }
 
     /// 调用模型生成摘要，替换可压缩的历史。
@@ -1921,13 +1941,9 @@ pub const Runtime = struct {
         const before = self.estimatedTokens();
         const after = self.estimator.tokens(context.rawTokens(self.system, self.executor.schemas, next.items));
 
-        // 压缩必须真正减少 token（至少 max(32, 5%)）且不超过输入预算，否则拒绝提交。
-        if (after >= before or before - after < @max(@as(usize, 32), before / 20) or after > commit_budget) {
-            // Remember a rejected automatic summary so a later run with the same
-            // budget and no smaller context stops paying for the same result.
-            if (planning == .automatic) self.failed_auto_summary = .{ .before = before, .budget = commit_budget };
-            return error.InsufficientCompaction;
-        }
+        // A summary must at least shorten the history. Whether the result still
+        // fits the budget is the send gate's decision, not this one.
+        if (after >= before) return error.InsufficientCompaction;
         try checkCanceled(cancel);
 
         // 切换点：arena 与 history 一起替换，旧 arena 在最后释放，避免悬垂引用。
@@ -1935,9 +1951,6 @@ pub const Runtime = struct {
         self.arena = next_arena;
         self.history = next;
         installed = true;
-        // A committed compaction proves history can still be summarized, so the
-        // remembered rejection no longer describes this session.
-        self.failed_auto_summary = null;
 
         // 压缩后把受保护区段的下标重新映射到新历史。
         self.protected_index = if (selection.protected_index < selection.cut) 1 else selection.protected_index - selection.cut + 1;
@@ -1946,8 +1959,7 @@ pub const Runtime = struct {
         self.last_context_tokens = null;
         self.resetNormalContextBaseline();
         if (planning == .automatic) {
-            task.auto_compactions +|= 1;
-            task.auto_after_tokens = after;
+            task.auto_floor = after;
         }
         try self.emit(.{ .compacted = .{ .before = before, .after = after } }, cancel);
     }

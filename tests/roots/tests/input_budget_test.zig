@@ -166,7 +166,7 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
     const terminal = try runtime.run(goal, &cancel);
     try std.testing.expectEqual(if (unknown_anthropic) r.Status.paused else r.Status.failed, terminal.status);
     try std.testing.expectEqual(if (unknown_anthropic) error.InputBudgetExceeded else error.ContextTooLarge, terminal.detail.?);
-    try std.testing.expect(terminal.detail.? != error.InputBudgetSummaryFailed);
+    try std.testing.expect(terminal.detail.? != error.SummaryFailed and terminal.detail.? != error.InsufficientCompaction);
     try std.testing.expect(terminal.model_failure == null and terminal.http_status == null);
     try std.testing.expectEqual(@as(usize, 1), capture.failures);
     try std.testing.expectEqual(if (unknown_anthropic) error.UnknownModelOutputCapacity else error.ContextTooLarge, capture.cause.?);

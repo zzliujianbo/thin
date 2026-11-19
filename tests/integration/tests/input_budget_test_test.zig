@@ -260,7 +260,9 @@ test "input budget failed paid summary stops no fallback or automatic repeated a
         var cancel: p.Cancellation = .{};
         const result = try runtime.run("new goal", &cancel);
         try std.testing.expectEqual(r.Status.paused, result.status);
-        try std.testing.expectEqual(error.InputBudgetSummaryFailed, result.detail.?);
+        // The terminal keeps the real cause: a server or transport failure is a
+        // summary failure, an empty body is an invalid summary.
+        try std.testing.expectEqual(if (fault == .invalid) error.InvalidSummary else error.SummaryFailed, result.detail.?);
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
         try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
@@ -302,7 +304,7 @@ test "input budget summary crosses 95K price tier while normal remains blocked a
         } else try c.checkInput(config, runtime.estimatedTokens());
     }
 }
-test "input budget rejects a reducing summary whose resulting history still exceeds normal price budget" {
+test "input budget accepts a reducing summary even when the result still exceeds the price budget" {
     var config = configuration();
     config.limits.low_price_input = true;
     config.model.input_price_threshold = 8000;
@@ -326,12 +328,13 @@ test "input budget rejects a reducing summary whose resulting history still exce
     try std.testing.expect(after_tokens > c.inputBudget(config));
     var cancel: p.Cancellation = .{};
     const result = try runtime.compactContext(&cancel);
-    try std.testing.expectEqual(r.Status.failed, result.status);
-    try std.testing.expectEqual(error.InsufficientCompaction, result.detail.?);
+    // The only acceptance rule is that the history got shorter; the budget is
+    // the send gate's business, so an over-budget result is still committed.
+    try std.testing.expectEqual(r.Status.success, result.status);
     try std.testing.expectEqual(@as(usize, 1), fake.summaries);
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
-    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
-    try std.testing.expectEqualDeep(before, runtime.messages());
+    try std.testing.expect(runtime.messages().ptr != before.ptr);
+    try std.testing.expect(c.rawTokens(runtime.system, runtime.executor.schemas, runtime.messages()) > c.inputBudget(config));
 }
 test "input budget summary physical window remains enforced" {
     var config = configuration();
@@ -433,7 +436,7 @@ test "input budget does not pay twice for a rejected automatic summary" {
     var cancel: p.Cancellation = .{};
     const first = try runtime.run("first goal", &cancel);
     try std.testing.expectEqual(r.Status.paused, first.status);
-    try std.testing.expectEqual(error.InputBudgetSummaryFailed, first.detail.?);
+    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
     try std.testing.expectEqual(@as(usize, 1), fake.summaries);
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
     try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
@@ -468,7 +471,7 @@ test "input budget skips a remembered rejected summary while the input still fit
     var cancel: p.Cancellation = .{};
     const first = try runtime.run("first goal", &cancel);
     try std.testing.expectEqual(r.Status.paused, first.status);
-    try std.testing.expectEqual(error.InputBudgetSummaryFailed, first.detail.?);
+    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
     try std.testing.expectEqual(@as(usize, 1), fake.summaries);
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
     // The input still fits, so the next turn continues without another summary.

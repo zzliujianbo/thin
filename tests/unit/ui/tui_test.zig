@@ -4427,7 +4427,7 @@ test "input policy pauses stay red in conversation and out of the footer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     ui.notice = "Ready";
-    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InputBudgetSummaryFailed }) |detail| {
+    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InsufficientCompaction }) |detail| {
         try std.testing.expect(r.inputBudgetPause(detail));
         const result: r.Terminal = .{ .status = .paused, .detail = detail };
         ui.last_terminal = result;
@@ -14000,7 +14000,7 @@ test "compaction status and result are visible in the conversation" {
     }
     try std.testing.expect(impossible);
 
-    try ui.applyEvent(.{ .compaction_skipped = .{ .reason = .limit } }, false, true);
+    try ui.applyEvent(.{ .compaction_skipped = .{ .reason = .recent } }, false, true);
     var skipped = false;
     for (ui.records.items) |record| {
         if (std.mem.startsWith(u8, record.body.items, "Automatic compaction skipped:")) skipped = true;
