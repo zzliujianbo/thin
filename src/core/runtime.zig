@@ -1139,6 +1139,9 @@ pub const Runtime = struct {
             }
         }
         try self.compact(cancel, task, .manual);
+        // A committed manual summary proves this budget can be summarized, so the
+        // remembered rejection must not keep blocking automatic attempts.
+        self.failed_auto_summary = null;
         self.last_context_tokens = null;
         try self.emitContext(cancel);
     }

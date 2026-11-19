@@ -524,3 +524,38 @@ test "compaction publishes the measured occupancy that triggered it" {
     try std.testing.expect(capture.measured_before_compacting.? > 0);
     try std.testing.expect(capture.measured_before_compacting.? >= c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
 }
+test "a committed manual summary clears the remembered rejection" {
+    const old: [12500]u8 = @splat('x');
+    const long_summary: [25000]u8 = @splat('s');
+    const brief: []const u8 = "condensed background";
+    var config = configuration();
+    config.limits.low_price_input = true;
+    var fake = Fake{ .config = &config, .summary_text = &long_summary };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    const fixed = c.fixedTokens(runtime.system, runtime.executor.schemas);
+    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + @as(u32, @intCast(fixed + 1000));
+    var cancel: p.Cancellation = .{};
+    // The paid summary comes back too long to shrink anything: rejected and
+    // remembered for this budget.
+    const first = try runtime.run("first goal", &cancel);
+    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+
+    // A manual summary that does shrink the history must clear that memory.
+    fake.summary_text = brief;
+    const manual = try runtime.compactContext(&cancel);
+    try std.testing.expectEqual(r.Status.success, manual.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.summaries);
+
+    // Regrow the context past the trigger: the next task may summarize again
+    // instead of skipping as "rejected".
+    const regrow: [20000]u8 = @splat('y');
+    const arena_alloc = runtime.arena.allocator();
+    try runtime.history.append(arena_alloc, try p.textMessage(arena_alloc, .user, &regrow));
+    try runtime.history.append(arena_alloc, try p.textMessage(arena_alloc, .assistant, "regrown answer"));
+    const next = try runtime.run("second goal", &cancel);
+    try std.testing.expectEqual(@as(usize, 3), fake.summaries);
+    try std.testing.expectEqual(r.Status.success, next.status);
+}
