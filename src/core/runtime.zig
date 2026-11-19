@@ -1770,10 +1770,12 @@ pub const Runtime = struct {
         // Publish the measure that decided this compaction. The displayed value
         // otherwise follows completed requests, so a tool result the provider has
         // not counted yet would make the trigger look premature.
+        const decided = std.math.cast(u64, measured) orelse std.math.maxInt(u64);
         try self.emit(.{ .context_snapshot = .{
-            .tokens = std.math.cast(u64, measured) orelse std.math.maxInt(u64),
+            .tokens = decided,
             .limit = @intCast(self.config.model.context_tokens),
             .known = true,
+            .estimated = decided,
         } }, cancel);
         const attempts = task.summary_attempts;
         self.compact(cancel, task, .automatic) catch |err| {
