@@ -9135,7 +9135,7 @@ test "slash composer frames keep model prefixes and hide credentials with comman
         .{ .raw = "/model\t", .shown = "/model    " },
         .{ .raw = "/model \t  ", .shown = "/model       " },
         .{ .raw = "/model provider/model-pre", .shown = "/model provider/model-pre" },
-        .{ .raw = "/model malformed extra", .shown = "/model [arguments hidden; use one model ID]", .hidden = "malformed" },
+        .{ .raw = "/model first\nsecond", .shown = "/model [arguments hidden; use one model ID]", .hidden = "first" },
         .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
         .{ .raw = "/compact fakecredential", .shown = "/compact [arguments hidden; no arguments]", .hidden = "fakecredential" },
         .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
@@ -9178,12 +9178,17 @@ test "slash composer keeps supported management arguments visible without submit
         .{ .raw = "/attach --takeover 0123456789abcdef0123456789abcdef", .shown = "/attach --takeover 0123456789abcdef0123456789abcdef" },
         .{ .raw = "/close 0123456789abcdef0123456789abcdef --force", .shown = "/close 0123456789abcdef0123456789abcdef --force" },
         .{ .raw = "/detach   ", .shown = "/detach   " },
+        .{ .raw = "/new hello world", .shown = "/new hello world" },
+        .{ .raw = "/new /help me", .shown = "/new /help me" },
+        .{ .raw = "/resume 0123", .shown = "/resume 0123" },
+        .{ .raw = "/attach --takeover", .shown = "/attach --takeover" },
+        .{ .raw = "/close --force", .shown = "/close --force" },
         .{ .raw = "/login ", .shown = "/login " },
         .{ .raw = "/compact\t", .shown = "/compact    " },
-        .{ .raw = "/attach bad!id extra", .shown = "/ [command arguments hidden]", .hidden = "bad!id" },
+        .{ .raw = "/attach bad!id extra", .shown = "/attach bad!id extra" },
+        .{ .raw = "/model one two", .shown = "/model one two" },
         .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
         .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
-        .{ .raw = "/model one two", .shown = "/model [arguments hidden; use one model ID]", .hidden = "one two" },
     };
     for (cases) |case| {
         var cancel = p.Cancellation{};
@@ -9211,6 +9216,26 @@ test "slash composer keeps supported management arguments visible without submit
         try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
         discardFixtureFrame(&ui);
     }
+}
+test "new prompt keeps multiline arguments visible in the composer" {
+    try text.initLocale();
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    _ = try ui.editor.insert("/new first\nsecond");
+    try ui.draw();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("first"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("second"));
+    try std.testing.expect(std.mem.find(u8, ui.frame, "command arguments hidden") == null);
+    try std.testing.expectEqualStrings("/new first\nsecond", ui.editor.bytes.items);
+    discardFixtureFrame(&ui);
 }
 test "settings proxy submenu toggles one acknowledged row and keeps parent draft" {
     try text.initLocale();

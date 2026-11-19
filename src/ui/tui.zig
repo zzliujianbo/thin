@@ -8009,46 +8009,25 @@ fn modelCommand(command: []const u8) bool {
     return std.mem.eql(u8, command, "/model") or std.mem.startsWith(u8, command, "/model ") or std.mem.startsWith(u8, command, "/model\t");
 }
 
-/// True when the slash arguments must stay masked. Only non-empty arguments of
-/// no-argument or unknown commands, /login credentials and malformed values are
-/// sensitive; ordinary supported argument shapes stay visible and editable.
+/// True when the slash arguments must stay masked. /login credentials,
+/// arguments of commands that take none, unknown commands and multiline values
+/// for single-line commands cannot be told apart from an accidental paste;
+/// supported commands keep their single-line arguments visible and editable.
 fn sensitiveArguments(name: []const u8, rest: []const u8) bool {
     const args = std.mem.trim(u8, rest, " \t\r\n");
     if (args.len == 0) return false; // Trailing whitespace alone is never sensitive.
-    if (std.mem.findAny(u8, args, "\r\n") != null) return true; // Commands are single-line.
-    if (std.mem.eql(u8, name, "/model")) return !picker_module.manualName(args);
-    if (std.mem.eql(u8, name, "/attach") or std.mem.eql(u8, name, "/close"))
-        return !sessionArgumentsValid(name, args);
-    // /login, /compact, /detach and unknown commands take no
-    // arguments; non-empty text cannot be told apart from an accidental paste.
+    // /new takes a free-form prompt, including internal newlines.
+    if (std.mem.eql(u8, name, "/new")) return false;
+    if (std.mem.findAny(u8, args, "\r\n") != null) return true; // Other commands are single-line.
+    // These commands accept an argument; validation belongs to submission so
+    // the draft stays visible while it is typed or corrected.
+    if (std.mem.eql(u8, name, "/model") or
+        std.mem.eql(u8, name, "/attach") or
+        std.mem.eql(u8, name, "/close") or
+        std.mem.eql(u8, name, "/resume")) return false;
+    // /login credentials, no-argument commands and unknown commands cannot
+    // tell an argument from an accidental pasted secret.
     return true;
-}
-
-/// Tokenizes into the same bounded shape the management parser accepts.
-fn splitQuiet(value: []const u8, out: *[4][]const u8) usize {
-    var count: usize = 0;
-    var it = std.mem.tokenizeAny(u8, value, " \t");
-    while (it.next()) |word| {
-        if (count == out.len) return out.len + 1;
-        out[count] = word;
-        count += 1;
-    }
-    return count;
-}
-
-fn sessionArgumentsValid(name: []const u8, args: []const u8) bool {
-    var words: [4][]const u8 = undefined;
-    const count = splitQuiet(args, &words);
-    if (count == 0 or count > words.len) return false;
-    const flag = if (std.mem.eql(u8, name, "/close")) "--force" else "--takeover";
-    var id: ?[]const u8 = null;
-    for (words[0..count]) |word| {
-        if (std.mem.eql(u8, word, flag)) continue;
-        if (word.len != 0 and word[0] == '-') return false;
-        if (id != null) return false;
-        id = word;
-    }
-    return (id orelse return false).len <= 256;
 }
 
 /// 输入行的显示副本：Tab 固定展开为四个空格，测宽、裁剪与输出共用；不修改提交字节。
