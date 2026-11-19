@@ -695,7 +695,12 @@ test "idle refresh publishes restored context after login without requests" {
         // of Session.initial_context, which remains the login-time value.
         app.runtime.last_context_tokens = 246;
         host.observe(.{ .context_snapshot = app.runtime.contextSnapshot() }, false, true);
-        try std.testing.expectEqualDeep(expected, host.session.initial_context.?);
+        // The restored history also yields a next-request estimate.
+        const live = host.session.initial_context.?;
+        try std.testing.expectEqual(expected.tokens, live.tokens);
+        try std.testing.expectEqual(expected.limit, live.limit);
+        try std.testing.expectEqual(expected.known, live.known);
+        try std.testing.expect(live.estimated > 0);
         const latest = r.ContextSnapshot{ .tokens = 246, .limit = 131072 };
         try Spy.expectSnapshot(host, latest);
         // Disabling an already-disabled image model is an unrelated settings
@@ -703,7 +708,12 @@ test "idle refresh publishes restored context after login without requests" {
         const setting = try dispatchJson(host, a, "{\"v\":5,\"id\":3,\"op\":\"image_model\",\"epoch\":1,\"off\":true}", 7);
         defer a.free(setting);
         try std.testing.expect(std.mem.indexOf(u8, setting, "\"ok\":true") != null);
-        try std.testing.expectEqualDeep(expected, host.session.initial_context.?);
+        // The restored history also yields a next-request estimate.
+        const refreshed = host.session.initial_context.?;
+        try std.testing.expectEqual(expected.tokens, refreshed.tokens);
+        try std.testing.expectEqual(expected.limit, refreshed.limit);
+        try std.testing.expectEqual(expected.known, refreshed.known);
+        try std.testing.expect(refreshed.estimated > 0);
         try Spy.expectSnapshot(host, latest);
         try std.testing.expectEqual(@as(usize, 0), spy.calls);
         try std.testing.expectEqual(@as(u64, 0), host.task_seq);

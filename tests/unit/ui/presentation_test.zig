@@ -813,3 +813,28 @@ test "individual command rows retain their icons and own outcome prefix colors" 
     defer a.free(clipped);
     try std.testing.expect(std.mem.endsWith(u8, clipped, "..." ++ theme.reset));
 }
+test "context slot shows the next-request estimate before the reported value" {
+    const a = std.testing.allocator;
+    const snapshot = shared.ContextSnapshot{ .tokens = 48_300, .limit = 100_000, .known = true, .estimated = 88_600 };
+    const value = try prompt(a, "fixture", snapshot, 79, .{ .reasoning_effort = .high });
+    defer value.deinit(a);
+    // Estimate first, provider report second, separated by one space.
+    try std.testing.expectEqualStrings("(fixture) 88.6% 48.3%> ", value.plain);
+    const muted = try std.fmt.allocPrint(a, "{s}48.3%", .{theme.muted});
+    defer a.free(muted);
+    try std.testing.expect(std.mem.find(u8, value.styled, muted) != null);
+    // The occupancy colour follows the estimate, not the stale report.
+    const hot = shared.ContextSnapshot{ .tokens = 1000, .limit = 100_000, .estimated = 95_000 };
+    const busy_value = try prompt(a, "fixture", hot, 79, .{});
+    defer busy_value.deinit(a);
+    try std.testing.expectEqualStrings("(fixture) 95.0% 1.0%> ", busy_value.plain);
+    const failure_color = try std.fmt.allocPrint(a, "{s}95.0%", .{theme.failure});
+    defer a.free(failure_color);
+    try std.testing.expect(std.mem.find(u8, busy_value.styled, failure_color) != null);
+
+    // Equal numbers are not repeated.
+    const same = shared.ContextSnapshot{ .tokens = 50, .limit = 100, .estimated = 50 };
+    const same_value = try prompt(a, "fixture", same, 79, .{});
+    defer same_value.deinit(a);
+    try std.testing.expectEqualStrings("(fixture) 50.0%> ", same_value.plain);
+}

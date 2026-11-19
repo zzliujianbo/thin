@@ -104,8 +104,13 @@ fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protoc
                 try connection.image_fn.?(connection.context, .off);
             }
             const state = session.connection().current();
-            try std.testing.expectEqualDeep(before, app.runtime.contextSnapshot());
-            try std.testing.expectEqualDeep(before, state.initial_context.?);
+            // Switching the image model adds or removes a tool schema, which moves
+            // the next-request estimate; the reported occupancy is untouched.
+            const current = app.runtime.contextSnapshot();
+            try std.testing.expectEqual(before.tokens, current.tokens);
+            try std.testing.expectEqual(before.known, current.known);
+            try std.testing.expectEqual(before.tokens, state.initial_context.?.tokens);
+            try std.testing.expectEqual(before.known, state.initial_context.?.known);
             try std.testing.expectEqual(display.contextRatio(before), display.contextRatio(state.initial_context.?));
             try std.testing.expect(app.client.authorization.ptr == primary);
             try std.testing.expectEqualDeep(estimator, app.runtime.estimator);

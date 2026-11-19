@@ -501,11 +501,12 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
             return .{ .plain = plain, .styled = try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ theme.accent, marker, theme.reset }) };
         return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     }
-    const value = if (motion.effort_flash) |level|
-        try a.dupe(u8, level.name() orelse "?")
-    else
-        try contextLabel(a, snapshot);
+    const label_ctx = try contextLabel(a, snapshot);
+    const value = if (motion.effort_flash) |level| try a.dupe(u8, level.name() orelse "?") else label_ctx.text;
+    if (motion.effort_flash != null) a.free(label_ctx.text);
     defer a.free(value);
+    // Byte offset of the muted provider-reported part inside `value`.
+    const muted_at = if (motion.effort_flash != null) value.len else label_ctx.muted_from;
     const percentage = try std.fmt.allocPrint(a, "{s}{s}", .{ if (motion.low_price_input) "L" else "", value });
     defer a.free(percentage);
     const marker = if (motion.busy) activity.spinner(motion.now_ms) else if (motion.command) "!" else ">";
@@ -523,10 +524,14 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     errdefer a.free(plain);
     const idle_color = theme.effortColor(motion.reasoning_effort);
     const slot_flow = motion.busy and motion.effort_flash != null;
-    const context_color = theme.contextColor(if (snapshot) |current| shared.state.contextRatio(current) else null);
+    // The slot colour follows whichever value it shows first: the estimate.
+    const context_color = theme.contextColor(if (snapshot) |current|
+        shared.state.estimateRatio(current) orelse shared.state.contextRatio(current)
+    else
+        null);
     const slot_color = if (motion.effort_flash != null) idle_color else context_color;
     const styled_model = label.len != 0 and (motion.streaming or !std.mem.eql(u8, idle_color, theme.reset));
-    const styled_slot = slot_flow or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
+    const styled_slot = slot_flow or muted_at < value.len or !std.mem.eql(u8, slot_color, theme.reset) or (motion.low_price_input and !std.mem.eql(u8, context_color, theme.reset));
     if (!motion.busy and !motion.command and ((label.len == 0 and !percent_only) or (!styled_model and !styled_slot))) return .{ .plain = plain, .styled = try a.dupe(u8, plain) };
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
@@ -550,9 +555,13 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
             ordinal += 1;
         }
         const slot = if (separate_marker) value else percentage;
+        const slot_muted_at = if (separate_marker) muted_at else muted_at + (percentage.len - value.len);
         if (slot_flow) {
             try flowText(&out.writer, slot, palette, motion.phase, &ordinal);
             try out.writer.writeAll(theme.reset);
+        } else if (slot_muted_at < slot.len) {
+            // Estimate in the occupancy colour, provider-reported value muted.
+            try out.writer.print("{s}{s}{s}{s}{s}{s}", .{ slot_color, slot[0..slot_muted_at], theme.reset, theme.muted, slot[slot_muted_at..], theme.reset });
         } else try out.writer.print("{s}{s}{s}", .{ slot_color, slot, theme.reset });
     }
     if (motion.busy) {
@@ -573,12 +582,36 @@ fn flowText(writer: *std.Io.Writer, bytes: []const u8, palette: []const []const 
     }
 }
 
-/// Retained-context estimate displayed as percentage only. Capacity unknown is
-/// ?%, not 0%; overflow-safe shared arithmetic never wraps an overfull context.
-fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot) ![]const u8 {
-    const ratio = shared.state.contextRatio(snapshot orelse return a.dupe(u8, "?%")) orelse return a.dupe(u8, "?%");
-    if (snapshot.?.tokens > snapshot.?.limit) return a.dupe(u8, ">100%");
-    return std.fmt.allocPrint(a, "{d}.{d}%", .{ ratio / 10, ratio % 10 });
+/// One percentage text plus where its muted tail starts (`text.len` when none).
+const ContextLabel = struct { text: []const u8, muted_from: usize };
+
+fn ratioText(a: std.mem.Allocator, ratio: ?u128, tokens: u64, limit: u64) ![]const u8 {
+    const permille = ratio orelse return a.dupe(u8, "?%");
+    if (tokens > limit) return a.dupe(u8, ">100%");
+    return std.fmt.allocPrint(a, "{d}.{d}%", .{ permille / 10, permille % 10 });
+}
+
+/// Next-request occupancy first, then the last provider-reported value muted when
+/// the two disagree. Capacity unknown is ?%, not 0%; overflow-safe shared
+/// arithmetic never wraps an overfull context.
+fn contextLabel(a: std.mem.Allocator, snapshot: ?shared.ContextSnapshot) !ContextLabel {
+    const current = snapshot orelse {
+        const unknown = try a.dupe(u8, "?%");
+        return .{ .text = unknown, .muted_from = unknown.len };
+    };
+    const estimate = shared.state.estimateRatio(current);
+    if (estimate == null) {
+        const label = try ratioText(a, shared.state.contextRatio(current), current.tokens, current.limit);
+        return .{ .text = label, .muted_from = label.len };
+    }
+    const primary = try ratioText(a, estimate, current.estimated, current.limit);
+    errdefer a.free(primary);
+    const secondary = try ratioText(a, shared.state.contextRatio(current), current.tokens, current.limit);
+    defer a.free(secondary);
+    if (std.mem.eql(u8, primary, secondary)) return .{ .text = primary, .muted_from = primary.len };
+    const label = try std.fmt.allocPrint(a, "{s} {s}", .{ primary, secondary });
+    a.free(primary);
+    return .{ .text = label, .muted_from = label.len - secondary.len };
 }
 
 // Test-only: the visible text of a rendered row, with renderer-owned SGR removed.

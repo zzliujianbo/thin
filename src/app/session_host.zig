@@ -710,7 +710,7 @@ pub const SessionHost = struct {
             .usage => |usage| {
                 if (self.context) |snapshot| {
                     const total = usage.value.total();
-                    self.context = .{ .tokens = total orelse 0, .limit = snapshot.limit, .known = total != null };
+                    self.context = .{ .tokens = total orelse 0, .limit = snapshot.limit, .known = total != null, .estimated = total orelse snapshot.estimated };
                 }
             },
             else => {},
@@ -1901,6 +1901,7 @@ pub const SessionHost = struct {
         if (state.initial_context) |context| {
             try out.beginObject("initial_context");
             try out.field("tokens", context.tokens);
+            try out.field("est", context.estimated);
             try out.field("limit", context.limit);
             try out.field("known", context.known);
             try out.endObject();
@@ -1908,6 +1909,7 @@ pub const SessionHost = struct {
         if (self.context) |context| {
             try out.beginObject("context");
             try out.field("tokens", context.tokens);
+            try out.field("est", context.estimated);
             try out.field("limit", context.limit);
             try out.field("known", context.known);
             try out.endObject();

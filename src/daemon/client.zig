@@ -1092,6 +1092,7 @@ pub const Client = struct {
         if (get.field(object, "ctx")) |value| switch (value) {
             .object => |ctx| cache.context = .{
                 .tokens = valueU64(ctx.get("tokens") orelse .{ .integer = 0 }) orelse 0,
+                .estimated = if (ctx.get("est")) |est| valueU64(est) orelse 0 else 0,
                 .limit = valueU64(ctx.get("limit") orelse .{ .integer = 0 }) orelse 0,
                 .known = valueBool(ctx.get("known") orelse .{ .bool = false }) orelse false,
             },

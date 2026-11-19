@@ -794,6 +794,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("tokens", snapshot.tokens);
             try out.field("limit", snapshot.limit);
             try out.field("known", snapshot.known);
+            try out.field("est", snapshot.estimated);
         },
         .text => |bytes| {
             try out.field("t", "text");
@@ -973,6 +974,7 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
                 try out.field("tokens", snapshot.tokens);
                 try out.field("limit", snapshot.limit);
                 try out.field("known", snapshot.known);
+                try out.field("est", snapshot.estimated);
                 try out.endObject();
             } else try out.field("ctx", @as(?[]const u8, null));
         },
@@ -1086,6 +1088,7 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
         try out.field("tokens", context.tokens);
         try out.field("limit", context.limit);
         try out.field("known", context.known);
+        try out.field("est", context.estimated);
         try out.endObject();
     } else try out.field("ctx", @as(?u8, null));
     try out.field("model", snapshot.model);
@@ -1527,6 +1530,7 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
             .tokens = try requireU64(object, "tokens"),
             .limit = try requireU64(object, "limit"),
             .known = try optionalBool(object, "known") orelse true,
+            .estimated = try optionalU64(object, "est") orelse 0,
         } };
     } else if (std.mem.eql(u8, kind, "text")) {
         event = .{ .text = try requireText(object, "v") };
@@ -1670,6 +1674,7 @@ fn decodeTerminalChecked(object: std.json.ObjectMap) !r.Terminal {
         .tokens = try requireU64(value, "tokens"),
         .limit = try requireU64(value, "limit"),
         .known = try optionalBool(value, "known") orelse true,
+        .estimated = try optionalU64(value, "est") orelse 0,
     } else null;
     // Counts are display-only and absent on frames from older daemons.
     const tool_calls = std.math.cast(u32, try optionalU64(object, "tool_calls") orelse 0) orelse return error.BadRequest;

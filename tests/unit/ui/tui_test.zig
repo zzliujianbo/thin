@@ -4318,12 +4318,19 @@ test "composer displays startup zero and latest actual usage or unknown without 
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, green_prompt ++ "0.0%" ++ prompt_end) != null);
     testAcknowledgeFullFrame(&ui);
-    const Case = struct { purpose: p.Purpose, usage: p.Usage, prefix: []const u8 };
+    const Case = struct {
+        purpose: p.Purpose,
+        usage: p.Usage,
+        prefix: ?[]const u8 = null,
+        estimate: ?[]const u8 = null,
+        muted: ?[]const u8 = null,
+    };
     const host = bridge.host();
     for ([_]Case{
         .{ .purpose = .normal, .usage = .{ .input_tokens = 12000, .output_tokens = 1000, .cached_input_tokens = 10000, .reasoning_tokens = 300 }, .prefix = green_prompt ++ "1.3%" ++ prompt_end },
         .{ .purpose = .summary, .usage = .{ .total_tokens = 1000 }, .prefix = green_prompt ++ "0.1%" ++ prompt_end },
-        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .prefix = "\x1b[1m(fixture) ?%>" ++ theme.reset ++ " " },
+        // Unknown report: the estimate stays primary, the report is muted.
+        .{ .purpose = .normal, .usage = .{ .input_tokens = 12 }, .estimate = "0.1%", .muted = "?%" },
         .{ .purpose = .normal, .usage = .{ .total_tokens = 0 }, .prefix = green_prompt ++ "0.0%" ++ prompt_end },
     }) |case| {
         try host.emit_fn(host.context, .{ .usage = .{ .purpose = case.purpose, .protocol = .chat, .value = case.usage } }, &cancel);
@@ -4331,7 +4338,14 @@ test "composer displays startup zero and latest actual usage or unknown without 
         try ui.event(item);
         item.deinit();
         try ui.draw();
-        try std.testing.expect(std.mem.find(u8, ui.frame, case.prefix) != null);
+        if (case.prefix) |prefix| {
+            try std.testing.expect(std.mem.find(u8, ui.frame, prefix) != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, ui.frame, case.estimate.?) != null);
+            const muted_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ theme.muted, case.muted.? });
+            defer std.testing.allocator.free(muted_expected);
+            try std.testing.expect(std.mem.find(u8, ui.frame, muted_expected) != null);
+        }
         testAcknowledgeFullFrame(&ui);
     }
 }
@@ -12622,7 +12636,8 @@ test "configure success adopts current context and keeps later runtime updates" 
             ui.display.seed(fixture.initial_context);
             try expectConfigureContextDraw(&ui, &screen, later, "15.5%");
 
-            const usage = r.ContextSnapshot{ .tokens = 86, .limit = 200 };
+            // A completed request makes the estimate equal to its report.
+            const usage = r.ContextSnapshot{ .tokens = 86, .limit = 200, .estimated = 86 };
             try host.emit_fn(host.context, .{ .usage = .{ .purpose = .normal, .protocol = .chat, .value = .{ .total_tokens = 86 } } }, &cancel);
             try drainBridge(&ui);
             try std.testing.expectEqualDeep(@as(?r.ContextSnapshot, usage), ui.display.context);

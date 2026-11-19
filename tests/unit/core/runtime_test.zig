@@ -437,14 +437,18 @@ test "memory reference preserves latest primary usage while input safety estimat
         var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer scratch.deinit();
         try runtime.appendMemoryReference(scratch.allocator(), "reference A");
-        try std.testing.expectEqualDeep(snapshot, runtime.contextSnapshot());
+        // The reported total stays put; the estimate for the next request grows.
+        const grown = runtime.contextSnapshot();
+        try std.testing.expectEqual(snapshot.tokens, grown.tokens);
+        try std.testing.expectEqual(snapshot.known, grown.known);
+        try std.testing.expect(grown.estimated > snapshot.estimated);
         try std.testing.expect(runtime.estimatedTokens() > estimate);
         const count = runtime.history.items.len;
         try runtime.appendMemoryReference(scratch.allocator(), "reference A");
         try std.testing.expectEqual(count, runtime.history.items.len);
         try runtime.appendMemoryReference(scratch.allocator(), "reference B");
         try std.testing.expectEqual(count + 1, runtime.history.items.len);
-        try std.testing.expectEqualDeep(snapshot, runtime.contextSnapshot());
+        try std.testing.expect(runtime.contextSnapshot().estimated > grown.estimated);
         try std.testing.expectEqual(@as(usize, 0), stub.calls);
     }
 }

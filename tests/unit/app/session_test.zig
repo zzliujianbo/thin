@@ -502,10 +502,18 @@ test "new llm pending startup and custom login activate without inference" {
     try std.testing.expect(logged_in.model_providers[0].allow_custom);
     try std.testing.expectEqualStrings("archive/saved", logged_in.selection_name.?);
     try std.testing.expectEqualStrings("archive/saved", session.global_config.?.value.registry.?.default);
-    try std.testing.expectEqualDeep(r.ContextSnapshot{ .tokens = 0, .limit = 65536 }, logged_in.initial_context.?);
+    // A fresh session reports zero; the next-request estimate is a separate value.
+    const fresh = logged_in.initial_context.?;
+    try std.testing.expectEqual(@as(u64, 0), fresh.tokens);
+    try std.testing.expectEqual(@as(u64, 65536), fresh.limit);
+    try std.testing.expect(fresh.known and fresh.estimated > 0);
     // The no-checkpoint fallback itself also remains fresh known zero.
     session.initial_context = null;
-    try std.testing.expectEqualDeep(r.ContextSnapshot{ .tokens = 0, .limit = 65536 }, session.connection().current().initial_context.?);
+    const fallback = session.connection().current().initial_context.?;
+    try std.testing.expectEqual(@as(u64, 0), fallback.tokens);
+    try std.testing.expectEqual(@as(u64, 65536), fallback.limit);
+    // Without a live runtime there is no next-request estimate to report.
+    try std.testing.expect(fallback.known and fallback.estimated == 0);
     try std.testing.expect(!session.app.?.journal.started);
     try std.testing.expect(!try session.saveOnExit());
 }

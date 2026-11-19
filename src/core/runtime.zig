@@ -172,12 +172,12 @@ pub const Terminal = struct {
     }
 };
 
-/// Latest request's provider-reported total, not an estimate or cumulative bill.
-/// A fresh session is known zero; missing usage is unknown, never invented zero.
-/// The one exception is the snapshot published just before a compaction, which
-/// carries the measured occupancy that decided it.
+/// Latest request's provider-reported total (`tokens`), not a cumulative bill,
+/// plus the anchored estimate (`estimated`) for the NEXT request. A fresh session
+/// is known zero; missing usage is unknown, never invented zero. The snapshot
+/// published just before a compaction carries the measured occupancy in `tokens`.
 /// Only the owner calls contextSnapshot while running; consumers get values.
-pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true };
+pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true, estimated: u64 = 0 };
 
 pub fn inputBudgetPause(detail: ?anyerror) bool {
     const err = detail orelse return false;
@@ -836,7 +836,13 @@ pub const Runtime = struct {
     /// thread's run. Streaming consumers use value events, not mutable history.
     /// The estimator above remains the ONLY source for safety/compaction checks.
     pub fn contextSnapshot(self: *const Runtime) ContextSnapshot {
-        return .{ .tokens = self.last_context_tokens orelse 0, .limit = @intCast(self.config.model.context_tokens), .known = self.last_context_tokens != null };
+        const estimated = self.estimatedTokens();
+        return .{
+            .tokens = self.last_context_tokens orelse 0,
+            .limit = @intCast(self.config.model.context_tokens),
+            .known = self.last_context_tokens != null,
+            .estimated = std.math.cast(u64, self.anchoredTokens(estimated)) orelse std.math.maxInt(u64),
+        };
     }
 
     fn emitContext(self: *Runtime, cancel: *const p.Cancellation) !void {

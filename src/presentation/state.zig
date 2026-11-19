@@ -14,6 +14,12 @@ pub fn contextRatio(snapshot: ContextSnapshot) ?u128 {
     return (@as(u128, snapshot.tokens) * 1000 + snapshot.limit / 2) / snapshot.limit;
 }
 
+/// 下一条请求的可期占用比例（anchored 估算）。未知（未估算或容量为 0）返回 null。
+pub fn estimateRatio(snapshot: ContextSnapshot) ?u128 {
+    if (snapshot.estimated == 0 or snapshot.limit == 0) return null;
+    return (@as(u128, snapshot.estimated) * 1000 + snapshot.limit / 2) / snapshot.limit;
+}
+
 /// Only what a frontend actually renders: occupancy, live receive rate, its band
 /// and the configured effort. No cumulative billing, TTFT or elapsed totals.
 pub const View = struct {
@@ -51,7 +57,7 @@ pub const State = struct {
             .usage => |usage| {
                 if (self.context) |snapshot| {
                     const total = usage.value.total();
-                    self.context = .{ .tokens = total orelse 0, .limit = snapshot.limit, .known = total != null };
+                    self.context = .{ .tokens = total orelse 0, .limit = snapshot.limit, .known = total != null, .estimated = total orelse snapshot.estimated };
                 }
                 // A completed normal request is no longer generating; the
                 // summary request that may follow opens its own window.
