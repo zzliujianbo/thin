@@ -339,12 +339,40 @@ test "closed worker keeps a resumable locator and drops an empty session" {
     defer registry.freeRecord(a, &kept);
     try std.testing.expectEqualStrings(keep_ep, kept.endpoint);
     try std.testing.expectEqualStrings(rig.project, kept.project);
+    const catalog = try rig.reg.daemonRecords(a);
+    defer registry.freeRecords(a, catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.len);
+    try std.testing.expectEqual(keep_id, catalog[0].id);
+    try std.testing.expect(!rig.reg.isLive(catalog[0], 20));
     // A session with nothing to resume loses exactly its own record.
     try std.testing.expect((try rig.reg.resolve(a, drop_id, rig.project)) == null);
     // Diagnostics are never treated as history.
     try std.testing.expect((try rig.reg.resolve(a, diagnostics_id, rig.project)) == null);
     try std.testing.expectEqual(@as(usize, 0), rig.supervisor.created.items.len);
 }
+test "daemon cold resume rechecks selected ownership before spawning" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const rig = try TestRig.create(a, io);
+    defer rig.deinit(a);
+    const id = try ids.generate(io);
+    try writeTestCheckpoint(a, io, rig.project, id);
+    const wire = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":1,\"op\":\"create\",\"project\":{f},\"resume\":\"{s}\"}}", .{ protocol.version, std.json.fmt(rig.project, .{}), id });
+    defer a.free(wire);
+    var request = try protocol.parseRequest(a, wire);
+    defer request.deinit();
+    try std.testing.expectError(error.SessionNotFound, rig.supervisor.handleCreate(&request));
+
+    const ep = try publishTestRecord(a, &rig.reg, id, rig.project, "ab");
+    defer a.free(ep);
+    var replacement = (try rig.reg.resolve(a, id, rig.project)).?;
+    defer registry.freeRecord(a, &replacement);
+    replacement.owner = .foreground;
+    try rig.reg.register(replacement);
+    try std.testing.expectError(error.SessionNotFound, rig.supervisor.handleCreate(&request));
+    try std.testing.expectEqual(@as(usize, 0), rig.workers.list.items.len);
+}
+
 test "a retired worker never deletes a locator a later owner republished" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -366,6 +394,39 @@ test "a retired worker never deletes a locator a later owner republished" {
     defer registry.freeRecord(a, &kept);
     try std.testing.expectEqualStrings(new_ep, kept.endpoint);
     try std.testing.expectEqualStrings("bbbbbbbbbbbbbbb2", kept.owner_instance);
+}
+test "ID-only attach and forced close refuse duplicates; qualified close selects exactly one owner" {
+    const a = std.testing.allocator;
+    const rig = try TestRig.create(a, std.testing.io);
+    defer rig.deinit(a);
+    const id = try ids.generate(std.testing.io);
+    const ep_a = try publishTestRecord(a, &rig.reg, id, rig.project, "aaaaaaaaaaaaaaa1");
+    defer a.free(ep_a);
+    const ep_b = try publishTestRecord(a, &rig.reg, id, rig.elsewhere, "bbbbbbbbbbbbbbb2");
+    defer a.free(ep_b);
+    try rig.supervisor.created.append(a, try ownedCreated(a, rig.project, id, ep_a));
+    try rig.supervisor.created.append(a, try ownedCreated(a, rig.elsewhere, id, ep_b));
+    for ([_][]const u8{ "close", "attach" }) |op| {
+        const wire = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":1,\"op\":\"{s}\",\"session\":\"{s}\",\"force\":true}}", .{ protocol.version, op, id });
+        defer a.free(wire);
+        var request = try protocol.parseRequest(a, wire);
+        defer request.deinit();
+        if (request.op == .close) {
+            try std.testing.expectError(error.AmbiguousSession, rig.supervisor.handleClose(&request));
+        } else try std.testing.expectError(error.AmbiguousSession, rig.supervisor.handleAttach(&request));
+    }
+    const qualified = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":1,\"op\":\"close\",\"session\":\"{s}\",\"project\":{f}}}", .{ protocol.version, id, std.json.fmt(rig.elsewhere, .{}) });
+    defer a.free(qualified);
+    var request = try protocol.parseRequest(a, qualified);
+    defer request.deinit();
+    var record = try rig.supervisor.resolveTarget(&request, id);
+    defer registry.freeRecord(a, &record);
+    try std.testing.expectEqualStrings(ep_b, record.endpoint);
+    try std.testing.expectEqual(@as(usize, 1), rig.supervisor.createdIndex(record).?);
+    const reply = try rig.supervisor.handleClose(&request);
+    defer a.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"accepted\":false") != null);
+    try std.testing.expectEqual(@as(usize, 2), rig.supervisor.created.items.len);
 }
 test "an owner lifecycle stop is never probed and then killed without force" {
     const a = std.testing.allocator;

@@ -710,10 +710,9 @@ test "app wires agents discovery and appends when the working directory changes"
     try env.put("SHELL", "/bin/zsh");
     const project = try absolute(a, tmp.dir, "tree/repo/mid");
     defer a.free(project);
-    const app = try App.init(a, io, &env, project, .{});
-    defer app.deinit();
-    const pinned_id = "0123456789abcdef0123456789abcdef";
-    try app.pinSessionID(pinned_id.*);
+    var session = try Session.init(a, io, &env, project, .{});
+    defer session.deinit();
+    const app = session.app.?;
     app.runtime.model = .{ .context = &stub_dummy, .call_fn = stubCall };
 
     var cancel = p.Cancellation{};

@@ -82,6 +82,10 @@ def run(app):
     base = Path(tempfile.mkdtemp(prefix='thin-subscribe.', dir='/tmp'))
     base.chmod(0o700)
     case = Case(app, base, 'wire')
+    # Explicit IPC create names the project on the wire, independently of
+    # the cwd used for bare TUI launches. Own a separate empty project.
+    project = base / 'project'
+    project.mkdir(mode=0o700)
     release, flood, sent = threading.Event(), threading.Event(), threading.Event()
     case.state.update(release=release, flood=flood, sent=sent)
     wires = []
@@ -129,16 +133,16 @@ def run(app):
         # touching project history; wire maps BadRequest to protocol.
         before = supervisor.call('list', running_only=False)['sessions']
         sockets_before = sorted(str(path) for path in case.workspace.runtime.rglob('*.sock'))
-        request_id = supervisor.send('create', project=str(case.workspace.project_a),
+        request_id = supervisor.send('create', project=str(project),
                                      auto_refresh_models=False, logging=False)
         rejected = supervisor.read()
         assert rejected['id'] == request_id and not rejected['ok'] and rejected['err'] == 'protocol', rejected
         assert supervisor.call('list', running_only=False)['sessions'] == before, 'rejected create changed owners'
         assert sorted(str(path) for path in case.workspace.runtime.rglob('*.sock')) == sockets_before, 'rejected create started a worker'
-        assert not session_files(case.workspace.project_a), 'rejected create wrote history'
-        assert not (case.workspace.project_a / '.thin').exists(), 'rejected create touched project state'
+        assert not session_files(project), 'rejected create wrote history'
+        assert not (project / '.thin').exists(), 'rejected create touched project state'
         assert case.model.count() == 0, 'rejected create reached model'
-        created = supervisor.call('create', project=str(case.workspace.project_a), auto_refresh_models=False)
+        created = supervisor.call('create', project=str(project), auto_refresh_models=False)
         endpoint = created['endpoint']
         assert Path(endpoint).is_relative_to(case.workspace.runtime)
         control = connect(endpoint)
@@ -227,8 +231,8 @@ s.close()
             raise AssertionError('no terminal then idle snapshot')
         case.model.check()
         assert case.model.count() == 1
-        assert wait_sessions(case.workspace.project_a), 'accepted session missing checkpoint'
-        assert list((case.workspace.project_a / '.thin' / 'sessions').glob('*.jsonl')), 'accepted session missing journal'
+        assert wait_sessions(project), 'accepted session missing checkpoint'
+        assert list((project / '.thin' / 'sessions').glob('*.jsonl')), 'accepted session missing journal'
         print('PASS subscription wire: ' + json.dumps(dict(updates=updates, requests=1,
               max_control_seconds=round(max(latencies), 4), same_pid=True,
               stream_mutation_rejected=True, takeover=True, terminal_before_idle=True)), flush=True)

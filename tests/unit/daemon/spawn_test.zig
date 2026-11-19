@@ -13,6 +13,35 @@ test "worker launch notice requires both exec and owned group" {
         try testing.expectEqual(case.expected, worker.launch.load(.acquire));
     }
 }
+test "equal session IDs admit independent live workers and close only their exact incarnation" {
+    const a = testing.allocator;
+    const id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    // Populate the manager's actual live-worker table; no process or fd is owned.
+    var first: Worker = undefined;
+    first.id = id;
+    first.project.path = @constCast("/project-a");
+    first.endpoint = @constCast("/workers/aaaaaaaaaaaaaaaa.sock");
+    first.done = .init(false);
+    var second: Worker = undefined;
+    second.id = id;
+    second.project.path = @constCast("/project-b");
+    second.endpoint = @constCast("/workers/bbbbbbbbbbbbbbbb.sock");
+    second.done = .init(false);
+    var workers: Workers = undefined;
+    workers.list = .empty;
+    defer workers.list.deinit(a);
+    try workers.list.append(a, &first);
+    // These are the exact admission and close lookups used by create/close.
+    try testing.expect(workers.findAlive(id, first.project.path) == &first);
+    try testing.expect(workers.findAlive(id, second.project.path) == null);
+    try workers.list.append(a, &second);
+    try testing.expect(workers.findAlive(id, second.project.path) == &second);
+    try testing.expect(workers.findInstance(id, second.project.path, second.endpoint) == &second);
+    try testing.expectError(error.SessionNotFound, workers.close(id, first.project.path, second.endpoint));
+    first.done.store(true, .release);
+    try testing.expect(!workers.isAlive(id, first.project.path, first.endpoint));
+    try testing.expect(workers.isAlive(id, second.project.path, second.endpoint));
+}
 test "worker argv quotes paths, selection ids and optional flags" {
     const a = testing.allocator;
     const id: ids.Id = "0123456789abcdef0123456789abcdef".*;

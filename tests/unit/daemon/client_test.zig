@@ -506,18 +506,18 @@ test "a v1 worker handshake is refused, while an exact v4 worker is adopted" {
             .generation = 1,
         };
         // A v1 envelope for the v4 greeting: explicit, sanitized refusal.
-        try testing.expectError(error.ProtocolMismatch, client.attachRecorded(&record, id, false));
+        try testing.expectError(error.ProtocolMismatch, client.attachRecorded(&record, id));
         try testing.expect(client.conn == null and client.session == null);
         try testing.expectEqual(@as(u64, 0), client.epoch);
         try testing.expect(client.stream == null);
         try testing.expectEqualStrings("ProtocolMismatch", session_client.describe(error.ProtocolMismatch));
         // A v1 worker that simply rejects and closes the v4 frame is the same
         // fail-closed class: no adoption and no automatic restart or kill.
-        try testing.expectEqual(AttachStage.outdated, try client.attachEndpoint(&record, id, false));
+        try testing.expectEqual(AttachStage.outdated, try client.attachEndpoint(&record, id));
         try testing.expect(client.conn == null and client.session == null and client.epoch == 0);
         // The compatible path is unchanged: exact v4 greeting, session identity,
         // watch capability and attach epoch are accepted together.
-        try testing.expect(try client.attachRecorded(&record, id, false));
+        try testing.expect(try client.attachRecorded(&record, id));
         try testing.expect(client.conn != null and client.stream != null);
         try testing.expectEqual(@as(u64, 7), client.epoch);
         try testing.expectEqual(id, client.session.?);
@@ -1881,7 +1881,7 @@ test "launcher readiness comes from the control transport, attachment from a wor
     var launcher = try connectClientWithControl(a);
     defer launcher.deinit();
     Client.rebuild(launcher.client);
-    // A --connect launcher may serve its first explicit submit without owning a
+    // A daemon launcher may serve its first explicit submit without owning a
     // session yet; that is not the same thing as being attached to one.
     try std.testing.expect(Client.snapshotFn(@ptrCast(launcher.client)).available);
     try std.testing.expect(!Client.snapshotFn(@ptrCast(launcher.client)).attached);
@@ -1892,7 +1892,7 @@ test "launcher readiness comes from the control transport, attachment from a wor
     try std.testing.expect(!Client.snapshotFn(@ptrCast(launcher.client)).available);
     try std.testing.expect(!Client.currentFn(@ptrCast(launcher.client)).available);
 }
-test "a foreground or attach launcher may start its own worker without a connection" {
+test "a foreground launcher may start its own worker without a connection" {
     const a = testing.allocator;
     // A takeover leaves no worker transport and no daemon control behind.
     var pair = try pairOf(a);
@@ -1904,11 +1904,7 @@ test "a foreground or attach launcher may start its own worker without a connect
     try std.testing.expect(!Client.snapshotFn(@ptrCast(pair.client)).attached);
     try std.testing.expectEqual(@as(u64, 0), Client.snapshotFn(@ptrCast(pair.client)).control_epoch);
 
-    pair.client.mode = .attach;
-    Client.rebuild(pair.client);
-    try std.testing.expect(Client.snapshotFn(@ptrCast(pair.client)).available);
-
-    // --connect has no worker of its own: the control socket is the capability.
+    // A daemon launcher has no worker of its own: the control socket is the capability.
     var connect = try connectClientWithControl(a);
     defer connect.deinit();
     Client.closeControl(connect.client);
@@ -2005,7 +2001,8 @@ test "a real takeover (owner reports epoch 0) returns to the launcher without to
     try std.testing.expect(Client.currentFn(@ptrCast(client)).session_id == null);
     // Owned work survives: the locator is kept and the launcher still owns it.
     try std.testing.expect(Client.ownsAnyWorker(client));
-    try std.testing.expect(Client.ownsSession(client, owned_id));
+    try std.testing.expectEqual(owned_id, client.published.items[0].id);
+    try std.testing.expectEqualStrings(client.launcher, client.published.items[0].project);
     try std.testing.expectEqual(@as(usize, 1), client.published.items.len);
     try std.testing.expectEqualStrings("/nonexistent/thin/owned.sock", client.published.items[0].endpoint);
 
@@ -2030,7 +2027,7 @@ test "resuming the attached session is a no-op with a caller-owned notice" {
     const revision = client.publication_revision;
     var caller = testing.FailingAllocator.init(a, .{});
     {
-        var outcome = try Client.manageFn(@ptrCast(client), caller.allocator(), .{ .@"resume" = &session_id });
+        var outcome = try Client.manageFn(@ptrCast(client), caller.allocator(), .{ .@"resume" = .{ .id = session_id } });
         defer outcome.deinit(caller.allocator());
         try testing.expectEqualStrings("Already attached", outcome.notice.?);
         try testing.expect(!outcome.switched);
@@ -2061,7 +2058,9 @@ test "resume notice allocation failure precedes local restore and daemon create"
         // start a process or wait for a real daemon/API response.
         if (daemon) try pair.replyError(1, "busy");
         var caller = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-        try testing.expectError(error.OutOfMemory, Client.manageFn(@ptrCast(client), caller.allocator(), .{ .@"resume" = &requested_id }));
+        try testing.expectError(error.SessionNotFound, client.manageResume(caller.allocator(), .{ .id = @splat('g'), .project = if (daemon) client.launcher else null }));
+        try testing.expect(!caller.has_induced_failure);
+        try testing.expectError(error.OutOfMemory, Client.manageFn(@ptrCast(client), caller.allocator(), .{ .@"resume" = .{ .id = requested_id, .project = if (daemon) client.launcher else null } }));
         try testing.expect(caller.has_induced_failure);
         try testing.expectEqual(caller.allocated_bytes, caller.freed_bytes);
         try testing.expectEqualDeep(session, client.session);
@@ -2072,106 +2071,6 @@ test "resume notice allocation failure precedes local restore and daemon create"
         try testing.expect(client.workers == null and client.reg == null);
         try expectNoFrame(&pair);
     }
-}
-test "closing the attached session carries its control epoch" {
-    const a = testing.allocator;
-    const session_id: ids.Id = "0123456789abcdef0123456789abcdef".*;
-    var pair = try pairOf(a);
-    defer pair.deinit();
-    const client = pair.client;
-    client.session = session_id;
-
-    // The owner refuses a busy task without force and the view survives.
-    try pair.reply(1, "\"accepted\":false");
-    try std.testing.expectError(error.Busy, Client.manageFn(@ptrCast(client), a, .{ .close = .{ .id = &session_id, .force = false } }));
-    const refused = try readFrameJson(&pair, a);
-    defer refused.deinit();
-    try std.testing.expectEqualStrings("close", refused.value.object.get("op").?.string);
-    try std.testing.expectEqual(@as(i64, 5), refused.value.object.get("epoch").?.integer);
-    try std.testing.expect(!refused.value.object.get("force").?.bool);
-    try std.testing.expect(client.conn != null and client.session != null);
-
-    // Accepted: the owner saved and exited, so this view is gone.
-    try pair.reply(2, "\"accepted\":true");
-    var outcome = try Client.manageFn(@ptrCast(client), a, .{ .close = .{ .id = &session_id, .force = true } });
-    defer outcome.deinit(a);
-    try std.testing.expect(client.conn == null and client.session == null);
-    try std.testing.expect(outcome.notice != null);
-}
-test "closing an owned session outside this view demands --force" {
-    const a = testing.allocator;
-    var fixture = try AttachEnv.init(a);
-    defer fixture.deinit(a);
-    const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
-    defer client.deinit();
-    // No view and no connection: this launcher only owns a detached worker.
-    const owned_id: ids.Id = "fedcbafedcbafedcbafedcbafedcbafe".*;
-    try client.published.append(a, .{
-        .id = owned_id,
-        .project = try a.dupe(u8, fixture.project),
-        .endpoint = try a.dupe(u8, "/nonexistent/thin/owned.sock"),
-    });
-
-    var outcome = try Client.manageFn(@ptrCast(client), a, .{ .close = .{ .id = &owned_id, .force = false } });
-    defer outcome.deinit(a);
-    try std.testing.expectEqualStrings(
-        "Closing an owned session outside this view requires /close fedcbafedcbafedcbafedcbafedcbafe --force",
-        outcome.notice.?,
-    );
-    // Refusal only: the locator is kept and no registry, worker manager or
-    // control socket was opened, so nothing observed or stopped that process.
-    try std.testing.expect(client.conn == null);
-    try std.testing.expect(client.session == null);
-    try std.testing.expect(client.workers == null);
-    try std.testing.expect(client.control == null);
-    try std.testing.expectEqual(@as(usize, 1), client.published.items.len);
-    try std.testing.expect(Client.ownsSession(client, owned_id));
-}
-test "a daemon-owned session close demands --force before any control request" {
-    const a = testing.allocator;
-    var fixture = try AttachEnv.init(a);
-    defer fixture.deinit(a);
-
-    const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
-    defer client.deinit();
-    var fds: [2]std.c.fd_t = undefined;
-    if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
-    const peer: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
-    client.control = unix.Connection.init(a, fds[0], peer);
-    var server = unix.Connection.init(a, fds[1], peer);
-    defer server.close();
-    client.reg = try Registry.init(a, testing.io, &fixture.env);
-
-    // An owner-managed record this launcher never published: only the daemon
-    // can stop it, so a busy task cannot be ruled out from here.
-    const id: ids.Id = "00112233445566778899aabbccddeeff".*;
-    const endpoint = try std.fmt.allocPrint(a, "{s}/workers/0011223344556677.sock", .{client.reg.?.runtime.path});
-    defer a.free(endpoint);
-    try client.reg.?.register(.{
-        .id = id,
-        .project = fixture.project,
-        .endpoint = endpoint,
-        .owner = .daemon,
-        .owner_instance = "0011223344556677",
-        .state = "running",
-        .pid = @intCast(std.c.getpid()),
-        .generation = 1,
-    });
-
-    var outcome = try Client.manageFn(@ptrCast(client), a, .{ .close = .{ .id = &id, .force = false } });
-    defer outcome.deinit(a);
-    try std.testing.expectEqualStrings(
-        "Closing an owned session outside this view requires /close 00112233445566778899aabbccddeeff --force",
-        outcome.notice.?,
-    );
-    // No `close` frame reached the daemon and no worker manager was created:
-    // the refusal stops nothing and only asks for the confirmation.
-    try expectNoFrameOn(&server);
-    try std.testing.expect(client.workers == null);
-    try std.testing.expect(client.session == null and client.conn == null);
-    var kept = (try client.reg.?.resolve(a, id, fixture.project)) orelse return error.TestExpectedRecord;
-    defer registry.freeRecord(a, &kept);
-    try std.testing.expectEqualStrings(endpoint, kept.endpoint);
 }
 test "resume live owner allocation failure and occupied controller preserve the old view" {
     const a = testing.allocator;
@@ -2217,7 +2116,7 @@ test "resume live owner allocation failure and occupied controller preserve the 
     const old_fd = client.conn.?.fd;
     const revision = client.publication_revision;
     var failing = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    try testing.expectError(error.OutOfMemory, client.manageResume(failing.allocator(), &target));
+    try testing.expectError(error.OutOfMemory, client.manageResume(failing.allocator(), .{ .id = target, .project = fixture.project }));
     try testing.expect(failing.has_induced_failure and client.reg == null);
     try testing.expectEqual(old_fd, client.conn.?.fd);
     try testing.expectEqual(current, client.session.?);
@@ -2233,7 +2132,7 @@ test "resume live owner allocation failure and occupied controller preserve the 
     defer if (pending) {
         task.cancel(io) catch {};
     };
-    try testing.expectError(error.Busy, client.manageResume(a, &target));
+    try testing.expectError(error.Busy, client.manageResume(a, .{ .id = target, .project = fixture.project }));
     const result = task.await(io);
     pending = false;
     try result;
@@ -2246,12 +2145,12 @@ test "resume live owner allocation failure and occupied controller preserve the 
     try expectNoFrameOn(&old_server);
     try expectNoFrameOn(&control_server);
 }
-test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" {
+test "resume never dials the previous runtime and only cold creates with a selected project checkpoint" {
     const a = testing.allocator;
     var fixture = try AttachEnv.init(a);
     defer fixture.deinit(a);
 
-    const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.project, fixture.home);
+    const client = try Client.init(a, testing.io, &fixture.env, .connect, fixture.home, fixture.home);
     defer client.deinit();
     var fds: [2]std.c.fd_t = undefined;
     if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
@@ -2277,12 +2176,23 @@ test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" 
 
     // Registered endpoint that no longer exists and no checkpoint: nothing may
     // start, and no owner is asked to create one.
-    try std.testing.expectError(error.SessionNotFound, Client.attachSession(client, id, false));
-    try std.testing.expectError(error.SessionNotFound, Client.manageResume(client, a, &id));
+    try testing.expectError(error.SessionNotFound, client.manageResume(a, .{ .id = id, .project = fixture.project }));
     try expectNoFrameOn(&server);
 
-    // A complete checkpoint makes the same history resumable. In --connect the
-    // daemon creates the replacement worker; it is never a local process.
+    // A different runtime now serves this HOME. Even a responding socket at
+    // the historical pathname is outside the new runtime's authority.
+    var old_workers = try unix.Directory.resolveUnder(a, client.reg.?.runtime.path, "workers", client.uid);
+    defer old_workers.deinit();
+    var listener = try unix.Listener.bind(a, &old_workers, "0123456789abcdef.sock", .{});
+    defer listener.deinit();
+    client.reg.?.deinit();
+    client.reg = null;
+    try fixture.env.put("XDG_RUNTIME_DIR", fixture.home);
+    var empty = try client.manageSavedSessions(a);
+    defer empty.deinit(a);
+    try testing.expectEqual(@as(usize, 0), empty.saved_sessions.?.len);
+
+    // Only a checkpoint permits a replacement via the current daemon.
     var name_buf: [128]u8 = undefined;
     const checkpoint = try std.fmt.bufPrint(&name_buf, "project/.thin/sessions/{s}.session", .{id});
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = checkpoint, .data = "complete checkpoint" });
@@ -2293,13 +2203,73 @@ test "attach resumes a confirmed-dead endpoint only with a complete checkpoint" 
     try server.writeFrame(create_frame, .{ .io = std.testing.io, .timeout_ms = 5_000 });
     // The published endpoint does not exist, so the candidate attach fails; the
     // control request that asked for the resume is what this test proves.
-    try std.testing.expectError(error.Transport, Client.attachSession(client, id, false));
+    try testing.expectError(error.Transport, client.manageResume(a, .{ .id = id, .project = fixture.project }));
     const create = try readJsonFrame(&server, a);
     defer create.deinit();
     try std.testing.expectEqualStrings("create", create.value.object.get("op").?.string);
     try std.testing.expectEqualStrings(fixture.project, create.value.object.get("project").?.string);
     try std.testing.expectEqualStrings(&id, create.value.object.get("resume").?.string);
+    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
 }
+test "daemon picker joins checkpoint metadata and live peers across projects without sending hello" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var fixture = try AttachEnv.init(a);
+    defer fixture.deinit(a);
+    const client = try Client.init(a, io, &fixture.env, .connect, fixture.home, fixture.home);
+    defer client.deinit();
+    client.reg = try Registry.init(a, io, &fixture.env);
+    var workers = try unix.Directory.resolveUnder(a, client.reg.?.runtime.path, "workers", client.uid);
+    defer workers.deinit();
+    var listener = try unix.Listener.bind(a, &workers, "0123456789abcdef.sock", .{});
+    defer listener.deinit();
+    const gone = try std.fmt.allocPrint(a, "{s}/fedcba9876543210.sock", .{workers.path});
+    defer a.free(gone);
+    const live: ids.Id = "11111111111111111111111111111111".*;
+    const saved: ids.Id = "22222222222222222222222222222222".*;
+    const dead: ids.Id = "33333333333333333333333333333333".*;
+    const foreground: ids.Id = "44444444444444444444444444444444".*;
+    const mismatch: ids.Id = "55555555555555555555555555555555".*;
+    try checkpointFor(&fixture, saved);
+    try checkpointFor(&fixture, foreground);
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "project/.thin/sessions/22222222222222222222222222222222.title", .data = "Saved elsewhere" });
+    for ([_]ids.Id{ live, saved, dead, foreground, mismatch }) |id| {
+        const socket = std.mem.eql(u8, &id, &live) or std.mem.eql(u8, &id, &mismatch);
+        const pid: u32 = @intCast(std.c.getpid());
+        try client.reg.?.register(.{ .id = id, .project = if (socket) fixture.home else fixture.project, .endpoint = if (socket) listener.path else gone, .owner = if (std.mem.eql(u8, &id, &foreground)) .foreground else .daemon, .owner_instance = if (socket) "0123456789abcdef" else "fedcba9876543210", .state = "running", .pid = if (std.mem.eql(u8, &id, &mismatch)) pid + 1 else pid, .generation = 1 });
+    }
+    var outcome = try client.manageSavedSessions(a);
+    defer outcome.deinit(a);
+    const rows = outcome.saved_sessions.?;
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    var live_count: usize = 0;
+    var saved_count: usize = 0;
+    for (rows) |row| {
+        if (std.mem.eql(u8, &row.id, &live)) {
+            live_count += 1;
+            try testing.expectEqualStrings(fixture.home, row.project.?);
+        } else {
+            saved_count += 1;
+            try testing.expectEqual(saved, row.id);
+            try testing.expectEqualStrings(fixture.project, row.project.?);
+            try testing.expectEqualStrings("Saved elsewhere", row.title.text());
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), live_count);
+    try testing.expectEqual(@as(usize, 1), saved_count);
+    const wait: unix.Wait = .{ .io = io, .timeout_ms = 250 };
+    for (0..2) |_| {
+        var peer = try listener.accept(wait);
+        defer peer.close();
+        const message = try peer.readFrame(wait);
+        defer if (message) |bytes| a.free(bytes);
+        try testing.expect(message == null);
+    }
+    try testing.expectError(error.SessionNotFound, client.manageResume(a, .{ .id = foreground, .project = fixture.project }));
+    try testing.expect(client.conn == null and client.control == null and client.workers == null);
+}
+
 test "an unreachable-but-present endpoint is never treated as dead" {
     const a = testing.allocator;
     var fixture = try AttachEnv.init(a);
@@ -2336,12 +2306,11 @@ test "an unreachable-but-present endpoint is never treated as dead" {
     const checkpoint = try std.fmt.bufPrint(&name_buf, "project/.thin/sessions/{s}.session", .{id});
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = checkpoint, .data = "complete checkpoint" });
 
-    try std.testing.expectError(error.Unavailable, Client.attachSession(client, id, false));
-    try std.testing.expectError(error.Unavailable, Client.manageResume(client, a, &id));
+    try testing.expectError(error.Unavailable, client.manageResume(a, .{ .id = id, .project = fixture.project }));
     try expectNoFrameOn(&server);
     try std.testing.expect(client.conn == null);
 }
-test "resume never resolves another project's registry owner" {
+test "resume refuses a missing project, wrong project, or daemon target in foreground mode" {
     const a = testing.allocator;
     var fixture = try AttachEnv.init(a);
     defer fixture.deinit(a);
@@ -2363,32 +2332,12 @@ test "resume never resolves another project's registry owner" {
         .pid = @intCast(std.c.getpid()),
         .generation = 1,
     });
-    try testing.expectError(error.SessionNotFound, client.manageResume(a, &id));
+    try checkpointFor(&fixture, id);
+    try testing.expectError(error.SessionNotFound, client.manageResume(a, .{ .id = id }));
+    try testing.expectError(error.SessionNotFound, client.manageResume(a, .{ .id = id, .project = fixture.project }));
+    client.mode = .foreground;
+    try testing.expectError(error.SessionNotFound, client.manageResume(a, .{ .id = id, .project = other }));
     try testing.expect(client.conn == null and client.session == null);
-}
-test "close via endpoint opens no watch" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var fixture = try AttachEnv.init(a);
-    defer fixture.deinit(a);
-    const client = try Client.init(a, io, &fixture.env, .foreground, fixture.project, fixture.home);
-    defer client.deinit();
-    var dir = try unix.Directory.resolveUnder(a, fixture.runtime, "close", client.uid);
-    defer dir.deinit();
-    var listener = try unix.Listener.bind(a, &dir, "worker.sock", .{});
-    defer listener.deinit();
-    const id: ids.Id = "abcdefabcdefabcdefabcdefabcdefab".*;
-    const record: registry.Record = .{ .id = id, .project = fixture.project, .endpoint = listener.path, .owner = .foreground, .owner_instance = "0123456789abcdef", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 };
-    var task = try std.Io.concurrent(io, closeOnlyPeer, .{ a, io, &listener, id });
-    var pending = true;
-    defer if (pending) task.cancel(io) catch {};
-    try client.closeViaEndpoint(&record, id, true);
-    const result = task.await(io);
-    pending = false;
-    try result;
-    var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
-    try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
-    try testing.expect(client.stream == null and client.conn == null);
 }
 test "record identity and watch admission failures never replace the current view or create" {
     const a = testing.allocator;
@@ -2439,7 +2388,7 @@ test "record identity and watch admission failures never replace the current vie
         var task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &listener, target, fixture.project, cli.WorkerOwner.daemon, behavior });
         var pending = true;
         defer if (pending) task.cancel(io) catch {};
-        try testing.expectError(error.Unavailable, client.manageResume(a, &target));
+        try testing.expectError(error.Unavailable, client.manageResume(a, .{ .id = target, .project = fixture.project }));
         const result = task.await(io);
         pending = false;
         try result;
@@ -2498,7 +2447,7 @@ test "malformed registry with live owner and checkpoint does not authorize a res
         stop.cancel();
         owner.cancel(io) catch {};
     };
-    const result = client.manageResume(a, &target);
+    const result = client.manageResume(a, .{ .id = target, .project = fixture.project });
     stop.cancel();
     const owner_result = owner.await(io);
     owner_pending = false;
@@ -2517,7 +2466,7 @@ test "malformed registry with live owner and checkpoint does not authorize a res
     var quiet = [_]std.c.pollfd{.{ .fd = listener.fd, .events = std.c.POLL.IN, .revents = 0 }};
     try testing.expectEqual(@as(c_int, 0), std.c.poll(&quiet, 1, 40));
 }
-test "resume selects launcher project when attached to another project's same id" {
+test "daemon resume disambiguates equal IDs across projects and preserves validated history" {
     const a = testing.allocator;
     const io = testing.io;
     var fixture = try AttachEnv.init(a);
@@ -2540,15 +2489,25 @@ test "resume selects launcher project when attached to another project's same id
     defer a_listener.deinit();
     var b_listener = try unix.Listener.bind(a, &workers_dir, "fedcba9876543210.sock", .{});
     defer b_listener.deinit();
-    try client.reg.?.register(.{ .id = id, .project = project_b, .endpoint = b_listener.path, .owner = .foreground, .owner_instance = "fedcba9876543210", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 });
-    var b_task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &b_listener, id, project_b, cli.WorkerOwner.foreground, CandidatePeerCase.good });
+    try client.reg.?.register(.{ .id = id, .project = project_b, .endpoint = b_listener.path, .owner = .daemon, .owner_instance = "fedcba9876543210", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 });
+    // Both project keys really exist. A is offline and B has no checkpoint.
+    const gone = try std.fmt.allocPrint(a, "{s}/workers/aaaaaaaaaaaaaaaa.sock", .{client.reg.?.runtime.path});
+    defer a.free(gone);
+    try client.reg.?.register(.{ .id = id, .project = fixture.project, .endpoint = gone, .owner = .daemon, .owner_instance = "aaaaaaaaaaaaaaaa", .state = "running", .pid = @intCast(std.c.getpid()), .generation = 1 });
+    var b_task = try std.Io.concurrent(io, candidatePeer, .{ a, io, &b_listener, id, project_b, cli.WorkerOwner.daemon, CandidatePeerCase.good });
     var b_pending = true;
     defer if (b_pending) b_task.cancel(io) catch {};
-    var attached = try client.attachSession(id, false);
+    var attached = try client.manageResume(a, .{ .id = id, .project = project_b });
     defer attached.deinit(a);
     try testing.expect(attached.switched);
     try testing.expectEqualStrings(project_b, client.view_project.?);
     try testing.expectEqual(id, client.session.?);
+    const serial_b = client.view_serial;
+    const epoch_b = client.epoch;
+    var same = try client.manageResume(a, .{ .id = id, .project = project_b });
+    defer same.deinit(a);
+    try testing.expect(!same.switched);
+    try testing.expectEqualStrings("Already attached", same.notice.?);
     const creds: unix.Credentials = .{ .pid = 0, .uid = client.uid, .gid = @intCast(std.c.getgid()) };
     var fds: [2]std.c.fd_t = undefined;
     if (testSocketPair(&fds) != 0) return error.SocketPairFailed;
@@ -2561,12 +2520,14 @@ test "resume selects launcher project when attached to another project's same id
     var create_task = try std.Io.concurrent(io, createResumePeer, .{ a, io, &daemon_peer, id, fixture.project, a_listener.path });
     var create_pending = true;
     defer if (create_pending) create_task.cancel(io) catch {};
-    var resumed = try client.manageResume(a, &id);
+    var resumed = try client.manageResume(a, .{ .id = id, .project = fixture.project });
     defer resumed.deinit(a);
     try testing.expect(resumed.switched);
     try testing.expectEqualStrings(session_client.restored_notice, resumed.notice.?);
     try testing.expectEqualStrings(fixture.project, client.view_project.?);
     try testing.expectEqual(id, client.session.?);
+    try testing.expectEqual(epoch_b, client.epoch);
+    try testing.expect(serial_b != client.view_serial);
     // The validated baseline is committed with the view, so a resumed notice
     // cannot be followed by a second failing history read.
     try testing.expect(!client.need_history);

@@ -52,7 +52,7 @@ pub const Prepared = struct {
     /// 展示给用户的操作描述（权限询问时显示）。
     description: []const u8,
     /// 非空：本次必须人工批准；批准只放行这一次，之后的非空调用仍会询问。
-    /// 用户拒绝（或 --print 无法询问）时，这段文案作为工具错误回给模型。
+    /// 审批被拒绝时，这段文案作为工具错误回给模型。
     explicit_denial: ?[]const u8 = null,
     /// Display-only: the one project file this call will create or replace, if
     /// any. Borrowed from the prepare arena; never a path check or authority.

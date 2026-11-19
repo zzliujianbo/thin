@@ -46,8 +46,6 @@ def parser():
     p.add_argument("group", choices=["preflight", *GROUPS])
     p.add_argument("--filter", help="required nonempty substring for focus only")
     p.add_argument("--unit-group", choices=["fast", "ui", "app", "core", "integration", "daemon"], help="optional unit group for focus only")
-    p.add_argument("--ssh-include")
-    p.add_argument("--ssh-library")
     p.add_argument("--optimize", choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"], default="Debug")
     p.add_argument("-j", "--jobs", type=int, default=1)
     return p
@@ -74,10 +72,6 @@ def command_for(args):
         command.append("-Dtest-filter=" + args.filter)
         if args.unit_group:
             command.append("-Dtest-group=" + args.unit_group)
-    if args.ssh_include:
-        command.append("-Dssh-include=" + args.ssh_include)
-    if args.ssh_library:
-        command.append("-Dssh-library=" + args.ssh_library)
     return command
 
 

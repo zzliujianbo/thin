@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real checkpoint/menu acceptance with owned PTYs and a loopback Chat server."""
+from contextlib import closing, contextmanager
 import errno
 import fcntl
 import http.server
@@ -10,6 +11,7 @@ import pty
 import re
 import select
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -19,6 +21,7 @@ import termios
 import threading
 import time
 
+from daemon_mock import assert_live_project, children_of, runtime_sockets, wait_checkpoint, wait_pids_gone
 from idle_enter_mock import Screen, FRAME_END, SYNC_BEGIN
 
 requests = []
@@ -45,7 +48,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             size = int(self.headers['Content-Length'])
             assert 0 < size < 524288
             body = json.loads(self.rfile.read(size))
-            requests.append(body)
+            actual = self.headers.get('x-opencode-session', '')
+            assert re.fullmatch(r'[0-9a-f]{32}', actual), 'missing original session ID'
+            requests.append(actual)
             n = len(requests)
             assert n <= 6, 'unexpected model call'
             messages = body['messages']
@@ -53,13 +58,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             names = [tool['function']['name'] for tool in tools]
             assert names.count('set_session_title') == 0, 'title tool must be removed'
             if n >= 4:
-                actual = self.headers.get('x-opencode-session')
                 continuation_sessions.append(actual)
                 assert actual == selected_ids[n - 4]
                 wire = json.dumps(messages)
+                assert 'unsolicited-turn' not in wire and f'/resume {selected_ids[1]}' not in wire, 'management input leaked into history'
                 if n in (4, 6):
                     assert 'seed-one-user' in wire and 'seed-one-answer' in wire
-                    assert ('continuation-user' if n == 4 else 'return-a-user') in wire
+                    assert 'continuation-user' in wire
+                    if n == 6:
+                        assert 'continuation-answer' in wire and 'return-a-user' in wire
                     assert 'resume-side-effect' in wire and 'seed-two-user' not in wire
                     assert any(m.get('role') == 'tool' for m in messages)
                     calls = [c for m in messages for c in m.get('tool_calls', [])]
@@ -94,7 +101,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 class Terminal:
-    def __init__(self, app, home, project, runtime, *, args=(), home_literal=None):
+    def __init__(self, app, home, project, runtime, *, home_literal=None):
         self.master, self.slave = pty.openpty()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 120, 0, 0))
         self.screen = Screen(120)
@@ -103,7 +110,7 @@ class Terminal:
         def setup():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-        self.child = subprocess.Popen([app, *args, '--no-model-auto-refresh'], cwd=project,
+        self.child = subprocess.Popen([app], cwd=project,
             stdin=self.slave, stdout=self.slave, stderr=self.slave, preexec_fn=setup,
             env={'PATH': '/usr/bin:/bin', 'HOME': home_literal or str(home), 'XDG_RUNTIME_DIR': str(runtime),
                  'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_FIXTURE_KEY': 'fixture-key',
@@ -186,6 +193,22 @@ def read_title(sessions, session_id):
     return path.read_bytes().decode('utf-8')
 
 
+def seed(app, home, project, runtime, title, answer, owner):
+    with closing(Terminal(app, home, project, runtime)) as term:
+        term.pump(term.idle, f'{title} startup')
+        before = len(requests)
+        term.send((title + '\r').encode())
+        term.pump(lambda: any(answer in line for line in term.lines()) and term.idle(), f'{title} answer')
+        ident = wait_checkpoint(project, title).stem
+        assert requests[before:] and set(requests[before:]) == {ident}, 'seed header/checkpoint mismatch'
+        assert_live_project(home, project, ident, owner)
+        term.send(b'\x04\x04')
+        term.pump(lambda: term.child.poll() is not None, f'{title} exit')
+        assert term.child.wait() == 0
+    assert read_title(project / '.thin/sessions', ident) == title
+    return ident
+
+
 def main(app):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -196,6 +219,8 @@ def main(app):
             (home / '.thin').mkdir(parents=True)
             project.mkdir()
             runtime.mkdir(mode=0o700)
+            # Only our loopback URL has credentials, so it cannot claim any
+            # official metadata source. Keep rejecting unexpected GETs.
             # The local mock has no real price evidence; production defaults are unchanged.
             config = {'limits': {'low_price_input': False},
                       'llm': {'default': 'local/fixture-model',
@@ -205,24 +230,9 @@ def main(app):
             config_path.write_text(json.dumps(config))
             config_path.chmod(0o600)
             sessions = project / '.thin/sessions'
-            ids = []
-            for number in (1, 2):
-                term = Terminal(app, home, project, runtime)
-                try:
-                    term.pump(term.idle, f'seed-{number} startup composer')
-                    term.send(f'seed-{("one", "two")[number - 1]}-user\r'.encode())
-                    answer = f'seed-{("one", "two")[number - 1]}-answer'
-                    term.pump(lambda: answer in '\n'.join(term.lines()) and term.idle(),
-                              f'seed-{number} complete answer')
-                    term.send(b'\x04\x04')
-                    term.pump(lambda: term.child.poll() is not None, f'seed-{number} clean exit')
-                    assert term.child.wait() == 0
-                finally:
-                    term.close()
-                current = {p.stem for p in sessions.glob('*.session') if re.fullmatch(r'[0-9a-f]{32}', p.stem)}
-                new = current - set(ids)
-                assert len(new) == 1
-                ids.append(new.pop())
+            ids = [seed(app, home, project, runtime, title, answer, 'foreground')
+                   for title, answer in ((FIRST_TITLE, 'seed-one-answer'), (FALLBACK_TITLE, 'seed-two-answer'))]
+            assert {p.stem for p in sessions.glob('*.session')} == set(ids) and len(set(ids)) == 2
             assert len(requests) == 3
             selected_ids[:] = [ids[0], ids[1], ids[0]]
             assert read_title(sessions, ids[0]) == FIRST_TITLE
@@ -314,118 +324,192 @@ def main(app):
                 assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
             finally:
                 term.close()
-        trailing_home_connect(app, server)
+            other = Path(tmp) / 'other-project'
+            other.mkdir(mode=0o700)
+            # Same HOME/index, different cwd: the two genuine foreground saves
+            # above are visible in their own cwd but not from this empty one.
+            with closing(Terminal(app, home, other, runtime)) as term:
+                term.pump(term.idle, 'foreign foreground startup')
+                mark = len(term.data)
+                term.send(b'/resume\r')
+                term.pump(lambda: b'No saved sessions' in term.data[mark:] and term.idle(),
+                          'empty foreground cwd excludes both foreign checkpoints')
+                term.send(b'\x04\x04')
+                term.pump(lambda: term.child.poll() is not None, 'empty foreground exit')
+                assert term.child.wait() == 0 and len(requests) == 6
+            daemon_roundtrip(app, home, project, other, runtime, ids)
+            assert marker.read_text() == 'once'
+            assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
     assert not errors, 'resume-menu mock recorded an unexpected HTTP or handler failure'
-    print('PASS resume-menu: foreground and trailing-HOME connect A-B-A, full history, no replay, six POSTs and zero GETs each')
+    print('PASS resume-menu: foreground cwd-only, daemon cross-project live/cold, original A-B-A IDs, no replay, six POSTs and zero GETs each')
 
 
-def trailing_home_connect(app, server):
-    """Real --connect launcher keeps using canonical HOME when returning to A."""
+@contextmanager
+def owned_daemon(app, home, runtime):
+    env = {'PATH': '/usr/bin:/bin', 'HOME': str(home) + '/', 'XDG_RUNTIME_DIR': str(runtime),
+           'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_FIXTURE_KEY': 'fixture-key',
+           'NO_PROXY': '*', 'no_proxy': '*'}
+    control = runtime / 'thin/daemon.sock'
+    daemon = subprocess.Popen([app, '--daemon'], cwd=home, env=env, start_new_session=True,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            assert daemon.poll() is None, 'owned daemon exited before becoming ready'
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(.3)
+                try:
+                    probe.connect(str(control))
+                except (FileNotFoundError, ConnectionRefusedError):
+                    time.sleep(.02)
+                    continue
+                creds = probe.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
+                assert struct.unpack('3i', creds)[0] == daemon.pid, 'wrong daemon at control endpoint'
+                break
+        else:
+            raise AssertionError('owned daemon never accepted connections')
+        yield daemon.pid
+        assert daemon.poll() is None, 'owned daemon exited unexpectedly'
+    finally:
+        if daemon.poll() is None:
+            workers = children_of(daemon.pid)
+            daemon.terminate()
+            try:
+                code = daemon.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=3)
+                raise
+            assert code in (0, -signal.SIGTERM, 128 + signal.SIGTERM)
+            wait_pids_gone(workers)
+            assert not runtime_sockets(runtime), 'old runtime still contains sockets'
+
+
+def daemon_roundtrip(app, home, project, other, runtime, foreground_ids):
     requests.clear()
     selected_ids.clear()
     continuation_sessions.clear()
-    with tempfile.TemporaryDirectory(prefix='thin-resume-connect-', dir='/tmp') as tmp:
-        home, runtime = (Path(tmp) / name for name in ('home', 'r'))
-        (home / '.thin').mkdir(parents=True)
-        runtime.mkdir(mode=0o700)
-        config = {'limits': {'low_price_input': False},
-                  'llm': {'default': 'local/fixture-model',
-                  'providers': {'local': {'kind': 'opencode_zen', 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
-                  'api_key_env': 'THIN_FIXTURE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}}
-        config_path = home / '.thin/config.json'
-        config_path.write_text(json.dumps(config))
-        config_path.chmod(0o600)
-        sessions = home / '.thin/sessions'
-        ids = []
-        for number in (1, 2):
-            term = Terminal(app, home, home, runtime)
-            try:
-                term.pump(term.idle, f'connect seed-{number} startup')
-                word = ('one', 'two')[number - 1]
-                term.send(f'seed-{word}-user\r'.encode())
-                term.pump(lambda: any(f'seed-{word}-answer' in line for line in term.lines()) and term.idle(),
-                          f'connect seed-{number} answer')
-                term.send(b'\x04\x04')
-                term.pump(lambda: term.child.poll() is not None, f'connect seed-{number} exit')
-                assert term.child.wait() == 0
-            finally:
-                term.close()
-            current = {p.stem for p in sessions.glob('*.session') if re.fullmatch(r'[0-9a-f]{32}', p.stem)}
-            new = current - set(ids)
-            assert len(new) == 1
-            ids.append(new.pop())
-        assert len(requests) == 3
+    titles = ('daemon-' + FIRST_TITLE, 'daemon-' + FALLBACK_TITLE)
+    marker = other / 'resume-side-effect'
+    home_literal = str(home) + '/'
+
+    def select(term, index, phase):
+        # Wait for the actual popup, not titles in scrollback. A checkpoint-less
+        # live worker may also have a (short-ID) row; don't assume default order.
+        def lines():
+            return [''.join(row).strip() for row in term.screen.grid]
+
+        def candidate(line):
+            return line.removeprefix('> ').partition(' ')[0]
+
+        def selection():
+            for line in lines():
+                if line.startswith('> '):
+                    label = candidate(line)
+                    if label in titles or re.fullmatch(r'[0-9a-f]{8}', label):
+                        return label
+            return None
+
+        mark = len(term.data)
+        term.send(b'/resume\r')
+        term.pump(lambda: term.data.endswith(FRAME_END) and term.data.rfind(SYNC_BEGIN) >= mark and
+                  selection() is not None and
+                  all(any(candidate(line) == title and line.removeprefix('> ') != title
+                          for line in lines()) for title in titles),
+                  f'{phase} fresh picker frame')
+        rows = lines()
+        forbidden = {FIRST_TITLE, FALLBACK_TITLE, *foreground_ids, *(ident[:8] for ident in foreground_ids)}
+        assert not any(candidate(line) in forbidden for line in rows), f'{phase}: foreground session listed'
+        for title, cwd in zip(titles, projects):
+            row, = [line for line in rows if candidate(line) == title and line.removeprefix('> ') != title]
+            # The time column may clip; require an unambiguous project on this very row.
+            assert re.search(r'(?<![\w.-])' + re.escape(cwd.name) + r'(?![\w.-])', row), (phase, row)
+        seen = set()
+        while selection() != titles[index]:
+            previous = selection()
+            assert previous and previous not in seen, f'{phase}: could not select {titles[index]}'
+            seen.add(previous)
+            mark = len(term.data)
+            term.send(b'\x1b[B')
+            term.pump(lambda: term.data.endswith(FRAME_END) and term.data.rfind(SYNC_BEGIN) >= mark and
+                      selection() not in (None, previous), f'{phase} Down selection')
+        mark = len(term.data)
+        term.send(b'\r')
+        term.pump(lambda: b'Conversation restored; prior tools are NOT rerun' in term.data[mark:] and
+                  term.idle(), f'{phase} restored')
+
+    # Keep the genuine foreground checkpoints in the same HOME/index. B even
+    # shares their project, so filtering on the project alone cannot pass.
+    with owned_daemon(app, home, runtime) as first_pid:
+        projects = (other, project)
+        ids = [seed(app, home, cwd, runtime, title, answer, 'daemon') for cwd, title, answer in
+               zip(projects, titles, ('seed-one-answer', 'seed-two-answer'))]
+        assert len(set(ids + foreground_ids)) == 4
+        checkpoints = [cwd / '.thin/sessions' / f'{ident}.session' for cwd, ident in zip(projects, ids)]
         selected_ids[:] = [ids[0], ids[1], ids[0]]
-        titles_before = {i: (sessions / f'{i}.title').read_bytes() for i in ids}
-        marker = home / 'resume-side-effect'
-        assert marker.read_text() == 'once'
-        home_literal = str(home) + '/'
-        env = {'PATH': '/usr/bin:/bin', 'HOME': home_literal, 'XDG_RUNTIME_DIR': str(runtime),
-               'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_FIXTURE_KEY': 'fixture-key',
-               'NO_PROXY': '*', 'no_proxy': '*'}
-        daemon = subprocess.Popen([app, '--daemon', '--no-model-auto-refresh'], cwd=home, env=env,
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  start_new_session=True)
-        term = None
-        try:
-            deadline = time.monotonic() + 15
-            socket = runtime / 'thin/daemon.sock'
-            while not socket.is_socket() and time.monotonic() < deadline:
-                assert daemon.poll() is None, 'owned daemon exited before publishing its socket'
-                time.sleep(.02)
-            assert socket.is_socket(), 'owned daemon did not publish its socket'
-            term = Terminal(app, home, home, runtime, args=('--connect',), home_literal=home_literal)
-            term.pump(term.idle, 'trailing-HOME connect startup')
+        with closing(Terminal(app, home, project, runtime, home_literal=home_literal)) as term:
+            term.pump(term.idle, 'warm daemon launcher ready')
+            select(term, 0, 'warm cross-project A')
+            term.pump(lambda: any('seed-one-answer' in line for line in term.lines()) and term.idle(),
+                      'warm cross-project history')
+            term.send(b'\x04\x04')
+            term.pump(lambda: term.child.poll() is not None, 'warm launcher exit')
+            assert term.child.wait() == 0
+        records = [next((home / '.thin/session-index').glob(f'*/{ident}.json')) for ident in ids]
+        owners = {json.loads(path.read_bytes())['pid'] for path in records}
+        assert len(owners) == 2 and owners <= children_of(first_pid), 'old owners not live before restart'
+        assert len(requests) == 3 and marker.read_text() == 'once'
 
-            def select(session_id, title, phase):
-                now = time.time_ns()
-                for item in ids:
-                    stamp = now if item == session_id else now - 10_000_000_000
-                    os.utime(sessions / f'{item}.session', ns=(stamp, stamp))
+    wait_pids_gone(owners | {first_pid})
+    # Reboot-style restart: keep HOME, index and projects, not the runtime root.
+    cold_runtime = runtime.with_name('r-cold')
+    cold_runtime.mkdir(mode=0o700)
+    with owned_daemon(app, home, cold_runtime) as second_pid:
+        assert second_pid != first_pid
+        with closing(Terminal(app, home, project, cold_runtime, home_literal=home_literal)) as term:
+            term.pump(term.idle, 'cold daemon launcher ready')
+            select(term, 0, 'cold cross-project A')
+            # Neither retired shortcut may switch away from A or submit a turn.
+            # The next POST independently checks A's original session ID and history.
+            for command, notice in ((f'/resume {ids[1]}', b'Usage: /resume'),
+                                    ('/new unsolicited-turn', b'Usage: /new')):
                 mark = len(term.data)
-                term.send(b'/resume\r')
-                term.pump(lambda: len(term.data) > mark and term.data.endswith(FRAME_END) and
-                          term.data.rfind(SYNC_BEGIN) >= mark and
-                          any(''.join(row).lstrip().startswith(f'> {title}') for row in term.screen.grid),
-                          f'{phase} selection')
-                mark = len(term.data)
-                term.send(b'\r')
-                term.pump(lambda: b'Conversation restored; prior tools are NOT rerun' in term.data[mark:] and
-                          term.idle() and not any(''.join(row).lstrip().startswith(f'> {title}') for row in term.screen.grid),
-                          f'{phase} restored')
-
-            select(ids[0], FIRST_TITLE, 'trailing-HOME A')
+                term.send((command + '\r').encode())
+                term.pump(lambda: notice in term.data[mark:] and term.idle(), f'{notice.decode()} rejection')
             assert len(requests) == 3 and marker.read_text() == 'once'
             term.send(b'continuation-user\r')
             term.pump(lambda: any('continuation-answer' in line for line in term.lines()) and term.idle(), 'trailing-HOME A continuation')
-            select(ids[1], FALLBACK_TITLE, 'trailing-HOME B')
+            select(term, 1, 'cold B')
             assert len(requests) == 4 and marker.read_text() == 'once'
             term.send(b'probe-b-user\r')
             term.pump(lambda: any('probe-b-answer' in line for line in term.lines()) and term.idle(), 'trailing-HOME B continuation')
-            select(ids[0], FIRST_TITLE, 'trailing-HOME live return to A')
+            select(term, 0, 'live return to cross-project A')
             assert len(requests) == 5 and marker.read_text() == 'once'
             term.send(b'return-a-user\r')
             term.pump(lambda: any('return-a-answer' in line for line in term.lines()) and term.idle(), 'trailing-HOME return A continuation')
             assert len(requests) == 6 and continuation_sessions == selected_ids
             assert marker.read_text() == 'once'
-            assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
+            for cwd, path in zip(projects, checkpoints):
+                assert_live_project(home, cwd, path.stem, 'daemon')
+            mark = len(term.data)
+            term.send(b'/new\r')
+            term.pump(lambda: b'New session; previous session keeps running' in term.data[mark:] and term.idle(),
+                      'empty new session ready')
             term.send(b'\x04\x04')
             term.pump(lambda: term.child.poll() is not None, 'trailing-HOME connect exit')
+            assert len(requests) == 6, '/new must not send an implicit prompt'
             assert term.child.wait() == 0
-        finally:
-            if term is not None:
-                term.close()
-            if daemon.poll() is None:
-                daemon.terminate()
-                try:
-                    daemon.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    daemon.kill()
-                    daemon.wait(timeout=3)
+    assert len(requests) == 6 and marker.read_text() == 'once'
+    for path, title, answer in zip(checkpoints, titles, ('return-a-answer', 'probe-b-answer')):
+        assert read_title(path.parent, path.stem) == title
+        assert answer.encode() in path.read_bytes(), 'continuation not saved to original checkpoint'
+    assert not list((home / '.thin/sessions').glob('*.session')), 'HOME was used as a project'
+    assert {p.stem for p in checkpoints[0].parent.glob('*.session')} == {ids[0]}
+    assert {p.stem for p in checkpoints[1].parent.glob('*.session')} == {*foreground_ids, ids[1]}
 
 
 if __name__ == '__main__':

@@ -126,7 +126,7 @@ pub const Frontend = struct {
         if (last == 0) return;
         if (first != 0 and first > last) return error.InvalidInput;
         if (epoch == 0 or epoch != self.view.snapshot.control_epoch) return error.StaleControl;
-        return self.communication.acknowledgeRange(epoch, first, last);
+        return self.communication.acknowledgeRange(self.generation, epoch, first, last);
     }
     fn poll(raw: *anyopaque, _: std.mem.Allocator) !?session.Item {
         const self = from(raw);

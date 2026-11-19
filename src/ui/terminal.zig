@@ -7,7 +7,6 @@ const c = std.c;
 const abi = @import("../platform/terminal_abi.zig");
 
 const posix = @import("../platform/posix_terminal.zig");
-const remote = @import("../platform/terminal_remote.zig");
 // 查询终端的前台进程组，用于判断当前进程是否位于前台。
 extern "c" fn tcgetpgrp(c_int) c_int;
 // 当前进程所属的进程组，与 tcgetpgrp 的结果比较。
@@ -89,19 +88,12 @@ pub const Terminal = struct {
     /// 是否仍处于 raw/显示托管状态；restore 依赖它保证幂等。
     active: bool = true,
     restored: bool = false,
-    remote: bool = false,
     notification_fd: c_int = -1,
     retained: [64]u8 = @splat(0),
     retained_len: usize = 0,
 
     /// 打开控制终端 /dev/tty。要求 stdin/stdout 均为 tty，且当前进程位于前台进程组，否则后台写终端会被 SIGTTOU 挂起。
     pub fn open() !Terminal {
-        if (remote.active()) {
-            var self: Terminal = .{ .fd = -1, .owned = false, .original = undefined, .original_flags = 0, .remote = true };
-            errdefer _ = self.restore();
-            try self.enterDisplay();
-            return self;
-        }
         if (c.isatty(0) != 1 or c.isatty(1) != 1) return error.TtyRequired;
         // 使用新的 open 文件描述，使 O_NONBLOCK 不会影响父 shell 继承的 stdio。
         // Darwin poll cannot monitor the indirect /dev/tty device. The C
@@ -156,12 +148,6 @@ pub const Terminal = struct {
 
     /// 查询终端尺寸。ioctl 失败或尺寸为 0 时回退为 80x24；上限为 512x200，防止异常尺寸撑爆缓冲。
     pub fn size(self: Terminal) Size {
-        if (self.remote) {
-            var columns: c_uint = 80;
-            var rows: c_uint = 24;
-            remote.size(&columns, &rows);
-            return .{ .columns = std.math.clamp(columns, 1, 512), .rows = std.math.clamp(rows, 1, 200) };
-        }
         var dimensions = std.mem.zeroes(c.winsize);
         if (posix.getSize(self.fd, &dimensions) != 0) return .{ .columns = 80, .rows = 24 };
         return .{ .columns = if (dimensions.col == 0) 80 else @min(dimensions.col, 512), .rows = if (dimensions.row == 0) 24 else @min(dimensions.row, 200) };
@@ -169,12 +155,6 @@ pub const Terminal = struct {
 
     /// Prove the unclamped physical row count; fallback or unknown sizes are not proof.
     pub fn exactPhysicalRows(self: Terminal, expected: usize) bool {
-        if (self.remote) {
-            var columns: c_uint = 0;
-            var rows: c_uint = 0;
-            remote.size(&columns, &rows);
-            return rows != 0 and rows == expected;
-        }
         var dimensions = std.mem.zeroes(c.winsize);
         return posix.getSize(self.fd, &dimensions) == 0 and
             dimensions.row != 0 and dimensions.row == expected;
@@ -236,10 +216,6 @@ pub const Terminal = struct {
     }
 
     fn rawRead(self: Terminal, out: []u8) !usize {
-        if (self.remote) {
-            const count = remote.read(out.ptr, out.len);
-            return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
-        }
         const n = c.read(self.fd, out.ptr, out.len);
         if (n >= 0) return @intCast(n);
         // Temporary lack of data or interruption, not application EOF.
@@ -251,10 +227,6 @@ pub const Terminal = struct {
 
     /// Main loop keeps any unwritten tail and continues input/cancel handling.
     pub fn write(self: Terminal, bytes: []const u8) !usize {
-        if (self.remote) {
-            const count = remote.write(bytes.ptr, bytes.len);
-            return if (count >= 0) @intCast(count) else error.TerminalDisconnected;
-        }
         const n = c.write(self.fd, bytes.ptr, bytes.len);
         if (n >= 0) return @intCast(n);
         // The owner retains the unwritten tail on interruption/backpressure.
@@ -266,18 +238,12 @@ pub const Terminal = struct {
 
     /// Register/unregister on the terminal owner thread. The producer must keep
     /// this fd alive until removal; only its queue consumer drains it.
-    pub fn setNotification(self: *Terminal, fd: c_int) !void {
-        if (self.notification_fd == fd) return;
-        if (self.remote and remote.notificationFd(fd) != 0) return error.TerminalSetupFailed;
+    pub fn setNotification(self: *Terminal, fd: c_int) void {
         self.notification_fd = fd;
     }
 
     /// 用 poll 等待终端可读（want_write 时等待可写），最多等待 ms 毫秒。
     pub fn wait(self: Terminal, want_write: bool, ms: c_int) !void {
-        if (self.remote) {
-            if (remote.wait(@intFromBool(want_write), ms) != 0) return error.TerminalDisconnected;
-            return;
-        }
         var descriptors = [_]c.pollfd{
             .{ .fd = self.fd, .events = c.POLL.IN | (if (want_write) @as(c_short, c.POLL.OUT) else 0), .revents = 0 },
             .{ .fd = self.notification_fd, .events = c.POLL.IN, .revents = 0 },
@@ -310,10 +276,6 @@ pub const Terminal = struct {
         self.retained_len = 0;
         if (!self.active) return self.restored;
         self.active = false;
-        if (self.remote) {
-            self.restored = self.writeBounded(leave, 50);
-            return self.restored;
-        }
 
         var attrs_ok = false;
         // At most eight attempts; only interruption is retryable.
@@ -345,10 +307,6 @@ pub const Terminal = struct {
     pub fn writeAfterRestoreStopped(self: *Terminal, data: []const u8, stop: Stop) !void {
         if (self.active or !self.restored) return error.TerminalNotRestored;
         if (data.len > 256) return error.TerminalWriteLimit;
-        if (self.remote) {
-            if (!try self.writeBoundedStopped(data, 50, stop)) return error.TerminalWriteFailed;
-            return;
-        }
         const flags = c.fcntl(self.fd, c.F.GETFL);
         if (flags < 0 or c.fcntl(self.fd, c.F.SETFL, flags | nonblock) < 0) return error.TerminalWriteFailed;
         // Preserve the error until AFTER temporary flags have been restored.
@@ -360,7 +318,7 @@ pub const Terminal = struct {
 
     /// 恢复终端状态；owned 为 true 时同时关闭 fd。可重复调用。
     pub fn deinit(self: *Terminal) void {
-        self.setNotification(-1) catch {};
+        self.setNotification(-1);
         _ = self.restore();
         if (self.owned) {
             _ = c.close(self.fd);

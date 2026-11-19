@@ -1,4 +1,4 @@
-test "global config switches survive selection restart and headless without a settings source" {
+test "global config switches survive model selection and session restart without a settings source" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
@@ -34,10 +34,9 @@ test "global config switches survive selection restart and headless without a se
     var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer restarted.deinit();
     try std.testing.expect(!restarted.connection().current().low_price_input_enabled);
-    const headless = try App.init(a, io, &env, home, .{});
-    defer headless.deinit();
-    try std.testing.expect(!headless.config.value.limits.low_price_input);
-    try std.testing.expectEqualStrings("second", headless.config.value.model.name);
+    const config = restarted.app.?.config.value;
+    try std.testing.expect(!config.limits.low_price_input);
+    try std.testing.expectEqualStrings("second", config.model.name);
 }
 test "history restore adopts current config switches rather than archived budget or tool prefix" {
     var tmp = std.testing.tmpDir(.{});
@@ -136,7 +135,7 @@ test "obsolete settings file is ignored and preserved even when malformed" {
     const bytes = try read(home, "settings.json");
     defer a.free(bytes);
     try std.testing.expectEqualStrings(bad, bytes);
-    const headless = try App.init(a, io, &env, home, .{});
-    defer headless.deinit();
-    try std.testing.expect(!headless.config.value.limits.low_price_input);
+    var restarted = try Session.init(a, io, &env, home, .{});
+    defer restarted.deinit();
+    try std.testing.expect(!restarted.app.?.config.value.limits.low_price_input);
 }

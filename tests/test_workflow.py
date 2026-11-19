@@ -17,8 +17,8 @@ spec.loader.exec_module(workflow)
 
 class WorkflowTests(unittest.TestCase):
     def test_forwarding_and_filter_scope(self):
-        a = workflow.parse_args(["focus", "--filter", "hello world", "--ssh-include", "/sdk/include", "--ssh-library", "/sdk/libssh.so", "--optimize", "ReleaseSmall", "-j", "2"])
-        self.assertEqual(workflow.command_for(a), ["zig", "build", "test-focus", "-j2", "-Doptimize=ReleaseSmall", "--summary", "all", "-Dtest-filter=hello world", "-Dssh-include=/sdk/include", "-Dssh-library=/sdk/libssh.so"])
+        a = workflow.parse_args(["focus", "--filter", "hello world", "--optimize", "ReleaseSmall", "-j", "2"])
+        self.assertEqual(workflow.command_for(a), ["zig", "build", "test-focus", "-j2", "-Doptimize=ReleaseSmall", "--summary", "all", "-Dtest-filter=hello world"])
         for args in (["focus"], ["focus", "--filter", "  "], ["full", "--filter", "x"], ["full", "-j", "0"]):
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 workflow.parse_args(args)
@@ -91,11 +91,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('grouped.step.dependOn(&variant.run.step)', source)
         self.assertIn('.root_source_file = variant.path(b, "src/__test_group_root.zig")', source)
         self.assertNotIn('.root_source_file = variant.path(b, "src/root.zig")', source)
-        self.assertIn('if (!std.mem.eql(u8, group, "fast")) addRuntime(b, grouped.root_module, ssh_include, ssh_library);', source)
+        self.assertIn('if (!std.mem.eql(u8, group, "fast")) addNative(b, grouped.root_module);', source)
         self.assertIn('.root_source_file = all.path(b, "src/root.zig")', source)
-        self.assertIn('unit.step.dependOn(&all.run.step)', source)
+        # Project Memory is exercised by the composed unit suite, not a standalone artifact.
+        tests = Path(__file__).resolve().parent
+        layout = json.loads((tests / 'layout.json').read_text())
+        memory = next(entry for entry in layout['files'] if entry['virtual'] == 'src/tools/memory.zig')
+        self.assertTrue(memory['unit'])
+        self.assertIn('tests/unit/tools/memory_test.zig', [f['path'] for f in memory['fragments']])
+        self.assertIn('_ = memory;', (tests / 'unit/root_discovery.zig').read_text())
         self.assertIn('pty_driver.step.dependOn(&driver.run.step)', source)
-        for artifact in ("presentation_tests", "filesystem_tests", "terminal_tests", "unit", "focused", "rendering", "memory_tests", "http_tests", "proxy_tests", "anthropic_tests"):
+        for artifact in ("presentation_tests", "filesystem_tests", "terminal_tests", "unit", "focused", "rendering", "http_tests", "proxy_tests", "anthropic_tests"):
             with self.subTest(artifact=artifact):
                 self.assertIn(f'{artifact}.step.dependOn(&all.run.step)', source)
         self.assertIn('.root_source_file = b.path("src/main.zig")', source)
@@ -136,8 +142,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('test_all.dependOn(&full_daemon.step);', full)
         self.assertIn('break :gate &full_daemon.step;', full)
         dependencies = re.findall(r'full_prerequisites\.dependOn\(([^)]+)\);', full)
-        # Original full inventory, except its daemon is now the downstream gate.
-        expected = {'workflow_tests', 'run_unit', 'run_memory', 'run_memory_app', 'run_background', 'run_subscription', 'run_ssh', 'run', 'run_presentation', 'run_http', 'run_anthropic', 'run_proxy', 'run_app', 'run_idle_enter', 'run_resume_menu', 'run_memory_background', 'run_resize', 'run_settings', 'run_command', 'run_approval_cancel', 'run_tool_preview', 'run_queued'}
+        # Every full prerequisite must finish before the entry-local daemon fixture.
+        expected = {'workflow_tests', 'run_unit', 'run_background', 'run_subscription', 'run_ssh', 'run', 'run_presentation', 'run_http', 'run_anthropic', 'run_proxy', 'run_app', 'run_idle_enter', 'run_resume_menu', 'run_resize', 'run_settings', 'run_command', 'run_approval_cancel', 'run_tool_preview', 'run_queued'}
         self.assertEqual(set(dependencies), {f'&{name}.step' for name in expected} | {'viewport_step'})
         self.assertEqual(len(dependencies), len(expected) + 1)
         communication = source.split('const communication = ', 1)[1].split('// Root-level offline tooling', 1)[0]
@@ -153,8 +159,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('if (target.result.os.tag == .linux) daemon_step.dependOn(&run_daemon.step)', source)
 
     def test_app_forwards_existing_build_and_preserves_runner_semantics(self):
-        argv = ["app", "--optimize", "ReleaseSmall", "--ssh-include", "/sdk/include", "--ssh-library", "/sdk/libssh.so"]
-        command = ["zig", "build", "test-app", "-j1", "-Doptimize=ReleaseSmall", "--summary", "all", "-Dssh-include=/sdk/include", "-Dssh-library=/sdk/libssh.so"]
+        argv = ["app", "--optimize", "ReleaseSmall"]
+        command = ["zig", "build", "test-app", "-j1", "-Doptimize=ReleaseSmall", "--summary", "all"]
         self.assertEqual(workflow.command_for(workflow.parse_args(argv)), command)
         wrapped = ["/stub/capsh", workflow.CAP_DROP, "--", "-c", 'exec "$@"', "thin-test", *command]
         for code, output, mutate, status in [(0, "", False, "passed"), (1, "FAIL application acceptance: example", False, "fixture_failure"), (0, "", True, "source_changed")]:
@@ -214,7 +220,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(calls[-1], ["node", "--check", "tests/example.mjs"])
 
     def test_normalizer_argument_integrity_and_fail_closed(self):
-        command = ["zig", "build", "test-focus", "-Dtest-filter=x; $(bad)", "-Dssh-library=/some path/lib.so"]
+        command = ["zig", "build", "test-focus", "-Dtest-filter=x; $(bad)", "--cache-dir", "/some path/cache"]
         wrapped = workflow.normalized_command(command, euid=0, which=lambda name: "/stub/capsh", limits=(0, workflow.STACK_BYTES))
         self.assertEqual(wrapped, ["/stub/capsh", workflow.CAP_DROP, "--", "-c", 'exec "$@"', "thin-test", *command])
         self.assertEqual(workflow.normalized_command(command, euid=1000, which=lambda _: None, limits=(0, workflow.STACK_BYTES)), command)

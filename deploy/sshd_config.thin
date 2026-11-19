@@ -1,6 +1,6 @@
 # Thin 专用 OpenSSH 入口：样例，未安装、未启用。
 #
-# 用途：为 Thin 提供独立 SSH 登录入口。登录后只运行 `thin --connect`，不提供 shell、
+# 用途：为 Thin 提供独立 SSH 登录入口。登录后只运行无参数 `thin`，不提供 shell、
 # sftp/scp、远程命令、端口转发或 agent 转发。认证仍由 OpenSSH + 系统 PAM/OS 账户完成；
 # Thin 不读取 /etc/shadow，不保存登录密码，也不再维护第二套账户密码。
 #
@@ -15,6 +15,8 @@
 
 # THIN:REPLACE 端口：必须是未占用的专用端口，不能等于管理端口 22，也不能与其它服务冲突。
 Port 2222
+# 样例仅绑定回环；对外绑定及放行防火墙需另行授权。
+ListenAddress 127.0.0.1
 
 # THIN:REPLACE 允许登录的 OS 账户（必须替换为你自己的账户名）。
 # 该账户须已存在、有可用的登录 shell、并由系统管理员批准的认证方式。
@@ -32,11 +34,11 @@ LoginGraceTime 30
 # 必须有 PTY；无 PTY 的请求不降级成 shell 或一次性模式。
 PermitTTY yes
 
-# THIN:REPLACE 最后一段必须保留 `thin --connect`。
-# ForceCommand 由 sshd 用登录 shell 执行，因此这里是管理员固定的字符串，
-# 不接受客户端自带的命令；`--connect` 不会自动启动守护服务。
+# THIN:REPLACE 若安装路径不同，仅改绝对路径，不加参数。
+# sshd 通过登录 shell 执行管理员固定的命令，不采用客户端命令。
+# thin 自动连接本 UID 已有的本地守护服务，否则独立前台运行；不会启动服务。
 # 该账户的登录 shell 必须是可用 shell（nologin / false 会导致登录失败）。
-ForceCommand /usr/local/bin/thin --connect
+ForceCommand /usr/local/bin/thin
 
 # 不执行用户 rc 与环境文件，避免绕过强制命令。
 PermitUserRC no
@@ -63,7 +65,7 @@ HostKey /etc/ssh/ssh_host_ed25519_key
 # 不声明 Subsystem：本入口不提供 sftp。
 
 # 连接空闲检测：客户端静默失联时由 sshd 关闭会话；
-# Thin 侧的会话所有权由用户守护服务持有，SSH 断开不等于取消任务。
+# 已连接守护服务时，断线不取消守护服务拥有的任务；独立前台任务则随前台退出而终止。
 ClientAliveInterval 300
 ClientAliveCountMax 2
 

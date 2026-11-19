@@ -431,38 +431,6 @@ fn busyResumePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id
     }
 }
 
-fn closeOnlyPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id: ids.Id) !void {
-    const wait: unix.Wait = .{ .io = io, .timeout_ms = 4_000 };
-    var conn = try listener.accept(wait);
-    defer conn.close();
-    const hello_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
-    defer a.free(hello_raw);
-    var hello = try protocol.parseRequest(a, hello_raw);
-    defer hello.deinit();
-    try testing.expectEqual(protocol.Op.hello, hello.op);
-    const greeting = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, hello.id, id, std.c.getpid(), protocol.version });
-    defer a.free(greeting);
-    try conn.writeFrame(greeting, wait);
-    const attach_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
-    defer a.free(attach_raw);
-    var attach = try protocol.parseRequest(a, attach_raw);
-    defer attach.deinit();
-    try testing.expectEqual(protocol.Op.attach, attach.op);
-    try testing.expect(!try attach.requiredBool("takeover"));
-    const attached = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"epoch\":7}}", .{ protocol.version, attach.id });
-    defer a.free(attached);
-    try conn.writeFrame(attached, wait);
-    const close_raw = (try conn.readFrame(wait)) orelse return error.TestUnexpectedResult;
-    defer a.free(close_raw);
-    var close = try protocol.parseRequest(a, close_raw);
-    defer close.deinit();
-    try testing.expectEqual(protocol.Op.close, close.op);
-    try testing.expectEqual(@as(u64, 7), try close.u64Field("epoch"));
-    const reply = try std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"accepted\":true}}", .{ protocol.version, close.id });
-    defer a.free(reply);
-    try conn.writeFrame(reply, wait);
-}
-
 const CandidatePeerCase = enum { good, record_pid, hello_pid, owner, watch_gone, watch_eof, watch_reject, watch_timeout, snapshot, snapshot_identity, snapshot_project, snapshot_epoch, baseline_epoch, baseline };
 
 fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id: ids.Id, project: []const u8, owner: cli.WorkerOwner, behavior: CandidatePeerCase) !void {

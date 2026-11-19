@@ -1,6 +1,8 @@
 //! Candidate-only saved-session picker. All data is owned by the caller.
 const std = @import("std");
 const session = @import("session_client.zig");
+const metadata = @import("../core/session_metadata.zig");
+const presentation = @import("presentation.zig");
 const text = @import("text.zig");
 
 pub const Picker = struct {
@@ -12,7 +14,7 @@ pub const Picker = struct {
     launcher: ?[]u8,
 
     pub fn deinit(self: *Picker, a: std.mem.Allocator) void {
-        a.free(self.sessions);
+        metadata.freeSavedSessions(a, self.sessions);
         if (self.launcher) |value| a.free(value);
     }
     pub fn move(self: *Picker, down: bool) void {
@@ -62,7 +64,11 @@ pub fn rows(a: std.mem.Allocator, picker: *const Picker, columns: usize, max_row
         const title = item.title.text();
         const label = if (title.len != 0) title else item.id[0..8];
         const stamp = try savedTime(a, item.modified_ms);
-        const raw = try std.fmt.allocPrint(a, "{s}{s}  {s}", .{ if (start + index == selected) "> " else "  ", label, stamp });
+        const marker: []const u8 = if (start + index == selected) "> " else "  ";
+        const raw = if (item.project) |project|
+            try std.fmt.allocPrint(a, "{s}{s}  {s}  {s}", .{ marker, label, try presentation.singleLine(a, project, columns), stamp })
+        else
+            try std.fmt.allocPrint(a, "{s}{s}  {s}", .{ marker, label, stamp });
         const fitted = text.fitBytes(raw, columns);
         lines[index] = raw[0..fitted];
         if (start + index == selected and columns >= 2) {

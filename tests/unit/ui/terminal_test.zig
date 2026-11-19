@@ -10,8 +10,8 @@ test "local terminal wait observes borrowed wakeup without consuming it as input
     defer terminal.deinit();
     var wake = try @import("../platform/wakeup.zig").Wakeup.init();
     defer wake.deinit();
-    try terminal.setNotification(wake.fd);
-    defer terminal.setNotification(-1) catch {};
+    terminal.setNotification(wake.fd);
+    defer terminal.setNotification(-1);
     wake.notify();
     const start = std.Io.Clock.awake.now(std.testing.io);
     try terminal.wait(false, 500);
@@ -22,7 +22,7 @@ test "local terminal wait observes borrowed wakeup without consuming it as input
     try std.testing.expectEqual(@as(c_int, 1), c.poll(&descriptor, 1, 0));
     wake.drain();
     try std.testing.expectEqual(@as(c_int, 0), c.poll(&descriptor, 1, 0));
-    try terminal.setNotification(-1);
+    terminal.setNotification(-1);
     terminal.deinit();
     try std.testing.expect(c.fcntl(wake.fd, c.F.GETFD) >= 0);
 }

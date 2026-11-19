@@ -7,19 +7,15 @@ Everything is an owned fixture: a temporary HOME/project, a literal 127.0.0.1
 chat server, an inline fake key, an owned `python3 -u` service per job, and
 bounded process groups. No real API, no user configuration, no installs.
 
-Two cases, because the two semantics differ:
+One foreground PTY, three user turns. The service started in turn 1 must
+still answer on its socket after that task finished; turn 2 manages it
+(status/logs/stop). Turn 3 starts six services, checks list/logs, stops one,
+checks its status, repeats the stop and queries an unknown id. Five siblings
+must still answer before Ctrl-D; all six PIDs and sockets must be gone after
+foreground exit, before the fixture withdraws their lease.
 
-* print: one real `thin --print` App instance, six synchronous `bash
-  background=true` starts. Each start is proven by the service's own bound
-  socket (port 0 reported through its marker file, never guessed) before the
-  fixture lets the next model round proceed. Later rounds run list, logs,
-  status, one stop (that socket closes, the five siblings still answer),
-  repeat stop and an unknown-id query. `--print` exit must cancel and join
-  every remaining service, so all six PIDs must be gone afterwards.
-* pty: one interactive App instance and two separate user turns. The service
-  started in turn 1 must still answer on its socket after that task finished,
-  and turn 2 manages it (status/logs/stop). This is the cross-task keep-alive
-  proof; a per-task owner or an exit-time-only cleanup cannot pass it.
+This checks answers on a settled terminal frame, not the former headless
+stdout/stderr separation, escape-free stdout or automatic one-shot exit.
 
 No fixed concurrency limit is asserted anywhere: six services are alive at the
 same time because all six really run, not because a counter allowed them.
@@ -144,21 +140,21 @@ class Screen:
 
 KEY = 'owned-loopback-background-fixture-key'
 MODEL = 'fixture-model'
-PRINT_PROMPT = 'background-print-proof start six owned services'
-PRINT_ANSWER = 'background-print-final-answer-marker'
+BATCH_PROMPT = 'background-pty-start-six-owned-services'
+BATCH_ANSWER = 'background-pty-six-services-answer-marker'
 PTY_START_PROMPT = 'background-pty-start-marker'
 PTY_MANAGE_PROMPT = 'background-pty-manage-marker'
 PTY_FIRST_ANSWER = 'background-pty-first-answer-marker'
 PTY_FINAL_ANSWER = 'background-pty-final-answer-marker'
 SERVICES = 6
-PRINT_STOPPED = 2
+STOPPED_INDEX = 2
 ID_PATTERN = re.compile(r'^[0-9a-f]+-[0-9]+$')
 BOUND = 2 * 1024 * 1024
 DARWIN = sys.platform == 'darwin'
 INTERRUPTS = {signal.SIGTERM, signal.SIGINT}
 _controller_interrupted = False
 PASS_LINES = (
-    'PASS background print: 6 concurrent services, list/logs/status/stop, '
+    'PASS background pty: 6 concurrent services, list/logs/status/stop, '
     'repeat stop, unknown id, exit reclaim',
     'PASS background pty: one App instance kept the service across two tasks '
     'and stopped it explicitly',
@@ -523,9 +519,11 @@ class Owned:
 # Planned model replies
 # ---------------------------------------------------------------------------
 
-def print_plan(owned, state):
+def batch_plan(owned):
+    state = {'ids': [], 'phase': 0, 'log_runs': 0}
+
     def plan(body):
-        calls, results = tool_history(body)
+        calls, results = calls_after_last_user(body)
         done = len(calls)
         if 0 < done <= SERVICES:
             receipt = parse_json(results[calls[done - 1]['id']], 'bash')
@@ -534,55 +532,63 @@ def print_plan(owned, state):
         if done < SERVICES:
             return tool_call(done, 'bash', {'command': service_command(str(done)), 'background': True})
         if done == SERVICES:
+            assert len(set(state['ids'])) == SERVICES, 'each service needs a distinct id'
+            for index in range(SERVICES):
+                owned.probe(str(index))
             return tool_call(done, 'background', {'action': 'list', 'limit': 20})
         if done == SERVICES + 1:
             listed = parse_json(results[calls[done - 1]['id']], 'background list')
             flattened = json.dumps(listed)
             for identity in state['ids']:
                 assert identity in flattened, 'list lost a started service'
-            return tool_call(done, 'background', {'action': 'logs', 'id': state['ids'][PRINT_STOPPED],
+            return tool_call(done, 'background', {'action': 'logs', 'id': state['ids'][STOPPED_INDEX],
                                                   'stdout_offset': 0, 'stderr_offset': 0})
         if state['phase'] == 0:
             logs = parse_json(results[calls[done - 1]['id']], 'background logs')
-            if 'SERVICE-%d-READY' % PRINT_STOPPED not in json.dumps(logs):
+            if 'SERVICE-%d-READY' % STOPPED_INDEX not in json.dumps(logs):
                 state['log_runs'] += 1
                 assert state['log_runs'] <= 8, 'service stdout never reached the bounded log ring'
-                return tool_call(done, 'background', {'action': 'logs', 'id': state['ids'][PRINT_STOPPED],
+                return tool_call(done, 'background', {'action': 'logs', 'id': state['ids'][STOPPED_INDEX],
                                                       'stdout_offset': 0, 'stderr_offset': 0})
             state['phase'] = 1
-            return tool_call(done, 'background', {'action': 'stop', 'id': state['ids'][PRINT_STOPPED]})
+            return tool_call(done, 'background', {'action': 'stop', 'id': state['ids'][STOPPED_INDEX]})
         if state['phase'] == 1:
             stopped = parse_json(results[calls[done - 1]['id']], 'background stop')
-            assert state['ids'][PRINT_STOPPED] in json.dumps(stopped), 'stop must echo the stopped id'
-            owned.wait_stopped(str(PRINT_STOPPED))
+            assert state['ids'][STOPPED_INDEX] in json.dumps(stopped), 'stop must echo the stopped id'
+            owned.wait_stopped(str(STOPPED_INDEX))
             for sibling in range(SERVICES):
-                if sibling == PRINT_STOPPED:
+                if sibling == STOPPED_INDEX:
                     continue
                 owned.probe(str(sibling))
             state['phase'] = 2
-            return tool_call(done, 'background', {'action': 'status', 'id': state['ids'][PRINT_STOPPED]})
+            return tool_call(done, 'background', {'action': 'status', 'id': state['ids'][STOPPED_INDEX]})
         if state['phase'] == 2:
             status = parse_json(results[calls[done - 1]['id']], 'background status')
-            assert state['ids'][PRINT_STOPPED] in json.dumps(status), 'status must echo the id'
+            assert state['ids'][STOPPED_INDEX] in json.dumps(status), 'status must echo the id'
             state['phase'] = 3
-            return tool_call(done, 'background', {'action': 'stop', 'id': state['ids'][PRINT_STOPPED]})
+            return tool_call(done, 'background', {'action': 'stop', 'id': state['ids'][STOPPED_INDEX]})
         if state['phase'] == 3:
             again = parse_json(results[calls[done - 1]['id']], 'background repeat stop')
-            assert state['ids'][PRINT_STOPPED] in json.dumps(again), 'repeat stop must serve the record'
+            assert state['ids'][STOPPED_INDEX] in json.dumps(again), 'repeat stop must serve the record'
             state['phase'] = 4
             return tool_call(done, 'background', {'action': 'status', 'id': 'deadbeef-4242'})
         if state['phase'] == 4:
             require_rejected(results[calls[done - 1]['id']], 'unknown background id')
             state['phase'] = 5
-            return {'kind': 'text', 'text': PRINT_ANSWER}
-        raise AssertionError('unexpected extra print-model request')
+            return {'kind': 'text', 'text': BATCH_ANSWER}
+        raise AssertionError('unexpected extra batch request')
 
     return plan
 
 
 def pty_plan(owned, state):
+    batch = batch_plan(owned)
+
     def plan(body):
         users = real_users(body)
+        if users == [PTY_START_PROMPT, PTY_MANAGE_PROMPT, BATCH_PROMPT]:
+            assert state['phase'] == 3, 'batch turn before explicit stop'
+            return batch(body)
         if users == [PTY_START_PROMPT] and state['turn'] == 0:
             calls, results = calls_after_last_user(body)
             if not calls:
@@ -667,7 +673,7 @@ def prepare(workspace, name, url):
 
 
 def owned_env(home, workspace):
-    # Both cases avoid shared runtime/config/cache locations. A short /tmp base
+    # Avoid shared runtime/config/cache locations. A short /tmp base
     # is selected in main: Darwin sockaddr_un.sun_path is only 104 bytes.
     runtime = workspace / 'runtime'
     runtime.mkdir(mode=0o700, exist_ok=True)
@@ -748,47 +754,6 @@ def cleanup(owned, child, fds=()):
                             os.close(fd)
                 finally:
                     owned.wait_cleanup()
-
-
-def run_print(app, workspace, url, start_server=None):
-    home, project, config_path, config_bytes = prepare(workspace, 'print', url)
-    owned, state = Owned(project), {'ids': [], 'log_runs': 0, 'phase': 0}
-    Model.plan = print_plan(owned, state)
-    Model.failed = None
-    child = None
-    try:
-        if DARWIN:
-            assert threading.active_count() == 1, 'single-threaded preexec controller required'
-        with ownership_handoff() as child_mask:
-            child = subprocess.Popen(
-                [app, '--print', PRINT_PROMPT, '--no-model-auto-refresh'],
-                cwd=project, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=owned_env(home, workspace), start_new_session=True,
-                preexec_fn=(lambda: restore_child_signals(child_mask)) if DARWIN else None)
-        if start_server is not None:
-            # Server/request threads inherit blocked interrupts, leaving only
-            # the controller main thread eligible for owner cancellation.
-            with ownership_handoff():
-                start_server()
-        out, err = child.communicate(timeout=60)
-        if Model.failed:
-            raise Model.failed
-        stdout, stderr = out.decode('utf-8', 'replace'), err.decode('utf-8', 'replace')
-        assert child.returncode == 0, 'print run failed: %s' % stderr[-400:]
-        assert PRINT_ANSWER in stdout, 'print final answer missing'
-        assert KEY not in stdout and KEY not in stderr, 'credential leaked to local output'
-        assert '\x1b' not in stdout, 'headless output carried terminal escapes'
-        assert config_path.read_bytes() == config_bytes, 'background starts rewrote the config'
-        assert not (home / '.thin' / 'sessions').exists(), 'headless run created a session'
-        assert list((project / '.thin' / 'sessions').glob('*.jsonl')), 'accepted headless session not recorded'
-        # Exit cleanup: every service must be canceled and joined by App.deinit.
-        # This proof precedes the fixture-only lease cancellation in finally.
-        for index in range(SERVICES):
-            owned.wait_stopped(str(index))
-        return {'case': 'print', 'requests': Model.requests, 'services': SERVICES,
-                'stopped': state['ids'][PRINT_STOPPED], 'ids': list(state['ids'])}
-    finally:
-        cleanup(owned, child)
 
 
 def run_pty(app, workspace, url, start_server=None):
@@ -874,7 +839,9 @@ def run_pty(app, workspace, url, start_server=None):
         if DARWIN:
             assert threading.active_count() == 1, 'single-threaded preexec controller required'
         with ownership_handoff() as child_mask:
-            child = subprocess.Popen([app, '--no-model-auto-refresh'], stdin=slave,
+            # Only the owned loopback provider is configured, so no official
+            # provider is eligible for automatic metadata discovery.
+            child = subprocess.Popen([app], stdin=slave,
                                      stdout=slave, stderr=slave, cwd=project, preexec_fn=child_setup,
                                      env=owned_env(home, workspace))
             # child ownership is established before any fallible parent setup.
@@ -904,6 +871,11 @@ def run_pty(app, workspace, url, start_server=None):
         os.write(master, PTY_MANAGE_PROMPT.encode() + b'\r')
         pump_until(lambda: settled(PTY_FINAL_ANSWER.encode()), 'final answer settled frame')
         owned.wait_stopped('pty')
+        os.write(master, BATCH_PROMPT.encode() + b'\r')
+        pump_until(lambda: settled(BATCH_ANSWER.encode()), 'six-service answer settled frame')
+        for index in range(SERVICES):
+            if index != STOPPED_INDEX:
+                owned.probe(str(index))
         os.write(master, b'\x04\x04')
         pump_until(lambda: child.poll() is not None, 'exit after Ctrl-D')
         assert child.wait(timeout=10) == 0, 'interactive app exit status'
@@ -920,10 +892,13 @@ def run_pty(app, workspace, url, start_server=None):
         output = capture.decode('utf-8', 'replace')
         assert KEY not in output, 'credential leaked to the terminal'
         assert config_path.read_bytes() == config_bytes, 'interactive run rewrote the config'
+        assert not (home / '.thin' / 'sessions').exists(), 'session recorded under HOME'
         assert list((project / '.thin' / 'sessions').glob('*.jsonl')), 'accepted interactive session not recorded'
+        # Prove exit cleanup before finally withdraws the service lease.
+        for index in range(SERVICES):
+            owned.wait_stopped(str(index))
     finally:
         cleanup(owned, child, (master, slave))
-    return {'case': 'pty', 'requests': Model.requests, 'turns': 2, 'id': state['pty_id']}
 
 
 def close_model_server(server, thread):
@@ -931,8 +906,7 @@ def close_model_server(server, thread):
         if thread.is_alive():
             server.shutdown()
     finally:
-        # Darwin uses non-daemon request threads: finish them before the next
-        # Python preexec_fn, not merely the serve_forever thread.
+        # Finish Darwin's non-daemon request threads as well as serve_forever.
         server.server_close()
         if thread.ident is not None:
             thread.join(timeout=5)
@@ -1020,32 +994,11 @@ def main():
     if not DARWIN:
         thread.start()
     url = 'http://127.0.0.1:%d/v1' % server.server_port
-    evidence = []
     try:
         with tempfile.TemporaryDirectory(prefix='thin-bg-', dir='/tmp') as base:
-            workspace = Path(base)
-            evidence.append(run_print(app, workspace, url, thread.start if DARWIN else None))
-            print(PASS_LINES[0])
-            if DARWIN:
-                # Print and PTY remain the same two cases. A fresh loopback
-                # listener lets all print handlers join before PTY fork/setup.
-                close_model_server(server, thread)
-                server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Model)
-                server.daemon_threads = False
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                url = 'http://127.0.0.1:%d/v1' % server.server_port
-            evidence.append(run_pty(app, workspace, url, thread.start if DARWIN else None))
-            print(PASS_LINES[1])
-            (workspace / 'evidence.json').write_text(json.dumps({
-                'cases': evidence,
-                'ownedLoopbackServices': SERVICES,
-                'fixedConcurrencyLimit': None,
-                'startupReadiness': 'service-bound-socket-probe',
-                'echoStoppedServiceIsolated': True,
-                'exitCleanupJoined': True,
-                'crossTaskKeepAlive': True,
-            }, indent=2) + '\n')
-        print(PASS_LINES[2])
+            run_pty(app, Path(base), url, thread.start if DARWIN else None)
+        for line in PASS_LINES:
+            print(line)
     finally:
         if DARWIN:
             close_model_server(server, thread)

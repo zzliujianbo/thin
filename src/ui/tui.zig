@@ -562,9 +562,6 @@ pub const Connection = struct {
         available: bool = false,
         /// Owner-reported task activity of the attached remote session.
         busy: bool = false,
-        /// Borrowed display-only session identity; never used as a path.
-        session_label: ?[]const u8 = null,
-        launcher_dir: ?[]const u8 = null,
         /// Controller epoch; a change invalidates old approvals and queue sends.
         control_epoch: u64 = 0,
         /// Immutable app-prepared startup snapshot; no runtime dereference in draw.
@@ -698,7 +695,7 @@ pub fn run(a: std.mem.Allocator, io: Io, connection: Connection, bridge: *bridge
     const initial_size = terminal.size();
     const origin = if (entry) |value| if (value.row < initial_size.rows and
         value.size.rows == initial_size.rows and value.size.columns == initial_size.columns) value else null else null;
-    if (connection.async_actions) |actions| try terminal.setNotification(actions.wake_fd);
+    if (connection.async_actions) |actions| terminal.setNotification(actions.wake_fd);
     var ui = Ui{ .allocator = a, .io = io, .connection = connection, .bridge = bridge, .cancel = cancel, .terminal = &terminal, .size = initial_size, .entry_origin = origin, .natural_flow = true, .editor = .{ .allocator = a }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" } };
     defer ui.deinit();
 
@@ -845,9 +842,6 @@ const Ui = struct {
     async_stop_intent: u64 = 0,
     stop_instance: u64 = 0,
     withdrawn_draft: ?[]u8 = null,
-    /// Owned prompt supplied with `/new`; moved into the editor only after the
-    /// new session view is adopted, then submitted through the normal remote path.
-    new_prompt: ?[]u8 = null,
     /// 事件队列与审批应答通道，运行时与 UI 的唯一桥梁。
     bridge: *bridge_module.Bridge,
     /// 取消信号，与后台任务共享。
@@ -1014,8 +1008,6 @@ const Ui = struct {
     inject_epoch: u64 = 0,
     /// Owned backend notice text; never a dangling borrowed reply buffer.
     notice_owned: ?[]u8 = null,
-    /// Owned id of a pending busy-session /close confirmation.
-    stop_close: ?[]const u8 = null,
 
     /// An explicit quit owns exit authority; local tasks are joined first.
     ctrl_d_exit: bool = false,
@@ -1216,13 +1208,8 @@ const Ui = struct {
         self.input_history.deinit(self.allocator);
         self.dropProxyRestore();
         if (self.notice_owned) |owned| self.allocator.free(owned);
-        if (self.stop_close) |id| self.allocator.free(id);
         for (&self.async_pending) |*pending| if (pending.*) |*value| value.deinit(self.allocator);
         if (self.withdrawn_draft) |bytes| {
-            std.crypto.secureZero(u8, bytes);
-            self.allocator.free(bytes);
-        }
-        if (self.new_prompt) |bytes| {
             std.crypto.secureZero(u8, bytes);
             self.allocator.free(bytes);
         }
@@ -1353,55 +1340,6 @@ const Ui = struct {
         self.publishNotice("Pending message withdrawn as plain draft");
     }
 
-    /// Put a prompt supplied with `/new` back into the composer when starting
-    /// the new session failed, so the user's input is not lost.
-    fn restoreNewPrompt(self: *Ui) void {
-        const prompt = self.new_prompt orelse return;
-        self.new_prompt = null;
-        if (self.editor.bytes.items.len != 0) {
-            std.crypto.secureZero(u8, prompt);
-            self.allocator.free(prompt);
-            self.notice = "New session failed; composer changed, prompt not restored";
-            self.requestDraw();
-            return;
-        }
-        self.adoptEditorOwned(prompt);
-        self.requestDraw();
-    }
-
-    /// Submit a prompt supplied with `/new`. Ordinary text goes through the
-    /// normal submit path, preserving idle barriers, history, receipts and draft
-    /// recovery. A leading `/` or `!` is still literal prompt text.
-    fn submitNewPrompt(self: *Ui) !void {
-        const prompt = self.new_prompt orelse return;
-        self.new_prompt = null;
-        self.adoptEditorOwned(prompt);
-        const value = self.editor.bytes.items;
-        if (value.len != 0 and (value[0] == '/' or value[0] == '!')) return self.submitEditorPrompt();
-        return self.submit();
-    }
-
-    /// Literal prompt admission for text that the normal submit path would
-    /// interpret as a slash or local command.
-    fn submitEditorPrompt(self: *Ui) !void {
-        if (self.exitAuthorized() or self.terminal_notice_pending != null) return;
-        if (self.busy) {
-            self.notice = "New session is busy; prompt kept";
-            return;
-        }
-        if (self.poisoned) {
-            self.notice = "Cleanup unconfirmed; prompt kept";
-            return;
-        }
-        const value = self.editor.bytes.items;
-        if (std.mem.trim(u8, value, " \\t\\r\\n").len == 0) return;
-        const client = self.remote() orelse {
-            self.notice = "Session unavailable; prompt kept";
-            return;
-        };
-        if (try self.remoteStart(client, .prompt, value)) self.wipeEditor();
-    }
-
     fn activateStop(self: *Ui) void {
         self.stop_instance +%= 1;
         self.stop_open = true;
@@ -1428,7 +1366,6 @@ const Ui = struct {
             defer pending.deinit(self.allocator);
             if (completion.obsolete) {
                 if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
-                if (pending.purpose == .manage and completion.request.action.manage == .new_session) self.restoreNewPrompt();
                 // A superseded login attempt must never strand an opening panel
                 // nor keep a deferred cancellation armed for a dead generation.
                 if (pending.purpose == .codex_login) {
@@ -1449,7 +1386,6 @@ const Ui = struct {
             }
             if (completion.failure) |err| {
                 if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
-                if (pending.purpose == .manage and completion.request.action.manage == .new_session) self.restoreNewPrompt();
                 if (pending.purpose == .codex_login) {
                     const start = completion.request.action.codex_login.action == .start;
                     self.codex_opening = false;
@@ -2344,10 +2280,6 @@ const Ui = struct {
         self.stop_generation +%= 1;
         self.displayed_stop = null;
         self.frame_stop = null;
-        if (self.stop_close) |id| {
-            self.allocator.free(id);
-            self.stop_close = null;
-        }
         self.detachInbox();
         self.queue_owner = null;
         self.inbox.deinit();
@@ -2438,113 +2370,24 @@ const Ui = struct {
         const name = trimmed[0..name_end];
         const is_resume = std.mem.eql(u8, name, "/resume");
         const is_new = std.mem.eql(u8, name, "/new");
-        const is_attach = std.mem.eql(u8, name, "/attach");
-        const is_detach = std.mem.eql(u8, name, "/detach");
-        const is_close = std.mem.eql(u8, name, "/close");
-        if (!(is_resume or is_new or is_attach or is_detach or is_close)) return false;
-        // The editor is wiped below; parse an owned copy so arguments stay valid.
-        const owned = self.allocator.dupe(u8, trimmed) catch {
-            self.wipeEditor();
-            self.notice = "Out of memory; command not sent";
-            return true;
-        };
-        defer self.allocator.free(owned);
+        if (!is_resume and !is_new) return false;
+        const single_line = std.mem.findAny(u8, trimmed, "\x00\r\n") == null;
+        const has_args = name_end != trimmed.len;
         self.wipeEditor();
         const backend = self.remote() orelse {
-            self.notice = "Session commands need a daemon connection (thin --connect)";
+            self.notice = "Session commands need a session connection";
             return true;
         };
-        const name_end_owned = std.mem.findAny(u8, owned, " \t\r\n") orelse owned.len;
-        const rest = std.mem.trim(u8, owned[name_end_owned..], " \t");
-        if (std.mem.findScalar(u8, owned, 0) != null or
-            (!is_new and (std.mem.findScalar(u8, owned, '\n') != null or std.mem.findScalar(u8, owned, '\r') != null)))
-        {
+        if (!single_line) {
             self.notice = "Session commands are single-line";
-            return true;
-        }
-        if (is_resume) {
-            if (rest.len == 0) {
-                self.openResumeRequest(backend);
-            } else if (rest.len == 32 and for (rest) |c| {
-                if (!std.ascii.isHex(c)) break false;
-            } else true) {
-                self.applyManage(backend, .{ .@"resume" = rest });
-            } else self.notice = "Usage: /resume [32-hex-id]";
-            return true;
-        }
-        if (is_new) {
-            if (self.new_prompt) |old| {
-                std.crypto.secureZero(u8, old);
-                self.allocator.free(old);
-                self.new_prompt = null;
-            }
-            const prompt = std.mem.trim(u8, owned[name_end_owned..], " \t\r\n");
-            if (prompt.len != 0) {
-                self.new_prompt = self.allocator.dupe(u8, prompt) catch {
-                    self.notice = "Out of memory; command not sent";
-                    return true;
-                };
-            }
-            self.applyManage(backend, .new_session);
-            return true;
-        }
-        if (is_detach) {
-            if (rest.len != 0) {
-                self.notice = "Usage: /detach";
-                return true;
-            }
-            self.applyManage(backend, .detach);
-            return true;
-        }
-        var words: [4][]const u8 = undefined;
-        const count = splitWords(rest, &words);
-        var force = false;
-        var takeover = false;
-        var id: ?[]const u8 = null;
-        for (words[0..count]) |word| {
-            if (is_attach and std.mem.eql(u8, word, "--takeover")) {
-                takeover = true;
-                continue;
-            }
-            if (is_close and std.mem.eql(u8, word, "--force")) {
-                force = true;
-                continue;
-            }
-            if (word.len != 0 and word[0] == '-') {
-                self.notice = if (is_attach) "Usage: /attach [--takeover] <id>" else "Usage: /close [--force] <id>";
-                return true;
-            }
-            if (id != null) {
-                self.notice = if (is_attach) "Usage: /attach [--takeover] <id>" else "Usage: /close [--force] <id>";
-                return true;
-            }
-            id = word;
-        }
-        const session_id = id orelse {
-            self.notice = if (is_attach) "Usage: /attach [--takeover] <id>" else "Usage: /close [--force] <id>";
-            return true;
-        };
-        if (session_id.len == 0 or session_id.len > 256) {
-            self.notice = "Invalid session id";
-            return true;
-        }
-        if (is_attach) {
-            self.applyManage(backend, .{ .attach = .{ .id = session_id, .takeover = takeover } });
+        } else if (has_args) {
+            self.notice = if (is_resume) "Usage: /resume" else "Usage: /new";
+        } else if (is_resume) {
+            self.openResumeRequest(backend);
         } else {
-            self.startClose(backend, session_id, force);
+            self.applyManage(backend, .new_session);
         }
         return true;
-    }
-
-    fn splitWords(text_: []const u8, out: *[4][]const u8) usize {
-        var count: usize = 0;
-        var it = std.mem.tokenizeAny(u8, text_, " \t");
-        while (it.next()) |word| {
-            if (count == out.len) break;
-            out[count] = word;
-            count += 1;
-        }
-        return count;
     }
 
     fn clearResumePending(self: *Ui) void {
@@ -2607,10 +2450,16 @@ const Ui = struct {
             },
             .enter => {
                 if (self.frame.len != 0 or self.displayed_resume_generation != picker.generation or self.normalAsyncPending()) return;
-                const id = picker.sessions[picker.selected].id;
+                // Move the selected project out before freeing the picker rows.
+                // applyManage consumes synchronously or clones the request.
+                const row = &picker.sessions[picker.selected];
+                const id = row.id;
+                const project = row.project;
+                row.project = null;
+                defer if (project) |path| self.allocator.free(path);
                 self.parser.stop_feed = true;
                 self.closeResumePicker();
-                if (self.remote()) |client| self.applyManage(client, .{ .@"resume" = &id });
+                if (self.remote()) |client| self.applyManage(client, .{ .@"resume" = .{ .id = id, .project = project } });
             },
             else => {},
         }
@@ -2618,15 +2467,11 @@ const Ui = struct {
 
     fn applyManage(self: *Ui, client: session_client.Client, request: session_client.Manage) void {
         if (self.connection.async_actions != null) {
-            if (self.beginAsync(.{ .manage = request }, .manage) == null) {
-                if (request == .saved_sessions) self.clearResumePending();
-                if (request == .new_session) self.restoreNewPrompt();
-            }
+            if (self.beginAsync(.{ .manage = request }, .manage) == null and request == .saved_sessions) self.clearResumePending();
             return;
         }
         var outcome = client.manage(self.allocator, request) catch |err| {
             if (request == .saved_sessions) self.clearResumePending();
-            if (request == .new_session) self.restoreNewPrompt();
             self.notice = self.describeError(err);
             self.requestDraw();
             return;
@@ -2641,7 +2486,7 @@ const Ui = struct {
             if (self.resume_pending) |pending| {
                 if (self.resumeContextCurrent(pending.epoch, pending.session_id, pending.launcher)) {
                     if (sessions.len == 0) {
-                        self.notice = "No saved sessions in this launcher directory";
+                        self.notice = "No saved sessions";
                     } else {
                         self.closeResumePicker();
                         self.resume_serial +%= 1;
@@ -2663,16 +2508,9 @@ const Ui = struct {
                 self.editor.deinit();
                 self.editor = parked;
                 self.editor_pasted = pasted;
-                result catch {
-                    self.restoreNewPrompt();
-                    return;
-                };
-            } else self.resetSessionView(client.snapshot()) catch {
-                self.restoreNewPrompt();
-                return;
-            };
+                result catch return;
+            } else self.resetSessionView(client.snapshot()) catch return;
         };
-        if (!outcome.switched) self.restoreNewPrompt();
         // Leaving the owner view ends any handled-terminal wait; the result and
         // its notice stay as the last known state instead of a busy display.
         if (self.remote()) |client| if (!client.snapshot().attached and self.remote_terminal_wait) self.releaseRemoteTerminalWait();
@@ -2680,42 +2518,10 @@ const Ui = struct {
             // Transfer ownership instead of copying the notice twice.
             outcome.notice = null;
             self.adoptNotice(notice);
+            // The new view's terminal can replace self.notice before advisories run.
+            if (outcome.switched and std.mem.eql(u8, notice, session_client.restored_notice)) self.publishNoticeAlias(.plain);
         }
-        self.submitNewPrompt() catch |err| {
-            self.notice = self.describeError(err);
-        };
         self.requestDraw();
-    }
-
-    fn attachedSession(self: *const Ui, id: []const u8) bool {
-        const hex = self.connection.current().session_id orelse return false;
-        if (id.len != hex.len * 2) return false;
-        const alphabet = "0123456789abcdef";
-        for (hex, 0..) |byte, index| {
-            if (id[index * 2] != alphabet[byte >> 4] or id[index * 2 + 1] != alphabet[byte & 0x0f]) return false;
-        }
-        return true;
-    }
-
-    /// Busy close needs an explicit confirmation; `--force` is the typed form of
-    /// the same intent. Unknown (not attached) sessions are decided by the owner.
-    fn startClose(self: *Ui, client: session_client.Client, id: []const u8, force: bool) void {
-        if (!force and self.busy and self.attachedSession(id)) {
-            if (self.stop_close) |old| self.allocator.free(old);
-            self.stop_close = self.allocator.dupe(u8, id) catch {
-                self.notice = "Out of memory; close not requested";
-                return;
-            };
-            self.stop_instance +%= 1;
-            self.stop_open = true;
-            self.stop_danger = false;
-            self.stop_identity = self.stopIdentity();
-            self.invalidateStop();
-            self.parser.stop_feed = true;
-            self.notice = "Session is busy; confirm close";
-            return;
-        }
-        self.applyManage(client, .{ .close = .{ .id = id, .force = force } });
     }
 
     /// A user decision, explicit revocation, or terminal retires this exact request.
@@ -4592,9 +4398,8 @@ const Ui = struct {
             synthetic = try std.fmt.allocPrint(self.allocator, "!{s}", .{self.editor.bytes.items});
             break :blk synthetic.?;
         } else typed;
-        // Session management resolves before steering: /attach, /detach,
-        // and /close work while a task is busy and never enter
-        // the model, Steering or FollowUp. Command mode is already a bash task.
+        // Handle /new and /resume before steering. enqueueDraft rejects all
+        // other slash input rather than forwarding a command to the model.
         if (!self.command_mode and self.runManageText(command)) return;
         if (self.terminal_notice_pending != null) return;
         if (self.busy) {
@@ -4702,10 +4507,9 @@ const Ui = struct {
         }
         if (std.mem.startsWith(u8, command, "/")) {
             const auth = std.mem.eql(u8, command, "/login");
-            const codex = std.mem.eql(u8, command, "/login openai-codex");
             const idle = self.settingsIdle() and !self.editor_pasted;
             self.wipeEditor();
-            if (!auth and !codex) {
+            if (!auth) {
                 self.notice = "Unknown command; use /model, /login, /compact or /settings";
             } else if (!idle) {
                 self.notice = "Setup requires an idle, non-pasted session";
@@ -4714,7 +4518,7 @@ const Ui = struct {
                     self.notice = "Setup requires a drained session bridge";
                     return;
                 };
-                if (codex) self.startCodexLogin() else if (self.connection.configure_provider_fn != null or self.connection.codex_login_fn != null) self.openProviderPicker() else if (configured(self.connection.current())) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
+                if (self.connection.configure_provider_fn != null or self.connection.codex_login_fn != null) self.openProviderPicker() else if (configured(self.connection.current())) self.notice = "Already configured; /login does not replace this session" else self.beginSecret(null);
             }
             return;
         }
@@ -5197,10 +5001,6 @@ const Ui = struct {
         self.stop_instance +%= 1;
         self.stop_danger = false;
         self.stop_identity = null;
-        if (self.stop_close) |id| {
-            self.allocator.free(id);
-            self.stop_close = null;
-        }
         self.invalidateStop();
         self.parser.stop_feed = true;
     }
@@ -5235,12 +5035,6 @@ const Ui = struct {
                 const identity = self.stop_identity orelse return;
                 if (!std.meta.eql(identity, self.stopIdentity())) {
                     self.refreshStop();
-                    return;
-                }
-                if (self.stop_close != null) {
-                    // Explicit confirmation for closing a busy session; the
-                    // backend performs cancel/join/save and releases ownership.
-                    self.confirmClose();
                     return;
                 }
                 if (self.remote()) |client| {
@@ -5301,18 +5095,6 @@ const Ui = struct {
             };
         } else self.inbox.pauseClaims(true);
         self.activateStop();
-    }
-
-    /// Busy /close confirmation accepted: cancel, join, save and release via
-    /// the backend. Teardown of the local modal stays local.
-    fn confirmClose(self: *Ui) void {
-        const id = self.stop_close orelse return;
-        const client = self.remote() orelse {
-            self.closeStop();
-            return;
-        };
-        self.applyManage(client, .{ .close = .{ .id = id, .force = true } });
-        self.closeStop();
     }
 
     fn escapeQueue(self: *Ui) !void {
@@ -6910,8 +6692,8 @@ const Ui = struct {
 
     fn prepareComposer(self: *Ui, a: std.mem.Allocator, state: Connection.State, cols: usize) !PreparedComposer {
         // Mask only genuinely sensitive or invalid slash arguments. Trailing
-        // whitespace alone never hides anything, and product-supported ordinary
-        // arguments (/attach, /close) stay visible and editable.
+        // whitespace alone never hides anything, and ordinary /model
+        // arguments stay visible and editable.
         const trimmed = std.mem.trimStart(u8, self.editor.bytes.items, " \t\r\n");
         const is_model = modelCommand(trimmed);
         const command_end = std.mem.findAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
@@ -7122,13 +6904,9 @@ const Ui = struct {
         const queue_snapshot = self.queueSnapshot();
         const confirmation_visible = !self.secret_mode and !self.secret_quarantine and !self.codex_open and !self.codex_opening;
         const modal_text: ?[]const u8 = if (!confirmation_visible) null else if (self.stop_open) blk: {
-            const closing = self.stop_close != null;
-            const title = if (closing)
-                try std.fmt.allocPrint(a, "Close busy session | Steering {d} FollowUp {d}", .{ queue_snapshot.steering, queue_snapshot.follow_up })
-            else
-                try std.fmt.allocPrint(a, "{s} | Steering {d} FollowUp {d}", .{ if (self.busy) "Task running" else "Task ended", queue_snapshot.steering, queue_snapshot.follow_up });
-            const safe = if (closing) (if (self.stop_danger) "Cancel" else "> Cancel") else (if (self.stop_danger) "Continue" else "> Continue");
-            const danger = if (closing) (if (self.stop_danger) "> Close session" else "Close session") else (if (self.stop_danger) "> Stop and clear" else "Stop and clear");
+            const title = try std.fmt.allocPrint(a, "{s} | Steering {d} FollowUp {d}", .{ if (self.busy) "Task running" else "Task ended", queue_snapshot.steering, queue_snapshot.follow_up });
+            const safe: []const u8 = if (self.stop_danger) "Continue" else "> Continue";
+            const danger: []const u8 = if (self.stop_danger) "> Stop and clear" else "Stop and clear";
             break :blk try std.fmt.allocPrint(a, "{s}: [{s} / {s}]", .{ title, safe, danger });
         } else if (self.permission) |permission| blk: {
             // One line when both choices fit; otherwise one choice per row.
@@ -7904,15 +7682,9 @@ fn modelCommand(command: []const u8) bool {
 fn sensitiveArguments(name: []const u8, rest: []const u8) bool {
     const args = std.mem.trim(u8, rest, " \t\r\n");
     if (args.len == 0) return false; // Trailing whitespace alone is never sensitive.
-    // /new takes a free-form prompt, including internal newlines.
-    if (std.mem.eql(u8, name, "/new")) return false;
-    if (std.mem.findAny(u8, args, "\r\n") != null) return true; // Other commands are single-line.
-    // These commands accept an argument; validation belongs to submission so
-    // the draft stays visible while it is typed or corrected.
-    if (std.mem.eql(u8, name, "/model") or
-        std.mem.eql(u8, name, "/attach") or
-        std.mem.eql(u8, name, "/close") or
-        std.mem.eql(u8, name, "/resume")) return false;
+    if (std.mem.findAny(u8, args, "\r\n") != null) return true;
+    // /model accepts an argument; keep it editable until submission.
+    if (std.mem.eql(u8, name, "/model")) return false;
     // /login credentials, no-argument commands and unknown commands cannot
     // tell an argument from an accidental pasted secret.
     return true;

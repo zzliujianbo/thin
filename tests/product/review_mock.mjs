@@ -4,9 +4,9 @@ import {mkdtemp, mkdir, writeFile, symlink, access, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createServer} from 'node:http';
-import {spawn} from 'node:child_process';
 
-const KEY = 'review-fixture-fake-key';
+// Driver.finish also refuses this sentinel anywhere in the terminal stream.
+const KEY = 'fixture-secret-never-log';
 const REFUSAL = 'fixture-refusal-answer';
 
 async function exists(path) {
@@ -14,31 +14,7 @@ async function exists(path) {
   catch { return false; }
 }
 
-// 只返回白名单断言所需输出；失败时不把原始进程输出带进诊断。
-async function run(app, args, home, project) {
-  const child = spawn(app, args, {
-    cwd: project,
-    env: {PATH: '/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8'},
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  let errors = '';
-  child.stdout.on('data', bytes => { output += bytes; });
-  child.stderr.on('data', bytes => { errors += bytes; });
-  // 场景只写文件/读取/显示，不会创建 bash 后代；精确终止我们启动的直接子进程。
-  const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
-  try {
-    const code = await new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', resolve);
-    });
-    return {code, output, errors};
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-export async function reviewRegressions(app) {
+export async function reviewRegressions({app, pty, execute}) {
   for (const kind of ['canonical-home', 'symlink-home', 'duplicate-tool-id', 'refusal']) {
     const root = await mkdtemp(join(tmpdir(), 'thin-app-review-'));
     const home = join(root, 'home');
@@ -58,6 +34,10 @@ export async function reviewRegressions(app) {
         for await (const bytes of req) raw += bytes;
         const body = JSON.parse(raw);
         requests++;
+        if (requests === 1) {
+          assert.equal(body.messages.at(-1).role,'user');
+          assert.equal(body.messages.at(-1).content,'fixture-only');
+        }
         assert(requests <= 2, 'unexpected extra request');
         credentialInHistory ||= body.messages.some(m => m.role === 'tool' && typeof m.content === 'string' && m.content.includes(KEY));
         let delta;
@@ -93,21 +73,27 @@ export async function reviewRegressions(app) {
         llm: {default:'local/fixture',providers:{local:{base_url:`http://127.0.0.1:${server.address().port}`,api_key:KEY,models:{fixture:{protocol:'chat',context_tokens:32768}}}}},
         limits: {low_price_input: false, request_timeout_ms: 5000},
       }), {mode: 0o600});
-      const args = ['--print', 'fixture-only'];
-      const result = await run(app, args, kind === 'symlink-home' ? alias : home, project);
+      const launchHome = kind === 'symlink-home' ? alias : home;
+      const result = await execute(pty, [], {
+        PATH:'/usr/bin:/bin', HOME:launchHome, LANG:'C.UTF-8', TERM:'xterm-256color',
+        THIN_APP_BIN:app, THIN_APP_TEST_HOME:launchHome, THIN_APP_TEST_PROJECT:project,
+        THIN_APP_TEST_URL:`http://127.0.0.1:${server.address().port}`, THIN_APP_TEST_MODE:kind === 'symlink-home' ? 'symlink-home-refused' : 'fixture-turn',
+        THIN_APP_TEST_PROMPT:'fixture-only', THIN_APP_TEST_EXPECT:kind === 'duplicate-tool-id' ? 'DuplicateToolId' : kind === 'refusal' ? REFUSAL : 'fixture-done',
+      }, project);
+      assert.equal(result.code, 0, 'PTY did not observe the expected terminal result');
       if (fixtureError) throw fixtureError;
       assert(!credentialInHistory, 'configuration credential entered model history');
-      assert(!result.output.includes(KEY) && !result.errors.includes(KEY), 'credential entered CLI output');
-      if (kind === 'duplicate-tool-id') {
-        assert.equal(result.code, 1, 'duplicate response must fail');
+      assert(!result.output.includes(KEY), 'credential entered driver output');
+      if (kind === 'symlink-home') {
+        // The foreground owner refuses a symlink HOME before task admission.
+        assert.equal(requests, 0);
+        assert(!result.output.includes('PTY_SESSION_ID='));
+      } else if (kind === 'duplicate-tool-id') {
         assert.equal(requests, 2);
         assert(await exists(join(project, 'one.txt')));
         assert(!await exists(join(project, 'two.txt')), 'duplicate response executed its tool');
-        assert(result.errors.includes('DuplicateToolId'), 'duplicate id must be rejected before encoding');
       } else {
-        assert.equal(result.code, 0, 'fixture application failed');
         assert.equal(requests, kind === 'refusal' ? 1 : 2);
-        assert(result.output.trim() === (kind === 'refusal' ? REFUSAL : 'fixture-done'), 'committed answer missing');
       }
       console.log(`PASS review/${kind}: requests=${requests}`);
     } catch (error) {

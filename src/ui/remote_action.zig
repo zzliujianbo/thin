@@ -50,9 +50,10 @@ pub const Action = union(enum) {
                 .model => |name| .{ .model = try text(a, name) },
             } },
             .manage => |v| .{ .manage = switch (v) {
-                .@"resume" => |id| .{ .@"resume" = try text(a, id) },
-                .attach => |value| .{ .attach = .{ .id = try text(a, value.id), .takeover = value.takeover } },
-                .close => |value| .{ .close = .{ .id = try text(a, value.id), .force = value.force } },
+                .@"resume" => |target| .{ .@"resume" = .{
+                    .id = target.id,
+                    .project = if (target.project) |path| try text(a, path) else null,
+                } },
                 else => v,
             } },
             else => self,

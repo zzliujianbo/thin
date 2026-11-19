@@ -235,15 +235,16 @@ pub const Directory = struct {
     pub fn resolveBase(allocator: std.mem.Allocator, base_path: []const u8, uid: u32) !Directory {
         if (base_path.len == 0 or base_path.len > 4096 or !std.fs.path.isAbsolute(base_path)) return error.InvalidPath;
         if (std.mem.findScalar(u8, base_path, 0) != null) return error.InvalidPath;
-        if (base_path.len + "/thin".len > max_socket_path_len) return error.NameTooLong;
 
         const canonical = try metadata.systemPath(allocator, base_path);
         defer allocator.free(canonical);
-        if (canonical.len + "/thin".len > max_socket_path_len) return error.NameTooLong;
+        // createChild supplies the separator, even when the base is root.
+        const prefix = std.mem.trimEnd(u8, canonical, "/");
+        if (prefix.len + "/thin".len > max_socket_path_len) return error.NameTooLong;
         const base_fd = try metadata.openDirectoryPath(allocator, canonical);
         defer fs.closeFd(base_fd);
         try validatePrivateDir(try statFd(base_fd), uid);
-        return createChild(allocator, base_fd, canonical, "thin", uid);
+        return createChild(allocator, base_fd, prefix, "thin", uid);
     }
 
     /// Low-level: create/verify `<parent_path>/<name>` as a 0700 UID-owned real
@@ -779,10 +780,18 @@ pub fn connect(allocator: std.mem.Allocator, path: []const u8, expected_uid: u32
 
     const peer = try socketCredentials(fd);
     if (peer.uid != expected_uid) return error.PeerUidMismatch;
-    const again = try statAt(parent_fd, name_z, true);
+    // The peer has already accepted this connection. Losing its pathname now
+    // is an identity failure, not evidence that no daemon was running.
+    const again = statAt(parent_fd, name_z, true) catch |err| switch (err) {
+        error.FileNotFound => return error.IdentityChanged,
+        else => return err,
+    };
     if (!Identity.from(again).eql(Identity.from(st)) or !isSock(again.mode) or
         again.uid != expected_uid) return error.IdentityChanged;
-    const path_fd = try metadata.openDirectoryPath(allocator, parent_path);
+    const path_fd = metadata.openDirectoryPath(allocator, parent_path) catch |err| switch (err) {
+        error.FileNotFound => return error.DirectoryMoved,
+        else => return err,
+    };
     defer fs.closeFd(path_fd);
     if (!Identity.from(try statFd(path_fd)).eql(parent_identity)) return error.DirectoryMoved;
     return Connection.init(allocator, fd, peer);

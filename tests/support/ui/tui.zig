@@ -771,8 +771,19 @@ const FakeRemote = struct {
         self.manages += 1;
         self.last_manage = std.meta.activeTag(request);
         if (self.manage_failure) |failure| return failure;
-        if (request == .saved_sessions) if (self.saved_fixture) |saved| return .{ .saved_sessions = try a.dupe(session_client.SavedSession, saved) };
-        if (request == .@"resume") self.record(request.@"resume");
+        if (request == .saved_sessions) if (self.saved_fixture) |saved| {
+            const rows = try a.alloc(session_client.SavedSession, saved.len);
+            errdefer a.free(rows);
+            var copied: usize = 0;
+            errdefer for (rows[0..copied]) |row| if (row.project) |project| a.free(project);
+            for (rows, saved) |*row, source| {
+                row.* = source;
+                if (source.project) |project| row.project = try a.dupe(u8, project);
+                copied += 1;
+            }
+            return .{ .saved_sessions = rows };
+        };
+        if (request == .@"resume") self.record(&request.@"resume".id);
         if (self.manage_switched) self.snapshot.control_epoch +%= 1;
         return .{ .switched = self.manage_switched };
     }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const App = @import("app.zig").App;
+const Session = @import("session.zig").Session;
 const cfg = @import("../core/config.zig");
 const auth = @import("auth_store.zig");
 const metadata = @import("model_metadata.zig");

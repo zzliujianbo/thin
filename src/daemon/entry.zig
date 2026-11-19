@@ -1,5 +1,4 @@
-//! Unified runtime entry. `main` keeps help/version, `--print`, the TTY gate and
-//! locale setup; this module only routes the remaining explicit modes.
+//! Runtime entry after argument, platform and terminal checks.
 //!
 //! Signal-guard ownership: the worker installs its own guard (it must install
 //! parent-death handling between two guard checks), the daemon installs its own,
@@ -16,10 +15,10 @@ const capabilities = @import("../platform/capabilities.zig");
 pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     try capabilities.validate(options);
     return switch (options.mode) {
-        // Explicit service mode only; ordinary foreground never starts a daemon.
+        // Only the explicit service mode starts a daemon.
         .daemon => if (comptime capabilities.daemon) supervisor.run(init, options) else error.UnsupportedPlatformMode,
         .worker => worker.run(init, options),
-        .foreground, .connect, .attach => blk: {
+        .foreground => blk: {
             var guard = try interrupt.Guard.install();
             defer guard.deinit();
             break :blk client.run(init, options);

@@ -75,6 +75,12 @@ fn ambiguousAllocationCase(a: std.mem.Allocator, registry: *Registry, id: ids.Id
     }
 }
 
+fn daemonRecordsAllocationCase(a: std.mem.Allocator, registry: *Registry) !void {
+    const records = try registry.daemonRecords(a);
+    defer freeRecords(a, records);
+    try testing.expectEqual(@as(usize, 1), records.len);
+}
+
 fn listAllocationCase(a: std.mem.Allocator, registry: *Registry) !void {
     const page = try registry.list(a, false, 0);
     defer freeRecords(a, page);

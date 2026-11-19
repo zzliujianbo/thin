@@ -118,6 +118,9 @@ const proxyModels = {
   unlogged:'ghost/Case-Model',
 };
 
+// These are declaration/allowlist tests, not official directory tests. Use
+// distinct paths on the owned loopback server so automatic metadata refresh
+// cannot send literal fixture keys to official hosts.
 // Literal keys make native and the second model independent of injected env
 // credentials. The ghost alias declares an env name this fixture never sets,
 // so it is a real declared-but-unauthenticated negative candidate.
@@ -132,10 +135,10 @@ async function proxyFixture(name, url, configured) {
       local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{
         'fixture-model':{protocol:'chat', context_tokens:32768},
       }},
-      zen:{base_url:'https://opencode.ai/zen/v1', api_key:'zen-fixture-key', models:{
+      zen:{base_url:`${url}/zen`, api_key:'zen-fixture-key', models:{
         'fixture-zen/model-x':{protocol:'chat', context_tokens:32768},
       }},
-      go:{base_url:'https://opencode.ai/zen/go/v1', api_key:'go-fixture-key', models:{
+      go:{base_url:`${url}/go`, api_key:'go-fixture-key', models:{
         'Repo/Model-X':{protocol:'responses', context_tokens:65536},
       }},
       native:{base_url:'https://native.invalid/v1', api_key:'native-fixture-key', models:{
@@ -162,8 +165,8 @@ async function fixture(name, url) {
     llm:{default:'local/fixture-model', providers:{local:{base_url:url, api_key_env:'THIN_FIXTURE_KEY', models:{
       'fixture-model':{protocol:'chat', context_tokens:32768},
     }},
-    zen:{base_url:'https://opencode.ai/zen/v1', api_key:'zen-fixture-key', models:{}},
-    go:{base_url:'https://opencode.ai/zen/go/v1', api_key:'go-fixture-key', models:{}},
+    zen:{base_url:`${url}/zen`, api_key:'zen-fixture-key', models:{}},
+    go:{base_url:`${url}/go`, api_key:'go-fixture-key', models:{}},
     native:{base_url:'https://native.invalid/v1', api_key:'native-fixture-key', models:{
       'family/native-review':{protocol:'chat', context_tokens:32768},
     }},

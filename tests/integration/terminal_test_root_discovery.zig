@@ -3,5 +3,4 @@ test {
     _ = @import("platform/wakeup.zig");
     _ = @import("ui/terminal.zig");
     _ = @import("ui/text.zig");
-    _ = @import("ui/startup.zig");
 }

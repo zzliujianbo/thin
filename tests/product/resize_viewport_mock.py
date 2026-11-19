@@ -276,7 +276,7 @@ def run(app, wrap=False, local_command=False):
             _check_editor_helper()
             try:
                 wait(lambda: (root / 'sock').exists(), 'owned emulator startup timed out')
-                tm('new-session', '-d', '-s', 'owned', '-x', '80', '-y', '24', '-c', str(project), shlex.join([app, '--no-model-auto-refresh']))
+                tm('new-session', '-d', '-s', 'owned', '-x', '80', '-y', '24', '-c', str(project), shlex.quote(app))
                 wait(lambda: visible(80, 24), 'initial composer frame not visible at 80x24')
                 initial_y, _ = caret()
                 assert initial_y < 23, 'initial composer was forced to the physical bottom'

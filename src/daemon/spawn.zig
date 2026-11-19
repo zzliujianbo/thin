@@ -136,12 +136,6 @@ pub const Workers = struct {
     pub fn create(self: *Workers, params: Params) !registry.Record {
         try validateParams(params);
         if (self.poisoned.load(.acquire)) return error.CleanupFailed;
-        if (params.@"resume" orelse params.restore_selection) |target_id| {
-            for (self.list.items) |worker| {
-                if (worker.done.load(.acquire)) continue;
-                if (std.mem.eql(u8, &worker.id, &target_id)) return error.Busy;
-            }
-        }
 
         const a = self.allocator;
         const io = self.io;
@@ -165,6 +159,9 @@ pub const Workers = struct {
             var owned = project;
             owned.deinit();
         };
+
+        if (params.restore_selection) |source| if (self.findAlive(source, project.path) != null) return error.Busy;
+        if (self.findAlive(id, project.path) != null) return error.Busy;
 
         var instance: [16]u8 = undefined;
         try randomInstance(io, &instance);
@@ -283,11 +280,8 @@ pub const Workers = struct {
     /// project this worker was created for. The reported cleanup budget applies
     /// here as well, so a worker that is still releasing its own nested
     /// services is neither killed early nor reported as a clean stop.
-    pub fn close(self: *Workers, id: ids.Id, project: ?[]const u8) !void {
-        const worker = self.find(id) orelse return error.SessionNotFound;
-        if (project) |expected| {
-            if (!std.mem.eql(u8, expected, worker.project.path)) return error.SessionNotFound;
-        }
+    pub fn close(self: *Workers, id: ids.Id, project: []const u8, endpoint: []const u8) !void {
+        const worker = self.findInstance(id, project, endpoint) orelse return error.SessionNotFound;
         if (!worker.done.load(.acquire)) {
             const grace_ms = self.requestShutdown(worker, self.close_grace_ms);
             self.awaitWorker(worker, grace_ms);
@@ -303,14 +297,10 @@ pub const Workers = struct {
         self.destroyWorker(worker);
     }
 
-    /// True while an owned worker with this id is alive. Exited-but-unreaped
-    /// workers are not alive; `reap` decides whether they can be released.
-    pub fn isAlive(self: *Workers, id: ids.Id) bool {
-        for (self.list.items) |worker| {
-            if (!std.mem.eql(u8, &worker.id, &id)) continue;
-            if (!worker.done.load(.acquire)) return true;
-        }
-        return false;
+    /// Maintenance tracks one publication, not a later worker of the same session.
+    pub fn isAlive(self: *Workers, id: ids.Id, project: []const u8, endpoint: []const u8) bool {
+        const worker = self.findInstance(id, project, endpoint) orelse return false;
+        return !worker.done.load(.acquire);
     }
 
     /// Join completed workers; any unconfirmed cleanup poisons new starts.
@@ -361,11 +351,22 @@ pub const Workers = struct {
         self.* = undefined;
     }
 
-    fn find(self: *Workers, id: ids.Id) ?*Worker {
+    fn findAlive(self: *Workers, id: ids.Id, project: []const u8) ?*Worker {
         for (self.list.items) |worker| {
-            if (std.mem.eql(u8, &worker.id, &id)) return worker;
+            if (matchesSession(worker, id, project) and !worker.done.load(.acquire)) return worker;
         }
         return null;
+    }
+
+    fn findInstance(self: *Workers, id: ids.Id, project: []const u8, endpoint: []const u8) ?*Worker {
+        for (self.list.items) |worker| {
+            if (matchesSession(worker, id, project) and std.mem.eql(u8, worker.endpoint, endpoint)) return worker;
+        }
+        return null;
+    }
+
+    fn matchesSession(worker: *const Worker, id: ids.Id, project: []const u8) bool {
+        return std.mem.eql(u8, &worker.id, &id) and std.mem.eql(u8, worker.project.path, project);
     }
 
     fn remove(self: *Workers, worker: *Worker) void {

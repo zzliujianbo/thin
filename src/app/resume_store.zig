@@ -59,6 +59,25 @@ fn readTitle(root: *fs.Root, dir: c_int, id: ids.Id) session_metadata.Title {
     return session_metadata.Title.fromText(bytes[0..n]);
 }
 
+/// Look up one cataloged checkpoint without enumerating the project or reading
+/// checkpoint contents. Only a nonempty regular file represents saved work.
+pub fn summary(root: *fs.Root, id: ids.Id) !?Summary {
+    const fd = logs.openExistingDirectory(root) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer fs.closeFd(fd);
+    var filename: [64]u8 = undefined;
+    const path = try name(&filename, id, ".session");
+    const dir: std.Io.Dir = .{ .handle = fd };
+    const stat = dir.statFile(root.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (stat.kind != .file or stat.size == 0) return null;
+    return .{ .id = id, .modified_ms = @intCast(stat.mtime.toMilliseconds()), .title = readTitle(root, fd, id) };
+}
+
 /// List checkpoint metadata in this project only. No checkpoint content is read,
 /// and a missing namespace stays missing. Candidate metadata is inspected
 /// relative to the validated directory without following final symlinks.

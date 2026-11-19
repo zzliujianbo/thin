@@ -16,10 +16,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const platform_only = b.option(bool, "platform-tests-only", "Only independent platform tests; no product executable") orelse false;
     const platform_llvm = target.result.os.tag == .macos;
-    // Only Linux terminal/product targets need the existing SSH C transport.
-    // Darwin local-terminal tests never compile SSH or require libssh.
-    const ssh_include = if (target.result.os.tag == .linux) b.option([]const u8, "ssh-include", "Directory containing libssh/ headers") else null;
-    const ssh_library = if (target.result.os.tag == .linux) b.option([]const u8, "ssh-library", "Absolute libssh shared-library path (otherwise link system ssh)") else null;
 
     // 可供其他前端直接导入；不链接 TTY 或 libc 宽度实现。
     _ = b.addModule("presentation", .{
@@ -59,7 +55,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     terminal_tests.step.dependOn(&all.run.step);
-    addRuntime(b, terminal_tests.root_module, ssh_include, ssh_library);
+    addNative(b, terminal_tests.root_module);
     const terminal_headers = b.addExecutable(.{
         .name = "thin-terminal-sdk-probe",
         .use_llvm = true,
@@ -97,7 +93,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    addRuntime(b, exe.root_module, ssh_include, ssh_library);
+    addNative(b, exe.root_module);
     b.installArtifact(exe);
     b.step("check", "Compile the product without installing or running it").dependOn(&exe.step);
 
@@ -118,7 +114,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit.step.dependOn(&all.run.step);
-    addRuntime(b, unit.root_module, ssh_include, ssh_library);
+    addNative(b, unit.root_module);
     const run_unit = runTest(b, unit);
     b.step("test-unit-full", "Run the complete unit suite in one process").dependOn(&run_unit.step);
 
@@ -152,7 +148,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }) });
         grouped.step.dependOn(&variant.run.step);
-        if (!std.mem.eql(u8, group, "fast")) addRuntime(b, grouped.root_module, ssh_include, ssh_library);
+        if (!std.mem.eql(u8, group, "fast")) addNative(b, grouped.root_module);
         configureStack(grouped);
         const name = if (std.mem.eql(u8, group, "fast")) "test-fast" else b.fmt("test-unit-{s}", .{group});
         const run_group = runTest(b, grouped);
@@ -281,11 +277,12 @@ pub fn build(b: *std.Build) void {
     });
 
     pty_driver.step.dependOn(&driver.run.step);
-    addRuntime(b, pty_driver.root_module, ssh_include, ssh_library);
+    addNative(b, pty_driver.root_module);
 
+    // Thin does not listen on TCP. OpenSSH deployment is a separate boundary.
     const run_ssh = fixture(b, "python3", "tests/product/ssh_mock.py", &.{exe}, &.{});
-    const ssh_step = b.step("test-ssh", "Run Linux SSH/TUI/key/lifecycle acceptance (requires OpenSSH)");
-    if (target.result.os.tag == .linux) ssh_step.dependOn(&run_ssh.step) else ssh_step.dependOn(&b.addFail("SSH is unsupported in the macOS local build").step);
+    const ssh_step = b.step("test-ssh", "Check Linux daemon has no public SSH listener option or implicit TCP listener");
+    if (target.result.os.tag == .linux) ssh_step.dependOn(&run_ssh.step) else ssh_step.dependOn(&b.addFail("The daemon listener boundary fixture is Linux-only").step);
 
     // 应用验收：Node 脚本同时拿到 thin 可执行文件与 PTY 驱动，在隔离环境中运行 CLI 与 PTY 测试。
     const run_app = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{});
@@ -293,15 +290,13 @@ pub fn build(b: *std.Build) void {
     const run_streaming = fixture(b, "node", "tests/product/app_mock.mjs", &.{ exe, pty_driver }, &.{"--streaming-only"});
     b.step("test-streaming", "Run focused streaming Markdown and history PTY acceptance").dependOn(&run_streaming.step);
 
-    // Instance-owned background services: owned loopback plus a real PTY, so
-    // cross-task keep-alive is proven in one App instance (--print exits must
-    // clear every service, which is the correct headless semantic).
+    // Instance-owned background services run across tasks on a real PTY.
     const run_background = fixture(b, "python3", "tests/product/background_mock.py", &.{exe}, &.{});
     b.step("test-background", "Run owned-loopback background service lifecycle and cross-task acceptance").dependOn(&run_background.step);
 
-    // Daemon/attach/takeover acceptance over owned loopback and a real PTY.
+    // Default startup and daemon session lifecycle over owned IPC and real PTYs.
     const run_daemon = fixture(b, "python3", "tests/product/daemon_mock.py", &.{exe}, &.{});
-    const daemon_step = b.step("test-daemon", "Run Linux daemon/attach/takeover/approval/SIGTERM acceptance");
+    const daemon_step = b.step("test-daemon", "Run Linux default startup, daemon session and SIGTERM acceptance");
     if (target.result.os.tag == .linux) daemon_step.dependOn(&run_daemon.step) else daemon_step.dependOn(&b.addFail("Persistent daemon is unsupported in the macOS local build").step);
     const run_subscription = fixture(b, "python3", "tests/product/subscription_mock.py", &.{exe}, &.{});
     b.step("test-subscription", "Run owned push-stream binding, watermark and slow-reader acceptance").dependOn(&run_subscription.step);
@@ -353,13 +348,13 @@ pub fn build(b: *std.Build) void {
     interaction.dependOn(viewport_step);
     interaction.dependOn(&run_approval_cancel.step);
     interaction.dependOn(&run_command.step);
-    const communication = b.step("test-communication", "Run subscription, daemon and SSH fixtures");
+    const communication = b.step("test-communication", "Run subscription, daemon session and no-TCP-listener fixtures");
     if (target.result.os.tag == .linux) {
         const communication_daemon = fixture(b, "python3", "tests/product/daemon_mock.py", &.{exe}, &.{});
         communication_daemon.step.dependOn(&run_subscription.step);
         communication_daemon.step.dependOn(&run_ssh.step);
         communication.dependOn(&communication_daemon.step);
-    } else communication.dependOn(&b.addFail("Daemon/SSH communication fixtures are Linux-only").step);
+    } else communication.dependOn(&b.addFail("Daemon communication fixtures are Linux-only").step);
 
     // Root-level offline tooling selftests are part of the complete gate.
     const workflow_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py" });
@@ -458,14 +453,6 @@ fn fixture(
     return run;
 }
 
-fn addRuntime(b: *std.Build, module: *std.Build.Module, include: ?[]const u8, library: ?[]const u8) void {
-    if (module.resolved_target.?.result.os.tag == .linux) {
-        addSsh(b, module, include, library);
-    } else {
-        addNative(b, module);
-    }
-}
-
 fn addNative(b: *std.Build, module: *std.Build.Module) void {
     if (module.resolved_target.?.result.os.tag != .macos) return;
     for ([_][]const u8{ "darwin_process.c", "darwin_ipc.c" }) |file| {
@@ -474,12 +461,4 @@ fn addNative(b: *std.Build, module: *std.Build.Module) void {
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
         });
     }
-}
-
-fn addSsh(b: *std.Build, module: *std.Build.Module, include: ?[]const u8, library: ?[]const u8) void {
-    if (include) |path| module.addSystemIncludePath(.{ .cwd_relative = path });
-    for ([_][]const u8{ "ssh_keys.c", "ssh_transport.c" }) |file| {
-        module.addCSourceFile(.{ .file = b.path(b.fmt("src/daemon/{s}", .{file})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
-    }
-    if (library) |path| module.addObjectFile(.{ .cwd_relative = path }) else module.linkSystemLibrary("ssh", .{});
 }

@@ -1,11 +1,12 @@
-test "registry headless resolves manual declarations without requests and protects every key source" {
+test "session resolves manual registry declarations without requests and protects every key source" {
     var fixture = try Fixture.init(
         \\{"llm":{"default":"work/org/model","providers":{"work":{"base_url":"https://unused.invalid/v1","api_key":"fake-registry-primary","models":{"org/model":{"protocol":"chat","context_tokens":1000000,"output_tokens":128000}}},"inactive":{"base_url":"https://other.invalid/v1","api_key_env":"PATH"},"third":{"base_url":"https://third.invalid/v1","api_key":"fake-registry-third"}}}}
     );
     defer fixture.deinit();
     try fixture.env.put("PATH", "fake-registry-inactive");
-    const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
-    defer app.deinit();
+    var session = try Session.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
+    defer session.deinit();
+    const app = session.app.?;
     try std.testing.expectEqualStrings("work", app.config.value.selected_provider.?);
     try std.testing.expectEqualStrings("org/model", app.config.value.model.name);
     try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
@@ -25,7 +26,7 @@ test "registry headless resolves manual declarations without requests and protec
     try std.testing.expect(disk.value.selection_pending);
     try std.testing.expectEqualStrings("work/org/model", disk.value.registry.?.default);
 }
-test "registry headless default resolves exact cached directory with no handwritten model row" {
+test "session resolves the registry default from the exact cached directory without a handwritten model row" {
     var fixture = try Fixture.init(
         \\{"llm":{"default":"go/org/cached","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"FAKE_GO_KEY"}}}}
     );
@@ -47,8 +48,9 @@ test "registry headless default resolves exact cached directory with no handwrit
     listing.dev_done = true;
     var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
     defer committed.deinit(std.testing.allocator);
-    const app = try App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
-    defer app.deinit();
+    var session = try Session.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
+    defer session.deinit();
+    const app = session.app.?;
     try std.testing.expectEqual(.responses, app.config.value.model.protocol);
     try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 128000), app.config.value.model.output_tokens);
@@ -67,11 +69,15 @@ test "registry headless default resolves exact cached directory with no handwrit
     try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }
-test "registry headless unknown default fails locally without changing settings or selecting another model" {
+test "unknown registry default leaves the session pending without changing settings or selecting another model" {
     var fixture = try Fixture.init(
         \\{"llm":{"default":"go/not-cached","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key":"fake-registry-unknown"}}}}
     );
     defer fixture.deinit();
-    try std.testing.expectError(error.DefaultModelUnavailable, App.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{}));
+    var session = try Session.init(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, .{});
+    defer session.deinit();
+    try std.testing.expect(session.connection().current().runtime == null);
+    try std.testing.expect(session.pending.?.value.selection_pending);
+    try std.testing.expectEqualStrings("go/not-cached", session.pending.?.value.registry.?.default);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, ".thin/settings.json", .{}));
 }

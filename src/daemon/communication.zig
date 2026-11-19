@@ -76,8 +76,9 @@ pub const Communication = struct {
     /// this index are frozen so the receiver's proof cannot be rewritten.
     ack_accepted: usize = 0,
 
-    // The following fields belong exclusively to the communication task.
+    // Only the communication task advances this; ACK admission reads under mutex.
     generation: u64 = 1,
+    // The following fields belong exclusively to the communication task.
     identity: Identity,
     revision: u64,
     stream_revision: u64,
@@ -90,9 +91,9 @@ pub const Communication = struct {
     const Identity = struct {
         session_id: ?[32]u8,
         epoch: u64,
-        launcher: u64,
+        view_serial: u64,
         fn of(client: *Client) Identity {
-            return .{ .session_id = client.session, .epoch = client.epoch, .launcher = std.hash.Wyhash.hash(0, client.launcher) };
+            return .{ .session_id = client.session, .epoch = client.epoch, .view_serial = client.view_serial };
         }
     };
 
@@ -204,20 +205,15 @@ pub const Communication = struct {
         return self.display_head != self.displays.items.len;
     }
 
-    /// Cumulative prefix admission retained for existing callers.
-    pub fn acknowledge(self: *Communication, epoch: u64, sequence: u64) !void {
-        return self.acknowledgeRange(epoch, 0, sequence);
-    }
-
     /// Nonblocking selective ACK admission for the UI thread: no RPC, no socket
     /// write and no wait for an owner reply. A stale epoch belongs to a replaced
     /// view and is refused, not recorded. A full set refuses rather than drops,
     /// so the UI keeps its exact display proof for retry.
-    pub fn acknowledgeRange(self: *Communication, epoch: u64, first: u64, last: u64) !void {
+    pub fn acknowledgeRange(self: *Communication, generation: u64, epoch: u64, first: u64, last: u64) !void {
         if (last == 0) return;
         if (first != 0 and first > last) return error.InvalidInput;
         self.lock();
-        const rejected: ?anyerror = if (self.stop.isRequested()) error.Canceled else if (epoch == 0) error.StaleControl else null;
+        const rejected: ?anyerror = if (self.stop.isRequested()) error.Canceled else if (generation != self.generation or epoch == 0) error.StaleControl else null;
         if (rejected) |err| {
             self.unlock();
             return err;
@@ -241,6 +237,9 @@ pub const Communication = struct {
     /// delayed cancel/approval reply cannot hold display proof hostage and a
     /// head-of-line ACK failure cannot block those controls.
     fn forwardAck(self: *Communication) void {
+        // A progress callback may run after candidate adoption but before the
+        // command's completion publishes the new generation.
+        if (!std.meta.eql(self.identity, Identity.of(self.client))) return;
         while (true) {
             self.lock();
             if (self.ack_accepted >= self.ack_ranges.count()) {
@@ -285,6 +284,10 @@ pub const Communication = struct {
         const identity = Identity.of(self.client);
         if (!std.meta.eql(identity, self.identity)) {
             self.identity = identity;
+            self.lock();
+            defer self.unlock();
+            self.ack_ranges.clear();
+            self.ack_accepted = 0;
             self.generation +%= 1;
             if (self.generation == 0) self.generation = 1;
         }

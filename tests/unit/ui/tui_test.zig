@@ -4493,6 +4493,37 @@ test "menu restored view falls back to one canonical footer success notice" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, "prior tools are NOT rerun"));
     testAcknowledgeFullFrame(&ui);
 }
+test "restored banner survives a terminal delivered before advisory observation" {
+    try text.initLocale();
+    const Owner = struct {
+        const warning = "Saved thinking level not applied: model capabilities unknown";
+        fn current(raw: *anyopaque) Connection.State {
+            var state = FakeRemote.current(raw);
+            state.settings_notice = warning;
+            return state;
+        }
+    };
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.current_fn = Owner.current;
+    fake.snapshot.control_epoch = 2;
+    var outcome: session_client.Outcome = .{ .switched = true, .notice = try std.testing.allocator.dupe(u8, session_client.restored_notice) };
+    defer outcome.deinit(std.testing.allocator);
+    ui.acceptManage(&outcome, true);
+    fake.item = try session_client.ownEvent(std.testing.allocator, 2, .{ .finished = .{ .status = .success } });
+    try ui.pumpDisplay();
+    try ui.finishReadyTask();
+    try std.testing.expectEqualStrings("Ready", ui.notice);
+    ui.observeAdvisories();
+    try ui.draw();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, session_client.restored_notice));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ui.frame, Owner.warning));
+    testAcknowledgeFullFrame(&ui);
+}
 test "restored banner keeps unrelated action and storage failures visible" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -8748,24 +8779,26 @@ test "slash composer frames keep model prefixes and hide credentials with comman
         try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
     }
 }
-test "slash composer keeps supported management arguments visible without submitting" {
+test "slash composer masks unknown and rejected arguments without submitting" {
     try text.initLocale();
-    const cases = [_]struct { raw: []const u8, shown: []const u8, hidden: ?[]const u8 = null }{
-        .{ .raw = "/attach 0123456789abcdef0123456789abcdef", .shown = "/attach 0123456789abcdef0123456789abcdef" },
-        .{ .raw = "/attach --takeover 0123456789abcdef0123456789abcdef", .shown = "/attach --takeover 0123456789abcdef0123456789abcdef" },
-        .{ .raw = "/close 0123456789abcdef0123456789abcdef --force", .shown = "/close 0123456789abcdef0123456789abcdef --force" },
+    const masked = "/ [command arguments hidden]";
+    const cases = [_]struct { raw: []const u8, shown: []const u8, hidden: []const []const u8 = &.{} }{
+        .{ .raw = "/attach --takeover 0123456789abcdef0123456789abcdef", .shown = masked, .hidden = &.{ "--takeover", "0123456789abcdef" } },
+        .{ .raw = "/close 0123456789abcdef0123456789abcdef --force", .shown = masked, .hidden = &.{ "--force", "0123456789abcdef" } },
         .{ .raw = "/detach   ", .shown = "/detach   " },
-        .{ .raw = "/new hello world", .shown = "/new hello world" },
-        .{ .raw = "/new /help me", .shown = "/new /help me" },
-        .{ .raw = "/resume 0123", .shown = "/resume 0123" },
-        .{ .raw = "/attach --takeover", .shown = "/attach --takeover" },
-        .{ .raw = "/close --force", .shown = "/close --force" },
+        .{ .raw = "/new  ", .shown = "/new  " },
+        .{ .raw = "/resume\t", .shown = "/resume    " },
+        .{ .raw = "/new hello world", .shown = masked, .hidden = &.{ "hello", "world" } },
+        .{ .raw = "/new /help me", .shown = masked, .hidden = &.{"/help"} },
+        .{ .raw = "/resume 0123", .shown = masked, .hidden = &.{"0123"} },
+        .{ .raw = "/new first\nsecond", .shown = masked, .hidden = &.{ "first", "second" } },
+        .{ .raw = "/resume first\nsecond", .shown = masked, .hidden = &.{ "first", "second" } },
         .{ .raw = "/login ", .shown = "/login " },
         .{ .raw = "/compact\t", .shown = "/compact    " },
-        .{ .raw = "/attach bad!id extra", .shown = "/attach bad!id extra" },
         .{ .raw = "/model one two", .shown = "/model one two" },
-        .{ .raw = "/login fakecredential", .shown = "/login [arguments hidden; no key argument]", .hidden = "fakecredential" },
-        .{ .raw = "/unknown fakecredential", .shown = "/ [command arguments hidden]", .hidden = "fakecredential" },
+        .{ .raw = "/login openai-codex", .shown = "/login [arguments hidden; no key argument]", .hidden = &.{"openai-codex"} },
+        .{ .raw = "/login openai-codex\nsecond", .shown = "/login [arguments hidden; no key argument]", .hidden = &.{ "openai-codex", "second" } },
+        .{ .raw = "/unknown fakecredential", .shown = masked, .hidden = &.{"fakecredential"} },
     };
     for (cases) |case| {
         var cancel = p.Cancellation{};
@@ -8782,7 +8815,7 @@ test "slash composer keeps supported management arguments visible without submit
         var screen: @import("../tests/regular_screen.zig").Screen = .{};
         try screen.replay(ui.frame);
         try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], case.shown) != null);
-        if (case.hidden) |hidden| {
+        for (case.hidden) |hidden| {
             try std.testing.expect(std.mem.find(u8, ui.frame, hidden) == null);
             try std.testing.expectEqual(@as(usize, 0), screen.count(hidden));
         }
@@ -8793,26 +8826,6 @@ test "slash composer keeps supported management arguments visible without submit
         try std.testing.expectEqual(@as(usize, 0), fixture.provider_saves);
         discardFixtureFrame(&ui);
     }
-}
-test "new prompt keeps multiline arguments visible in the composer" {
-    try text.initLocale();
-    var cancel = p.Cancellation{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var fixture = SelectionFixture{};
-    defer fixture.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.connection = fixture.connection();
-    _ = try ui.editor.insert("/new first\nsecond");
-    try ui.draw();
-    var screen: @import("../tests/regular_screen.zig").Screen = .{};
-    try screen.replay(ui.frame);
-    try std.testing.expectEqual(@as(usize, 1), screen.count("first"));
-    try std.testing.expectEqual(@as(usize, 1), screen.count("second"));
-    try std.testing.expect(std.mem.find(u8, ui.frame, "command arguments hidden") == null);
-    try std.testing.expectEqualStrings("/new first\nsecond", ui.editor.bytes.items);
-    discardFixtureFrame(&ui);
 }
 test "settings proxy submenu toggles one acknowledged row and keeps parent draft" {
     try text.initLocale();
@@ -9573,24 +9586,6 @@ test "inline stop keeps unrelated persistent hint without repeating queue counts
     try std.testing.expect(screen.visible("Steering 1 FollowUp 0"));
     try std.testing.expect(ui.frame_stop != null);
 }
-test "inline busy close offers safe cancel without closing" {
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = fixtureUi(&bridge, &cancel);
-    defer ui.deinit();
-    ui.busy = true;
-    ui.openStop();
-    ui.stop_close = try ui.allocator.dupe(u8, "fixture-session");
-    var screen: @import("../tests/regular_screen.zig").Screen = .{};
-    try ui.draw();
-    try screen.replay(ui.frame);
-    try std.testing.expect(std.mem.indexOf(u8, &screen.grid[screen.row], "Close busy session | Steering 0 FollowUp 0: [> Cancel / Close session]") != null);
-    try std.testing.expect(!ui.stop_danger and ui.frame_stop != null);
-    testAcknowledgeFullFrame(&ui);
-    try Ui.key(&ui, .escape);
-    try std.testing.expect(!ui.stop_open and !cancel.isRequested() and ui.stop_close == null);
-}
 test "higher priority input owners hide confirmations and frame authority" {
     for (0..4) |owner| {
         for (1..4) |combination| {
@@ -9952,7 +9947,7 @@ test "new starts a fresh session and resets the previous view" {
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try std.testing.expect(ui.busy);
 }
-test "new submits the supplied prompt as ordinary text after switching" {
+test "bare new switches sessions before a separately submitted prompt" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -9960,11 +9955,16 @@ test "new submits the supplied prompt as ordinary text after switching" {
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
     fake.manage_switched = true;
-    try typeDraft(&ui, "/new hello world");
+    try typeDraft(&ui, "/new");
     try ui.submit();
     try std.testing.expectEqual(@as(usize, 1), fake.manages);
     try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .new_session), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 0), fake.submits);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try typeDraft(&ui, "hello world");
+    try ui.submit();
     try std.testing.expectEqual(@as(usize, 1), fake.submits);
+    try std.testing.expectEqual(@as(u64, 7), fake.last_submit_epoch);
     try std.testing.expectEqual(session_client.TaskKind.prompt, fake.last_submit_kind);
     try std.testing.expectEqualStrings("hello world", fake.text[0..fake.text_len]);
     try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
@@ -9974,70 +9974,44 @@ test "new submits the supplied prompt as ordinary text after switching" {
     try std.testing.expectEqualStrings("hello world", ui.input_history.entries.items[0]);
     try std.testing.expect(ui.busy);
 }
-test "new prompt survives async admission failure" {
-    var actions: FakeAsync = .{};
-    defer actions.deinit();
-    actions.next = actions.requests.len;
-    var fake: FakeRemote = .{};
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    ui.connection.async_actions = actions.channel();
-    try typeDraft(&ui, "/new queued prompt");
-    try ui.submit();
-    try std.testing.expect(ui.new_prompt == null);
-    try std.testing.expectEqualStrings("queued prompt", ui.editor.bytes.items);
-    try std.testing.expectEqual(@as(usize, 0), fake.manages);
-    try std.testing.expectEqualStrings("QueueFull", ui.notice);
+test "typed new and resume arguments trigger no synchronous or asynchronous action" {
+    const cases = [_]struct { command: []const u8, notice: []const u8 }{
+        .{ .command = "/new hello world", .notice = "Usage: /new" },
+        .{ .command = "/new /help me", .notice = "Usage: /new" },
+        .{ .command = "/new first\nsecond", .notice = "Session commands are single-line" },
+        .{ .command = "/resume 0123456789abcdef0123456789abcdef", .notice = "Usage: /resume" },
+        .{ .command = "/resume first\nsecond", .notice = "Session commands are single-line" },
+    };
+    for ([_]bool{ false, true }) |use_async| {
+        for ([_]bool{ false, true }) |busy| {
+            var actions: FakeAsync = .{};
+            defer actions.deinit();
+            var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = busy, .control_epoch = 6 } };
+            var cancel: p.Cancellation = .{};
+            var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+            defer bridge.deinit();
+            var ui = remoteUi(&fake, &bridge, &cancel);
+            defer ui.deinit();
+            if (use_async) ui.connection.async_actions = actions.channel();
+            _ = try ui.add(.assistant, "old conversation");
+            for (cases) |case| {
+                try typeDraft(&ui, case.command);
+                try ui.submit();
+                try std.testing.expectEqualStrings(case.notice, ui.notice);
+                try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+                try std.testing.expectEqual(@as(usize, 0), fake.manages);
+                try std.testing.expectEqual(@as(usize, 0), fake.submits);
+                try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+                try std.testing.expectEqual(@as(usize, 0), actions.next);
+                try std.testing.expect(ui.resume_pending == null and ui.resume_picker == null);
+                try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+                try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+                try std.testing.expectEqualStrings("old conversation", ui.records.items[0].body.items);
+            }
+        }
+    }
 }
-test "new prompt keeps internal newlines" {
-    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    fake.manage_switched = true;
-    try typeDraft(&ui, "/new first\nsecond");
-    try ui.submit();
-    try std.testing.expectEqual(@as(usize, 1), fake.manages);
-    try std.testing.expectEqual(@as(usize, 1), fake.submits);
-    try std.testing.expectEqualStrings("first\nsecond", fake.text[0..fake.text_len]);
-    try std.testing.expectEqualStrings("first\nsecond", ui.records.items[0].body.items);
-}
-test "new prompt beginning with a slash stays literal text" {
-    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    fake.manage_switched = true;
-    try typeDraft(&ui, "/new /help me");
-    try ui.submit();
-    try std.testing.expectEqual(@as(usize, 1), fake.manages);
-    try std.testing.expectEqual(@as(usize, 1), fake.submits);
-    try std.testing.expectEqualStrings("/help me", fake.text[0..fake.text_len]);
-    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
-    try std.testing.expectEqualStrings("/help me", ui.records.items[0].body.items);
-}
-test "new prompt is restored when starting the session fails" {
-    var fake: FakeRemote = .{ .manage_failure = error.Busy };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    try typeDraft(&ui, "/new keep this prompt");
-    try ui.submit();
-    try std.testing.expectEqual(@as(usize, 1), fake.manages);
-    try std.testing.expectEqual(@as(usize, 0), fake.submits);
-    try std.testing.expectEqualStrings("keep this prompt", ui.editor.bytes.items);
-    try std.testing.expectEqualStrings("Busy", ui.notice);
-}
-test "asynchronous new submits the supplied prompt after switching" {
+test "asynchronous bare new waits for a separate prompt after switching" {
     var actions: FakeAsync = .{};
     defer actions.deinit();
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
@@ -10047,15 +10021,19 @@ test "asynchronous new submits the supplied prompt after switching" {
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
     ui.connection.async_actions = actions.channel();
-    try typeDraft(&ui, "/new async prompt");
+    try typeDraft(&ui, "/new");
     try ui.submit();
     try std.testing.expect(actions.requests[0].?.action.manage == .new_session);
     try std.testing.expectEqualStrings("", ui.editor.bytes.items);
     fake.snapshot.control_epoch += 1;
     actions.complete(.{ .managed = .{ .switched = true } }, null, false);
     ui.pumpAsync();
-    try std.testing.expect(ui.new_prompt == null);
-    try std.testing.expectEqualStrings("async prompt", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+    try std.testing.expectEqualStrings("", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
+    try typeDraft(&ui, "async prompt");
+    try ui.submit();
+    try std.testing.expectEqual(@as(usize, 2), actions.next);
     try std.testing.expectEqualStrings("async prompt", actions.requests[1].?.action.submit.text);
     actions.complete(.none, null, false);
     ui.pumpAsync();
@@ -10075,7 +10053,7 @@ test "resume empty list and failed request preserve display and draft" {
     try typeDraft(&ui, "unsent draft");
     ui.openResumeRequest(fake.client());
     try std.testing.expect(ui.resume_picker == null and ui.resume_pending == null);
-    try std.testing.expectEqualStrings("No saved sessions in this launcher directory", ui.notice);
+    try std.testing.expectEqualStrings("No saved sessions", ui.notice);
     try std.testing.expectEqualStrings("complete old conversation", ui.records.items[0].body.items);
     try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
     fake.manage_failure = error.TestSelectionFailure;
@@ -10083,6 +10061,31 @@ test "resume empty list and failed request preserve display and draft" {
     try std.testing.expect(ui.resume_pending == null);
     try std.testing.expectEqualStrings("complete old conversation", ui.records.items[0].body.items);
     try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
+}
+test "project resume request owns the selected row identity after the picker closes" {
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var fake: FakeRemote = .{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    ui.openResumeRequest(fake.client());
+    const sessions = try std.testing.allocator.dupe(session_client.SavedSession, &resume_test_sessions);
+    actions.complete(.{ .managed = .{ .saved_sessions = sessions } }, null, false);
+    sessions[0].project = try std.testing.allocator.dupe(u8, "/daemon/project");
+    ui.pumpAsync();
+    ui.resumeKey(.enter);
+    try std.testing.expectEqual(@as(usize, 1), actions.next);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    ui.resumeKey(.enter);
+    try std.testing.expect(ui.resume_picker == null);
+    const target = actions.requests[1].?.action.manage.@"resume";
+    try std.testing.expectEqualStrings(&resume_test_sessions[0].id, &target.id);
+    try std.testing.expectEqualStrings("/daemon/project", target.project.?);
 }
 test "resume loading transfers the owned launcher and real sessions to the ready picker" {
     var actions: FakeAsync = .{};
@@ -10342,6 +10345,28 @@ test "resume picker holds live draft stream rows until it closes" {
     testAcknowledgeFullFrame(&ui);
     try std.testing.expect(ui.records.items[index].stream_written > written);
     try std.testing.expect(ui.records.items[index].stream.?.base > base);
+}
+test "Escape on a ready resume picker only closes the picker" {
+    var fake: FakeRemote = .{ .saved_fixture = &resume_test_sessions };
+    fake.snapshot.busy = true;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    try typeDraft(&ui, "draft");
+    ui.openResumeRequest(fake.client());
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(ui.resume_picker == null and !ui.stop_open and ui.busy);
+    try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(usize, 0), fake.cancels);
+    try std.testing.expectEqual(@as(usize, 0), fake.detaches);
+    try std.testing.expectEqual(@as(usize, 0), fake.cancel_clears);
 }
 test "resume loading approval Escape denies without consuming list ownership" {
     var actions: FakeAsync = .{};
@@ -12746,7 +12771,7 @@ test "remote queue sends bind the current epoch and are never launched locally" 
     try ui.dispatchNext();
     try std.testing.expectEqual(@as(usize, 0), fake.submits);
 }
-test "remote management commands run while busy instead of entering steering" {
+test "new switches while busy without entering steering and clears old view state" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -12754,15 +12779,6 @@ test "remote management commands run while busy instead of entering steering" {
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
     ui.remote_kind = .prompt;
-    try typeDraft(&ui, "/detach");
-    try ui.submit();
-    try std.testing.expectEqual(@as(usize, 1), fake.manages);
-    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .detach), fake.last_manage);
-    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
-    try std.testing.expectEqual(@as(usize, 0), fake.submits);
-    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
-
-    // /attach runs before steering too and adopts the new owner snapshot.
     fake.manage_switched = true;
     fake.snapshot.busy = true;
     fake.snapshot.mode = .awaiting_permission;
@@ -12775,10 +12791,10 @@ test "remote management commands run while busy instead of entering steering" {
     try ui.pumpRemote();
     try std.testing.expect(ui.permission != null);
 
-    try typeDraft(&ui, "/attach --takeover session-b");
+    try typeDraft(&ui, "/new");
     try ui.submit();
-    try std.testing.expectEqual(@as(usize, 2), fake.manages);
-    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .attach), fake.last_manage);
+    try std.testing.expectEqual(@as(usize, 1), fake.manages);
+    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .new_session), fake.last_manage);
     try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
     try std.testing.expectEqual(@as(u64, 7), ui.remote_epoch);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
@@ -13200,32 +13216,34 @@ test "deltas from a replaced control epoch are dropped before display" {
     try std.testing.expect(ui.draft == null);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
-test "remote busy close requires confirmation before any backend close or steering" {
-    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 2, .session_id = @splat(0) } };
-    var cancel: p.Cancellation = .{};
-    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-    defer bridge.deinit();
-    var ui = remoteUi(&fake, &bridge, &cancel);
-    defer ui.deinit();
-    ui.remote_kind = .prompt;
-    const current = "0000000000000000000000000000000000000000000000000000000000000000";
-    try typeDraft(&ui, "/close " ++ current);
-    try ui.submit();
-    // Busy and attached: nothing is sent yet; the ACKed popup owns the decision.
-    try std.testing.expectEqual(@as(usize, 0), fake.manages);
-    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
-    try std.testing.expect(ui.stop_open);
-    try std.testing.expect(ui.stop_close != null);
-    try std.testing.expectEqualStrings(current, ui.stop_close.?);
-
-    // The typed --force form is an explicit confirmation and skips the popup.
-    ui.closeStop();
-    try typeDraft(&ui, "/close --force " ++ current);
-    try ui.submit();
-    try std.testing.expectEqual(@as(usize, 1), fake.manages);
-    try std.testing.expectEqual(@as(?std.meta.Tag(session_client.Manage), .close), fake.last_manage);
-    try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
-    try std.testing.expect(!ui.stop_open);
+test "retired session commands never manage, steer, queue a follow-up or take over" {
+    for ([_]bool{ false, true }) |busy| {
+        var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = busy, .control_epoch = 2 } };
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = remoteUi(&fake, &bridge, &cancel);
+        defer ui.deinit();
+        ui.remote_kind = .prompt;
+        for ([_][]const u8{ "/close", "/close --force abc", "/attach abc", "/attach --takeover abc", "/detach", "/sessions", "/list" }) |command| {
+            try typeDraft(&ui, command);
+            try Ui.key(&ui, .enter);
+            if (busy) {
+                try std.testing.expectEqualStrings(command, ui.editor.bytes.items);
+                try Ui.key(&ui, .follow_up);
+                try std.testing.expectEqualStrings(command, ui.editor.bytes.items);
+                ui.wipeEditor();
+            } else {
+                try std.testing.expect(std.mem.startsWith(u8, ui.notice, "Unknown command"));
+            }
+            try std.testing.expect(!ui.stop_open and ui.resume_picker == null);
+            try std.testing.expectEqual(@as(usize, 0), fake.manages);
+            try std.testing.expectEqual(@as(usize, 0), fake.submits);
+            try std.testing.expectEqual(@as(usize, 0), fake.enqueues);
+            try std.testing.expectEqual(@as(usize, 0), fake.detaches);
+            try std.testing.expectEqual(@as(u64, 2), ui.remote_epoch);
+        }
+    }
 }
 test "remote stop gates the owner first and authorizes the adopted queue revision" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 5, .queue_revision = 11, .session_id = @splat(1) } };
@@ -13373,7 +13391,12 @@ test "Codex device login binds generation and publishes success once" {
     try std.testing.expectEqual(@as(u64, 7), owner.canceled_generation);
     _ = try ui.editor.insert("/login openai-codex");
     try ui.submit();
-    try std.testing.expect(ui.codex_open and !ui.secret_mode and owner.starts == 4);
+    try std.testing.expectEqualStrings("Unknown command; use /model, /login, /compact or /settings", ui.notice);
+    try std.testing.expectEqual(@as(usize, 3), owner.starts);
+    try std.testing.expectEqual(@as(usize, 2), owner.cancels);
+    try std.testing.expect(!ui.codex_open and !ui.codex_opening and !ui.secret_mode and !ui.provider_open);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.prompt == null);
+    try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
 test "remote codex login opens only after the owner receipt and cancels its exact generation" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6, .session_id = @splat(3) } };

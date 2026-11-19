@@ -277,7 +277,7 @@ def run(app, width, batched):
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        child = subprocess.Popen([app, '--no-model-auto-refresh'], stdin=slave, stdout=slave, stderr=slave,
+        child = subprocess.Popen([app], stdin=slave, stdout=slave, stderr=slave,
                                  cwd=project, preexec_fn=child_setup,
                                  env={'PATH': '/usr/bin:/bin', 'HOME': str(home), 'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8', 'TERM': 'xterm-256color', 'THIN_IDLE_KEY': 'idle-fixture-only'})
         screen = Screen(width)
@@ -559,7 +559,7 @@ def deny_inet_sockets():
         raise OSError(ctypes.get_errno(), 'seccomp setup')
 
 
-def first_entry(app, origin, width, auto, response='normal'):
+def first_entry(app, origin, width, response='normal'):
     """First-frame origin/scrollback oracle; never submits a user prompt."""
     with tempfile.TemporaryDirectory(prefix='thin-entry-', dir='/tmp') as base:
         home, project, runtime = (Path(base) / name for name in ('home', 'project', 'r'))
@@ -699,8 +699,7 @@ def first_entry(app, origin, width, auto, response='normal'):
             raise AssertionError('phase-timeout')
 
         try:
-            args = [app] + ([] if auto else ['--no-model-auto-refresh'])
-            child = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave,
+            child = subprocess.Popen([app], stdin=slave, stdout=slave, stderr=slave,
                                      cwd=project, preexec_fn=setup,
                                      env={'PATH': '/usr/bin:/bin', 'HOME': str(home),
                                           'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8',
@@ -767,7 +766,7 @@ def first_entry(app, origin, width, auto, response='normal'):
                 assert len(shell) == 1, 'shell-count'
                 assert 0 < shell[0] - positions[-1] <= 3, 'shell-gap'
             assert seen == 1, 'missing-query'
-            print(f'PASS first-entry row={origin} width={width} auto={int(auto)} response={response}')
+            print(f'PASS first-entry row={origin} width={width} response={response}')
         finally:
             if child is not None and child.poll() is None:
                 child.terminate()
@@ -872,7 +871,7 @@ def streaming(app, line_count):
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        child = subprocess.Popen([app, '--no-model-auto-refresh'], stdin=slave, stdout=slave,
+        child = subprocess.Popen([app], stdin=slave, stdout=slave,
                                  stderr=slave, cwd=project, preexec_fn=setup,
                                  env={'PATH': '/usr/bin:/bin', 'HOME': str(home),
                                       'XDG_RUNTIME_DIR': str(runtime), 'LANG': 'C.UTF-8',
@@ -1062,13 +1061,10 @@ if __name__ == '__main__':
     for width, batched in [(80, False), (24, True)]:
         run(app, width, batched)
     print('PASS test-idle-enter: 2 owned PTYs, idle HTTP=0, explicit normal HTTP=2')
-    for origin, width, auto, response in [(0, 80, True, 'normal'),
-                                           (12, 80, False, 'normal'),
-                                           (23, 80, True, 'normal'),
-                                           (12, 120, True, 'fragmented'),
-                                           (23, 120, False, 'normal'),
-                                           (12, 80, False, 'early'),
-                                           (12, 80, True, 'timeout')]:
-        first_entry(app, origin, width, auto, response)
+    for origin, width, response in [(0, 80, 'normal'), (12, 80, 'normal'),
+                                    (23, 80, 'normal'), (12, 120, 'fragmented'),
+                                    (23, 120, 'normal'), (12, 80, 'early'),
+                                    (12, 80, 'timeout')]:
+        first_entry(app, origin, width, response)
     for line_count in (1, 2, 3, 80):
         streaming(app, line_count)

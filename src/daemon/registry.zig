@@ -20,11 +20,9 @@ const metadata = @import("../platform/metadata.zig");
 
 extern "c" fn fsync(c_int) c_int;
 
-/// Page size for `list`; the only hard bound on registry output. There is no
-/// limit on the number of sessions/projects, only on one response.
+/// Page size for the probed `list` response; not a catalog limit.
 pub const max_page = 64;
-/// Upper bound on index directories/files scanned for one query. Exceeding it
-/// is reported, never silently truncated.
+/// Scan window for the probed list and unscoped id lookup. Exceeding it is reported.
 pub const max_scan_entries: usize = 4096;
 pub const max_project_bytes: usize = 4096;
 pub const max_index_bytes: usize = 8 * 1024;
@@ -37,6 +35,8 @@ const index_suffix = ".json";
 pub const Record = struct {
     id: ids.Id,
     project: []const u8,
+    /// Empty on read for a daemon locator published under a different runtime
+    /// root. In that case only project/id are usable, never the old socket.
     endpoint: []const u8,
     owner: cli.WorkerOwner,
     owner_instance: []const u8,
@@ -170,6 +170,7 @@ pub const Registry = struct {
 
         const key_fd = try self.openKeyDir(key, true);
         defer fs.closeFd(key_fd);
+        try lockPublication(self.io, key_fd); // closing this independent fd releases the lock
         try atomicReplace(self.allocator, self.io, key_fd, file_name, bytes);
     }
 
@@ -215,110 +216,147 @@ pub const Registry = struct {
             all.deinit(a);
         }
 
-        var scanned: usize = 0;
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            self.list_truncated = false;
-            scan: {
-                var keys = KeyIterator.init(self);
-                while (keys.next() catch |err| switch (err) {
-                    error.TooManySessions => {
-                        self.list_truncated = true;
-                        break :scan;
-                    },
-                    else => return err,
-                }) |key| {
-                    const key_fd = self.openKeyDir(key, false) catch |err| switch (err) {
-                        error.FileNotFound => continue,
-                        else => return err,
-                    };
-                    defer fs.closeFd(key_fd);
-                    const dir: std.Io.Dir = .{ .handle = key_fd };
-                    var it = dir.iterate();
-                    while (it.next(self.io) catch return error.Unavailable) |entry| {
-                        scanned += 1;
-                        if (scanned > max_scan_entries) {
-                            self.list_truncated = true;
-                            break :scan;
-                        }
-                        if (entry.kind != .file) continue;
-                        if (entry.name.len != 32 + index_suffix.len) continue;
-                        if (!std.mem.endsWith(u8, entry.name, index_suffix)) continue;
-                        const id_text = entry.name[0..32];
-                        if (!ids.valid(id_text[0..32].*)) continue;
-                        const id: ids.Id = id_text[0..32].*;
-                        // Listing remains best-effort for unreadable or corrupt
-                        // entries, but cannot produce a reliable page on OOM.
-                        const stored = (self.readOneLocked(a, id, key, key_fd, null) catch |err| switch (err) {
-                            error.OutOfMemory => return err,
-                            else => continue,
-                        }) orelse continue;
-                        var record = stored;
-                        // One kernel+hello verified probe decides both visibility
-                        // and the state the caller displays; it never starts a
-                        // Runtime and never takes the controller role.
-                        const live_probe = self.probeUnlocked(record, probe_timeout_ms);
-                        record.probe = live_probe;
-                        if (!probeVisible(live_probe.state, running_only)) {
-                            freeRecord(a, &record);
-                            continue;
-                        }
-                        const owned_state = a.dupe(u8, stateLabel(live_probe.state)) catch |err| {
-                            freeRecord(a, &record);
-                            return err;
-                        };
-                        a.free(@constCast(record.state));
-                        record.state = owned_state;
-                        all.append(a, record) catch |err| {
-                            freeRecord(a, &record);
-                            return err;
-                        };
-                    }
-                }
-            }
-        }
-
+        try self.scan(a, &all, running_only);
         std.mem.sort(Record, all.items, {}, recordLessThan);
         const start = if (page > all.items.len / max_page) all.items.len else page * max_page;
         const end = @min(start + max_page, all.items.len);
         const result = try a.alloc(Record, end - start);
         @memcpy(result, all.items[start..end]);
-        // Only keep ownership of the returned page.
         for (all.items[0..start]) |*record| freeRecord(a, record);
         for (all.items[end..]) |*record| freeRecord(a, record);
         all.deinit(a);
         return result;
     }
 
-    /// Remove one index entry (best effort, no lease semantics). A stale entry
-    /// that cannot be removed never authorizes or blocks a resume.
-    pub fn unpublish(self: *Registry, id: ids.Id, project: ?[]const u8) !void {
-        if (!ids.valid(id)) return error.InvalidSessionID;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (project) |proj| {
-            if (!std.unicode.utf8ValidateSlice(proj)) return error.InvalidInput;
-            const key = projectKey(proj);
-            try self.unlinkOne(id, key);
-            return;
+    /// All valid daemon-owned locators, across projects, including offline
+    /// ones. No liveness probes, checkpoint reads, list window or page limit.
+    /// The caller owns the result and releases it with freeRecords.
+    pub fn daemonRecords(self: *Registry, a: std.mem.Allocator) ![]Record {
+        var all: std.ArrayList(Record) = .empty;
+        errdefer {
+            for (all.items) |*record| freeRecord(a, record);
+            all.deinit(a);
         }
-        var keys = KeyIterator.init(self);
-        while (try keys.next()) |key| try self.unlinkOne(id, key);
+        try self.scan(a, &all, null);
+        std.mem.sort(Record, all.items, {}, recordLessThan);
+        return all.toOwnedSlice(a);
     }
 
-    fn unlinkOne(self: *Registry, id: ids.Id, key: [32]u8) !void {
+    /// null is the unpaged, unprobed daemon catalog; otherwise the live list.
+    fn scan(self: *Registry, a: std.mem.Allocator, all: *std.ArrayList(Record), running_only: ?bool) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (running_only != null) self.list_truncated = false;
+        var scanned: usize = 0;
+        var keys = KeyIterator.init(self);
+        keys.bounded = running_only != null;
+        while (keys.next() catch |err| switch (err) {
+            error.TooManySessions => {
+                self.list_truncated = true;
+                return;
+            },
+            else => return err,
+        }) |key| {
+            const key_fd = self.openKeyDir(key, false) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer fs.closeFd(key_fd);
+            const dir: std.Io.Dir = .{ .handle = key_fd };
+            var it = dir.iterate();
+            while (try it.next(self.io)) |entry| {
+                scanned += 1;
+                if (running_only != null and scanned > max_scan_entries) {
+                    self.list_truncated = true;
+                    return;
+                }
+                if (entry.kind != .file) continue;
+                if (entry.name.len != 32 + index_suffix.len) continue;
+                if (!std.mem.endsWith(u8, entry.name, index_suffix)) continue;
+                const id_text = entry.name[0..32];
+                if (!ids.valid(id_text[0..32].*)) continue;
+                const id: ids.Id = id_text[0..32].*;
+                // Skip invalid publications. Don't present a partial catalog
+                // as complete on a system I/O failure, cancellation or OOM.
+                var record = (self.readOneLocked(a, id, key, key_fd, null) catch |err| switch (err) {
+                    error.ProtocolError, error.InvalidInput, error.NotRegularFile, error.NotOwned, error.InsecurePermissions, error.UnexpectedLinkCount, error.IdentityChanged, error.SymlinkNotAllowed, error.FileTooLarge => continue,
+                    error.OutOfMemory => return err,
+                    else => if (running_only == null) return err else continue,
+                }) orelse continue;
+                // One kernel+hello verified probe decides both visibility
+                // and the state the caller displays; it never starts a
+                // Runtime and never takes the controller role.
+                errdefer freeRecord(a, &record);
+                if (running_only) |filter| {
+                    record.probe = self.probeUnlocked(record, probe_timeout_ms);
+                    if (!probeVisible(record.probe.state, filter)) {
+                        freeRecord(a, &record);
+                        continue;
+                    }
+                    const state = try a.dupe(u8, stateLabel(record.probe.state));
+                    a.free(record.state);
+                    record.state = state;
+                } else if (record.owner != .daemon) {
+                    freeRecord(a, &record);
+                    continue;
+                }
+                try all.append(a, record);
+            }
+        }
+    }
+
+    /// Retire only the publication belonging to a joined worker. The per-key
+    /// lock serializes compare+unlink with register in other processes.
+    pub fn unpublish(self: *Registry, id: ids.Id, project: []const u8, expected_endpoint: []const u8) !void {
+        if (!ids.valid(id)) return error.InvalidSessionID;
+        try validateAbsolutePath(project);
+        if (expected_endpoint.len == 0) return error.InvalidInput;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const key = projectKey(project);
         const key_fd = self.openKeyDir(key, false) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer fs.closeFd(key_fd);
+        try lockPublication(self.io, key_fd);
+        const record = (try self.readOneLocked(self.allocator, id, key, key_fd, project)) orelse return;
+        defer freeRecord(self.allocator, &record);
+        if (!std.mem.eql(u8, record.endpoint, expected_endpoint)) return;
+        if (record.owner == .daemon and !try self.checkpointAbsent(project, id)) return;
         var buf: [64]u8 = undefined;
         const name_z = try std.fmt.bufPrintSentinel(&buf, "{s}{s}", .{ id[0..], index_suffix }, 0);
         if (c.unlinkat(key_fd, name_z, 0) != 0) {
             if (fs.errno() == .NOENT) return;
             return fs.osError();
         }
+    }
+
+    /// Do not erase history on an unavailable project, unreadable checkpoint
+    /// or damaged archive marker. Only an absent checkpoint is disposable.
+    fn checkpointAbsent(self: *Registry, project: []const u8, id: ids.Id) !bool {
+        var root = try fs.Root.open(self.allocator, self.io, project);
+        defer root.deinit();
+        // Check the actual entry, not a higher-level reader that might also
+        // return FileNotFound for a missing .gitignore in a populated archive.
+        const thin = fs.openDirectory(root.dir.handle, ".thin") catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return err,
+        };
+        defer fs.closeFd(thin);
+        const sessions = fs.openDirectory(thin, "sessions") catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return err,
+        };
+        defer fs.closeFd(sessions);
+        var buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrintSentinel(&buf, "{s}.session", .{id}, 0);
+        const dir: std.Io.Dir = .{ .handle = sessions };
+        _ = dir.statFile(self.io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return err,
+        };
+        return false;
     }
 
     /// True only when the endpoint is served by the exact live worker described
@@ -390,6 +428,25 @@ pub const Registry = struct {
         return std.mem.eql(u8, expected, endpoint);
     }
 
+    /// Recognize the two runtime layouts used by Directory.resolve, but never
+    /// expose, dial or stat an old path (its directories are not verified now).
+    fn historicalEndpoint(self: *const Registry, instance: []const u8, endpoint: []const u8) bool {
+        if (endpoint.len > unix.max_socket_path_len) return false;
+        validateAbsolutePath(endpoint) catch return false;
+        var buf: [unix.max_socket_path_len + 1]u8 = undefined;
+        const suffix = std.fmt.bufPrint(&buf, "/workers/{s}.sock", .{instance}) catch return false;
+        if (!std.mem.endsWith(u8, endpoint, suffix)) return false;
+        const root = endpoint[0 .. endpoint.len - suffix.len];
+        if (std.mem.endsWith(u8, root, "/thin")) {
+            // Old publishers appended "/thin" to XDG_RUNTIME_DIR verbatim.
+            // Allow redundant separators only at that join, never for dialing.
+            const base = std.mem.trimEnd(u8, root[0 .. root.len - "/thin".len], "/");
+            return std.mem.indexOf(u8, base, "//") == null and std.mem.indexOf(u8, root, "/./") == null;
+        }
+        const fallback = std.fmt.bufPrint(&buf, "/tmp/thin-{d}", .{self.uid}) catch return false;
+        return std.mem.eql(u8, root, fallback) or (std.mem.startsWith(u8, root, "/private/") and std.mem.eql(u8, root["/private".len..], fallback));
+    }
+
     fn validateEndpoint(self: *const Registry, owner_instance: []const u8, endpoint: []const u8) !void {
         if (!validOwnerInstance(owner_instance)) return error.InvalidInput;
         if (!self.endpointMatches(owner_instance, endpoint)) return error.InvalidInput;
@@ -442,8 +499,8 @@ pub const Registry = struct {
         if (fd < 0) return if (fs.errno() == .NOENT) null else fs.osError();
         defer fs.closeFd(fd);
 
-        if (!try isRegularFd(fd)) return error.NotRegularFile;
         const st = try metadata.statFd(fd);
+        if (st.mode & c.S.IFMT != c.S.IFREG) return error.NotRegularFile;
         if (st.uid != self.uid) return error.NotOwned;
         if (st.mode & 0o777 != 0o600) return error.InsecurePermissions;
         if (st.nlink != 1) return error.UnexpectedLinkCount;
@@ -481,7 +538,7 @@ pub const Registry = struct {
         if (project) |expected| if (!std.mem.eql(u8, expected, project_text)) return error.ProtocolError;
 
         const key_text = jsonString(object.get("project_key")) orelse return error.ProtocolError;
-        if (!std.mem.eql(u8, key_text, &key)) return error.ProtocolError;
+        if (!std.mem.eql(u8, key_text, &key) or !std.mem.eql(u8, &projectKey(project_text), &key)) return error.ProtocolError;
 
         const owner_text = jsonString(object.get("owner")) orelse return error.ProtocolError;
         const owner = std.meta.stringToEnum(cli.WorkerOwner, owner_text) orelse return error.ProtocolError;
@@ -491,7 +548,8 @@ pub const Registry = struct {
 
         const endpoint = jsonString(object.get("endpoint")) orelse return error.ProtocolError;
         if (!std.unicode.utf8ValidateSlice(endpoint)) return error.ProtocolError;
-        if (!self.endpointMatches(instance, endpoint)) return error.ProtocolError;
+        const current_endpoint = self.endpointMatches(instance, endpoint);
+        if (!current_endpoint and (owner != .daemon or !self.historicalEndpoint(instance, endpoint))) return error.ProtocolError;
 
         const state = jsonString(object.get("state")) orelse return error.ProtocolError;
         if (state.len == 0 or state.len > max_state_bytes) return error.ProtocolError;
@@ -504,7 +562,7 @@ pub const Registry = struct {
 
         const owned_project = try a.dupe(u8, project_text);
         errdefer a.free(owned_project);
-        const owned_endpoint = try a.dupe(u8, endpoint);
+        const owned_endpoint = try a.dupe(u8, if (current_endpoint) endpoint else "");
         errdefer a.free(owned_endpoint);
         const owned_instance = try a.dupe(u8, instance);
         errdefer a.free(owned_instance);
@@ -542,6 +600,7 @@ pub const Registry = struct {
         registry: *Registry,
         it: std.Io.Dir.Iterator,
         scanned: usize = 0,
+        bounded: bool = true,
 
         fn init(registry: *Registry) KeyIterator {
             const dir: std.Io.Dir = .{ .handle = registry.index_fd };
@@ -552,7 +611,7 @@ pub const Registry = struct {
             while (true) {
                 const entry = (try self.it.next(self.registry.io)) orelse return null;
                 self.scanned += 1;
-                if (self.scanned > max_scan_entries) return error.TooManySessions;
+                if (self.bounded and self.scanned > max_scan_entries) return error.TooManySessions;
                 if (entry.kind != .directory) continue;
                 if (entry.name.len != 32 or !ids.valid(entry.name[0..32].*)) continue;
                 return entry.name[0..32].*;
@@ -590,11 +649,6 @@ fn validateAbsolutePath(path: []const u8) !void {
     if (!std.fs.path.isAbsolute(path)) return error.InvalidInput;
     var parts = std.mem.tokenizeScalar(u8, path, '/');
     while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.InvalidInput;
-}
-
-fn isRegularFd(fd: c.fd_t) !bool {
-    const st = try metadata.statFd(fd);
-    return st.mode & c.S.IFMT == c.S.IFREG;
 }
 
 const OpenedIndex = struct { fd: c.fd_t, path: []u8 };
@@ -698,6 +752,18 @@ fn atomicReplace(a: std.mem.Allocator, io: std.Io, dir: c.fd_t, name: []const u8
     ) != 0) return fs.osError();
     try fsyncFd(dir);
     _ = a;
+}
+
+fn lockPublication(io: std.Io, dir_fd: c.fd_t) !void {
+    // Same bounded directory flock as other per-project stores. Contention or
+    // cancellation leaves the file intact; no lockfile needs recovery.
+    for (0..100) |_| {
+        if (fs.flock(dir_fd, fs.LOCK.EX | fs.LOCK.NB) == 0) return;
+        const errno = fs.errno();
+        if (errno != .AGAIN and errno != .INTR) return fs.osError();
+        try std.Io.sleep(io, .fromMilliseconds(2), .awake);
+    }
+    return error.RegistryBusy;
 }
 
 fn fsyncFd(fd: c.fd_t) !void {

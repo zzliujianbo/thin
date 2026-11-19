@@ -21,12 +21,10 @@ const linux = std.os.linux;
 
 const fs = @import("../platform/filesystem.zig");
 const interrupt = @import("../platform/interrupt.zig");
-const logs = @import("../app/log_store.zig");
 const protocol = @import("protocol.zig");
 const unix = @import("unix.zig");
 const registry = @import("registry.zig");
 const spawn = @import("spawn.zig");
-const ssh = @import("ssh.zig");
 const session_host = @import("../app/session_host.zig");
 const cli = @import("../app/cli.zig");
 const ids = @import("../app/session_id.zig");
@@ -67,17 +65,10 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     var listener = try unix.Listener.bind(a, runtime, daemon_socket, .{ .lock = &lock });
     defer listener.deinit();
 
-    var ssh_listener: ?ssh.Listener = if (options.ssh_listen) |address|
-        try ssh.Listener.init(a, io, init.environ_map, address, options.auto_refresh_models)
-    else
-        null;
-    defer if (ssh_listener) |*active| active.deinit();
-
     var supervisor = Supervisor{
         .allocator = a,
         .io = io,
         .environ = init.environ_map,
-        .ssh_listener = if (ssh_listener) |*active| active else null,
         .registry = &reg,
         .workers = &workers,
         .listener = &listener,
@@ -121,7 +112,6 @@ const Supervisor = struct {
     registry: *registry.Registry,
     workers: *spawn.Workers,
     listener: *unix.Listener,
-    ssh_listener: ?*ssh.Listener = null,
     auto_refresh_models: bool,
     created: std.ArrayList(Created) = .empty,
     /// Directory of the first user input this daemon accepted (the first
@@ -159,10 +149,6 @@ const Supervisor = struct {
                 failure = err;
                 break;
             };
-            if (self.ssh_listener) |active| active.tick() catch |err| {
-                failure = err;
-                break;
-            };
             self.acceptTick();
             self.serveTick();
         }
@@ -188,13 +174,7 @@ const Supervisor = struct {
             slot.* = null;
         }
         var unclean = false;
-        // Stop every connection before waiting for workers; connection cleanup
-        // runs concurrently, and no new view can arrive during daemon shutdown.
-        if (self.ssh_listener) |active| active.stop();
         self.workers.shutdown() catch {
-            unclean = true;
-        };
-        if (self.ssh_listener) |active| active.shutdown() catch {
             unclean = true;
         };
         // A joined worker that left a complete checkpoint stays the durable
@@ -202,7 +182,7 @@ const Supervisor = struct {
         // `list` read the record, while liveness is still proven only by the
         // endpoint probe and the writer lease stays the execution authority.
         for (self.created.items) |item| {
-            self.retireWorker(item.id, item.project, item.endpoint);
+            if (!unclean) self.retireWorker(item.id, item.project, item.endpoint);
             self.allocator.free(item.project);
             self.allocator.free(item.endpoint);
         }
@@ -217,7 +197,7 @@ const Supervisor = struct {
         var index: usize = 0;
         while (index < self.created.items.len) {
             const item = self.created.items[index];
-            if (self.workers.isAlive(item.id)) {
+            if (self.workers.isAlive(item.id, item.project, item.endpoint)) {
                 index += 1;
                 continue;
             }
@@ -234,30 +214,7 @@ const Supervisor = struct {
     /// on-disk entry already belongs to a later owner. `list` reports a kept
     /// record as not-live; the index is never a live-owner authority.
     fn retireWorker(self: *Supervisor, id: ids.Id, project: []const u8, endpoint: []const u8) void {
-        var record = (self.registry.resolve(self.allocator, id, project) catch return) orelse return;
-        defer registry.freeRecord(self.allocator, &record);
-        if (!std.mem.eql(u8, record.endpoint, endpoint)) return;
-        if (self.hasCheckpoint(project, id)) return;
-        self.registry.unpublish(id, project) catch {};
-    }
-
-    /// Anchored, nofollow check of the published checkpoint file in this
-    /// project's own checkpoint directory. It never creates a directory, never
-    /// follows a link and never mistakes diagnostics for resumable history.
-    fn hasCheckpoint(self: *Supervisor, project: []const u8, id: ids.Id) bool {
-        var root = fs.Root.open(self.allocator, self.io, project) catch return false;
-        defer root.deinit();
-        const dir = logs.openExistingDirectory(&root) catch return false;
-        defer fs.closeFd(dir);
-        var buffer: [64]u8 = undefined;
-        const path = std.fmt.bufPrintSentinel(&buffer, "{s}.session", .{id}, 0) catch return false;
-        const fd = fs.openAt(dir, path, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
-        if (fd < 0) return false;
-        defer fs.closeFd(fd);
-        const stat = fs.fileFromFd(fd).stat(self.io) catch return false;
-        // Actual frame validation belongs to the resume reader; this is only
-        // an existence check before launching the owner.
-        return stat.kind == .file and stat.size > 0;
+        self.registry.unpublish(id, project, endpoint) catch {};
     }
 
     fn acceptTick(self: *Supervisor) void {
@@ -405,6 +362,7 @@ const Supervisor = struct {
     fn localErrorCode(err: anyerror) protocol.ErrorCode {
         return switch (err) {
             error.Unsupported => .unsupported,
+            error.AmbiguousSession => .invalid_input,
             else => protocol.errorCode(err),
         };
     }
@@ -493,15 +451,19 @@ const Supervisor = struct {
 
         const target = resume_id orelse restore_id;
         if (target) |id| {
-            if (try self.registry.resolve(self.allocator, id, null)) |found| {
-                var record = found;
+            // A picker resume is keyed by (project,id), not by id alone. A
+            // missing or republished foreground locator cannot authorize it.
+            if (try self.registry.resolve(self.allocator, id, canonical)) |record| {
                 defer registry.freeRecord(self.allocator, &record);
-                if (!std.mem.eql(u8, record.project, canonical)) return error.AmbiguousSession;
-                // Live (or merely reachable) owner: never start a second Runtime.
+                if (resume_id != null and record.owner != .daemon) return error.SessionNotFound;
                 if (self.registry.isLive(record, probe_timeout_ms)) return error.Busy;
-            }
+            } else if (resume_id != null) return error.SessionNotFound;
         }
 
+        try self.created.ensureUnusedCapacity(self.allocator, 1);
+        const project_copy = try self.allocator.dupe(u8, canonical);
+        var tracked = false;
+        defer if (!tracked) self.allocator.free(project_copy);
         const record = try self.workers.create(.{
             .project = canonical,
             .owner = .daemon,
@@ -509,31 +471,21 @@ const Supervisor = struct {
             .restore_selection = restore_id,
             .auto_refresh_models = auto_refresh,
         });
-        self.registry.register(record) catch |err| {
-            // Never leave an unindexed owner behind.
-            self.workers.close(record.id, record.project) catch {};
+        const endpoint_copy = self.allocator.dupe(u8, record.endpoint) catch |err| {
+            self.workers.close(record.id, record.project, record.endpoint) catch {};
             return err;
         };
-        const project_copy = try self.allocator.dupe(u8, record.project);
-        // Owned copy: the worker's own endpoint storage dies with its process
-        // record, but this daemon must still identify its index entry later.
-        const endpoint_copy = self.allocator.dupe(u8, record.endpoint) catch |err| {
-            self.allocator.free(project_copy);
-            self.registry.unpublish(record.id, record.project) catch {};
-            self.workers.close(record.id, record.project) catch {};
+        self.registry.register(record) catch |err| {
+            self.allocator.free(endpoint_copy);
+            self.workers.close(record.id, record.project, record.endpoint) catch {};
             return err;
         };
         // First accepted user input defines the setup default workspace.
         if (self.first_project == null) {
             self.first_project = self.allocator.dupe(u8, record.project) catch null;
         }
-        self.created.append(self.allocator, .{ .id = record.id, .project = project_copy, .endpoint = endpoint_copy }) catch |err| {
-            self.allocator.free(project_copy);
-            self.allocator.free(endpoint_copy);
-            self.registry.unpublish(record.id, record.project) catch {};
-            self.workers.close(record.id, record.project) catch {};
-            return err;
-        };
+        self.created.appendAssumeCapacity(.{ .id = record.id, .project = project_copy, .endpoint = endpoint_copy });
+        tracked = true;
 
         var out = protocol.Out.init(self.allocator);
         defer out.deinit();
@@ -550,7 +502,7 @@ const Supervisor = struct {
     /// are resumed through `create`, never through `attach`.
     fn handleAttach(self: *Supervisor, request: *const protocol.Request) ![]u8 {
         const id = try sessionIdField(request);
-        var record = (try self.registry.resolve(self.allocator, id, null)) orelse return error.SessionNotFound;
+        var record = try self.resolveTarget(request, id);
         defer registry.freeRecord(self.allocator, &record);
         if (!self.registry.isLive(record, probe_timeout_ms)) return error.SessionNotFound;
 
@@ -571,27 +523,22 @@ const Supervisor = struct {
     fn handleClose(self: *Supervisor, request: *const protocol.Request) ![]u8 {
         const id = try sessionIdField(request);
         const force = try request.boolField("force", false);
-        const owned = self.createdProject(id);
-        if (owned == null) {
-            // A foreground-owned (or otherwise foreign) live endpoint is never
-            // killed by the daemon; report it instead.
-            var record = (try self.registry.resolve(self.allocator, id, null)) orelse return error.SessionNotFound;
-            defer registry.freeRecord(self.allocator, &record);
+        var record = try self.resolveTarget(request, id);
+        defer registry.freeRecord(self.allocator, &record);
+        const index = self.createdIndex(record) orelse {
+            // A foreground-owned or republished endpoint is never ours to kill.
             const live = self.registry.isLive(record, probe_timeout_ms);
             return self.acceptedFrame(request.id, false, if (live) "not_owned" else "not_found");
-        }
+        };
         // Never probe and then kill: `accepted=false` asks the operator for
         // `force` without touching the worker or its created entry.
         if (!force) return self.acceptedFrame(request.id, false, "busy");
-        const project = owned.?;
-        // Identity of this daemon's own record, captured before the worker's
-        // process storage is released by `close`.
-        const endpoint = if (self.createdEntry(id)) |entry| entry.endpoint else return error.SessionNotFound;
-        try self.workers.close(id, project);
-        // Keep the locator when a complete checkpoint remains, so the history is
-        // still discoverable/resumable after this clean close.
-        self.retireWorker(id, project, endpoint);
-        self.retireCreated(id);
+        const entry = self.created.items[index];
+        try self.workers.close(id, entry.project, entry.endpoint);
+        self.retireWorker(id, entry.project, entry.endpoint);
+        _ = self.created.orderedRemove(index);
+        self.allocator.free(entry.project);
+        self.allocator.free(entry.endpoint);
         return self.acceptedFrame(request.id, true, null);
     }
 
@@ -679,32 +626,26 @@ const Supervisor = struct {
         slot.* = null;
     }
 
-    fn createdProject(self: *Supervisor, id: ids.Id) ?[]const u8 {
-        for (self.created.items) |item| {
-            if (std.mem.eql(u8, &item.id, &id)) return item.project;
-        }
-        return null;
+    /// A legacy ID-only request must identify one project in both the index
+    /// and our owned workers. A malformed qualifier must never broaden a lookup.
+    fn resolveTarget(self: *Supervisor, request: *const protocol.Request, id: ids.Id) !registry.Record {
+        const project = if (request.field("project") != null) try request.stringField("project", registry.max_project_bytes) else null;
+        if (project) |path| if (!std.fs.path.isAbsolute(path)) return error.BadRequest;
+        var record = (try self.registry.resolve(self.allocator, id, project)) orelse return error.SessionNotFound;
+        errdefer registry.freeRecord(self.allocator, &record);
+        if (project == null) for (self.created.items) |item| {
+            if (std.mem.eql(u8, &item.id, &id) and !std.mem.eql(u8, item.project, record.project)) return error.AmbiguousSession;
+        };
+        return record;
     }
 
-    fn createdEntry(self: *Supervisor, id: ids.Id) ?*Created {
-        for (self.created.items) |*item| {
-            if (std.mem.eql(u8, &item.id, &id)) return item;
+    fn createdIndex(self: *Supervisor, record: registry.Record) ?usize {
+        if (record.owner != .daemon) return null;
+        for (self.created.items, 0..) |item, index| {
+            if (std.mem.eql(u8, &item.id, &record.id) and std.mem.eql(u8, item.project, record.project) and
+                std.mem.eql(u8, item.endpoint, record.endpoint)) return index;
         }
         return null;
-    }
-
-    fn retireCreated(self: *Supervisor, id: ids.Id) void {
-        var index: usize = 0;
-        while (index < self.created.items.len) {
-            const item = self.created.items[index];
-            if (!std.mem.eql(u8, &item.id, &id)) {
-                index += 1;
-                continue;
-            }
-            self.allocator.free(item.project);
-            self.allocator.free(item.endpoint);
-            _ = self.created.orderedRemove(index);
-        }
     }
 
     fn canonicalProject(self: *Supervisor, path: []const u8) ![]u8 {

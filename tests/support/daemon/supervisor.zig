@@ -1,4 +1,5 @@
 const c = std.c;
+const logs = @import("../app/log_store.zig");
 
 fn testWait() unix.Wait {
     return .{ .io = std.testing.io, .timeout_ms = 5_000 };

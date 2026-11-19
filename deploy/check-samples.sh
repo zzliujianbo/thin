@@ -140,6 +140,8 @@ check_sshd_config() {
         fi
     fi
 
+    require_value "$file" ListenAddress '127\.0\.0\.1' "sshd 样例（仅绑定本机回环）"
+
     # 认证：OS 账户 + PAM，默认拒绝 root 与空密码。
     require_value "$file" UsePAM yes "sshd 样例"
     require_value "$file" PasswordAuthentication yes "sshd 样例"
@@ -164,20 +166,18 @@ check_sshd_config() {
     forbid_key "$file" Subsystem "sshd 样例（不提供 sftp）"
     forbid_key "$file" StrictModes "sshd 样例（不得改写 StrictModes）"
 
-    # ForceCommand：唯一，且只是 --connect。
+    # ForceCommand：唯一，直接执行安装的 thin，不接受任何参数。
     local fc_count fc_command
     fc_count=$(grep -Eic '^[[:space:]]*ForceCommand([[:space:]]|$)' -- "$file" || true)
     if ((fc_count != 1)); then
         fail "sshd 样例：必须恰好有一个 ForceCommand，实际 $fc_count"
     else
         fc_command=$(first_value "$file" ForceCommand)
-        if [[ $fc_command != "$expected_binary --connect" ]]; then
-            fail "sshd 样例：ForceCommand 必须是 '$expected_binary --connect'，实际 '$fc_command'"
+        if [[ $fc_command != "$expected_binary" ]]; then
+            fail "sshd 样例：ForceCommand 必须是无参数的 '$expected_binary'，实际 '$fc_command'"
         else
             pass
         fi
-        forbid_active "$file" '(^|[[:space:]])(--daemon|--print|--attach|--no-log)([[:space:]]|$)' \
-            "sshd 样例（登录路径不得携带守护/一次性/恢复参数）"
         forbid_active "$file" '(^|[[:space:]])(nohup|systemctl|setsid|sudo|exec)([[:space:]]|$)' \
             "sshd 样例（登录路径不得启动服务）"
         forbid_active "$file" '(/|[[:space:]])(ba|z|k)?sh([[:space:]]|$)' \
@@ -229,9 +229,7 @@ check_daemon_unit() {
         fi
     fi
 
-    # 只以 --daemon 启动：不得变成 SSH 入口、一次性模式或前台恢复，也不得自行脱离 systemd。
-    forbid_active "$file" '(^|[[:space:]])(--connect|--print|--attach|--no-log|--help)([[:space:]]|$)' \
-        "守护服务（ExecStart 不得携带其它运行模式参数）"
+    # 不得自行脱离 systemd。上面的精确匹配已排除附加参数。
     forbid_active "$file" '(^|[[:space:]])(ba|z|k)?sh[[:space:]]+-c' "守护服务（不得用 shell -c 包装）"
     forbid_active "$file" '(^|[[:space:]])(nohup|setsid|screen|tmux)([[:space:]]|$)' \
         "守护服务（不得自行脱离 systemd 托管）"
@@ -359,8 +357,9 @@ check_doc() {
     local file=$doc
     local required=(
         'thin --daemon'
-        'thin --connect'
-        'ForceCommand'
+        "ForceCommand $expected_binary"
+        '独立前台'
+        'TCP'
         'enable-linger'
         '不是沙箱'
         '不保证'
@@ -375,11 +374,8 @@ check_doc() {
     for item in "${required[@]}"; do
         require_text "$file" "$item" "部署文档"
     done
-    if grep -Fq '默认' "$file" && grep -Fq '前台' "$file"; then
-        pass
-    else
-        fail "部署文档：必须明确默认 thin 仍为前台模式"
-    fi
+    # 不要把旧命令重新放入部署指南；样例的两个生效命令已在上面完整匹配。
+    forbid_text "$file" 'thin([[:space:]]+--daemon)?[[:space:]]+(-h|-p|--(connect|attach|resume|restore-selection|help|version|print|ssh-listen|no-model-auto-refresh))([^[:alnum:]_-]|$)' "部署文档（过时的 Thin 命令）"
     if grep -Fq '未安装' "$file" && grep -Fq '不执行' "$file"; then
         pass
     else

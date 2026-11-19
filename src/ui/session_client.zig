@@ -293,7 +293,6 @@ pub const Snapshot = struct {
     mode: ?r.State = null,
     task_kind: TaskKind = .prompt,
     session_id: ?[32]u8 = null,
-    session_label: ?[]const u8 = null,
     launcher_dir: ?[]const u8 = null,
     control_epoch: u64 = 0,
     queue_revision: u64 = 0,
@@ -307,17 +306,15 @@ pub const Snapshot = struct {
     input_history: []const []const u8 = &.{},
 };
 
-/// Session-management request. `id` and `close` arguments are borrowed for
-/// the duration of `manage` only; the adapter must copy anything it retains.
 pub const SavedSession = @import("../core/session_metadata.zig").SavedSession;
+
+/// Only the project path is borrowed for the duration of `manage`.
+pub const ResumeTarget = struct { id: [32]u8, project: ?[]const u8 = null };
 
 pub const Manage = union(enum) {
     saved_sessions: void,
     new_session: void,
-    @"resume": []const u8,
-    attach: struct { id: []const u8, takeover: bool = false },
-    detach,
-    close: struct { id: []const u8, force: bool = false },
+    @"resume": ResumeTarget,
 };
 
 /// Management result. `notice` is allocated with the allocator passed
@@ -330,7 +327,7 @@ pub const Outcome = struct {
 
     pub fn deinit(self: *Outcome, a: std.mem.Allocator) void {
         if (self.notice) |value| a.free(value);
-        if (self.saved_sessions) |value| a.free(value);
+        if (self.saved_sessions) |value| @import("../core/session_metadata.zig").freeSavedSessions(a, value);
         self.* = undefined;
     }
 };

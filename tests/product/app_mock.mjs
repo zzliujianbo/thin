@@ -3,7 +3,7 @@
 // node tests/product/app_mock.mjs /absolute/path/thin /absolute/path/thin-app-pty
 // 文件概览：应用级验收脚本，驱动 thin CLI 与 thin-app-pty（PTY）驱动，
 // 并由本地伪造的 OpenAI 兼容服务（chat 与 responses 两种协议）提供固定回复。
-// 覆盖：帮助与无配置、普通对话、默认工具执行与审批、自动压缩、畸形与截断响应、取消、输出超限、Unicode 与 PTY 场景。
+// 覆盖：旧参数拒绝、无配置、普通对话、默认工具执行与审批、自动压缩、畸形与截断响应、取消、输出超限、Unicode 与 PTY 场景。
 // 任何断言失败都会以非零退出码结束；错误信息经过脱敏，不输出捕获的终端或模型原文。
 // 依赖 Node 内置模块：http 提供伪造服务，child_process 启动 CLI 与 PTY 驱动，assert 做断言。
 
@@ -214,8 +214,7 @@ async function runExecute(bin, args, env, cwd, onChild, timeout = 30000, spawnCh
     const output = Buffer.concat(chunks).toString('utf8');
     assert(!output.includes(KEY), 'fake key leaked in captured output');
     assert(!output.includes(injection), 'model executable ANSI leaked');
-    // 无头模式（thin）的输出必须是纯文本，不得含 ANSI 转义。
-    if (bin === app) assert(!output.includes('\x1b'), 'headless ANSI leaked');
+    if (bin === app) assert(!output.includes('\x1b'), 'usage diagnostic contained terminal escapes');
 
     // 安全断言通过后才报告超时或输出超限错误。
     if (failure) throw failure;
@@ -228,15 +227,14 @@ async function runExecute(bin, args, env, cwd, onChild, timeout = 30000, spawnCh
 
 /**
  * 运行一个应用验收场景：创建临时 HOME 与项目目录，启动伪造 OpenAI 兼容服务（chat 或 responses），
- * 写入 config.json，然后运行 CLI 或 PTY 驱动，并按 kind 断言结果。
- * kind 取值：help、no-config、legacy-config、plain、auto、ordinary-tools、compact、malformed、truncated、stall、auto-tools、
- * cancel、term、output、unicode、auth-missing、auth-empty、auth-activate。场景结束时关闭服务器并删除临时目录。
+ * Every positive launch uses the bare TUI. A dedicated driver mode exercises
+ * richer interactions; fixture-turn checks a single submitted turn on screen.
  */
-async function scenario(name, protocol, kind, isPty = false) {
-  return timed('case', name, () => runScenario(name, protocol, kind, isPty));
+async function scenario(name, protocol, kind, dedicatedMode = false) {
+  return timed('case', name, () => runScenario(name, protocol, kind, dedicatedMode));
 }
 
-async function runScenario(name, protocol, kind, isPty = false) {
+async function runScenario(name, protocol, kind, dedicatedMode) {
   // 每个场景使用独立的临时根目录，包含 home 与 project 两个子目录。
   const root = await mkdtemp(join(tmpdir(), 'thin-app-'));
   const home = join(root,'home'), project = join(root,'project');
@@ -254,8 +252,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
   let releaseSelection;
   const selectionGate = new Promise(resolve => { releaseSelection = resolve; });
 
-  // stalled 表示已到达挂起点；signalChild 与 ownsChild 来自 execute 回调，非 PTY 取消时用于发送 SIGINT。
-  let stalled, signalChild, ownsChild;
+  let stalled;
 
   // sockets 用于清理；observations 记录每个工具调用 id 对应的输出，供后续断言使用。
   const sockets = new Set(), observations = new Map();
@@ -272,6 +269,11 @@ async function runScenario(name, protocol, kind, isPty = false) {
       // 请求体上限 1 MiB，然后解析 JSON。
       for await (const chunk of req) { bytes += chunk.length; assert(bytes < 1024*1024); data += chunk; }
       const body = JSON.parse(data);
+      if (!dedicatedMode && body.tool_choice !== 'none' && rounds === 0) {
+        const turn = (protocol === 'chat' ? body.messages : body.input).at(-1);
+        assert.equal(turn.role,'user');
+        assert.deepEqual(turn.content,protocol === 'chat' ? 'fixture-task' : [{type:'input_text',text:'fixture-task'}]);
+      }
       if (kind === 'auth-reject401' || kind === 'auth-reject403') {
         const status = Number(kind.slice(-3));
         res.writeHead(status, {'content-type':'application/json'});
@@ -330,12 +332,10 @@ async function runScenario(name, protocol, kind, isPty = false) {
         return;
       }
 
-      // 挂起场景：返回 SSE 响应头后不再发送数据；非 PTY 时发送 SIGINT 以测试取消。
-      if (kind === 'stall' || kind === 'exit-busy' || (isPty && (kind === 'cancel' || kind === 'term') && rounds === 1)) {
+      if (kind === 'exit-busy' || ((kind === 'cancel' || kind === 'term') && rounds === 1)) {
         stalled = true;
         if (kind === 'exit-busy') await writeFile(join(project, 'exit-busy-arrived'), 'ready', {mode:0o600});
         res.writeHead(200, {'content-type':'text/event-stream'}); res.flushHeaders();
-        if (!isPty && ownsChild()) signalChild.kill('SIGINT');
         return;
       }
 
@@ -603,9 +603,15 @@ async function runScenario(name, protocol, kind, isPty = false) {
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:KEY,
       THIN_APP_BIN:app, THIN_APP_TEST_HOME:home, THIN_APP_TEST_PROJECT:project, THIN_APP_TEST_URL:url, THIN_APP_TEST_MODE:kind};
 
-    // 除 help、no-config 与 auth-missing 外写入 config.json：指定 provider、模型协议、上下文与各项限制。
-    // legacy-config 只写旧文件，确认程序不会悄悄回退并连接其中配置的服务。
-    if (kind !== 'help' && kind !== 'no-config' && kind !== 'auth-missing') {
+    if (kind === 'legacy-config') env.THIN_APP_TEST_MODE = 'auth-missing';
+    else if (!dedicatedMode) {
+      env.THIN_APP_TEST_MODE = 'fixture-turn';
+      env.THIN_APP_TEST_PROMPT = 'fixture-task';
+      env.THIN_APP_TEST_EXPECT = kind.startsWith('auth-reject') ? `[HTTP ${kind.slice(-3)}]: fixture-provider-secret-must-not-render` :
+        ['malformed','truncated'].includes(kind) ? '✗' : kind === 'idle-peer' ? 'idle-peer-final-answer' : 'fixture-answer';
+    }
+    // legacy-config only seeds the ignored file: no activation or API key input.
+    if (kind !== 'auth-missing') {
       await mkdir(join(home,'.thin'));
       const filename = kind === 'legacy-config' ? 'auth.json' : 'config.json';
       // 空白文件走交互初始化；待激活配置始终使用回环服务，绝不向公共端点发送密钥或消息。
@@ -615,14 +621,14 @@ async function runScenario(name, protocol, kind, isPty = false) {
       await writeFile(join(home,'.thin',filename), content);
     }
 
-    // 启动参数：help 使用 --help；其它使用 --print 任务；PTY 不传参数。
-    const args = kind === 'help' ? ['--help'] : ['--print','fixture-task'];
+    // Go login schedules a MANUAL metadata claim even with a fresh cache.
+    // A non-regular cache is refused before either official or public fetch;
+    // the registered built-ins remain available for the picker checks.
+    if (kind === 'auth-go') await mkdir(join(home,'.thin/model-metadata.json'),{mode:0o700});
 
     const navigationConfig = kind === 'menu-navigation' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     const selectionConfig = kind === 'model-select' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
-    // 运行 CLI 或 PTY 驱动（PTY 超时 90 秒，其它 30 秒）。
-    const result = await execute(isPty?pty:app, isPty?[]:args, env, project, (child, owns) => {
-      signalChild=child; ownsChild=owns;
+    const result = await execute(pty, [], env, project, child => {
       if (kind === 'model-select') {
         let markers = '';
         child.stderr.on('data', chunk => {
@@ -630,23 +636,21 @@ async function runScenario(name, protocol, kind, isPty = false) {
           if (markers.includes('SELECTION_GATE=release\n')) releaseSelection();
         });
       }
-    }, isPty?90000:30000);
+    }, 90000);
 
     // 先检查伪造服务的断言错误，避免被 CLI 的失败掩盖。
     if (fixtureError) throw fixtureError;
-    // 失败类场景必须以非零码退出；其余场景必须返回 0。
-    const failureCase = ['no-config','legacy-config','malformed','truncated','stall','auth-reject401','auth-reject403'].includes(kind);
-    if (failureCase) assert.notEqual(result.code, 0, `${name} unexpectedly succeeded`);
-    else {
+    // A failed model turn is visible in the TUI, not a driver exit code.
+    if (result.code !== 0) {
       // 只提取 thin:/error: 后的标识符作为诊断信息，不输出原始内容。
       const codes = [...result.output.matchAll(/(?:thin:|error:)\s+[A-Za-z_][A-Za-z0-9_]*/g)].slice(-10).map(m=>m[0]).join(', ');
-      if (kind === 'auth-go' && result.code !== 0) {
+      if (kind === 'auth-go') {
         const error = new Error('Go login PTY failed');
         error.fixtureCase = 'login/go';
         error.fixtureCheck = codes.replaceAll(', ', ' ') || 'no safe error code';
         throw error;
       }
-      if (kind === 'model-select' && result.code !== 0) {
+      if (kind === 'model-select') {
         const error = new Error('owned selection PTY failed');
         const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
         error.fixtureCase = `selection/${protocol}`;
@@ -654,38 +658,44 @@ async function runScenario(name, protocol, kind, isPty = false) {
         if (result.selectionFrameDiag) error.fixtureCheck += ` ${result.selectionFrameDiag}`;
         throw error;
       }
-      if (isPty && result.code !== 0) {
-        const error = new Error('owned PTY failed');
-        const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
-        error.fixtureCase = `pty/${kind}`;
-        error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}${codes ? ` ${codes.replaceAll(', ', ' ')}` : ''}`;
-        if (kind === 'stream-markdown') {
-          const index = result.output.match(/(?:^|\n)Markdown assertion index: (\d+)\r?(?=\n|$)/);
-          if (index) error.fixtureCheck += ` Markdown assertion index: ${index[1]}`;
-        }
-        // Only numeric/missing row positions, never raw terminal or auth text.
-        if (kind === 'menu-navigation') {
-          const rows = result.output.match(/menu missing: prior=(null|\d+) candidate=(null|\d+) composer=(null|\d+);/);
-          if (rows) error.fixtureCheck += ` menu rows ${rows.slice(1).join('/')}`;
-        }
-        throw error;
+      const error = new Error('owned PTY failed');
+      const lines = [...result.output.matchAll(/app_pty_test\.zig:(\d+):/g)].slice(0,6).map(match => match[1]).join('-') || 'unknown';
+      error.fixtureCase = `pty/${kind}`;
+      error.fixtureCheck = `PTY code ${result.code} at ${lines} requests ${requests}${codes ? ` ${codes.replaceAll(', ', ' ')}` : ''}`;
+      if (kind === 'stream-markdown') {
+        const index = result.output.match(/(?:^|\n)Markdown assertion index: (\d+)\r?(?=\n|$)/);
+        if (index) error.fixtureCheck += ` Markdown assertion index: ${index[1]}`;
       }
-      assert.equal(result.code, 0, `${name}: exit ${result.code}; ${codes || 'no safe error code'}; captured ${result.output.length} bytes (not rendered)`);
+      if (kind === 'menu-navigation') {
+        const rows = result.output.match(/menu missing: prior=(null|\d+) candidate=(null|\d+) composer=(null|\d+);/);
+        if (rows) error.fixtureCheck += ` menu rows ${rows.slice(1).join('/')}`;
+      }
+      throw error;
     }
 
-    if (isPty && !['term','output'].includes(kind)) {
+    if (!['term','output'].includes(kind)) {
       const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','auth-missing','auth-empty','menu-navigation','auth-go','model-select-empty'].includes(kind);
+      const silentExit = ['exit-no-submit','exit-unconfigured','exit-batched','exit-secret','auth-missing','auth-empty','legacy-config','menu-navigation','auth-go','model-select-empty'].includes(kind);
       if (silentExit) assert.equal(ids.length,0, 'empty exit must not announce a session');
       else if (kind === 'model-select') assert(ids.length <= 1); // Transient unsaved profiles can refuse checkpointing.
       else assert.equal(ids.length,1, 'saved conversation must announce exactly one session id');
       const announced = ids[0]?.[1];
       const logDir = join(project,'.thin/sessions');
+      const terminal = [];
       if (announced && await exists(logDir) && (await stat(logDir)).isDirectory()) {
         for (const file of (await readdir(logDir)).filter(name=>name.endsWith('.jsonl'))) {
           assert(file.startsWith(`${announced}-`), 'archive filename differs from announced identity');
-          for (const line of (await readFile(join(logDir,file),'utf8')).trimEnd().split('\n').filter(Boolean)) assert.equal(JSON.parse(line).session,announced, 'record identity differs from immutable owner identity');
+          for (const line of (await readFile(join(logDir,file),'utf8')).trimEnd().split('\n').filter(Boolean)) {
+            const row = JSON.parse(line);
+            assert.equal(row.session,announced,'record identity differs from immutable owner identity');
+            if (row.event === 'finished') terminal.push(row.data);
+          }
         }
+      }
+      if (!dedicatedMode && kind !== 'legacy-config') {
+        const failed = kind.startsWith('auth-reject') || ['malformed','truncated'].includes(kind);
+        assert.deepEqual(terminal.map(row=>row.status),[failed ? 'failed' : 'success']);
+        if (kind.startsWith('auth-reject')) assert.equal(terminal[0].http_status,Number(kind.slice(-3)));
       }
     }
     if (kind === 'exact-edit') {
@@ -703,6 +713,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
     }
     if (kind === 'auth-go') {
       const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
+      assert.deepEqual(await readdir(join(home,'.thin/model-metadata.json')),[],'metadata obstruction was replaced');
       assert.equal(disk.llm.providers['opencode-go'].api_key, 'fixture-secret-never-log');
       assert.equal(disk.llm.default, 'local/fixture-model');
       assert.equal(disk.llm.providers.local.base_url, url, 'login must not silently switch active/global provider');
@@ -728,12 +739,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
       if (kind === 'exit-busy') assert(stalled);
     }
 
-    // --help remains side-effect free. Missing canonical config initializes the
-    // same new schema as the TUI, but no key means no request or conversation state.
-    if (kind === 'help') {
-      assert.equal(requests,0); assert(!await exists(join(home,'.thin'))); assert(!await exists(join(project,'.thin')));
-      assert(result.output.includes('Usage: thin'));
-    } else if (kind === 'no-config' || kind === 'legacy-config') {
+    if (kind === 'legacy-config') {
       assert.equal(requests,0);
       const path = join(home,'.thin/config.json');
       const initialized = JSON.parse(await readFile(path,'utf8'));
@@ -744,27 +750,14 @@ async function runScenario(name, protocol, kind, isPty = false) {
       assert(!('local' in initialized.llm.providers), 'old filename must not supply connection or credentials');
       assert.equal((await stat(path)).mode & 0o777,0o600);
       assert.equal(initialized.llm.reasoning_effort,'off');
-      const projectThin = join(project,'.thin');
-      assert(!await exists(projectThin), 'failed activation created project storage');
-      if (kind === 'legacy-config') {
-        const ignored = JSON.parse(await readFile(join(home,'.thin/auth.json'),'utf8'));
-        assert.equal(ignored.llm.default,'local/fixture-model', 'ignored old filename was modified');
-      }
-    } else if (!failureCase && !isPty) assert(result.output.includes('fixture-answer'));
+      await noSubmissionState(project);
+      const ignored = JSON.parse(await readFile(join(home,'.thin/auth.json'),'utf8'));
+      assert.equal(ignored.llm.default,'local/fixture-model', 'ignored old filename was modified');
+    }
 
     if (kind === 'auth-reject401' || kind === 'auth-reject403') {
       assert.equal(requests, 1, 'authentication failure must not retry');
-      assert(result.output.includes(`[HTTP ${kind.slice(-3)}]`), 'HTTP status lost');
-      // The row shows the provider's own error text, not a category or a hint.
-      assert(result.output.includes('fixture-provider-secret-must-not-render'), 'raw provider cause lost');
-      assert(!result.output.includes('/ authentication'), 'internal failure category leaked');
-      assert(!result.output.includes('check /login'));
-      assert(!result.output.includes(KEY));
-    }
-    // 帮助与缺少新配置时的诊断均应指向 config.json，而不是旧文件名。
-    if (['help','no-config','legacy-config'].includes(kind)) {
-      assert(result.output.includes('~/.thin/config.json'));
-      assert(!result.output.includes('~/.thin/auth.json'));
+      // The driver checks the HTTP status adjacent to the provider's raw cause.
     }
 
     // 交互配置验收：驱动检查屏幕、密钥脱敏与终端恢复，这里检查持久化与网络/文件副作用。
@@ -855,10 +848,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
     }
 
     // 取消类场景必须确实到达挂起点。
-    if (kind === 'stall' || kind === 'cancel' || kind === 'term') assert(stalled, 'cancel never reached HTTP fixture');
-
-    // stall：SIGINT 应使 CLI 以 130（128 + SIGINT）退出。
-    if (kind === 'stall') assert.equal(result.code, 130, 'SIGINT must return canceled status');
+    if (kind === 'cancel' || kind === 'term') assert(stalled, 'cancel never reached HTTP fixture');
     // cancel：取消后 CLI 应能继续发起第二轮请求。
     if (kind === 'cancel') assert.equal(rounds,2, 'did not resume after cancel');
     if (kind === 'model-select-empty') {
@@ -891,8 +881,7 @@ async function runScenario(name, protocol, kind, isPty = false) {
     if (kind === 'file-stats') assert.equal(requests,2, 'file stats request count');
     if (kind === 'idle-peer') {
       assert.equal(requests,2, 'idle peer must issue exactly the two intended calls');
-      assert(result.output.includes('idle-peer-final-answer'), 'idle peer final body missing');
-      assert(!result.output.includes('ModelRequestFailed'), 'idle peer transport still failed');
+      // fixture-turn checks the final answer on the actual terminal.
     }
 
     // 场景通过，输出请求数与摘要数（不含内容）。
@@ -954,7 +943,8 @@ try {
   } else if (process.argv.includes('--tool-presentation-only')) {
     for (const kind of ['tool-icons','file-stats','memory-summary']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (!watchdogOnly) {
-  // 运行全部场景：先测无配置的 help 与 print，再对 chat 与 responses 运行通用场景，最后运行 PTY 场景（仅 chat）。
+  // Help/version and one-shot SIGINT exit status are retired; removed flag
+  // refusals are checked below. Interactive cancellation uses its real UI.
   await scenario('PTY compact menu navigation','chat','menu-navigation',true);
   await scenario('PTY manual context compaction','chat','manual-compact',true);
   await scenario('PTY read failure reason','chat','read-error',true);
@@ -964,26 +954,25 @@ try {
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
   for (const kind of ['exit-batched','exit-no-submit','exit-recorded','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
-  await scenario('owned CLI exact edit','chat','exact-edit');
-  await scenario('help without configuration','chat','help');
-  await scenario('print without configuration','chat','no-config');
+  await scenario('PTY exact edit','chat','exact-edit');
   await scenario('legacy configuration is not loaded','chat','legacy-config');
   for (const status of [401,403]) await scenario(`Responses authentication ${status}`,'responses',`auth-reject${status}`);
 
   // 对两种协议分别运行全部通用场景。
   for (const protocol of ['chat','responses']) {
-    for (const kind of ['plain','auto','ordinary-tools','compact','malformed','truncated','stall','idle-peer']) await scenario(`${protocol}/${kind}`,protocol,kind);
+    for (const kind of ['plain','auto','ordinary-tools','compact','malformed','truncated','idle-peer']) await scenario(`${protocol}/${kind}`,protocol,kind);
   }
 
-  // PTY 场景：通过 thin-app-pty 驱动交互式终端，仅使用 chat 协议。
+  await scenario('Responses interactive cancel and resume','responses','cancel',true);
+  // Additional mode-specific PTY checks use chat.
   for (const kind of ['unicode','regular-two','keyboard-history','esc-cancel-tool','stream-markdown','stream-native-history','architecture-table','tool-icons','file-stats','memory-summary','auto-tools','cancel','term','output','auth-missing','auth-empty','auth-activate']) await scenario(`PTY/${kind}`,'chat',kind,true);
-  await timed('suite', 'review', () => reviewRegressions(app));
+  await timed('suite', 'review', () => reviewRegressions({app,pty,execute}));
   await timed('suite', 'log', () => logRegressions(app,pty));
   await timed('suite', 'settings', () => settingsRegressions({app,pty,execute,send}));
   await timed('suite', 'image-model', () => imageModelRegressions({app,pty,execute,send}));
   await timed('suite', 'settings-values', () => settingsValuesRegressions({app,pty,execute,send}));
   await timed('suite', 'selection-restore', () => selectionRestoreRegressions({app,pty,execute}));
-  console.log('Application fixture suite passed; general PTY tests exercise chat, model selection also covers responses.');
+  console.log('Application fixture suite passed; chat and responses exercised through the TUI.');
   }
 
 // 顶层捕获：任何场景失败都打印脱敏后的错误（替换密钥、去除控制字符），并以退出码 1 结束。

@@ -70,11 +70,12 @@ function sendPrimary(res,text,calls = []) {
 
 export async function imageModelRegressions({app,pty,execute}) {
   for (const kind of ['pty','success','malformed','timeout']) {
-    const isPty = kind === 'pty';
+    // Only the menu scenario changes the image model during a conversation.
+    const menu = kind === 'pty';
     const root = await mkdtemp(join(tmpdir(),'thin-image-model-'));
     const home = join(root,'home'), project = join(root,'project'), configPath = join(home,'.thin/config.json');
     let stage = 'prepare', fixtureError, mainPosts = 0, auxPosts = 0, connections = 0;
-    let primarySocket, primarySystem, primaryTools, original, baseline, selected = !isPty, off = false;
+    let primarySocket, primarySystem, primaryTools, original, baseline, selected = !menu, off = false;
     const sockets = new Set(), gates = [];
     let gateQueue = Promise.resolve();
     const fail = error => { fixtureError ??= error; };
@@ -87,7 +88,7 @@ export async function imageModelRegressions({app,pty,execute}) {
         if (req.url === '/aux/v1/chat/completions') {
           auxPosts++;
           assert(selected && !off); assert.equal(auxPosts,1);
-          assert.equal(mainPosts,isPty ? 2 : 1);
+          assert.equal(mainPosts,menu ? 2 : 1);
           assert.notEqual(req.socket,primarySocket);
           assert.equal(req.headers.authorization,`Bearer ${AUX_KEY}`);
           assert.deepEqual(Object.keys(body).sort(),['messages','model','stream','thinking']);
@@ -118,7 +119,7 @@ export async function imageModelRegressions({app,pty,execute}) {
           return;
         }
         assert.equal(req.url,'/primary/v1/chat/completions');
-        mainPosts++; assert(mainPosts <= (isPty ? 4 : 2));
+        mainPosts++; assert(mainPosts <= (menu ? 4 : 2));
         assert.equal(req.headers.authorization,`Bearer ${MAIN_KEY}`);
         assert.equal(body.model,MAIN); assert.equal(body.reasoning_effort,'high');
         clean(Buffer.from(raw));
@@ -133,15 +134,15 @@ export async function imageModelRegressions({app,pty,execute}) {
         assert.deepEqual(names, [...FIRST_FOUR,...(selected && !off ? ['read_image'] : []),'background','edit_file']);
         assert.equal(names.at(-1),'edit_file');
         assert.deepEqual(body.tools.slice(0,4),primaryTools,'Image changed an existing tool schema');
-        if (isPty && mainPosts === 1) {
+        if (menu && mainPosts === 1) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,WARMUP);
           sendPrimary(res,'image-warmup-answer'); return;
         }
-        if (isPty) {
+        if (menu) {
           assert(body.messages.some(m=>m.role==='user' && m.content===WARMUP));
           assert(body.messages.some(m=>m.role==='assistant' && m.content==='image-warmup-answer'));
         }
-        if (mainPosts === (isPty ? 2 : 1)) {
+        if (mainPosts === (menu ? 2 : 1)) {
           assert.equal(auxPosts,0); assert.equal(body.messages.at(-1).content,TASK);
           sendPrimary(res,'',[{id:CALL,name:'read_image',arguments:JSON.stringify({path:FILE,question:QUESTION})}]);
         } else {
@@ -182,7 +183,7 @@ export async function imageModelRegressions({app,pty,execute}) {
         aux:provider('aux',AUX_KEY,{'deepseek-flash':{},'not-image':{protocol:'chat',context_tokens:32768}}),
         locked:provider('locked',null,{'deepseek-flash':{}}),
       }},limits:{...defaults,request_timeout_ms:kind === 'timeout' ? 300 : 10000}};
-      if (!isPty) baseline.image = {model:SELECTOR};
+      if (!menu) baseline.image = {model:SELECTOR};
       original = JSON.stringify(baseline);
       await writeFile(configPath,original,{mode:0o600});
       const expected = structuredClone(baseline);
@@ -222,12 +223,13 @@ export async function imageModelRegressions({app,pty,execute}) {
           }
         });
       };
-      stage = isPty ? 'owned PTY' : 'owned CLI';
-      const result = await execute(isPty ? pty : app,isPty ? [] : ['--no-model-auto-refresh','--print',TASK],{
+      stage = 'owned PTY';
+      const result = await execute(pty,[],{
         PATH:'/usr/bin:/bin',HOME:home,LANG:'C.UTF-8',TERM:'xterm-256color',
         THIN_APP_BIN:app,THIN_APP_TEST_HOME:home,THIN_APP_TEST_PROJECT:project,
-        THIN_APP_TEST_URL:`${origin}/primary/v1`,THIN_APP_TEST_MODE:'settings-image-model',
-      },project,isPty ? attach : undefined,isPty ? 90000 : 15000);
+        THIN_APP_TEST_URL:`${origin}/primary/v1`,
+        ...(menu ? {THIN_APP_TEST_MODE:'settings-image-model'} : {THIN_APP_TEST_MODE:'fixture-turn',THIN_APP_TEST_PROMPT:TASK,THIN_APP_TEST_EXPECT:'image-tool-result-verified'}),
+      },project,menu ? attach : undefined,menu ? 90000 : 15000);
       await gateQueue;
       if (fixtureError) throw fixtureError;
       clean(Buffer.from(result.output));
@@ -237,21 +239,15 @@ export async function imageModelRegressions({app,pty,execute}) {
         stage += ` driver ${tag} source-lines ${lines.join('-')}`;
       }
       assert.equal(result.code,0); assert.equal(result.signal,null);
-      assert.equal(mainPosts,isPty ? 4 : 2); assert.equal(auxPosts,1); assert.equal(connections,2);
-      // Only a real interactive shutdown publishes a saved id; headless never does.
-      let savedId = null;
-      if (isPty) {
-        const saved = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-        assert.equal(saved.length,1,'saved session id missing');
-        savedId = saved[0][1];
-      }
-      if (isPty) {
+      assert.equal(mainPosts,menu ? 4 : 2); assert.equal(auxPosts,1); assert.equal(connections,2);
+      const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
+      assert.equal(ids.length,1,'saved session id missing');
+      const savedId = ids[0][1];
+      await assertConfigHome(home,{project,id:savedId});
+      if (menu) {
         assert.deepEqual(gates,['opened','canceled','selected','off']); await saved(false);
-        // This owner published a checkpoint, so its discovery record is retained.
-        await assertConfigHome(home,{project,id:savedId});
         assert.deepEqual((await readdir(project)).sort(),['.thin',FILE,...gates.map(n=>`image-model-release-${n}`)].sort());
       } else {
-        assert(result.output.includes('image-tool-result-verified'));
         assert.equal(await readFile(configPath,'utf8'),original);
         // Scan only emitted private storage, NOT the original PNG or config.
       }
@@ -269,22 +265,17 @@ export async function imageModelRegressions({app,pty,execute}) {
           if ((await stat(path)).isDirectory()) scanned += await scan(path);
           else {clean(await readFile(path));scanned++;}
         }
-        assert(scanned > 0,'logged CLI must exercise persisted history');
+        assert(scanned > 0,'logged turn must exercise persisted history');
         const sessionDir = join(project,'.thin/sessions');
         const sessionFiles = await readdir(sessionDir);
         assert(sessionFiles.some(n=>n.endsWith('.jsonl')),'diagnostic journal missing');
-        if (isPty) {
-          // Headless print journals diagnostics but has no interactive resume
-          // checkpoint. The real logged PTY must publish canonical state.
-          const checkpoint = sessionFiles.filter(n=>n.endsWith('.session'));
-          assert.equal(checkpoint.length,1,'canonical checkpoint missing');
-          assert.equal(checkpoint[0],`${savedId}.session`,'checkpoint does not match saved id');
-          const bytes = await readFile(join(sessionDir,checkpoint[0]));
-          assert(bytes.includes(Buffer.from(DESCRIPTION)),'image result absent from checkpoint');
-          assert(bytes.includes(Buffer.from('image-off-verified')),'final checkpoint not current');
-        }
+        const checkpoint = sessionFiles.filter(n=>n.endsWith('.session'));
+        assert.deepEqual(checkpoint,[`${savedId}.session`],'checkpoint does not match saved id');
+        const bytes = await readFile(join(sessionDir,checkpoint[0]));
+        if (kind === 'pty' || kind === 'success') assert(bytes.includes(Buffer.from(DESCRIPTION)),'image result absent from checkpoint');
+        assert(bytes.includes(Buffer.from(menu ? 'image-off-verified' : 'image-tool-result-verified')),'final checkpoint not current');
       }
-      console.log(`PASS image-model/${kind}: primary=${mainPosts} aux=1 TCP=2; isolated exact PNG/auth; textual canonical result; ${isPty ? 'menu HTTP=0, socket retained, Off removes fifth tool' : 'persisted storage scanned, no payload/credential leak, no retry'}`);
+      console.log(`PASS image-model/${kind}: primary=${mainPosts} aux=1 TCP=2; isolated exact PNG/auth; textual canonical result; ${menu ? 'menu HTTP=0, socket retained, Off removes fifth tool' : 'persisted storage scanned, no payload/credential leak, no retry'}`);
     } catch (error) {
       const safe = new Error('image model fixture failed');
       safe.fixtureCase = `settings/image-model-${kind}`;

@@ -47,4 +47,11 @@ pub const SavedSession = struct {
     id: [32]u8,
     modified_ms: i64,
     title: Title = .{},
+    /// Owned canonical project for daemon rows; foreground rows are launcher-local.
+    project: ?[]const u8 = null,
 };
+
+pub fn freeSavedSessions(a: std.mem.Allocator, sessions: []SavedSession) void {
+    for (sessions) |row| if (row.project) |project| a.free(project);
+    a.free(sessions);
+}

@@ -119,7 +119,7 @@ const AttachStage = enum { attached, busy, unknown, gone, outdated };
 /// authorize a resume.
 fn dialStage(err: anyerror) AttachStage {
     return switch (err) {
-        error.FileNotFound, error.ConnectionRefused, error.NotDir => .gone,
+        error.FileNotFound, error.ConnectionRefused => .gone,
         else => .unknown,
     };
 }
@@ -288,7 +288,6 @@ const Request = struct {
 // ---------------------------------------------------------------------------
 
 const max_preview_bytes = 96;
-const max_label_bytes = 64;
 
 const SnapshotCache = struct {
     background: @import("../core/background_status.zig").View = .{},
@@ -308,8 +307,6 @@ const SnapshotCache = struct {
     newest_id: ?u64 = null,
     newest_bytes: u64 = 0,
     context: ?r.ContextSnapshot = null,
-    label_len: u8 = 0,
-    label: [max_label_bytes]u8 = undefined,
     preview_count: u8 = 0,
     previews: [session_client.max_previews]Preview = @splat(.{}),
 
@@ -365,12 +362,14 @@ const Pub = struct {
 // Client
 // ---------------------------------------------------------------------------
 
+const ClientMode = enum { foreground, connect };
+
 pub const Client = struct {
     a: std.mem.Allocator,
     io: std.Io,
     uid: u32,
     environ: ?*const std.process.Environ.Map,
-    mode: cli.Mode,
+    mode: ClientMode,
 
     /// Launcher root (HOME) and the initial launcher directory. The next
     /// explicit submission creates a session there.
@@ -391,6 +390,8 @@ pub const Client = struct {
     session: ?ids.Id = null,
     /// Canonical project reported by the verified owner of the current view.
     view_project: ?[]u8 = null,
+    // Worker-local IDs and controller epochs can coincide across projects.
+    view_serial: u64 = 0,
     epoch: u64 = 0,
     next_req: u64 = 0,
     /// Set only while a communication owner task has exclusive access.
@@ -467,7 +468,7 @@ pub const Client = struct {
         a: std.mem.Allocator,
         io: std.Io,
         environ: ?*const std.process.Environ.Map,
-        mode: cli.Mode,
+        mode: ClientMode,
         launcher: []const u8,
         root: []const u8,
     ) !*Client {
@@ -766,12 +767,11 @@ pub const Client = struct {
         return .{
             // Serving readiness is backend capability, not the current view: a
             // worker transport, or a launcher that can still get one. A revoked
-            // foreground/attach view starts its own worker on the next explicit
-            // submit; only --connect needs a live control socket for that.
+            // foreground view starts its own worker on the next explicit
+            // submit; only a daemon launcher needs a live control socket for that.
             .available = !self.initial_settings_loading and !self.stream_recovery_pending and !(self.stream_expected and self.need_history) and (self.conn != null or switch (self.mode) {
-                .foreground, .attach => true,
+                .foreground => true,
                 .connect => self.control != null,
-                else => false,
             }),
             // Attachment is still only a worker connection with a control epoch.
             .attached = self.conn != null and self.epoch != 0,
@@ -779,7 +779,6 @@ pub const Client = struct {
             .mode = if (cache.valid) cache.phase else null,
             .task_kind = if (cache.valid) cache.kind else .prompt,
             .session_id = self.session,
-            .session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null,
             .launcher_dir = try arena.dupe(u8, self.launcher),
             .control_epoch = self.epoch,
             .queue_revision = if (cache.valid) cache.revision else 0,
@@ -803,8 +802,6 @@ pub const Client = struct {
         state.background = cache.background;
         state.available = cfg.available and (self.conn != null or self.control != null);
         state.busy = (cache.valid and cache.busy) or (self.need_history and self.snap.busy);
-        state.session_label = if (cache.valid and cache.label_len != 0) try arena.dupe(u8, cache.label[0..cache.label_len]) else null;
-        state.launcher_dir = try arena.dupe(u8, self.launcher);
         state.control_epoch = self.epoch;
         state.initial_context = if (cache.valid) cache.context else null;
         state.model = try arena.dupe(u8, cfg.model);
@@ -1039,12 +1036,6 @@ pub const Client = struct {
             },
             else => {},
         };
-        if (get.text(object, "label")) |label| {
-            var clipped = @min(label.len, max_label_bytes);
-            while (clipped > 0 and clipped < label.len and label[clipped] & 0xc0 == 0x80) clipped -= 1;
-            @memcpy(cache.label[0..clipped], label[0..clipped]);
-            cache.label_len = @intCast(clipped);
-        }
         var preview_count: usize = 0;
         if (get.field(object, "previews")) |value| switch (value) {
             .array => |array| for (array.items) |entry| {
@@ -1852,9 +1843,8 @@ pub const Client = struct {
         }
     }
 
-    /// Greet and take write control on an already dialed candidate. This path
-    /// does not start a watch, so it is also suitable for close-only requests.
-    fn openController(self: *Client, conn: unix.Connection, id: ?ids.Id, takeover: bool, expected: ?*const registry.Record) !Candidate {
+    /// Greet and take write control before starting the candidate watch.
+    fn openController(self: *Client, conn: unix.Connection, id: ids.Id, expected: ?*const registry.Record) !Candidate {
         var owned = conn;
         errdefer owned.close();
         var session: ids.Id = undefined;
@@ -1883,16 +1873,14 @@ pub const Client = struct {
             if (pid != owned.peer.pid) return error.PeerPidMismatch;
             if (expected) |record| {
                 if (pid != record.pid or owner != record.owner) return error.OwnerMismatch;
-            }
+            } else if (owner != (if (self.worksFromDaemon()) cli.WorkerOwner.daemon else cli.WorkerOwner.foreground)) return error.OwnerMismatch;
             // The greeting carries the authoritative session identity for this
             // view, even when the caller already knows the endpoint.
             const raw = resp.text("session") orelse return error.ProtocolError;
             if (raw.len != 32) return error.ProtocolError;
             const greeted: ids.Id = raw[0..32].*;
             if (!ids.valid(greeted)) return error.ProtocolError;
-            if (id) |want| {
-                if (!std.mem.eql(u8, &greeted, &want)) return error.SessionNotFound;
-            }
+            if (!std.mem.eql(u8, &greeted, &id)) return error.SessionNotFound;
             session = greeted;
         }
         var epoch: u64 = 0;
@@ -1900,7 +1888,7 @@ pub const Client = struct {
             var req = try self.request(.attach);
             defer req.deinit();
             try req.put("write", true);
-            try req.put("takeover", takeover);
+            try req.put("takeover", false);
             var resp = try self.exchangeOn(&owned, &req, join_timeout_ms);
             defer resp.deinit();
             epoch = resp.uint("epoch") orelse return error.ProtocolError;
@@ -2009,6 +1997,7 @@ pub const Client = struct {
         self.session = view.session;
         if (self.view_project) |project| self.a.free(project);
         self.view_project = view.project;
+        self.view_serial +%= 1;
         view.project = null;
         self.epoch = view.epoch;
         self.cursor = view.history_base;
@@ -2023,12 +2012,12 @@ pub const Client = struct {
     /// Attach the endpoint of one worker and take write control. Typed control
     /// outcomes survive; any dial/protocol failure of the new view is a
     /// transport failure (the old view was already untouched).
-    fn joinWorker(self: *Client, endpoint: []const u8, id: ?ids.Id, takeover: bool, project: []const u8) !void {
+    fn joinWorker(self: *Client, endpoint: []const u8, id: ids.Id, project: []const u8) !void {
         const conn = unix.connect(self.a, endpoint, self.uid, self.waitFor(join_timeout_ms)) catch |err| return switch (err) {
             error.Canceled, error.OutOfMemory => err,
             else => transport(err),
         };
-        var view = self.openController(conn, id, takeover, null) catch |err| return switch (err) {
+        var view = self.openController(conn, id, null) catch |err| return switch (err) {
             error.Busy, error.StaleControl, error.SessionNotFound, error.ProtocolMismatch, error.Canceled, error.OutOfMemory => err,
             else => transport(err),
         };
@@ -2043,12 +2032,12 @@ pub const Client = struct {
     /// Only failure of the initial controller dial can prove an endpoint gone.
     /// Once connected, no greeting, attach, watch or baseline failure can
     /// authorize creation of a second owner.
-    fn attachEndpoint(self: *Client, record: *const registry.Record, id: ids.Id, takeover: bool) !AttachStage {
+    fn attachEndpoint(self: *Client, record: *const registry.Record, id: ids.Id) !AttachStage {
         const conn = unix.connect(self.a, record.endpoint, self.uid, self.waitFor(join_timeout_ms)) catch |err| return switch (err) {
             error.Canceled, error.OutOfMemory => err,
             else => dialStage(err),
         };
-        var view = self.openController(conn, id, takeover, record) catch |err| return switch (err) {
+        var view = self.openController(conn, id, record) catch |err| return switch (err) {
             error.Busy, error.StaleControl => .busy,
             error.ProtocolMismatch => .outdated,
             error.Canceled, error.OutOfMemory => return err,
@@ -2082,14 +2071,6 @@ pub const Client = struct {
         return self.published.items.len != 0;
     }
 
-    fn ownsSession(self: *const Client, id: ?ids.Id) bool {
-        const target = id orelse return false;
-        for (self.published.items) |entry| {
-            if (std.mem.eql(u8, &entry.id, &target)) return true;
-        }
-        return false;
-    }
-
     /// Retire this launcher's locator after its worker is gone. A complete
     /// checkpoint keeps the durable locator (liveness is still only the endpoint
     /// probe), and an entry already published by a later owner_instance or
@@ -2100,7 +2081,7 @@ pub const Client = struct {
         defer registry.freeRecord(self.a, &record);
         if (!std.mem.eql(u8, record.endpoint, entry.endpoint)) return;
         if (hasCheckpoint(self.a, self.io, entry.project, entry.id)) return;
-        reg.unpublish(entry.id, entry.project) catch {};
+        reg.unpublish(entry.id, entry.project, entry.endpoint) catch {};
     }
 
     fn retireAllPublished(self: *Client) void {
@@ -2112,31 +2093,15 @@ pub const Client = struct {
         self.published.clearRetainingCapacity();
     }
 
-    fn forgetPublished(self: *Client, id: ids.Id) void {
-        var index: usize = 0;
-        while (index < self.published.items.len) {
-            if (!std.mem.eql(u8, &self.published.items[index].id, &id)) {
-                index += 1;
-                continue;
-            }
-            const entry = self.published.items[index];
-            self.retirePublished(entry);
-            self.a.free(entry.project);
-            self.a.free(entry.endpoint);
-            _ = self.published.orderedRemove(index);
-        }
-    }
-
     /// Create one foreground-owned worker and publish its locator. Used by the
     /// ordinary foreground launcher and by an explicit history resume that must
     /// not touch the local view until it is really attached.
-    fn startOwnedWorker(self: *Client, project: []const u8, resume_id: ?ids.Id, restore_selection: ?ids.Id) !registry.Record {
+    fn startOwnedWorker(self: *Client, project: []const u8, resume_id: ?ids.Id) !registry.Record {
         const workers = try self.ensureWorkers();
         const record = workers.create(.{
             .project = project,
             .owner = .foreground,
             .@"resume" = resume_id,
-            .restore_selection = restore_selection,
             .auto_refresh_models = self.auto_refresh,
         }) catch |err| {
             // The management-UI aliases (Busy/SessionNotFound) are for an
@@ -2150,18 +2115,23 @@ pub const Client = struct {
             return err;
         };
         self.publishOwned(record) catch |err| {
-            workers.close(record.id, record.project) catch {};
+            workers.close(record.id, record.project, record.endpoint) catch {};
             return err;
         };
         return record;
     }
 
-    fn connectDaemonControl(self: *Client) !void {
+    /// A missing or stale socket permits standalone startup. Once connected,
+    /// any identity, protocol or I/O failure must be reported, not bypassed.
+    fn connectDaemonControl(self: *Client) !bool {
         const dir = try self.runtimeDirectory();
         const path = try dir.join(self.a, control_socket);
         defer self.a.free(path);
         const conn = unix.connect(self.a, path, self.uid, self.waitFor(quick_timeout_ms)) catch |err| {
-            return transport(err);
+            return switch (err) {
+                error.FileNotFound, error.ConnectionRefused => false,
+                else => err,
+            };
         };
         self.control = conn;
         // From here the stored connection owns the descriptor exactly once.
@@ -2178,6 +2148,7 @@ pub const Client = struct {
         defer greeting.deinit();
         if (greeting.uint("protocol") != protocol.version) return error.ProtocolMismatch;
         if (!greeting.flag("daemon", false)) return error.ProtocolMismatch;
+        return true;
     }
 
     fn worksFromDaemon(self: *const Client) bool {
@@ -2202,14 +2173,13 @@ pub const Client = struct {
             if (raw.len != 32) return error.ProtocolError;
             const id: ids.Id = raw[0..32].*;
             if (!ids.valid(id)) return error.ProtocolError;
-            try self.joinWorker(endpoint, id, true, self.launcher);
+            try self.joinWorker(endpoint, id, self.launcher);
             return;
         }
-        // The foreground owner publishes its endpoint so SSH and
-        // `--attach` can discover it; a failed publication closes it again.
-        const record = try self.startOwnedWorker(self.launcher, null, null);
-        self.joinWorker(record.endpoint, record.id, true, record.project) catch |err| {
-            if (self.workers) |*workers| workers.close(record.id, record.project) catch {};
+        // Publish the new worker for resume; a failed publication closes it again.
+        const record = try self.startOwnedWorker(self.launcher, null);
+        self.joinWorker(record.endpoint, record.id, record.project) catch |err| {
+            if (self.workers) |*workers| workers.close(record.id, record.project, record.endpoint) catch {};
             return err;
         };
     }
@@ -2233,14 +2203,14 @@ pub const Client = struct {
     }
 
     fn controlRequest(self: *Client, op: protocol.Op) !Request {
-        if (self.control == null) try self.connectDaemonControl();
+        if (self.control == null and !try self.connectDaemonControl()) return error.Transport;
         var req = try self.request(op);
         req.target = .control;
         return req;
     }
 
     /// Route one settings-related request without spawning or registering a
-    /// session. A live worker gets the control epoch; a --connect launcher with
+    /// session. A live worker gets the control epoch; a daemon launcher with
     /// no worker sends the setup op over the control connection with the
     /// launcher project and no epoch; anything else has no owner to ask.
     fn trySettingsRequest(self: *Client, op: protocol.Op) !?Request {
@@ -2257,7 +2227,7 @@ pub const Client = struct {
         return req;
     }
 
-    /// A settings callback may start the local foreground worker. --connect
+    /// A settings callback may start the local foreground worker. A daemon launcher
     /// never creates or registers an empty session just to change a setting.
     fn settingsRequest(self: *Client, op: protocol.Op) !Request {
         if (self.conn == null and !self.worksFromDaemon()) try self.ensureSession();
@@ -2323,10 +2293,7 @@ pub const Client = struct {
         return switch (options) {
             .saved_sessions => self.manageSavedSessions(a),
             .new_session => self.manageNew(),
-            .@"resume" => |id| self.manageResume(a, id),
-            .attach => |args| self.manageAttach(args.id, args.takeover),
-            .detach => self.manageDetach(),
-            .close => |args| self.manageClose(args.id, args.force),
+            .@"resume" => |target| self.manageResume(a, target),
         };
     }
 
@@ -2343,91 +2310,109 @@ pub const Client = struct {
     }
 
     fn manageSavedSessions(self: *Client, a: std.mem.Allocator) !session_client.Outcome {
+        if (self.worksFromDaemon()) return .{ .saved_sessions = try self.daemonSessions(a) };
         var root = try fs.Root.open(a, self.io, self.launcher);
         defer root.deinit();
         return .{ .saved_sessions = try resume_store.list(&root, a) };
     }
 
-    fn manageResume(self: *Client, a: std.mem.Allocator, text: []const u8) !session_client.Outcome {
-        if (text.len != 32) return error.SessionNotFound;
-        const id: ids.Id = text[0..32].*;
-        if (!ids.valid(id)) return error.SessionNotFound;
-        if (self.conn != null) if (self.session) |current| if (self.view_project) |project| {
-            if (std.mem.eql(u8, &current, &id) and std.mem.eql(u8, project, self.launcher)) return .{ .notice = try a.dupe(u8, "Already attached") };
+    fn checkpointSummary(self: *Client, record: registry.Record) !?resume_store.Summary {
+        var root = try fs.Root.open(self.a, self.io, record.project);
+        defer root.deinit();
+        return resume_store.summary(&root, record.id);
+    }
+
+    /// Take only the kernel peer credentials of a checkpoint-less worker. No
+    /// protocol round trip, controller claim or worker request on picker open.
+    fn hasRecordedPeer(self: *Client, record: registry.Record) !bool {
+        if (record.endpoint.len == 0) return false;
+        var conn = unix.connect(self.a, record.endpoint, self.uid, self.waitFor(10)) catch |err| return switch (err) {
+            error.Canceled, error.OutOfMemory => err,
+            else => false,
         };
-        // Reserve the one caller-owned result before registry or filesystem I/O.
-        const notice = try a.dupe(u8, session_client.restored_notice);
-        errdefer a.free(notice);
+        defer conn.close();
+        return conn.peer.pid == record.pid;
+    }
+
+    fn daemonSessions(self: *Client, a: std.mem.Allocator) ![]resume_store.Summary {
         const reg = try self.ensureRegistry();
-        var record = try reg.resolve(self.a, id, self.launcher);
+        const records = try reg.daemonRecords(self.a);
+        defer registry.freeRecords(self.a, records);
+        var rows: std.ArrayList(resume_store.Summary) = .empty;
+        errdefer {
+            for (rows.items) |row| a.free(row.project.?);
+            rows.deinit(a);
+        }
+        for (records) |record| {
+            const saved = self.checkpointSummary(record) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => return err,
+                else => null, // A removed/inaccessible project cannot hide other sessions.
+            };
+            var row = saved orelse blk: {
+                if (!try self.hasRecordedPeer(record)) continue;
+                break :blk resume_store.Summary{ .id = record.id, .modified_ms = std.math.cast(i64, record.updated_ms) orelse 0 };
+            };
+            try rows.ensureUnusedCapacity(a, 1);
+            row.project = try a.dupe(u8, record.project);
+            rows.appendAssumeCapacity(row);
+        }
+        std.mem.sort(resume_store.Summary, rows.items, {}, struct {
+            fn less(_: void, left: resume_store.Summary, right: resume_store.Summary) bool {
+                if (left.modified_ms != right.modified_ms) return left.modified_ms > right.modified_ms;
+                const order = std.mem.order(u8, &left.id, &right.id);
+                if (order != .eq) return order == .lt;
+                return std.mem.order(u8, left.project.?, right.project.?) == .lt;
+            }
+        }.less);
+        return rows.toOwnedSlice(a);
+    }
+
+    fn manageResume(self: *Client, a: std.mem.Allocator, target: session_client.ResumeTarget) !session_client.Outcome {
+        const id = target.id;
+        if (!ids.valid(id)) return error.SessionNotFound;
+        const daemon = self.worksFromDaemon();
+        if (daemon != (target.project != null)) return error.SessionNotFound;
+        const project = target.project orelse self.launcher;
+        const current = self.conn != null and self.epoch != 0 and self.session != null and std.mem.eql(u8, &self.session.?, &id) and
+            self.view_project != null and std.mem.eql(u8, self.view_project.?, project);
+        const notice = try a.dupe(u8, if (current) "Already attached" else session_client.restored_notice);
+        errdefer a.free(notice);
+        if (!daemon and current) return .{ .notice = notice };
+
+        // The project from the UI is only a registry key, never a filesystem
+        // path until strict lookup has matched the full (project, id) pair.
+        const reg = try self.ensureRegistry();
+        const record = try reg.resolve(self.a, id, project);
+        defer if (record) |*found| registry.freeRecord(self.a, found);
         if (record) |*found| {
-            defer registry.freeRecord(self.a, found);
-            if (try self.attachRecorded(found, id, false)) {
+            if (daemon and found.owner != .daemon) return error.SessionNotFound;
+            if (current) {
+                if (found.endpoint.len == 0 or self.conn.?.peer.pid != found.pid) return error.Unavailable;
+                return .{ .notice = notice };
+            }
+            if (found.endpoint.len != 0 and try self.attachRecorded(found, id)) {
                 self.markSessionUsed(found.project, id);
                 return .{ .switched = true, .notice = notice };
             }
-        }
-        if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
-        try self.resumeSession(self.launcher, id);
+        } else if (daemon) return error.SessionNotFound;
+        // An empty endpoint is a durable historical locator, not a pathname
+        // from the previous runtime directory that this client may dial.
+        const selected = if (record) |found| found.project else self.launcher;
+        if (!hasCheckpoint(self.a, self.io, selected, id)) return error.SessionNotFound;
+        try self.resumeSession(selected, id);
         return .{ .switched = true, .notice = notice };
-    }
-
-    /// `/attach` and `--attach`: prefer the launcher project, then the unique
-    /// cross-project entry. A live owner is attached directly, a confirmed-dead
-    /// endpoint with a complete checkpoint is resumed into a new worker, and an
-    /// unreachable or foreign owner refuses instead of starting a second writer.
-    fn attachSession(self: *Client, id: ids.Id, takeover: bool) !session_client.Outcome {
-        // Re-attaching to the session already on screen is a no-op (only
-        // `--takeover` re-establishes the same control deliberately).
-        if (!takeover) if (self.conn != null) if (self.session) |current| {
-            if (std.mem.eql(u8, &current, &id)) return .{ .notice = try self.a.dupe(u8, "Already attached") };
-        };
-
-        const reg = try self.ensureRegistry();
-        var record: ?registry.Record = try reg.resolve(self.a, id, self.launcher);
-        if (record == null) record = try reg.resolve(self.a, id, null);
-        if (record == null) {
-            // No index entry: only this launcher project's own checkpoint may
-            // locate the history. A missing one keeps the current view as is.
-            if (!hasCheckpoint(self.a, self.io, self.launcher, id)) return error.SessionNotFound;
-            return self.resumeForAttach(self.launcher, id);
-        }
-        var found = record.?;
-        defer registry.freeRecord(self.a, &found);
-
-        const notice = try self.a.dupe(u8, "Attached");
-        const attached = self.attachRecorded(&found, id, takeover) catch |err| {
-            self.a.free(notice);
-            return err;
-        };
-        if (attached) {
-            self.markSessionUsed(found.project, id);
-            return .{ .switched = true, .notice = notice };
-        }
-        self.a.free(notice);
-        if (!hasCheckpoint(self.a, self.io, found.project, id)) return error.SessionNotFound;
-        const project = try self.a.dupe(u8, found.project);
-        defer self.a.free(project);
-        return self.resumeForAttach(project, id);
     }
 
     /// A false result means the endpoint is confirmed gone. The caller owns a
     /// preallocated notice, and retains it across a possible checkpoint restore.
-    fn attachRecorded(self: *Client, found: *const registry.Record, id: ids.Id, takeover: bool) !bool {
-        return switch (try self.attachEndpoint(found, id, takeover)) {
+    fn attachRecorded(self: *Client, found: *const registry.Record, id: ids.Id) !bool {
+        return switch (try self.attachEndpoint(found, id)) {
             .attached => true,
             .busy => error.Busy,
             .unknown => error.Unavailable,
             .outdated => error.ProtocolMismatch,
             .gone => false,
         };
-    }
-
-    fn resumeForAttach(self: *Client, project: []const u8, id: ids.Id) !session_client.Outcome {
-        const notice = try self.a.dupe(u8, session_client.restored_notice);
-        errdefer self.a.free(notice);
-        try self.resumeSession(project, id);
-        return .{ .switched = true, .notice = notice };
     }
 
     /// Restore one history into a brand-new worker without submitting anything.
@@ -2447,15 +2432,15 @@ pub const Client = struct {
             if (raw.len != 32) return error.ProtocolError;
             const session: ids.Id = raw[0..32].*;
             if (!ids.valid(session) or !std.mem.eql(u8, &session, &id)) return error.ProtocolError;
-            try self.joinWorker(endpoint, id, false, project);
+            try self.joinWorker(endpoint, id, project);
             self.markSessionUsed(project, id);
             return;
         }
         // Local mode owns the restored worker and publishes its locator.
-        const record = try self.startOwnedWorker(project, id, null);
-        self.joinWorker(record.endpoint, record.id, false, record.project) catch |err| {
+        const record = try self.startOwnedWorker(project, id);
+        self.joinWorker(record.endpoint, record.id, record.project) catch |err| {
             if (self.workers) |*workers| {
-                workers.close(record.id, record.project) catch {};
+                workers.close(record.id, record.project, record.endpoint) catch {};
             }
             return err;
         };
@@ -2468,137 +2453,6 @@ pub const Client = struct {
         var root = fs.Root.open(self.a, self.io, project) catch return;
         defer root.deinit();
         resume_store.touch(&root, id) catch {};
-    }
-
-    fn manageAttach(self: *Client, id_text: []const u8, takeover: bool) !session_client.Outcome {
-        if (id_text.len != 32) return error.SessionNotFound;
-        const id: ids.Id = id_text[0..32].*;
-        if (!ids.valid(id)) return error.SessionNotFound;
-        return self.attachSession(id, takeover);
-    }
-
-    fn manageDetach(self: *Client) !session_client.Outcome {
-        Client.detachFn(@ptrCast(self));
-        return .{ .notice = try self.a.dupe(u8, "Detached; the session keeps running") };
-    }
-
-    fn manageClose(self: *Client, id_text: []const u8, force: bool) !session_client.Outcome {
-        if (id_text.len != 32) return error.SessionNotFound;
-        const id: ids.Id = id_text[0..32].*;
-        if (!ids.valid(id)) return error.SessionNotFound;
-
-        // 1. The session on this connection: the owner decides about a busy task
-        //    and its epoch must authorize this very controller.
-        if (self.conn != null) if (self.session) |current| {
-            if (std.mem.eql(u8, &current, &id)) {
-                var req = try self.request(.close);
-                defer req.deinit();
-                try req.put("epoch", self.epoch);
-                try req.put("force", force);
-                var resp = try req.exchange(finish_timeout_ms);
-                defer resp.deinit();
-                if (!resp.flag("accepted", false)) return error.Busy;
-                self.loseView();
-                self.session = null;
-                self.forgetPublished(id);
-                self.rebuild();
-                return .{ .notice = try self.a.dupe(u8, "Session closed and saved") };
-            }
-        };
-
-        // A worker this launcher owns but this view does not show: whether its
-        // task is busy cannot be confirmed atomically from here, so closing it
-        // is always an explicit confirmation. Nothing is probed, stopped,
-        // cancelled or unpublished before the operator asks for `--force`.
-        if (self.ownsSession(id) and !force) {
-            return .{ .notice = try std.fmt.allocPrint(self.a, "Closing an owned session outside this view requires /close {s} --force", .{&id}) };
-        }
-
-        // 2. A worker this launcher owns: stop exactly that process, never a
-        //    cached pid and never somebody else's endpoint.
-        if (self.workers) |*workers| {
-            if (workers.isAlive(id)) {
-                const project = self.publishedProject(id);
-                workers.close(id, project) catch |err| return err;
-                self.forgetPublished(id);
-                return .{ .notice = try self.a.dupe(u8, "Session closed and saved") };
-            }
-        }
-
-        const reg = try self.ensureRegistry();
-        var record = (try reg.resolve(self.a, id, self.launcher)) orelse (try reg.resolve(self.a, id, null)) orelse return error.SessionNotFound;
-        defer registry.freeRecord(self.a, &record);
-        // 3. A daemon-owned session is closed by its owner through the control
-        //    socket. A daemon that did not create this worker (or no longer runs)
-        //    falls through to the endpoint path instead of claiming success.
-        if (record.owner == .daemon) {
-            // Managed by this launcher's daemon rather than by the worker's own
-            // control channel: a busy task cannot be checked atomically here, so
-            // the stop is confirmed first and nothing is asked of the daemon.
-            if (!force) return .{ .notice = try std.fmt.allocPrint(self.a, "Closing an owned session outside this view requires /close {s} --force", .{&id}) };
-            var handled = true;
-            self.closeViaDaemon(id, force) catch |err| switch (err) {
-                error.Busy => return error.Busy,
-                error.SessionNotFound, error.Transport, error.Unavailable => handled = false,
-                else => return err,
-            };
-            if (handled) return .{ .notice = try self.a.dupe(u8, "Session closed and saved") };
-        }
-        // 4. Another foreground owner: attach control on a fresh connection
-        //    first. An occupied console is refused; its process is never killed.
-        try self.closeViaEndpoint(&record, id, force);
-        if (self.session) |current| if (std.mem.eql(u8, &current, &id)) {
-            Client.detachFn(@ptrCast(self));
-            self.session = null;
-            self.rebuild();
-        };
-        return .{ .notice = try self.a.dupe(u8, "Session closed and saved") };
-    }
-
-    fn publishedProject(self: *Client, id: ids.Id) ?[]const u8 {
-        for (self.published.items) |entry| {
-            if (std.mem.eql(u8, &entry.id, &id)) return entry.project;
-        }
-        return null;
-    }
-
-    /// Ask the daemon to close one of its own sessions. `not_found` falls through
-    /// to the endpoint path because a previous daemon generation may still be
-    /// recorded while this service never created that worker.
-    fn closeViaDaemon(self: *Client, id: ids.Id, force: bool) !void {
-        var req = try self.controlRequest(.close);
-        defer req.deinit();
-        try req.put("session", id[0..]);
-        try req.put("force", force);
-        var resp = try req.exchange(finish_timeout_ms);
-        defer resp.deinit();
-        if (resp.flag("accepted", false)) return;
-        const reason = resp.text("reason") orelse "";
-        if (std.mem.eql(u8, reason, "busy")) return error.Busy;
-        return error.SessionNotFound;
-    }
-
-    /// Close a session owned by another foreground launcher: take control on a
-    /// dedicated connection (no takeover, so an attached console refuses), then
-    /// ask that owner to cancel/join/save and exit.
-    fn closeViaEndpoint(self: *Client, record: *const registry.Record, id: ids.Id, force: bool) !void {
-        const conn = unix.connect(self.a, record.endpoint, self.uid, self.waitFor(join_timeout_ms)) catch |err| return switch (err) {
-            error.Canceled, error.OutOfMemory => err,
-            else => transport(err),
-        };
-        var view = self.openController(conn, id, false, record) catch |err| return switch (err) {
-            error.Busy, error.StaleControl => error.Busy,
-            error.SessionNotFound, error.Canceled, error.OutOfMemory => err,
-            else => transport(err),
-        };
-        defer view.conn.close();
-        var req = try self.request(.close);
-        defer req.deinit();
-        try req.put("epoch", view.epoch);
-        try req.put("force", force);
-        var resp = try self.exchangeOn(&view.conn, &req, finish_timeout_ms);
-        defer resp.deinit();
-        if (!resp.flag("accepted", false)) return error.Busy;
     }
 
     // -- UI settings callbacks --------------------------------------------
@@ -3102,7 +2956,7 @@ fn parseProviders(a: std.mem.Allocator, next: *Pub, value: ?std.json.Value) !voi
 pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     const a = init.gpa;
     const io = init.io;
-    if (options.mode == .daemon or options.mode == .worker) return error.Unsupported;
+    if (options.mode != .foreground) return error.Unsupported;
 
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cwd_len = std.Io.Dir.cwd().realPath(io, &buf) catch return error.Unavailable;
@@ -3113,13 +2967,7 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
         if (value.len == 0 or !std.fs.path.isAbsolute(value)) break :blk cwd;
         break :blk value;
     };
-    // Worker projects and registry keys use the canonical path, while HOME
-    // itself remains unchanged as the credentials/index root.
-    var connect_root: ?fs.Root = if (options.mode == .connect) try fs.Root.open(a, io, home) else null;
-    defer if (connect_root) |*root| root.deinit();
-    const launcher = if (connect_root) |root| root.path else cwd;
-
-    const client = try Client.init(a, io, init.environ_map, options.mode, launcher, home);
+    const client = try Client.init(a, io, init.environ_map, .foreground, cwd, home);
     defer client.deinit();
     // Any startup failure after a worker is published still releases it before
     // `deinit` runs: `deinit` only fails the owner stop, it never cancels a
@@ -3129,40 +2977,20 @@ pub fn run(init: std.process.Init, options: cli.Options) !u8 {
     }
     client.auto_refresh = options.auto_refresh_models;
 
-    switch (options.mode) {
-        .foreground => {
-            // One foreground-owned worker, published before the TUI can block on
-            // it. A failed publication closes the worker again.
-            const record = client.startOwnedWorker(client.launcher, null, options.restore_selection) catch |err| {
-                report(io, "thin: could not start the session worker", err);
-                return err;
-            };
-            client.joinWorker(record.endpoint, record.id, true, record.project) catch |err| {
-                report(io, "thin: could not attach the session worker", err);
-                return err;
-            };
-        },
-        .connect => {
-            client.connectDaemonControl() catch |err| {
-                report(io, "thin: no running thin --daemon service for this user", err);
-                return err;
-            };
-            // Owner-reported setup readiness before the first frame, so the
-            // launcher never claims "Not configured" for a working service.
-            client.refreshSettings();
-            client.rebuild();
-        },
-        .attach => {
-            const id = options.attach_session orelse return error.InvalidArguments;
-            // Same resolution as `/attach`: live owner, or a confirmed-dead
-            // endpoint with a complete checkpoint. Never starts a daemon.
-            var outcome = client.attachSession(id, options.takeover) catch |err| {
-                report(io, "thin: could not attach that session", err);
-                return err;
-            };
-            outcome.deinit(a);
-        },
-        else => return error.Unsupported,
+    if (@import("../platform/capabilities.zig").daemon and try client.connectDaemonControl()) {
+        // Reuse the authenticated control socket; new sessions stay in cwd.
+        client.mode = .connect;
+        client.refreshSettings();
+        client.rebuild();
+    } else {
+        const record = client.startOwnedWorker(client.launcher, null) catch |err| {
+            report(io, "thin: could not start the session worker", err);
+            return err;
+        };
+        client.joinWorker(record.endpoint, record.id, record.project) catch |err| {
+            report(io, "thin: could not attach the session worker", err);
+            return err;
+        };
     }
 
     var cancel = p.Cancellation{};
@@ -3228,7 +3056,7 @@ fn writeErr(io: std.Io, bytes: []const u8) void {
 
 // One real written submit frame: its sequential envelope id and receipt nonce.
 
-// A --connect launcher with only a control socket: no worker and no session.
+// A daemon launcher with only a control socket: no worker and no session.
 
 // Parse one request the client actually wrote; the frame buffer is released.
 
@@ -3238,7 +3066,7 @@ fn writeErr(io: std.Io, bytes: []const u8) void {
 // regression needs are overridden, everything else stays the Host's own.
 
 // ---------------------------------------------------------------------------
-// Tests: launcher/attach/close wiring (offline, no worker process is started).
+// Tests: launcher and resume wiring (offline, no worker process is started).
 // ---------------------------------------------------------------------------
 
 // Parse one request the client wrote on an explicit connection.

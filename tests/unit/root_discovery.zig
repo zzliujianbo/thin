@@ -29,7 +29,6 @@ test {
     _ = @import("daemon/spawn.zig");
     if (@import("builtin").os.tag == .linux) {
         _ = @import("daemon/supervisor.zig");
-        _ = @import("daemon/ssh.zig");
     }
     // These modules are otherwise reached only through transitive imports;
     // reference them explicitly so filtered test-unit groups always enumerate
@@ -42,7 +41,6 @@ test {
     _ = @import("platform/posix_terminal.zig");
     _ = @import("platform/spawn.zig");
     _ = @import("platform/terminal_abi.zig");
-    _ = @import("platform/terminal_remote.zig");
     _ = @import("platform/wakeup.zig");
     _ = @import("platform/capabilities.zig");
     _ = @import("daemon/worker.zig");
@@ -96,7 +94,6 @@ test {
     _ = @import("ui/markdown.zig");
     _ = @import("ui/tail_frame.zig");
     _ = @import("ui/stream_prefix.zig");
-    _ = @import("ui/startup.zig");
     _ = @import("tests/markdown_colors_test.zig");
     _ = @import("ui/bridge.zig");
     _ = @import("ui/command_menu.zig");

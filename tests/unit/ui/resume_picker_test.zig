@@ -24,6 +24,17 @@ test "saved session titles fit cells and empty titles fall back to short ids" {
     picker.selected = 1;
     try std.testing.expect((try rows(a, &picker, 3, 5)).can_confirm);
 }
+test "daemon session row shows its project as a single safe line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const items = try std.testing.allocator.alloc(session.SavedSession, 1);
+    items[0] = .{ .id = "0123456789abcdef0123456789abcdef".*, .modified_ms = 0 };
+    var picker = Picker{ .sessions = items, .epoch = 1, .session_id = null, .launcher = null };
+    defer picker.deinit(std.testing.allocator);
+    items[0].project = try std.testing.allocator.dupe(u8, "/work/one\ntwo");
+    const shown = try rows(arena.allocator(), &picker, 80, 1);
+    try std.testing.expectEqualStrings("> 01234567  /work/one two  1970-01-01 00:00 UTC", shown.lines[0]);
+}
 test "saved time uses UTC leap years and rejects out of range" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -1,12 +1,12 @@
 # macOS 分阶段验证（P0 / P1）
 
-这里保存 [macOS 实施方案](../../docs/macos-support.md) 的独立机制探针与平台子集回归。当前 Intel Mac 本地产品已合并，支持本地 CLI/TUI，不支持 SSH 或常驻服务。下文测量是原 macOS 分支的历史记录，不是本轮测试迁移后的新 Mac 验收；探针本身不替代产品验收。
+Intel Mac 的公开入口只有不带参数的 `thin`：在本地终端启动前台 TUI。`--help`、`--version`、`--print`、`--ssh-listen` 都不是公开选项；macOS 不提供 daemon、SSH 或 launchd 服务。前台使用的内部 worker 和 Unix IPC 不构成常驻服务。
 
-当前 macOS 目标仅为本地 CLI/TUI、`--print` 和本地会话/工具功能；SSH、常驻 daemon、launchd 不在范围内。前台必需的内部 worker/Unix IPC 仍须适配，Linux 原有 SSH/daemon 及测试不取消。
+本目录验证文件系统、终端、IPC 和进程回收等平台机制，不验证公开 CLI。下文命令用于开发测试，不是 Thin 启动参数；原分支测量仅作为[历史适配记录](../../docs/macos-support.md)保留，不能作为新 CLI 的实机验收结果。
 
 ## P1a：原生文件系统回归
 
-使用 Zig 0.17.0，无需 libssh、Node 或真实凭据：
+使用 Zig 0.17.0，无需 Node 或真实凭据：
 
 ```sh
 zig build test-filesystem -Dplatform-tests-only=true --summary all
@@ -18,7 +18,7 @@ zig build test-terminal -Dplatform-tests-only=true --summary all
 
 `test-filesystem` 包含文件系统、认证、checkpoint、Memory 及相关纯模块。`tests` 中的文件系统测试验证受保护名称的元数据比较、硬链接、无读权限、符号链接/FIFO/设备、目录替换、打开标志和 AGENTS/技能策略，也进入 Linux 完整 unit 根。测试源由 `tests/layout.json` 映射，在本地缓存中组合后编译；不要直接对业务 `src` 运行 `zig test`，否则可能得到零测试的假成功。
 
-`platform-tests-only` 不创建产品：默认安装和 install/run 都失败；构建边界由 `test_build_mode.py` 验证。正常 Intel Mac 本地产品构建已开放，不依赖 libssh，并明确拒绝 daemon/SSH 参数；本平台子集入口仍不替代完整产品验收。
+`platform-tests-only` 不创建产品：默认安装和 install/run 都失败；构建边界由 `test_build_mode.py` 验证。正常 Intel Mac 本地产品构建已开放。这些检查不运行前台 TUI。
 
 ## P0：独立机制探针
 
@@ -66,7 +66,7 @@ python3 -B -m unittest discover -s tests/macos -p 'test_*.py' -v
 
 使用上面的 `zig build test-presentation -Dplatform-tests-only=true` 标准入口；测试通过 layout 与缓存组合恢复，不再直接测试业务源文件。
 
-历史分支记录中，本机 Zig 0.17.0 的非 LLVM 产物曾被 dyld 以 `__CONST_ZIG` 段顺序错误拒绝加载。当前 Darwin 构建使用 LLVM；后续本地产品验收记录见主方案 P2。
+历史分支记录中，本机 Zig 0.17.0 的非 LLVM 产物曾被 dyld 以 `__CONST_ZIG` 段顺序错误拒绝加载。当前 Darwin 构建使用 LLVM；旧 CLI 的本地产品验收记录见主方案历史档案 P2。
 
 ## 历史交叉构建说明（未执行目标测试）
 
@@ -93,4 +93,4 @@ python3 -B -m unittest discover -s tests/macos -p 'test_*.py' -v
 - `LOCAL_PEERPID` 和 fd 归属仍需覆盖生产中所有转交路径；不把 audit token 宣称为冻结的连接时身份。
 - 元数据失败注入不代替真实权限/资源错误测试；探针不覆盖所有 `libproc/sysctl` 截断和进程退出竞态，也不证明生产级父进程监测已正确接入取消流程。
 - 当前机器的通过不代表 Apple Silicon 或最低 macOS 版本通过。
-- 本轮测试源码迁移后的 Mac 回归尚未执行；不得把上述历史记录当作本轮验收，不要求 macOS SSH/daemon 测试。
+- 新公开 CLI 的 Intel Mac 前台验收未在此记录；上述历史结果不验证新入口，也不要求在 macOS 提供 SSH/daemon。

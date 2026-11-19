@@ -8,8 +8,7 @@ Everything here is an owned fixture, never a stub of the product:
 * a temporary HOME/projects/XDG_RUNTIME_DIR tree (0700) created by this script,
 * one literal 127.0.0.1 Chat/SSE server whose responses are gated by this script,
 * an inline fake key inside the owned config (0600), no environment credential,
-* real `thin` processes: one `--daemon` Popen, real PTY `--connect`/`--attach`
-  clients, and a real foreground `thin`,
+* real `thin` processes: an explicit `--daemon` and bare PTY clients,
 * one owned background service per daemon-reclaim case (bound 127.0.0.1:0, its
   own pid/port marker file) so SIGTERM convergence is observed on a real port.
 
@@ -19,22 +18,19 @@ Isolation rules:
 * Only loopback HTTP is used; nothing listens on or touches a real SSH port.
 * Only PIDs this script created are signalled. Teardown never calls pkill, never
   scans the whole process table, and never re-signals an already reaped PID.
-* No product wire/private AF_UNIX message format is asserted: the private
-  endpoint layout and IPC framing stay backend-owned. Cases are black-box CLI
-  + PTY, with session IDs read from the public `.thin/sessions/<32hex>.session`
-  names.
+* The wrong-endpoint fixture occupies only its owned `thin/daemon.sock`;
+  it does not encode private IPC frames. Session identity and project routing
+  are checked against real checkpoints and their discovery records.
 
 Coverage (one case per user-visible requirement):
-1. missing service: `--connect`/`--attach` fail explicitly with no spawned
-   service and no inference; plain `thin` is not a daemon; mode conflicts are
-   rejected by the CLI before any UI/session exists.
-2. daemon start, PTY `--connect` in an owned project, real inference
-   POST gated by this script, SIGKILL of the front-end process (not Ctrl-C),
-   then release: the daemon worker finishes, exactly one request was made, and
-   `--attach <id>` replays the completed result without new inference.
-3. one writable console: a second `--attach` without `--takeover` is refused
-   and does not displace the controller; explicit `--takeover` replaces it and
-   a stale controller's Ctrl-C cannot cancel the running task.
+1. Bare `thin` works independently in cwd without starting a daemon. A wrong
+   control endpoint fails closed instead. Retired flags are rejected.
+2. With a daemon, bare `thin` auto-connects in its cwd. After SIGKILL of the
+   frontend, the worker finishes the gated POST; a client launched elsewhere
+   can select the completed conversation in `/resume` without new inference.
+3. One writable console: listing and Esc on the original busy view do not
+   stop its task. Selecting it from a second launcher refuses without
+   replacing either view; both controllers remain independently usable.
 4. an offline dangerous `rm` stays pending with no client (the owned
    fixture survives), and a reattached console sees the full approval popup,
    approves it explicitly, and the side effect happens exactly once.
@@ -50,6 +46,7 @@ CLI/ownership contract and is only executed by the merged backend/UI/CLI.
 """
 import errno
 import fcntl
+import hashlib
 import http.server
 import json
 import os
@@ -756,12 +753,49 @@ class Case:
         self.children.append(child)
         return child
 
-    def client(self, args, cwd, label):
-        """Interactive clients always disable the startup metadata refresh."""
-        return self.spawn(list(args) + ['--no-model-auto-refresh'], cwd, label, pty_mode=True)
+    def client(self, cwd, label):
+        # Only the owned loopback URL has credentials: there is no official
+        # metadata source. Any GET to the fixture is still a test failure.
+        return self.spawn([], cwd, label, pty_mode=True)
+
+    def pick_session(self, client, project, ident, title):
+        # Match the visible candidate, not a prompt in scrollback. The final
+        # UTC field may be clipped after a long project path. These cases have
+        # one target, plus at most the empty current launcher.
+        labels = (title + ' ', ident[:8] + ' ')
+        canonical = str(project.resolve())
+
+        def target_row():
+            for row in client.screen.grid:
+                line = ''.join(row).strip()
+                if line.removeprefix('> ').startswith(labels) and canonical in line:
+                    return line
+            return ''
+
+        def fresh():
+            return client.capture.rfind(SYNC_BEGIN) >= mark and client.frame_after(mark)
+
+        mark = client.mark()
+        client.send_line('/resume')
+        client.pump_until(lambda: fresh() and target_row(),
+                          'resume candidate: ' + title, guard=self.model.check)
+        if not target_row().startswith('> '):
+            mark = client.mark()
+            client.send(b'\x1b[B')
+            client.pump_until(lambda: fresh() and target_row().startswith('> '),
+                              'selected resume candidate: ' + title, guard=self.model.check)
+        return target_row
+
+    def resume(self, cwd, project, ident, title, label):
+        client = self.client(cwd, label)
+        client.pump_until(lambda: client.idle_after(0), 'resume launcher ready', guard=self.model.check)
+        self.pick_session(client, project, ident, title)
+        mark = client.mark()
+        client.send(b'\r')
+        return client, mark
 
     def start_daemon(self, label='daemon'):
-        argvs = ['--daemon', '--no-model-auto-refresh']
+        argvs = ['--daemon']
         daemon = self.spawn(argvs, self.workspace.home, label, pty_mode=False)
         self.daemon = daemon
         wait_daemon_socket(self)
@@ -837,6 +871,8 @@ class Case:
         self.assert_no_secret()
         if self.model is not None:
             self.model.stop()
+            if sys.exc_info()[0] is None:
+                self.model.check()  # A late unexpected GET is still a failure.
         assert_private_sessions(self.workspace.home)
         assert_private_runtime(self.workspace.runtime)
 
@@ -928,6 +964,28 @@ def children_of(pid):
     return out
 
 
+def assert_no_tcp_listener(pid):
+    """Match LISTEN inodes to this owned process tree, not to host-wide ports."""
+    listeners = set()
+    for name in ('tcp', 'tcp6'):
+        path = Path('/proc/self/net') / name
+        if name == 'tcp6' and not path.exists():
+            continue  # IPv6 disabled in this kernel.
+        with path.open() as rows:
+            next(rows)
+            for row in rows:
+                fields = row.split()
+                if fields[3] == '0A':
+                    listeners.add('socket:[%s]' % fields[9])
+    for owned in children_of(pid) | {pid}:
+        for fd in Path('/proc/%d/fd' % owned).iterdir():
+            try:
+                target = os.readlink(fd)
+            except FileNotFoundError:
+                continue  # A concurrent close of a non-listener is normal.
+            assert target not in listeners, 'owned thin process unexpectedly listening on TCP'
+
+
 def wait_pids_gone(pids, timeout=20):
     deadline = time.monotonic() + timeout
     pending = set(pids)
@@ -1011,6 +1069,17 @@ def wait_checkpoint(project, marker, timeout=45):
             return path
         time.sleep(0.05)
     raise AssertionError('checkpoint never contained %r' % marker)
+
+
+def assert_live_project(home, project, ident, owner):
+    canonical = str(project.resolve())
+    key = hashlib.sha256(os.fsencode(canonical)).hexdigest()[:32]
+    index = home / '.thin/session-index'
+    path = index / key / (ident + '.json')
+    assert list(index.glob('*/' + ident + '.json')) == [path], 'session indexed under wrong project'
+    record = json.loads(path.read_bytes())
+    assert (record['id'], record['project'], record['project_key'], record['owner']) == (
+        ident, canonical, key, owner), 'wrong session owner or project'
 
 
 def assert_private_sessions(project):
@@ -1169,28 +1238,16 @@ def annotate(text, label):
     return '%s: %r' % (label, text[-1200:])
 
 
-def assert_service_error(text, label):
-    lower = text.lower()
-    assert lower.strip(), '%s produced no diagnostic' % label
-    assert any(word in lower for word in
-               ('service', 'daemon', 'connect', 'attach', 'session', 'socket', 'endpoint')), \
-        annotate(text, label)
-    assert any(word in lower for word in
-               ('not', 'no ', 'unavailable', 'failed', 'refused', 'missing', 'unable',
-                'cannot', 'error', 'thin:')), annotate(text, label)
-
-
 def run_conflict(app, workspace, args, label):
-    """Mode conflicts are rejected by the parser before any TTY/session work."""
+    """Retired or conflicting flags must fail parsing, not just require a TTY."""
     completed = subprocess.run([app] + list(args), cwd=str(workspace.home),
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, env=workspace.env(), timeout=15)
     output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, '%s unexpectedly succeeded' % label
+    assert completed.returncode == 2, '%s was not rejected at parse time' % label
     assert 0 < len(output) <= 8192, '%s diagnostic must be bounded' % label
     text = output.decode('utf-8', 'replace')
-    assert 'thin:' in text or 'Invalid' in text or 'Unknown' in text or '--help' in text, \
-        annotate(text, label)
+    assert 'Usage: thin' in text, annotate(text, label)
     return text
 
 
@@ -1210,9 +1267,15 @@ def detach_plan(fx, state, body):
 
 def controller_plan(fx, state, body):
     users = real_users(body)
-    assert users == [CONTROLLER_PROMPT], 'unexpected request users: %r' % (users,)
     calls, results = tool_history(body)
-    assert not calls and not results, 'single-turn controller proof has no tools'
+    assert not calls and not results, 'controller proof has no tools'
+    if users == ['second-console-probe']:
+        return text_answer('second-console-ok')
+    if users == [CONTROLLER_PROMPT, 'first-console-probe']:
+        assert any(m['role'] == 'assistant' and CONTROLLER_ANSWER in message_text(m)
+                   for m in body['messages']), 'first controller lost its previous answer'
+        return text_answer('first-console-ok')
+    assert users == [CONTROLLER_PROMPT], 'unexpected request users: %r' % (users,)
     state['seen'].set()
     assert state['release'].wait(CONTROLLER_TIMEOUT), 'controller reply was never released'
     return text_answer(CONTROLLER_ANSWER)
@@ -1258,76 +1321,114 @@ def case_no_service(app, base):
     case.state['gate'].set()
     case.start_model(detach_plan)
     try:
-        for args, label in (
-            (['--daemon', '--connect'], 'daemon+connect'),
-            (['--connect', '--daemon'], 'connect+daemon'),
-            (['--daemon', '--attach', '0' * 32], 'daemon+attach'),
-            (['--attach', '0' * 32, '--daemon'], 'attach+daemon'),
-            (['--connect', '--print', 'x'], 'connect+print'),
-            (['--daemon', '--print', 'x'], 'daemon+print'),
-            (['--takeover'], 'takeover without attach'),
-            (['--attach', 'not-a-session-id'], 'invalid attach id'),
-            (['--attach', '0' * 31], 'short attach id'),
-            (['--daemon', '--daemon'], 'repeated daemon'),
-        ):
-            run_conflict(app, case.workspace, args, label)
-        assert case.model.count() == 0, 'mode conflicts must not infer'
+        retired = (['--connect'], ['--attach', '0' * 32], ['--takeover'],
+                   ['--no-model-auto-refresh'], ['--daemon', '--ssh-listen', '127.0.0.1:0'],
+                   ['--restore-selection', '0' * 32], ['--help'], ['--version'],
+                   ['--print', 'x'], ['--daemon', '--daemon'])
+        for args in retired:
+            run_conflict(app, case.workspace, args, ' '.join(args))
+        assert case.model.count() == 0 and not runtime_sockets(case.workspace.runtime)
 
-        # --connect with no service: clear failure, no spawned service.
-        connect = case.client(['--connect'], case.workspace.home, 'connect-empty')
-        connect.pump_until(lambda: connect.proc.poll() is not None, 'connect without service', 25)
-        connect.drain()
-        assert connect.wait_exit('connect failure') != 0, '--connect must fail without a service'
-        assert_service_error(connect.text(), 'connect without service')
-        assert case.model.count() == 0, 'failed --connect must not infer'
-        assert_no_live_endpoint(case, timeout=3)
-        assert session_files(case.workspace.home) == [], 'failed --connect created a session'
-
-        # Second attempt must also fail: no service was started behind our back.
-        again = case.client(['--connect'], case.workspace.home, 'connect-again')
-        again.pump_until(lambda: again.proc.poll() is not None, 'second connect failure', 25)
-        again.drain()
-        assert again.wait_exit('second connect failure') != 0
-        assert_no_live_endpoint(case, timeout=3)
-
-        # --attach with no service: explicit failure, no auto-start either.
-        attach = case.client(['--attach', '1' * 32], case.workspace.home, 'attach-empty')
-        attach.pump_until(lambda: attach.proc.poll() is not None, 'attach without service', 25)
-        attach.drain()
-        assert attach.wait_exit('attach failure') != 0, '--attach must fail without a service'
-        assert_service_error(attach.text(), 'attach without service')
-        assert_no_live_endpoint(case, timeout=3)
-        assert case.model.count() == 0
-
-        # Default thin is ordinary foreground: it exits and leaves no daemon.
-        default = case.client([], case.workspace.home, 'default-foreground')
+        # No daemon: there may be a private worker socket while the view is
+        # alive, but not a daemon control socket. An empty visit saves no chat.
+        project = case.workspace.root / 'independent-project'
+        project.mkdir(mode=0o700)
+        control = case.workspace.runtime / 'thin/daemon.sock'
+        default = case.client(project, 'default-foreground')
         default.pump_until(lambda: default.idle_after(0), 'default interactive idle', 30,
                            guard=case.model.check)
+        assert not os.path.lexists(control), 'plain thin published a daemon socket'
         default.send(b'\x04\x04')
         code = default.wait_exit('default exit', 25)
         default.drain()
         assert code == 0, 'ordinary thin exit status %r' % (code,)
         assert not runtime_sockets(case.workspace.runtime), 'plain thin left a daemon endpoint'
         assert_no_live_endpoint(case, timeout=3)
-        assert session_files(case.workspace.home) == [], 'empty chat created a session'
+        assert not session_files(project) and not session_files(case.workspace.home)
         assert case.model.count() == 0, 'plain thin startup inferred'
-        return {'case': 'no-service', 'conflicts': 10, 'requests': 0}
+
+        client = case.client(project, 'independent-chat')
+        client.pump_until(lambda: client.idle_after(0), 'independent chat ready', guard=case.model.check)
+        client.send_line(DETACH_PROMPT)
+        client.pump_until(lambda: client.idle_after(0, DETACH_ANSWER.encode()),
+                          'independent answer', guard=case.model.check)
+        ident = wait_checkpoint(project, DETACH_ANSWER).stem
+        assert_live_project(case.workspace.home, project, ident, 'foreground')
+        assert_no_tcp_listener(client.proc.pid)
+        assert not os.path.lexists(control) and not session_files(case.workspace.home)
+        client.send(b'\x04\x04')
+        assert client.wait_exit('independent chat exit') == 0
+        assert not runtime_sockets(case.workspace.runtime)
+        assert case.model.count() == 1
+        return {'case': 'no-service', 'rejected': len(retired), 'requests': 1}
     finally:
         case.close()
 
 
 # ---------------------------------------------------------------------------
-# Case 2: client killed mid-task, worker completes, attach replays result
+# A present but invalid daemon endpoint is not a standalone launch signal
 # ---------------------------------------------------------------------------
+
+def case_wrong_endpoint(app, base):
+    case = Case(app, base, 'wrong-endpoint')
+    case.start_model(detach_plan)
+    home = case.workspace.home
+    project = case.workspace.root / 'unopened-project'
+    project.mkdir(mode=0o700)
+    control = case.workspace.runtime / 'thin/daemon.sock'
+    control.parent.mkdir(mode=0o700)
+
+    def rejected(client, expected_error):
+        assert client.wait_exit(client.label, 15) > 0, 'invalid endpoint accepted or process crashed'
+        client.drain()
+        assert expected_error in client.text(), annotate(client.text(), client.label)
+        assert not client.frames(), 'fell back to interactive startup'
+        client.assert_termios_restored()
+        assert not (project / '.thin').exists(), 'started a foreground worker after rejection'
+        assert not session_files(home) and not list((home / '.thin/session-index').glob('*/*.json'))
+        case.model.check()
+        assert case.model.count() == 0
+
+    try:
+        control.write_bytes(b'not a socket\n')
+        control.chmod(0o600)
+        rejected(case.client(project, 'wrong-file'), 'NotASocket')
+        assert control.read_bytes() == b'not a socket\n', 'wrong file was replaced'
+        control.unlink()
+
+        # A real same-user stream accepts the dial, then closes without a
+        # daemon handshake. Losing that peer is not proof of an absent daemon.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as impostor:
+            impostor.bind(str(control))
+            control.chmod(0o600)
+            impostor.listen(1)
+            impostor.settimeout(10)
+            before = control.stat()
+            client = case.client(project, 'wrong-peer')
+            peer, _ = impostor.accept()
+            with peer:
+                peer.settimeout(5)
+                assert peer.recv(1), 'launcher did not initiate a daemon greeting'
+            rejected(client, 'ProtocolMismatch')
+            assert control.is_socket() and os.path.samestat(before, control.stat())
+        return {'case': 'wrong-endpoint', 'requests': 0}
+    finally:
+        case.close()
+
+
+# Case 2: client killed mid-task, worker completes, picker restores result.
 
 def case_detach_continues(app, base):
     case = Case(app, base, 'case2-detach')
     case.state.update({'seen': threading.Event(), 'gate': threading.Event()})
     case.start_model(detach_plan)
-    project = case.workspace.home
+    project = case.workspace.root / 'source-project'
+    project.mkdir(mode=0o700)
     try:
         case.start_daemon()
-        client = case.client(['--connect'], project, 'detach-client')
+        other_cwd = case.workspace.root / 'other-project'
+        other_cwd.mkdir(mode=0o700)
+        client = case.client(project, 'detach-client')
         client.pump_until(lambda: client.idle_after(0), 'connect launcher idle', 30,
                           guard=case.model.check)
         client.send_line(DETACH_PROMPT)
@@ -1343,22 +1444,27 @@ def case_detach_continues(app, base):
         assert case.daemon.proc.poll() is None, 'daemon exited with the client'
 
         ident = session_id(project)
-        attached = case.client(['--attach', ident], project, 'detach-attach')
+        assert_live_project(case.workspace.home, project, ident, 'daemon')
+        assert_no_tcp_listener(case.daemon.proc.pid)
+        assert not session_files(case.workspace.home), 'auto-connect saved in HOME instead of cwd'
+        attached, mark = case.resume(other_cwd, project, ident, DETACH_PROMPT, 'completed-resume')
         attached.pump_until(
-            lambda: attached.idle_after(0, DETACH_ANSWER.encode()),
+            lambda: attached.idle_after(mark, DETACH_ANSWER.encode()),
             'attached completed answer', 40, guard=case.model.check)
         assert case.model.count() == 1, 'attach caused new inference'
         assert DETACH_ANSWER in attached.screen_text(), 'completed answer missing after attach'
         attached.send(b'\x04\x04')
         assert attached.wait_exit('attached exit', 25) == 0
-        assert session_files(project)[0].name == ident + '.session'
+        assert [path.stem for path in session_files(project)] == [ident]
+        assert not session_files(other_cwd) and not session_files(case.workspace.home)
+        assert_private_sessions(project)
         return {'case': 'detach', 'id': ident, 'requests': case.model.count()}
     finally:
         case.close()
 
 
 # ---------------------------------------------------------------------------
-# Case 3: parallel project sessions and root isolation
+# Case 3: controller occupancy; listing/cancel and refusal preserve both views
 # ---------------------------------------------------------------------------
 
 def case_controller(app, base):
@@ -1368,7 +1474,7 @@ def case_controller(app, base):
     project = case.workspace.home
     try:
         case.start_daemon()
-        first = case.client(['--connect'], project, 'controller-first')
+        first = case.client(project, 'controller-first')
         first.pump_until(lambda: first.idle_after(0), 'first launcher idle', 30,
                          guard=case.model.check)
         busy = first.mark()
@@ -1380,50 +1486,48 @@ def case_controller(app, base):
                          'controller busy frame', 30, guard=case.model.check)
         ident = session_id(project)
 
-        # No implicit preemption: plain --attach must be refused.
-        second = case.client(['--attach', ident], project, 'controller-second')
-        second.pump_until(lambda: second.proc.poll() is not None, 'occupancy refusal', 20)
-        second.drain()
-        code = second.wait_exit('occupancy refusal', 20)
-        assert code != 0, 'a second --attach silently replaced the writable console'
-        text = second.text().lower()
-        assert any(word in text for word in
-                   ('use', 'busy', 'occupied', 'attach', 'console', 'controller', 'takeover')), \
-            annotate(second.text(), 'occupancy refusal')
-        assert case.model.count() == 1, 'refused attach changed inference'
-        assert not first.screen.idle(), 'first controller lost its live task'
-        assert case.daemon.proc.poll() is None
+        row = case.pick_session(first, project, ident, CONTROLLER_PROMPT)
+        esc_mark = first.mark()
+        first.send(b'\x1b')
+        first.pump_until(lambda: first.frame_after(esc_mark) and not row(),
+                         'Esc closed picker on running task', guard=case.model.check)
+        assert not first.screen.idle(), 'Esc stopped the pending task'
 
-        # Explicit takeover becomes the only controller.
-        third = case.client(['--attach', ident, '--takeover'], project, 'controller-takeover')
-        third.pump_until(lambda: third.frame_after(0, CONTROLLER_PROMPT.encode()),
-                         'takeover transcript', 30, guard=case.model.check)
-        assert case.model.count() == 1, 'takeover inferred'
+        other = case.workspace.root / 'second-project'
+        other.mkdir(mode=0o700)
+        second, mark = case.resume(other, project, ident, CONTROLLER_PROMPT, 'controller-second')
+        second.pump_until(lambda: second.idle_after(mark) and b'busy' in second.capture[mark:].lower(),
+                          'occupancy refusal', 20, guard=case.model.check)
+        assert case.model.count() == 1, 'listing, Esc or refused resume issued inference'
 
-        # A stale controller's cancellation must not reach the new epoch.
-        if first.proc.poll() is None and first.master is not None:
-            try:
-                first.send(b'\x03')
-            except OSError:
-                pass
-        time.sleep(1.0)
-        assert case.model.count() == 1, 'stale cancellation issued a new request'
-        assert case.daemon.proc.poll() is None, 'stale cancellation killed the daemon'
+        # The refused launcher still controls its own project, not the occupied
+        # session. A second writer or a hidden fork of its history fails here.
+        second.send_line('second-console-probe')
+        second.pump_until(lambda: second.idle_after(mark, b'second-console-ok'),
+                          'refused launcher still usable', guard=case.model.check)
+        assert wait_checkpoint(other, 'second-console-ok').stem != ident
+        assert case.model.count() == 2 and case.daemon.proc.poll() is None
 
         case.state['release'].set()
-        third.pump_until(lambda: third.idle_after(0, CONTROLLER_ANSWER.encode()),
-                         'takeover completion', 40, guard=case.model.check)
-        assert case.model.count() == 1, 'takeover completion repeated inference'
-        wait_checkpoint(project, CONTROLLER_ANSWER)
-        third.send(b'\x04\x04')
-        assert third.wait_exit('takeover exit', 25) == 0
+        first.pump_until(lambda: first.idle_after(busy, CONTROLLER_ANSWER.encode()),
+                         'original task completed on first console', guard=case.model.check)
+        assert b'Stop and clear' not in first.capture[esc_mark:], 'picker Esc opened the stop dialog'
+        assert wait_checkpoint(project, CONTROLLER_ANSWER).stem == ident
+        first.send_line('first-console-probe')
+        first.pump_until(lambda: first.idle_after(busy, b'first-console-ok'),
+                         'original controller still writable', guard=case.model.check)
+        assert wait_checkpoint(project, 'first-console-ok').stem == ident
+        assert case.model.count() == 3, 'extra inference after refused switch'
+        for client in (second, first):
+            client.send(b'\x04\x04')
+            assert client.wait_exit('controller exit', 25) == 0
         return {'case': 'controller', 'id': ident, 'requests': case.model.count()}
     finally:
         case.close()
 
 
 # ---------------------------------------------------------------------------
-# Case 5: ownership boundaries + resume without replay or lock stealing
+# Offline approval survives frontend loss
 # ---------------------------------------------------------------------------
 
 def case_offline_approval(app, base):
@@ -1437,7 +1541,7 @@ def case_offline_approval(app, base):
     case.start_model(approval_plan)
     try:
         case.start_daemon()
-        client = case.client(['--connect'], project, 'approval-client')
+        client = case.client(project, 'approval-client')
         client.pump_until(lambda: client.idle_after(0), 'approval launcher idle', 30,
                           guard=case.model.check)
         client.send_line(APPROVAL_PROMPT)
@@ -1454,7 +1558,7 @@ def case_offline_approval(app, base):
             'offline approval was auto-granted'
         assert case.model.count(APPROVAL_PROMPT) == 1, 'offline approval continued inference'
 
-        attached = case.client(['--attach', ident], project, 'approval-attach')
+        attached, mark = case.resume(project, project, ident, APPROVAL_PROMPT, 'approval-resume')
         deadline = time.monotonic() + 40
 
         def approval_guard():
@@ -1463,7 +1567,7 @@ def case_offline_approval(app, base):
             assert case.model.count(APPROVAL_PROMPT) == 1, 'popup caused inference'
 
         attached.pump_until(
-            lambda: attached.frame_after(0, b'Y allow once') and
+            lambda: attached.frame_after(mark, b'Y allow once') and
             b'Y allow once' in attached.capture and b'N deny' in attached.capture,
             'full approval popup frame', max(0, deadline - time.monotonic()), guard=approval_guard)
         tokens = set()
@@ -1529,7 +1633,7 @@ def case_daemon_reclaim(app, base):
     service_pid = None
     try:
         daemon = case.start_daemon()
-        client = case.client(['--connect'], project, 'reclaim-client')
+        client = case.client(project, 'reclaim-client')
         client.pump_until(lambda: client.idle_after(0), 'reclaim launcher idle', 30,
                           guard=case.model.check)
         client.send_line(SERVICE_PROMPT)
@@ -1616,7 +1720,7 @@ def case_streaming(app, base, daemon=False):
         project = case.workspace.home
         if daemon:
             case.start_daemon()
-        client = case.client(['--connect'] if daemon else [], project, 'stream-view')
+        client = case.client(project, 'stream-view')
         client.pump_until(lambda: client.idle_after(0), 'stream initial idle', 25,
                           guard=case.model.check)
         mark = client.mark()
@@ -1683,8 +1787,9 @@ def main():
         root.chmod(0o700)
         cases = (
             ('no service and mode conflicts', case_no_service),
-            ('daemon detach and attach completion', case_detach_continues),
-            ('single console and takeover', case_controller),
+            ('wrong endpoint fails closed', case_wrong_endpoint),
+            ('daemon auto-connect and resume completion', case_detach_continues),
+            ('busy picker Esc and controller refusal', case_controller),
             ('offline dangerous approval', case_offline_approval),
             ('daemon SIGTERM reclaim', case_daemon_reclaim),
             ('foreground incremental stream', case_streaming),
@@ -1695,7 +1800,7 @@ def main():
             results.append(evidence)
             print('PASS daemon %s: %s' % (label, json.dumps(evidence)))
         (root / 'evidence.json').write_text(json.dumps({'cases': results}, indent=2) + '\n')
-    print('PASS test-daemon: owned daemon, PTY attach/takeover, offline approval, '
+    print('PASS test-daemon: owned daemon, PTY resume without takeover, offline approval, '
           'SIGTERM reclaim; no real API, no real SSH port')
 
 

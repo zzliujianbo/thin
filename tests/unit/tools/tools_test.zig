@@ -206,13 +206,13 @@ test "project settings exact aliases protected at prepared and direct execute" {
     const config: cfg.Config = .{ .provider = .{ .base_url = "http://127.0.0.1" }, .model = .{ .name = "fake", .context_tokens = 10000 } };
     var tools: Tools = .{ .root = &root, .memory = undefined, .config = &config, .environment = undefined };
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
-    try root.writeMode(settings.relative_path, "private", false, 0o600);
+    try root.writeMode(".thin/settings.json", "private", false, 0o600);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const absolute = try std.fs.path.join(a, &.{ root.path, ".thin/./settings.json" });
     var cancel: p.Cancellation = .{};
-    for ([_][]const u8{ settings.relative_path, "./.thin//./settings.json", ".thin/./settings.json/.", absolute }) |path| {
+    for ([_][]const u8{ ".thin/settings.json", "./.thin//./settings.json", ".thin/./settings.json/.", absolute }) |path| {
         // Read authorization is descriptor-based so aliases and hard links are
         // rejected against the same opened inode, not guessed during prepare.
         try tools.checkFileAction(a, .{ .read_file = .{ .path = path } });
@@ -263,9 +263,9 @@ test "write preview baseline is one-shot read only missing-safe and protected" {
     cancel.cancel();
     try std.testing.expect((try Tools.previewWrite(&tools, std.testing.allocator, "existing.txt", &cancel)) == null);
     var active: p.Cancellation = .{};
-    try std.testing.expectError(error.ProtectedSettingsFile, Tools.previewWrite(&tools, std.testing.allocator, settings.relative_path, &active));
+    try std.testing.expectError(error.ProtectedSettingsFile, Tools.previewWrite(&tools, std.testing.allocator, ".thin/settings.json", &active));
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(root.dir.handle, ".thin", 0o700));
-    try root.writeMode(settings.relative_path, "private", false, 0o600);
+    try root.writeMode(".thin/settings.json", "private", false, 0o600);
     try std.testing.expectEqual(@as(c_int, 0), std.c.linkat(root.dir.handle, ".thin/settings.json", root.dir.handle, "settings-alias.txt", 0));
     try std.testing.expectError(error.ProtectedSettingsFile, root.readBinaryGuarded(std.testing.allocator, "settings-alias.txt", 1024, tools.textReadGuard()));
     try std.testing.expect((try Tools.previewWrite(&tools, std.testing.allocator, "settings-alias.txt", &active)) == null);

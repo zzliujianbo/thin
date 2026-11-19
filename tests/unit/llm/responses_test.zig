@@ -53,6 +53,10 @@ test "codex request fields and terminal done" {
     try std.testing.expect(j.get(ordinary, "include") != null);
     try std.testing.expectEqualStrings("reasoning.encrypted_content", (try c.list(j.get(wire, "include").?))[0].string);
     try std.testing.expect(j.get(wire, "parallel_tool_calls").?.bool);
+    try std.testing.expectEqualStrings("auto", try c.text(wire, "tool_choice"));
+    req.purpose = .summary;
+    const summary = try j.parse(a, try encodeCodex(a, req));
+    try std.testing.expectEqualStrings("none", try c.text(summary, "tool_choice"));
     req.system = " ";
     try std.testing.expectError(error.EmptyInstructions, encodeCodex(a, req));
     var stream = Stream.init(a, test_support.response_scope, .{});

@@ -10,8 +10,8 @@
 #   loginctl enable-linger <你的账户>          # 需管理员/授权策略批准
 # 不能靠在 SSH 会话里 nohup/后台启动代替这个授权。
 #
-# 只以显式参数 `--daemon` 启动。默认 `thin` 仍是前台模式；
-# 本服务不会被普通 thin、`--connect` 或 `--attach` 隐式拉起。
+# 本单元显式运行 thin --daemon，只提供本机 Unix socket，不监听 TCP。
+# 无参数 thin 自动连接已有守护服务；没有守护服务时独立前台运行，不会启动本单元。
 
 [Unit]
 Description=Thin per-user daemon (explicit --daemon)

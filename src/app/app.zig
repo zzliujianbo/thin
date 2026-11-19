@@ -10,10 +10,7 @@ const codex_auth = @import("../core/codex_auth.zig");
 const CodexManager = @import("codex_oauth.zig").Manager;
 const r = @import("../core/runtime.zig");
 const Journal = @import("journal.zig").Journal;
-const reasoning_defaults = @import("reasoning_defaults.zig");
-const metadata = @import("model_metadata.zig");
 const session_context = @import("../core/session_context.zig");
-const model_resolver = @import("model_resolver.zig");
 const image = @import("../core/image.zig");
 const ImageClient = @import("image_client.zig").Client;
 const image_setup = @import("image_setup.zig");
@@ -42,7 +39,7 @@ fn rememberConfiguredKeys(journal: *Journal, config: cfg.Config, environ: *const
 }
 
 /// 应用聚合体：持有配置、项目根目录、记忆存储、工具执行器、HTTP 客户端与 Runtime，
-/// 生命周期与进程一致（--print 或 TUI 会话结束时统一释放）。
+/// 持有当前会话的运行资源，销毁时统一释放。
 pub const App = struct {
     allocator: std.mem.Allocator,
 
@@ -86,62 +83,9 @@ pub const App = struct {
 
     /// Heap placement is intentional: Store, Tools, Client and Runtime refer to
     /// these fields, so returning a self-referential value would invalidate them.
-    /// 按依赖顺序初始化各组件，并用 errdefer 保证任一步失败时已创建的部分被回滚。
-    /// API key 来自配置指定的凭证源；临时副本使用后清零，客户端持有自己的副本。
-    pub fn init(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, host: r.Host) !*App {
-        const home = environ.get("HOME") orelse return error.MissingHome;
-        const path = try cfg.defaultPath(a, home);
-        defer a.free(path);
-        var parsed = cfg.load(a, io, path) catch |err| switch (err) {
-            // Use the same new-schema initializer as interactive startup. A
-            // truncated nonempty document is rechecked, never overwritten.
-            error.FileNotFound, error.UnexpectedEndOfInput => blk: {
-                var store = try @import("auth_store.zig").Store.open(a, io, home);
-                defer store.deinit();
-                break :blk try store.loadOrInitialize();
-            },
-            else => return err,
-        };
-        // Derived defaults are not embedded in config.json. Headless entry can
-        // reuse a compatible cached profile without creating/fetching metadata.
-        // Price thresholds are always derived, even with explicit reasoning/output.
-        {
-            var cache: metadata.Cache = .{};
-            defer cache.deinit(a);
-            var store: ?@import("auth_store.zig").Store = @import("auth_store.zig").Store.openExisting(a, io, home) catch null;
-            if (store) |*value| {
-                defer value.deinit();
-                cache = metadata.load(&value.root) catch metadata.Cache{};
-            }
-            model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &cache) catch |err| {
-                cfg.release(&parsed);
-                return err;
-            };
-        }
-        // Only anchor the project here. Empty sessions take model/thinking from
-        // global configuration; project settings are neither read nor created.
-        var root = fs.Root.open(a, io, project) catch |err| {
-            cfg.release(&parsed);
-            return err;
-        };
-        defer root.deinit();
-        _ = reasoning_defaults.applyConfigured(&parsed.value);
-        return initConfiguredAnchored(a, io, environ, &root, host, parsed);
-    }
-
-    /// Duplicate an already anchored project; never re-open its replaceable
-    /// pathname during activation. parsed is consumed on success AND failure.
-    pub fn initConfiguredAnchored(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, null, host, parsed);
-    }
-
-    /// Delayed activation must retain the Auth Store's startup pathname in the
-    /// SAME lexical namespace as root, not rediscover a replaced HOME path.
+    /// Consume parsed on success and failure. Duplicate the Session's anchored
+    /// root and retain its auth pathname without resolving either path again.
     pub fn initConfiguredAnchoredAuth(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: *const fs.Root, protected_auth: []const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
-        return initConfiguredRoot(a, io, environ, root.path, root, protected_auth, host, parsed);
-    }
-
-    fn initConfiguredRoot(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, project: []const u8, anchored: ?*const fs.Root, protected_auth: ?[]const u8, host: r.Host, parsed: std.json.Parsed(cfg.Config)) !*App {
         var owned = parsed;
         errdefer cfg.release(&owned);
         if (owned.value.selection_pending) return error.DefaultModelUnavailable;
@@ -152,17 +96,7 @@ pub const App = struct {
         self.thinking_control = .{};
         self.config = owned;
 
-        self.auth_path = if (protected_auth) |path| try a.dupe(u8, path) else blk: {
-            const home = environ.get("HOME") orelse return error.MissingHome;
-            const configured_path = try cfg.defaultPath(a, home);
-            defer a.free(configured_path);
-            // Ordinary loading may follow HOME/file aliases; preserve actual
-            // canonical protection. Delayed anchored activation uses the
-            // explicit startup namespace instead of this pathname lookup.
-            var path_buffer: [4096]u8 = undefined;
-            const path_len = try std.Io.Dir.cwd().realPathFile(io, configured_path, &path_buffer);
-            break :blk try a.dupe(u8, path_buffer[0..path_len]);
-        };
+        self.auth_path = try a.dupe(u8, protected_auth);
         errdefer a.free(self.auth_path);
 
         self.codex_manager = null;
@@ -176,7 +110,7 @@ pub const App = struct {
             a.free(key);
         }
 
-        self.root = if (anchored) |root| try root.duplicate() else try fs.Root.open(a, io, project);
+        self.root = try root.duplicate();
         errdefer self.root.deinit();
         self.home_path = if (environ.get("HOME")) |home| try a.dupe(u8, home) else try a.dupe(u8, "");
         errdefer a.free(self.home_path);

@@ -204,17 +204,25 @@ test "UI ACK admission coalesces adjacent ranges keeps holes and never sends a c
     defer owner.ready.deinit();
     defer owner.ack_ranges.deinit(a);
     defer std.debug.assert(std.c.pthread_mutex_destroy(&owner.mutex) == .SUCCESS);
-    try std.testing.expectError(error.StaleControl, owner.acknowledge(0, 5));
-    try std.testing.expectError(error.InvalidInput, owner.acknowledgeRange(3, 9, 4));
-    try owner.acknowledgeRange(3, 10, 20);
-    try owner.acknowledgeRange(3, 21, 30);
-    try owner.acknowledgeRange(3, 40, 50);
-    try owner.acknowledgeRange(3, 0, 9);
+    try std.testing.expectError(error.StaleControl, owner.acknowledgeRange(1, 0, 0, 5));
+    try std.testing.expectError(error.InvalidInput, owner.acknowledgeRange(1, 3, 9, 4));
+    try owner.acknowledgeRange(1, 3, 10, 20);
+    try owner.acknowledgeRange(1, 3, 21, 30);
+    try owner.acknowledgeRange(1, 3, 40, 50);
+    try owner.acknowledgeRange(1, 3, 0, 9);
     try std.testing.expectEqual(@as(u64, 3), owner.ack_epoch);
     try std.testing.expectEqualSlices(AckRanges.Range, &.{ .{ .first = 0, .last = 30 }, .{ .first = 40, .last = 50 } }, owner.ack_ranges.items.items);
     owner.forwardAck();
     try std.testing.expectEqual(@as(usize, 0), owner.ack_ranges.count());
     try std.testing.expectEqual(@as(usize, 0), owner.ack_accepted);
+    // Another worker can have the same session ID and the same wire epoch.
+    // Changing only the adopted view must retire its predecessor's ranges.
+    try owner.acknowledgeRange(1, 3, 40, 50);
+    client.view_serial += 1;
+    owner.synchronizeIdentity();
+    try std.testing.expectEqual(@as(usize, 0), owner.ack_ranges.count());
+    try std.testing.expectError(error.StaleControl, owner.acknowledgeRange(1, 3, 40, 50));
+    try owner.acknowledgeRange(2, 3, 1, 1);
     owner.stop.cancel();
-    try std.testing.expectError(error.Canceled, owner.acknowledgeRange(3, 60, 70));
+    try std.testing.expectError(error.Canceled, owner.acknowledgeRange(2, 3, 60, 70));
 }

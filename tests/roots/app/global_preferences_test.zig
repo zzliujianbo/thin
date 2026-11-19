@@ -3,7 +3,6 @@ const std = @import("std");
 const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const Session = @import("session.zig").Session;
-const App = @import("app.zig").App;
 const Store = @import("auth_store.zig").Store;
 const a = std.testing.allocator;
 const io = std.testing.io;

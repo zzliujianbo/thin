@@ -94,14 +94,6 @@
       "unit": true
     },
     {
-      "virtual": "src/app/console.zig",
-      "production": "src/app/console.zig",
-      "support": null,
-      "fragments": [],
-      "group": "app",
-      "unit": false
-    },
-    {
       "virtual": "src/app/global_preferences_test.zig",
       "production": null,
       "support": "tests/roots/app/global_preferences_test.zig",
@@ -844,19 +836,6 @@
       "unit": true
     },
     {
-      "virtual": "src/daemon/ssh.zig",
-      "production": "src/daemon/ssh.zig",
-      "support": null,
-      "fragments": [
-        {
-          "path": "tests/unit/daemon/ssh_test.zig",
-          "container": []
-        }
-      ],
-      "group": "daemon",
-      "unit": true
-    },
-    {
       "virtual": "src/daemon/stream_receiver.zig",
       "production": "src/daemon/stream_receiver.zig",
       "support": null,
@@ -1253,19 +1232,6 @@
       "fragments": [
         {
           "path": "tests/unit/platform/terminal_abi_test.zig",
-          "container": []
-        }
-      ],
-      "group": "core",
-      "unit": true
-    },
-    {
-      "virtual": "src/platform/terminal_remote.zig",
-      "production": "src/platform/terminal_remote.zig",
-      "support": "tests/support/platform/terminal_remote.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/platform/terminal_remote_test.zig",
           "container": []
         }
       ],
@@ -2143,19 +2109,6 @@
       "unit": true
     },
     {
-      "virtual": "src/ui/startup.zig",
-      "production": "src/ui/startup.zig",
-      "support": "tests/support/ui/startup.zig",
-      "fragments": [
-        {
-          "path": "tests/unit/ui/startup_test.zig",
-          "container": []
-        }
-      ],
-      "group": "ui",
-      "unit": true
-    },
-    {
       "virtual": "src/ui/stream_prefix.zig",
       "production": "src/ui/stream_prefix.zig",
       "support": "tests/support/ui/stream_prefix.zig",
@@ -2265,20 +2218,6 @@
       "support": null,
       "fragments": [],
       "group": "ui",
-      "unit": false
-    },
-    {
-      "virtual": "src/unified_tool_test_root.zig",
-      "production": null,
-      "support": "tests/roots/unified_tool_test_root.zig",
-      "fragments": [
-        {
-          "path": "tests/integration/unified_tool_test_root_discovery.zig",
-          "container": [],
-          "role": "discovery"
-        }
-      ],
-      "group": "integration",
       "unit": false
     },
     {

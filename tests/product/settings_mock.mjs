@@ -87,7 +87,9 @@ export async function settingsRegressions({app,pty,execute,send}) {
         await writeFile(settingsPath(p),raw,{mode:0o600});
         legacyFixtures.set(p,raw);
       }
-      const submitted = new Map();
+      // The headless no-title/settings probes retired with one-shot print.
+      // Same-project and other-project PTY restarts verify the saved defaults.
+      const submitted = new Set();
       const checkpoints = [];
       async function projectState(directory) {
         const legacy = legacyFixtures.get(directory), root = join(directory,'.thin');
@@ -114,7 +116,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
           } else if (name.endsWith('.jsonl')) { assert(submitted.has(directory)); logs++; }
           else if (/^[a-f0-9]{32}\.session$/.test(name)) { assert(submitted.has(directory)); checkpoints++; }
           else if (/^[a-f0-9]{32}\.title$/.test(name)) {
-            assert(submitted.get(directory), 'title requires an interactive submitted session');
+            assert(submitted.has(directory), 'title requires an interactive submitted session');
             assert(entries.includes(name.replace(/\.title$/, '.session')), 'title without matching checkpoint');
             assert(entry.size > 0 && entry.size <= 256, 'title size');
             const bytes = await readFile(path);
@@ -125,10 +127,10 @@ export async function settingsRegressions({app,pty,execute,send}) {
         }
         if (submitted.has(directory)) {
           assert(logs > 0, 'accepted prompt must create JSONL');
-          if (submitted.get(directory)) assert(checkpoints > 0, 'interactive prompt must create checkpoint');
+          assert(checkpoints > 0, 'interactive prompt must create checkpoint');
         }
       }
-      async function run(mode, levels=[], {p=project, map=sparse, format='standard', headless=false, savedEffort}={}) {
+      async function run(mode, levels=[], {p=project, map=sparse, format='standard', savedEffort}={}) {
         stage = 'owned process';
         assert.equal(expected.length,0);
         expected = levels.map(level => ({level,wire:map[level] ?? level,format,savedEffort,configPath}));
@@ -136,7 +138,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
         await assertConfigHome(home, checkpoints);
         const sessionDir = join(p,'.thin/sessions');
         const beforeRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session') || n.endsWith('.title')).sort() : [];
-        const result = await execute(headless?app:pty,headless?['--print','settings-task']:[],env,p,undefined,headless?30000:90000);
+        const result = await execute(pty,[],env,p,undefined,90000);
         if (fixtureError) throw fixtureError;
         const reason = result.output.match(/^error: ([A-Za-z][A-Za-z0-9_]{0,63})$/m)?.[1] ?? 'unclassified';
         const lines = [...result.output.matchAll(/src\/tests\/app_pty_test\.zig:(\d+):/g)].map(match => match[1]).slice(0,8).join('-') || 'unknown';
@@ -144,16 +146,10 @@ export async function settingsRegressions({app,pty,execute,send}) {
         assert.equal(result.code,0);
         assert.equal(expected.length,0);
         assert(!result.output.includes(KEY));
-        if (!headless) {
-          const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
-          assert.equal(ids.length, levels.length ? 1 : 0);
-          if (ids.length) checkpoints.push({project:p,id:ids[0][1]});
-        }
-        if (headless) {
-          const afterTitles = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.title')).sort() : [];
-          assert.deepEqual(afterTitles, beforeRecords.filter(n => n.endsWith('.title')), 'headless must not create titles');
-        }
-        if (levels.length) submitted.set(p, Boolean(submitted.get(p)) || !headless);
+        const ids = [...result.output.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
+        assert.equal(ids.length, levels.length ? 1 : 0);
+        if (ids.length) checkpoints.push({project:p,id:ids[0][1]});
+        if (levels.length) submitted.add(p);
         else {
           const afterRecords = await exists(sessionDir) ? (await readdir(sessionDir)).filter(n => n.endsWith('.jsonl') || n.endsWith('.session') || n.endsWith('.title')).sort() : [];
           assert.deepEqual(afterRecords,beforeRecords,'idle settings must not create history');
@@ -209,8 +205,6 @@ export async function settingsRegressions({app,pty,execute,send}) {
     await t.savedGlobal('low');
     await t.run('settings-probe-low',['low'],{p:t.other,format});
     await t.savedGlobal('low');
-    await t.run('', ['low'],{headless:true,format});
-    await t.savedGlobal('low');
   });
 
   for (const protocol of ['chat','responses']) await group(protocol,protocol,async t => {
@@ -221,22 +215,16 @@ export async function settingsRegressions({app,pty,execute,send}) {
     await t.savedGlobal('low');
     await t.run('settings-probe-low',['low'],{p:t.other,map:custom});
     await t.savedGlobal('low');
-    await t.run('', ['low'],{headless:true,map:custom});
-    await t.savedGlobal('low');
   });
 
   await group('clamp','chat',async t => {
     await t.configure({globalEffort:'medium'});
     await t.run('settings-clamp-high',['high']);
     await t.globalUnchanged(); // Clamp the active level, not the logical global.
-    await t.run('', ['high'],{headless:true});
-    await t.globalUnchanged();
     // No supported level above max: fallback searches downward.
     const map = {off:'none',low:'low'};
     await t.configure({map,globalEffort:'max'});
     await t.run('settings-clamp-low',['low'],{map});
-    await t.globalUnchanged();
-    await t.run('', ['low'],{headless:true,map});
     await t.globalUnchanged();
   });
 
@@ -250,17 +238,12 @@ export async function settingsRegressions({app,pty,execute,send}) {
     // Unknown capabilities retain explicit raw low, but cannot authorize a
     // cycle or write global preferences (nor initialize project settings).
     await t.globalUnchanged();
-    await t.run('', ['low'],{headless:true});
-    await t.globalUnchanged();
   });
 
   for (const [kind,raw] of [['malformed','{"version":1,"reasoning_effort":'],['oversize',' '.repeat(1025)]]) await group(kind,'chat',async t => {
     await t.configure({effort:'low'});
     await t.seed(t.project,raw);
     await t.run('settings-probe-low',['low']);
-    await t.legacyUnchanged(t.project,raw);
-    await t.globalUnchanged();
-    await t.run('', ['low'],{headless:true});
     await t.legacyUnchanged(t.project,raw);
     await t.globalUnchanged();
   });

@@ -996,7 +996,7 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     // Unsubmitted management drafts stay ordinary editable text: the exact
     // draft is visible in the composer, no hidden-arguments placeholder is
     // substituted, and nothing runs because Enter is never sent.
-    for ([_][]const u8{"/attach "}) |draft| {
+    for ([_][]const u8{ "/new ", "/resume " }) |draft| {
         const visible = std.mem.trimEnd(u8, draft, " \t\r\n");
         try settingsKey(d, draft);
         try settingsScreen(d, a, &.{visible}, &.{"command arguments hidden"});
@@ -2250,27 +2250,25 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     const mode = try required(init, "THIN_APP_TEST_MODE");
     const home_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "HOME={s}", .{home}), 0);
 
-    const restore_error: ?[]const u8 = if (std.mem.eql(u8, mode, "restore-failure")) try required(init, "THIN_APP_TEST_RESTORE_ERROR") else null;
-    if (restore_error) |expected| {
-        try check(std.mem.eql(u8, expected, "SelectionNotFound") or std.mem.eql(u8, expected, "ApiKeyNotFound") or std.mem.eql(u8, expected, "SelectionEndpointUnavailable") or std.mem.eql(u8, expected, "ResumeNotFound") or std.mem.eql(u8, expected, "ResumeAuthenticationFailed") or std.mem.eql(u8, expected, "ResumeConflict") or std.mem.eql(u8, expected, "ResumeNotClosed") or std.mem.eql(u8, expected, "UnsupportedVersion") or std.mem.eql(u8, expected, "SessionInUse") or std.mem.eql(u8, expected, "InvalidResumeLength") or std.mem.eql(u8, expected, "InvalidJson"));
-    }
-    const restore_mode = std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key") or std.mem.eql(u8, mode, "restore-failure");
-    // All child environment bytes are prepared before fork; missing-key case
-    // terminates the env array before the fixture key, never inheriting HOME.
+    // All child environment bytes are prepared before fork.
     const timezone = init.environ_map.get("THIN_APP_TEST_TZ") orelse "UTC0";
     try check(std.mem.eql(u8, timezone, "UTC0") or std.mem.eql(u8, timezone, "UTC-8"));
     const timezone_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "TZ={s}", .{timezone}), 0);
 
     const runtime_env = try a.dupeSentinel(u8, try std.fmt.allocPrint(a, "XDG_RUNTIME_DIR={s}", .{runtime_path}), 0);
 
-    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, runtime_env, if (std.mem.eql(u8, mode, "restore-no-key") or (restore_error != null and std.mem.eql(u8, restore_error.?, "ApiKeyNotFound"))) null else "THIN_FIXTURE_KEY=fixture-secret-never-log" };
+    const env = [_:null]?[*:0]const u8{ "PATH=/usr/bin:/bin", home_env, "LANG=C.UTF-8", "TERM=xterm-256color", timezone_env, runtime_env, "THIN_FIXTURE_KEY=fixture-secret-never-log" };
 
-    const interactive_argv = [_:null]?[*:0]const u8{ bin, "--no-model-auto-refresh" };
-    const print_argv = [_:null]?[*:0]const u8{ bin, "--print", "large-output" };
-    const restore_id = try a.dupeSentinel(u8, if (restore_mode) try required(init, "THIN_APP_TEST_RESTORE_ID") else "", 0);
-    const restore_argv = [_:null]?[*:0]const u8{ bin, "--restore-selection", restore_id };
-    // output 模式直接执行 --print 大输出；其余模式启动交互式界面。
-    const argv: [*:null]const ?[*:0]const u8 = if (restore_mode) &restore_argv else if (std.mem.eql(u8, mode, "output")) &print_argv else &interactive_argv;
+    // Only rejection probes pass arguments. Use formerly valid operands so a
+    // missing prompt or malformed session ID cannot explain the refusal.
+    const reject_print = std.mem.eql(u8, mode, "reject-print");
+    const reject_restore = std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key") or std.mem.eql(u8, mode, "restore-failure");
+    const argv: [*:null]const ?[*:0]const u8 = if (reject_print)
+        &[_:null]?[*:0]const u8{ bin, "--print", "unused-prompt" }
+    else if (reject_restore)
+        &[_:null]?[*:0]const u8{ bin, "--restore-selection", "0123456789abcdef0123456789abcdef" }
+    else
+        &[_:null]?[*:0]const u8{bin};
 
     var master: c_int = undefined;
     var slave: c_int = undefined;
@@ -2325,9 +2323,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     const nonblock: c_int = @intCast(@as(u32, @bitCast(c.O{ .NONBLOCK = true })));
     try check(c.fcntl(master, c.F.SETFL, master_flags | nonblock) == 0);
 
-    // Seed pre-existing terminal OUTPUT through the owned slave, never master
-    // input. --print backpressure must wait for genuine application stdout.
-    if (!std.mem.eql(u8, mode, "output")) {
+    // Keep rejection captures empty so they must contain only usage text.
+    if (!reject_print and !reject_restore) {
         const seed = regular.prior ++ "\r\n";
         try check(c.write(slave, seed.ptr, seed.len) == seed.len);
     }
@@ -2379,28 +2376,27 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     }
 
     if (std.mem.eql(u8, mode, "output")) {
-        // A slow output consumer must not trap the installed signal handler.
-        // Wait for first output without reading, then leave this owned PTY full.
-        var readable = [_]c.pollfd{.{ .fd = master, .events = 1, .revents = 0 }};
-        try check(c.poll(&readable, 1, 10000) > 0);
-
-        // 短暂停顿，确保子进程已因 PTY 缓冲区写满而阻塞在 write 上。
+        // Submit the fixture's large answer through the foreground composer,
+        // then stop reading. Startup bytes alone are not backpressure.
+        try d.waitIdle(0);
+        try d.send("large-output\r");
+        var writable = [_]c.pollfd{.{ .fd = slave, .events = c.POLL.OUT, .revents = 0 }};
         var pause = [_]c.pollfd{.{ .fd = -1, .events = 0, .revents = 0 }};
-        _ = c.poll(&pause, 1, 150);
+        const fill_until = now() + 10000;
+        while (true) {
+            const result = c.poll(&writable, 1, 0);
+            if (result == 0) break;
+            try check(result > 0 and writable[0].revents == c.POLL.OUT);
+            if (now() >= fill_until) return error.OutputBackpressureTimeout;
+            _ = c.poll(&pause, 1, 5);
+        }
 
         // 在子进程阻塞写入时发送 SIGINT，验证取消路径不会被未读取的输出卡住。
         try check(d.owned and kill(d.pid, @backingInt(c.SIG.INT)) == 0);
         const until = now() + 2000;
-        // 循环非阻塞回收，最长等待 2 秒；超时则报告取消超时。
-        while (d.owned and now() < until) {
-            const result = waitpid(pid, &d.status, c.W.NOHANG);
-            if (result == pid) d.owned = false;
-            if (result < 0 and c._errno().* != @backingInt(c.E.INTR)) {
-                if (c._errno().* == @backingInt(c.E.CHILD)) d.owned = false;
-                return error.WaitFailed;
-            }
-            if (d.owned) _ = c.poll(&pause, 1, 5);
-        }
+        // Unlike one-shot stdout, the foreground TUI must still write its
+        // terminal-leave sequence. Resume reading only *after* the signal.
+        while (d.owned and now() < until) try d.drain(5);
         if (d.owned) return error.OutputCancellationTimeout;
 
         // 期望退出码 130（128 + SIGINT）。
@@ -2411,23 +2407,21 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     // A startup refusal before task admission must fail closed: the owned
     // child never reaches a composer, so finish on the real child and check its
     // exit/termios cleanup rather than waiting for banner or idle.
-    if (std.mem.eql(u8, mode, "log-owner-refused")) {
+    if (std.mem.eql(u8, mode, "log-owner-refused") or std.mem.eql(u8, mode, "symlink-home-refused")) {
         try d.finish(1);
         const output = d.output[0..d.used];
         // Client.run 的固定前缀：拿不到执行锁时拒绝启动前台会话。
         try check(std.mem.indexOf(u8, output, "thin: could not start the session worker") != null);
-        // Same early-shaped refusal as restore-error: no raw mode, no frame.
+        // Startup refusal: no raw mode, no frame.
         try check(std.mem.indexOfScalar(u8, output, 0x1b) == null);
         return;
     }
 
-    // Startup refusals precede raw mode and the first frame. Check their exit
-    // directly; waiting for a composer would mistake correct refusal for EOF.
-    if (restore_error) |expected| {
-        try d.finish(1);
-        const message = try std.fmt.allocPrint(a, "thin: {s}", .{expected});
-        try check(std.mem.indexOf(u8, d.output[0..d.used], message) != null);
-        try check(std.mem.indexOfScalar(u8, d.output[0..d.used], 0x1b) == null);
+    // Invalid launch syntax exits before terminal setup or session lookup.
+    if (reject_print or reject_restore) {
+        try d.finish(2);
+        const bytes = d.output[0..d.used];
+        try check(std.mem.eql(u8, bytes, "Usage: thin [--daemon]\r\n") or std.mem.eql(u8, bytes, "Usage: thin [--daemon]\n"));
         return;
     }
     // The first owned frame establishes a blank viewport with the composer at
@@ -2443,16 +2437,9 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         }
         return err;
     };
-    // A restored selection may raise an owned notice row above the composer;
-    // other starts have only the composer and an optional single hint row.
     const clamp = std.mem.eql(u8, mode, "settings-clamp-high") or std.mem.eql(u8, mode, "settings-clamp-low");
-    const expected_notice: ?[]const u8 = if (clamp)
-        "Saved thinking level adjusted for this model; preference unchanged"
-    else if (std.mem.eql(u8, mode, "restore-selection") or std.mem.eql(u8, mode, "restore-idle"))
-        "Selection restored; NEW EMPTY CHAT (history not restored)"
-    else
-        null;
-    if (expected_notice) |notice| {
+    if (clamp) {
+        const notice = "Saved thinking level adjusted for this model; preference unchanged";
         var ready = false;
         while (now() < startup_until) {
             try d.drain(20);
@@ -2480,7 +2467,22 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try queuedScenario(&d, init, mode, project);
         return;
     }
-    if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
+    if (std.mem.eql(u8, mode, "fixture-turn")) {
+        const prompt = try required(init, "THIN_APP_TEST_PROMPT");
+        const expect = try required(init, "THIN_APP_TEST_EXPECT");
+        // One ordinary submission; neither the input echo nor a pre-submit
+        // frame may satisfy the expected reply (which can be a failure).
+        try check(prompt.len != 0 and expect.len != 0 and std.mem.indexOf(u8, prompt, expect) == null);
+        for (prompt) |byte| try check(byte >= 0x20 and byte != 0x7f);
+        const start = d.used;
+        try d.send(prompt);
+        try d.send("\r");
+        try d.waitText(start, expect);
+        const at = std.mem.indexOf(u8, d.output[start..d.used], expect).?;
+        try d.waitIdle(start + at + expect.len);
+        // Common exit below confirms Ctrl+D, checks restoration and reports
+        // the saved checkpoint ID on stderr without dumping terminal output.
+    } else if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // A generated disk default is not an activated selection. Do not enter
         // a key or submit a prompt: no public endpoint may be contacted.
         try d.waitText(0, "/login");
@@ -2733,27 +2735,6 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         login_stage = 9;
         start = d.used;
         try d.send("\x1b");
-        try d.waitIdle(start);
-    } else if (std.mem.eql(u8, mode, "restore-idle") or std.mem.eql(u8, mode, "restore-no-key")) {
-        const needle = if (std.mem.eql(u8, mode, "restore-no-key")) "Not configured: /login, then /model" else "history not restored";
-        d.waitFrame(0, needle) catch |err| {
-            if (std.mem.eql(u8, mode, "restore-idle")) {
-                const bytes = d.output[0..d.used];
-                const at = std.mem.indexOf(u8, bytes, needle);
-                const ack = if (at) |pos| std.mem.indexOf(u8, bytes[pos + needle.len ..], "\x1b[?25h") != null else false;
-                std.debug.print("RESTORE_IDLE_WAIT text={any} ack={any}\n", .{ at != null, ack });
-            }
-            return err;
-        };
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "OLD-HISTORY-MUST-NOT-APPEAR") == null);
-        try d.quiet(150);
-    } else if (std.mem.eql(u8, mode, "restore-selection")) {
-        try d.waitFrame(0, "history not restored");
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "fixture-restored") != null);
-        try check(std.mem.indexOf(u8, d.output[0..d.used], "OLD-HISTORY-MUST-NOT-APPEAR") == null);
-        const start = d.used;
-        try d.send("restore-new-turn\r");
-        try d.waitText(start, "restore-fresh-answer");
         try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "exit-no-submit") or std.mem.eql(u8, mode, "exit-unconfigured") or std.mem.eql(u8, mode, "exit-batched")) {
         try d.quiet(100);

@@ -88,14 +88,14 @@ test "registry publishes schema v1 id strings and resolves across projects" {
     defer freeRecords(a, past_end);
     try testing.expectEqual(@as(usize, 0), past_end.len);
 
-    try registry.unpublish(id, "/tmp/project-two");
+    try registry.unpublish(id, "/tmp/project-two", other.endpoint);
     const remaining = (try registry.resolve(a, id, null)) orelse return error.TestUnexpectedResult;
     defer {
         var owned = remaining;
         freeRecord(a, &owned);
     }
     try testing.expectEqualStrings(project, remaining.project);
-    try registry.unpublish(id, project);
+    try registry.unpublish(id, project, record.endpoint);
     const after = try registry.resolve(a, id, null);
     if (after) |value| {
         var owned = value;
@@ -103,6 +103,170 @@ test "registry publishes schema v1 id strings and resolves across projects" {
         return error.TestUnexpectedResult;
     }
 }
+test "daemon catalog spans projects and pages without dialing even an existing listener" {
+    const a = testing.allocator;
+    var env = try TestEnv.init(a);
+    defer env.deinit(a);
+    var reg = try Registry.init(a, testing.io, &env.env);
+    defer reg.deinit();
+
+    var workers = try unix.Directory.resolveUnder(a, reg.runtime.path, "workers", reg.uid);
+    defer workers.deinit();
+    var listener = try unix.Listener.bind(a, &workers, "ab.sock", .{});
+    defer listener.deinit();
+
+    const count = max_page + 2;
+    for (0..count + 1) |i| {
+        var id: ids.Id = undefined;
+        _ = try std.fmt.bufPrint(&id, "{x:0>32}", .{i});
+        var record = try testRecord(&reg, id, if (i == 0) "/tmp/a" else "/tmp/b", "ab");
+        defer freeRecord(a, &record);
+        record.owner = if (i == count) .foreground else .daemon;
+        try reg.register(record);
+    }
+    const records = try reg.daemonRecords(a);
+    defer freeRecords(a, records);
+    try testing.expectEqual(@as(usize, count), records.len);
+    for (records, 0..) |record, i| {
+        var id: ids.Id = undefined;
+        _ = try std.fmt.bufPrint(&id, "{x:0>32}", .{i});
+        try testing.expectEqual(id, record.id);
+        try testing.expectEqual(cli.WorkerOwner.daemon, record.owner);
+        try testing.expectEqualStrings(if (i == 0) "/tmp/a" else "/tmp/b", record.project);
+    }
+    if (try listener.acceptStep()) |accepted| {
+        var unexpected = accepted;
+        unexpected.close();
+        return error.UnexpectedProbe;
+    }
+}
+
+test "daemon locator survives a different runtime root but never offers the old endpoint" {
+    const a = testing.allocator;
+    var env = try TestEnv.init(a);
+    defer env.deinit(a);
+    var first = try Registry.init(a, testing.io, &env.env);
+    defer first.deinit();
+    const id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    var original = try testRecord(&first, id, env.home_path, "ab");
+    defer freeRecord(a, &original);
+    original.owner = .daemon;
+    try first.register(original);
+
+    try env.tmp.dir.createDir(testing.io, "boot2", .fromMode(0o700));
+    const base = try std.fmt.allocPrint(a, "{s}/boot2", .{std.fs.path.dirname(env.runtime_base).?});
+    defer a.free(base);
+    try env.env.put("XDG_RUNTIME_DIR", base);
+    var second = try Registry.init(a, testing.io, &env.env);
+    defer second.deinit();
+    // Even an explicit stale cleanup with the old path cannot remove it.
+    try second.unpublish(id, original.project, original.endpoint);
+    const records = try second.daemonRecords(a);
+    defer freeRecords(a, records);
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqualStrings("", records[0].endpoint);
+    const selected = (try second.resolve(a, id, original.project)) orelse return error.TestExpectedRecord;
+    defer freeRecord(a, &selected);
+    try testing.expectEqual(id, selected.id);
+    try testing.expectEqualStrings(original.project, selected.project);
+    try testing.expectEqual(cli.WorkerOwner.daemon, selected.owner);
+    try testing.expectEqualStrings("", selected.endpoint);
+    try testing.expect(!second.isLive(selected, 20));
+
+    // Reject an unrelated socket, or a self-consistent JSON project_key
+    // that does not hash the claimed project. Neither grants a cold locator.
+    const key = projectKey(original.project);
+    const key_fd = try second.openKeyDir(key, false);
+    defer fs.closeFd(key_fd);
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}.json", .{id});
+    var forged = original;
+    for (0..2) |i| {
+        if (i == 0) {
+            forged.endpoint = "/tmp/foreign.sock";
+        } else {
+            forged.endpoint = original.endpoint;
+            forged.project = "/tmp/foreign-project";
+        }
+        const encoded = try second.encode(forged, key);
+        defer a.free(encoded);
+        try atomicReplace(a, testing.io, key_fd, name, encoded);
+        try testing.expectError(error.ProtocolError, second.resolve(a, id, null));
+        const empty = try second.daemonRecords(a);
+        defer freeRecords(a, empty);
+        try testing.expectEqual(@as(usize, 0), empty.len);
+    }
+}
+
+test "trailing XDG slashes publish one separator and legacy daemon records are metadata only" {
+    const a = testing.allocator;
+    var env = try TestEnv.init(a);
+    defer env.deinit(a);
+    const with_slashes = try std.fmt.allocPrint(a, "{s}//", .{env.runtime_base});
+    defer a.free(with_slashes);
+    try env.env.put("XDG_RUNTIME_DIR", with_slashes);
+    var reg = try Registry.init(a, testing.io, &env.env);
+    defer reg.deinit();
+    const expected = try std.fmt.allocPrint(a, "{s}/thin", .{env.runtime_base});
+    defer a.free(expected);
+    try testing.expectEqualStrings(expected, reg.runtime.path);
+
+    // The legacy spelling reaches this listener if anyone tries to dial it.
+    var workers = try unix.Directory.resolveUnder(a, reg.runtime.path, "workers", reg.uid);
+    defer workers.deinit();
+    var listener = try unix.Listener.bind(a, &workers, "ab.sock", .{});
+    defer listener.deinit();
+    const id: ids.Id = "0123456789abcdef0123456789abcdef".*;
+    const legacy = try std.fmt.allocPrint(a, "{s}/thin/workers/ab.sock", .{with_slashes});
+    defer a.free(legacy);
+    const record: Record = .{
+        .id = id,
+        .project = env.home_path,
+        .owner = .daemon,
+        .owner_instance = "ab",
+        .endpoint = legacy,
+        .state = "running",
+        .pid = 4242,
+        .generation = 1,
+    };
+    try testing.expectError(error.InvalidInput, reg.register(record));
+    const key = projectKey(record.project);
+    const fd = try reg.openKeyDir(key, true);
+    defer fs.closeFd(fd);
+    const bytes = try reg.encode(record, key);
+    defer a.free(bytes);
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}.json", .{id});
+    try atomicReplace(a, testing.io, fd, name, bytes);
+    // The same record must remain discoverable after moving the runtime.
+    try env.tmp.dir.createDir(testing.io, "boot2", .fromMode(0o700));
+    const moved_base = try std.fmt.allocPrint(a, "{s}/boot2", .{std.fs.path.dirname(env.runtime_base).?});
+    defer a.free(moved_base);
+    try env.env.put("XDG_RUNTIME_DIR", moved_base);
+    var moved = try Registry.init(a, testing.io, &env.env);
+    defer moved.deinit();
+    const catalog = try moved.daemonRecords(a);
+    defer freeRecords(a, catalog);
+    try testing.expectEqual(@as(usize, 1), catalog.len);
+    try testing.expectEqual(id, catalog[0].id);
+    try testing.expectEqualStrings("", catalog[0].endpoint);
+    const selected = (try reg.resolve(a, id, record.project)) orelse return error.TestExpectedRecord;
+    defer freeRecord(a, &selected);
+    try testing.expectEqualStrings("", selected.endpoint);
+    try testing.expect(!reg.isLive(selected, 20));
+    if (try listener.acceptStep()) |accepted| {
+        var unexpected = accepted;
+        unexpected.close();
+        return error.UnexpectedProbe;
+    }
+
+    for ([_][]const u8{
+        "/old//base//thin/workers/ab.sock", "/old/.//thin/workers/ab.sock",
+        "/old/..//thin/workers/ab.sock",    "/old//thin//workers/ab.sock",
+        "/old//thin/workers/ff.sock",
+    }) |invalid| try testing.expect(!reg.historicalEndpoint("ab", invalid));
+}
+
 test "registry distinguishes absent entries from invalid or unreadable records" {
     const a = testing.allocator;
     var test_env = try TestEnv.init(a);
@@ -194,7 +358,7 @@ test "registry distinguishes absent entries from invalid or unreadable records" 
 
     // Open and metadata failures are not reclassified as a missing entry.
     try testing.expectError(error.FileSystemError, registry.readOneLocked(a, id, key, -1, project));
-    try testing.expectError(error.FileSystemError, isRegularFd(-1));
+    try testing.expectError(error.FileSystemError, metadata.statFd(-1));
 }
 test "registry read allocation failures propagate and release partial records" {
     const a = testing.allocator;
@@ -207,6 +371,7 @@ test "registry read allocation failures propagate and release partial records" {
     const project = "/tmp/allocation-one";
     var first = try testRecord(&registry, id, project, "cccccccccccccccc");
     defer freeRecord(a, &first);
+    first.owner = .daemon;
     try registry.register(first);
 
     // Exercise JSON parsing and every separately owned record field, as well
@@ -214,6 +379,7 @@ test "registry read allocation failures propagate and release partial records" {
     try testing.checkAllAllocationFailures(a, resolveAllocationCase, .{ &registry, id, @as(?[]const u8, project) });
     try testing.checkAllAllocationFailures(a, resolveAllocationCase, .{ &registry, id, @as(?[]const u8, null) });
     try testing.checkAllAllocationFailures(a, listAllocationCase, .{&registry});
+    try testing.checkAllAllocationFailures(a, daemonRecordsAllocationCase, .{&registry});
 
     // If a later project fails or is ambiguous, the first result must be freed.
     const other_project = "/tmp/allocation-two";

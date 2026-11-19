@@ -52,8 +52,8 @@ function send(res, text, call) {
 }
 
 // stdout/stderr 分开捕获；所有 watchdog 与输出均有界，只终止尚未回收的自有进程组。
-async function execute(bin, args, env, cwd, expectRejected = false) {
-  const child = spawn(bin, args, {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
+async function execute(bin, env, cwd) {
+  const child = spawn(bin, [], {cwd, env, detached:true, stdio:['ignore','pipe','pipe']});
   let owned = true, size = 0, failed = false, rejectPending;
   const stdout = [], stderr = [];
   const kill = signal => { if (owned && child.pid) { try { process.kill(-child.pid, signal); } catch {} } };
@@ -75,10 +75,7 @@ async function execute(bin, args, env, cwd, expectRejected = false) {
       child.once('error', reject); child.once('close', resolve);
     });
     assert(!failed, 'bounded child execution failed');
-    if (expectRejected) {
-      assert.notEqual(code, 0, 'removed flag unexpectedly accepted');
-      assert.match(Buffer.concat(stderr).toString('utf8'), /UnknownOption/, 'removed flag must be rejected');
-    } else if (code !== 0) {
+    if (code !== 0) {
       const diagnostic = Buffer.concat(stderr).toString('utf8').split('\n').find(line => /^(?:thin: (?:(?:failed|canceled)(?:: [A-Za-z0-9_]+)?(?: \/ [a-z_]+)?|[A-Za-z][A-Za-z0-9_]*)|error: [A-Za-z][A-Za-z0-9_]*)$/.test(line));
       const error = new Error('application did not exit successfully');
       error.fixtureCheck = diagnostic ?? 'application did not exit successfully';
@@ -192,16 +189,16 @@ async function records(project, began, ended, key) {
 async function scenario(app, pty, kind) {
   const root = await mkdtemp(join(tmpdir(),'thin-log-'));
   const home = join(root,'home'), project = join(root,'project');
-  const key = kind === 'redact-json' ? JSON_KEY : KEY;
+  const key = kind === 'redact-json' ? JSON_KEY : kind === 'redact' ? 'log-redaction-test-key' : KEY;
   let requests = 0, fixtureFailed = false, actualDate;
   const sockets = new Set();
-  const date = kind === 'date' || kind === 'date-pty';
+  const date = kind === 'date';
   const redact = kind === 'redact' || kind === 'redact-json';
   const memoryAuto = kind === 'memory-auto';
   const writeAuto = kind === 'write-auto';
   const usesTool = date || memoryAuto || writeAuto || redact;
-  const user = redact ? `user ${key}` : kind === 'date-pty' ? '获取时间' : 'log-fixture-task';
-  const answer = redact ? `assistant ${key}` : date ? 'date-completed' : 'log-fixture-answer';
+  const user = redact ? `user ${key}` : date ? '获取时间' : 'log-fixture-task';
+  const answer = redact ? `assistant ${key} log-redact-complete` : date ? 'date-completed' : 'log-fixture-answer';
   const server = http.createServer(async (req,res) => {
     try {
       requests++;
@@ -238,49 +235,33 @@ async function scenario(app, pty, kind) {
     await mkdir(home); await mkdir(project); await mkdir(join(home,'.thin'));
     await new Promise((resolve,reject) => { server.once('error',reject); server.listen(0,'127.0.0.1',resolve); });
     const url = `http://127.0.0.1:${server.address().port}/v1`;
-    await writeFile(join(home,'.thin/config.json'), JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,request_timeout_ms:5000}}));
+    await writeFile(join(home,'.thin/config.json'), JSON.stringify({llm:{default:'local/fixture-model',providers:{local:{base_url:url,...(redact ? {api_key:key} : {api_key_env:'THIN_FIXTURE_KEY'}),models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}}, limits:{low_price_input:false,request_timeout_ms:5000}}));
     if (redact) await writeFile(join(project,`secret-${key}.json`), JSON.stringify({secret:key, [key]:key}));
-    if (kind === 'failure' || kind === 'failure-pty') { await mkdir(join(project,'.thin')); await writeFile(join(project,'.thin/sessions'),'occupied'); }
+    if (kind === 'failure-pty') { await mkdir(join(project,'.thin')); await writeFile(join(project,'.thin/sessions'),'occupied'); }
     const env = {PATH:'/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'xterm-256color', THIN_FIXTURE_KEY:key,
       THIN_APP_BIN:app, THIN_APP_TEST_HOME:home, THIN_APP_TEST_PROJECT:project, THIN_APP_TEST_URL:url,
-      THIN_APP_TEST_MODE:kind === 'date-pty' ? 'date' : kind === 'failure-pty' ? 'log-owner-refused' : 'log-idle'};
-    const isPty = ['date-pty','failure-pty','idle'].includes(kind);
-    const args = kind === 'help' ? ['--help'] : kind === 'version' ? ['--version'] : ['--print',user, ...(kind === 'no-log' ? ['--no-log'] : [])];
+      THIN_APP_TEST_MODE:date ? 'date' : kind === 'failure-pty' ? 'log-owner-refused' : kind === 'idle' ? 'log-idle' : 'fixture-turn',
+      THIN_APP_TEST_PROMPT:user, THIN_APP_TEST_EXPECT:redact ? 'log-redact-complete' : answer};
     const began = Date.now();
-    const result = await execute(isPty?pty:app, isPty?[]:args, env, project, kind === 'no-log');
+    const result = await execute(pty, env, project);
     const ended = Date.now();
-    const announced = isPty ? [...(result.stdout + '\n' + result.stderr).matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)] : [];
-    if (isPty) assert.equal(announced.length,kind === 'date-pty' ? 1 : 0,'session id must reflect a saved nonempty conversation');
+    assert(result.stdout === '', 'driver must not replay terminal output');
+    const announced = [...result.stderr.matchAll(/^PTY_SESSION_ID=([a-f0-9]{32})$/gm)];
+    assert.equal(announced.length,['idle','failure-pty'].includes(kind) ? 0 : 1,'session id must reflect a saved nonempty conversation');
     assert(!fixtureFailed, 'loopback fixture failed');
-    if (kind === 'help') {
-      assert(result.stdout.includes('.thin/sessions/*.jsonl') && !result.stdout.includes('.thin/logs'), 'session path missing from help');
-    }
-    if (['help','version','idle','no-log'].includes(kind)) {
-      // idle 启动由 PTY 驱动持有 Lease root anchor（空 resume-lock）；
-      // help/version/no-log 仍必须完全没有 sessions 目录。
-      if (kind === 'idle') await noSubmissionState(project);
-      else {
-        assert(!await exists(join(project,'.thin/sessions')), 'session record created without submission');
-        if (kind === 'no-log') assert(!await exists(join(project,'.thin')), 'rejected flag created project state');
-      }
+    if (kind === 'idle') {
+      await noSubmissionState(project);
       assert(!await exists(join(project,'.thin/logs')), 'legacy log directory created');
-      assert.equal(requests, 0, 'rejected flag or empty invocation reached network');
-    } else if (kind === 'failure' || kind === 'failure-pty') {
-      // print 路径：记录失败发生在任务受理之后，主结果照常完成。
-      if (kind === 'failure') {
-        assert(requests === 1, 'logger failure changed request count');
-        assert(result.stdout.includes(answer), 'logger failure changed answer');
-        assert(result.stderr.includes('session recording disabled'), 'logger failure not visible on stderr');
-      } else {
-        // 前台启动在受理任何任务之前必须拿不到执行锁并 fail-closed：
-        // 既不启动 Runtime，也不得发出任何模型请求。
-        assert(requests === 0, 'owner refusal reached the model');
-      }
+      assert.equal(requests,0);
+    } else if (kind === 'failure-pty') {
+      // Print's post-admission stderr warning retired. An interactive owner
+      // must refuse this obstruction before accepting any model task.
+      assert.equal(requests,0,'owner refusal reached the model');
       assert(await readFile(join(project,'.thin/sessions'),'utf8') === 'occupied', 'obstruction overwritten');
     } else {
       assert(requests === (usesTool ? 2 : 1), 'unexpected conversation length');
       const rows = await records(project,began,ended,key);
-      if (isPty) assert(rows.every(row => row.session === announced[0][1]), 'announced/archive session identity differs');
+      assert(rows.every(row => row.session === announced[0][1]), 'announced/archive session identity differs');
       const events = name => rows.filter(r => r.event === name).map(r => r.data);
       const users = events('user'), assistants = events('assistant'), finished = events('finished');
       assert(users.length === 1 && users[0].source_bytes === Buffer.byteLength(user) && users[0].truncated === false, 'user metadata missing');
@@ -342,5 +323,5 @@ async function scenario(app, pty, kind) {
 }
 
 export async function logRegressions(app, pty) {
-  for (const kind of ['plain','no-log','help','version','idle','date','write-auto','memory-auto','redact','redact-json','failure','date-pty','failure-pty']) await scenario(app,pty,kind);
+  for (const kind of ['plain','idle','date','write-auto','memory-auto','redact','redact-json','failure-pty']) await scenario(app,pty,kind);
 }

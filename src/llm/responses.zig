@@ -56,7 +56,7 @@ fn encodeMode(a: std.mem.Allocator, req: p.Request, codex: bool) ![]u8 {
         var text = c.object(t);
         try c.put(t, &text, "verbosity", j.str("low"));
         try c.put(t, &root, "text", text);
-        try c.put(t, &root, "tool_choice", j.str("auto"));
+        if (req.purpose != .summary) try c.put(t, &root, "tool_choice", j.str("auto"));
         try c.put(t, &root, "parallel_tool_calls", .{ .bool = true });
     }
     var include = j.array(t);

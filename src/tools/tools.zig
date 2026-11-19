@@ -9,7 +9,6 @@ const fs = @import("../platform/filesystem.zig");
 // Reserved legacy path: no preference reader/writer remains.
 const settings = struct {
     const file_name = "settings.json";
-    const relative_path = ".thin/settings.json";
 };
 const mem = @import("memory.zig");
 const knowledge_store = @import("knowledge_store.zig");

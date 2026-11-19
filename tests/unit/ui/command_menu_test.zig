@@ -10,11 +10,9 @@ test "slash suggestions preserve model login compact order and support local fuz
         try std.testing.expectEqual(@as(usize, 1), found.len);
         try std.testing.expectEqual(Command.compact, found.commands[0]);
     }
-    // /co now genuinely prefixes /compact and /close; both stay candidates.
     const co = suggestions("/co", 3, false);
-    try std.testing.expectEqual(@as(usize, 2), co.len);
+    try std.testing.expectEqual(@as(usize, 1), co.len);
     try std.testing.expectEqual(Command.compact, co.commands[0]);
-    try std.testing.expectEqual(Command.close, co.commands[1]);
     for ([_][]const u8{ "/mo", "/MD", "/model" }) |query| {
         const found = suggestions(query, query.len, false);
         try std.testing.expectEqual(@as(usize, 1), found.len);
@@ -23,16 +21,8 @@ test "slash suggestions preserve model login compact order and support local fuz
     const auth = suggestions("/lgn", 4, false);
     try std.testing.expectEqual(@as(usize, 1), auth.len);
     try std.testing.expectEqual(Command.auth, auth.commands[0]);
-    for ([_][]const u8{ "/new", "/attach", "/detach" }) |query| {
-        const found = suggestions(query, query.len, false);
-        try std.testing.expect(found.len >= 1);
-        // Subsequence matching may offer extra candidates; the exact command
-        // must always be present.
-        var hit = false;
-        for (found.commands[0..found.len]) |command| {
-            if (std.mem.eql(u8, info(command).value, query)) hit = true;
-        }
-        try std.testing.expect(hit);
+    for ([_][]const u8{ "/attach", "/detach", "/close", "/sessions", "/list" }) |query| {
+        try std.testing.expectEqual(@as(usize, 0), suggestions(query, query.len, false).len);
     }
 }
 test "new is a remote root candidate and completes to its exact command" {
@@ -42,7 +32,7 @@ test "new is a remote root candidate and completes to its exact command" {
         if (command == .new_session) {
             found = true;
             try std.testing.expectEqualStrings("/new", info(command).value);
-            try std.testing.expectEqualStrings("[prompt]", info(command).arguments);
+            try std.testing.expectEqualStrings("", info(command).arguments);
             try std.testing.expectEqualStrings("Start a new session", info(command).description);
         }
     }
@@ -56,6 +46,7 @@ test "resume is a remote root candidate and completes to its exact command" {
         if (command == .@"resume") {
             found = true;
             try std.testing.expectEqualStrings("/resume", info(command).value);
+            try std.testing.expectEqualStrings("", info(command).arguments);
         }
     }
     try std.testing.expect(found);
@@ -63,7 +54,9 @@ test "resume is a remote root candidate and completes to its exact command" {
 }
 test "session commands are classified apart from local commands" {
     try std.testing.expect(!sessionOnly(.model) and !sessionOnly(.auth) and !sessionOnly(.compact) and !sessionOnly(.settings));
-    for ([_]Command{ .new_session, .attach, .detach, .close }) |command| try std.testing.expect(sessionOnly(command));
+    const all = suggestions("/", 1, false);
+    try std.testing.expectEqualSlices(Command, &.{ .model, .auth, .compact, .settings, .new_session, .@"resume" }, all.commands[0..all.len]);
+    try std.testing.expect(sessionOnly(.new_session) and sessionOnly(.@"resume"));
 }
 test "slash suggestions exclude arguments multiline prompts paste and mid-token cursor" {
     for ([_][]const u8{ "", "hello /", " /model", "/login key", "/model\n", "/unknown", "/../", "/compact now", "/压缩", "/compact1" }) |value|
@@ -79,7 +72,7 @@ test "command rows are bounded clipped and mark the selection" {
         for (rendered.lines) |line| a.free(line);
         a.free(rendered.lines);
     }
-    try std.testing.expectEqual(@as(usize, 8), rendered.lines.len);
+    try std.testing.expectEqual(items.len, rendered.lines.len);
     try std.testing.expectEqual(@as(usize, 0), rendered.start);
     try std.testing.expectEqual(@as(usize, 2 + "/model [exact-id|--refresh]".len), labelBytes(.model));
     try std.testing.expectEqual(@as(usize, 2 + "/login".len), labelBytes(.auth));

@@ -29,19 +29,18 @@ test "empty no-log selections persist global logical defaults and restart across
         try fixture.expectIdle(project);
     }
 }
-test "headless and UI share global preference and capability clamp without rewriting it" {
+test "active model and UI reflect capability clamp without rewriting the global preference" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     try fixture.seed("local/first", "medium");
-    try fixture.env.put("OWNED_SETTINGS_KEY", "fake-headless-key");
+    try fixture.env.put("OWNED_SETTINGS_KEY", "fake-settings-key");
     const before = try fixture.bytes();
     defer a.free(before);
-    const app = try App.init(a, io, &fixture.env, fixture.project, .{});
-    defer app.deinit();
-    try std.testing.expectEqualStrings("high", app.config.value.model.reasoning_effort.?);
-    try expectWire(app.config.value, "intensive");
     var session = try fixture.session(fixture.other);
     defer session.deinit();
+    const app = session.app.?;
+    try std.testing.expectEqualStrings("high", app.config.value.model.reasoning_effort.?);
+    try expectWire(app.config.value, "intensive");
     try std.testing.expectEqual(effort.medium, session.preferred_effort.?);
     try std.testing.expectEqual(effort.high, session.connection().current().reasoning_effort);
     try std.testing.expect(session.connection().current().settings_notice != null);
@@ -49,7 +48,6 @@ test "headless and UI share global preference and capability clamp without rewri
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
     try fixture.expectDefaults("local/first", "medium");
-    try fixture.expectIdle(fixture.project);
     try fixture.expectIdle(fixture.other);
 }
 test "missing global preference uses explicit model option before off fallback" {
@@ -76,9 +74,6 @@ test "unknown capabilities never turn global preference into a wire option" {
     try std.testing.expect(activeConfig(&session).model.reasoning_effort == null);
     try std.testing.expectError(error.UnsupportedReasoningEffort, session.connection().setEffort(.high));
     try expectWire(activeConfig(&session).*, null);
-    const app = try App.init(a, io, &fixture.env, fixture.other, .{});
-    defer app.deinit();
-    try expectWire(app.config.value, null);
     try fixture.expectDefaults("local/unknown", "max");
 }
 test "context-only prefix remains an empty conversation for global selection defaults" {
@@ -215,9 +210,9 @@ test "legacy project settings malformed oversized and inaccessible are ignored a
             try std.testing.expectEqual(effort.medium, session.connection().current().reasoning_effort);
             try session.connection().setEffort(.high);
             try session.connection().selectModel("local/first");
-            const app = try App.init(a, io, &fixture.env, fixture.project, .{});
-            defer app.deinit();
-            try std.testing.expectEqualStrings("high", app.config.value.model.reasoning_effort.?);
+            var restarted = try fixture.session(fixture.project);
+            defer restarted.deinit();
+            try std.testing.expectEqualStrings("high", restarted.app.?.config.value.model.reasoning_effort.?);
             const stat = try fixture.tmp.dir.statFile(io, "project/.thin/settings.json", .{});
             try std.testing.expectEqual(@as(u32, @intCast(mode)), stat.permissions.toMode() & 0o777);
             try std.testing.expectEqual(@as(u64, @intCast(legacy.len)), stat.size);

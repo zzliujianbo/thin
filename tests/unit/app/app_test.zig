@@ -1,4 +1,4 @@
-test "headless missing and blank configuration use the same new schema without requests" {
+test "missing and blank configurations initialize the default model without credentials" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ false, true }) |blank| {
@@ -12,7 +12,11 @@ test "headless missing and blank configuration use the same new schema without r
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        try std.testing.expectError(error.ApiKeyNotFound, App.init(a, io, &env, home, .{}));
+        var session = try @import("session.zig").Session.init(a, io, &env, home, .{});
+        defer session.deinit();
+        try std.testing.expect(session.connection().current().runtime == null);
+        try std.testing.expect(!session.pending.?.value.selection_pending);
+        try std.testing.expectError(error.ApiKeyNotFound, cfg.resolveApiKey(a, session.pending.?.value, &env));
         var created = try store.loadExisting();
         defer cfg.release(&created);
         try std.testing.expect(created.value.registry != null);
@@ -21,7 +25,8 @@ test "headless missing and blank configuration use the same new schema without r
         try std.testing.expectError(error.FileNotFound, store.root.read(a, "settings.json", 0, 1024));
     }
 }
-test "headless global defaults ignore legacy settings and never create project settings" {
+test "session startup uses global defaults and never creates project settings" {
+    const Session = @import("session.zig").Session;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const cases = [_]struct { json: []const u8, effort: ?[]const u8 }{
@@ -60,8 +65,9 @@ test "headless global defaults ignore legacy settings and never create project s
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
         try env.put("HOME", home);
-        const app = try App.init(a, io, &env, project, .{});
-        defer app.deinit();
+        var session = try Session.init(a, io, &env, project, .{});
+        defer session.deinit();
+        const app = session.app.?;
         try std.testing.expectEqualStrings("fake", app.config.value.model.name);
         try std.testing.expectEqualStrings("fixture/fake", app.config.value.registry.?.default);
         if (case.effort) |effort| {
@@ -76,8 +82,7 @@ test "headless global defaults ignore legacy settings and never create project s
         defer a.free(unchanged_config.data);
         try std.testing.expectEqualStrings(case.json, unchanged_config.data);
 
-        // App owns a duplicated dirfd after init's local Root has closed. A
-        // replacement pathname must never redirect its file operations.
+        // Replacing the startup path must not redirect the active App's dirfd.
         try std.testing.expectEqual(@as(c_int, 0), std.c.renameat(tmp.dir.handle, "project", tmp.dir.handle, "retired"));
         try std.testing.expectEqual(@as(c_int, 0), std.c.mkdirat(tmp.dir.handle, "project", 0o700));
         try app.root.write("anchored.txt", "original inode", false);
@@ -92,7 +97,7 @@ test "headless global defaults ignore legacy settings and never create project s
         const alias = try std.fs.path.join(a, &.{ home, "project-alias" });
         defer a.free(alias);
         // Linux O_DIRECTORY | O_NOFOLLOW rejects the symlink as ENOTDIR.
-        try std.testing.expectError(error.NotDir, App.init(a, io, &env, alias, .{}));
+        try std.testing.expectError(error.NotDir, Session.init(a, io, &env, alias, .{}));
     };
 }
 test "App ignores retired memory layout and preserves its artifacts" {
@@ -138,8 +143,9 @@ test "App ignores retired memory layout and preserves its artifacts" {
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    const app = try App.init(a, io, &env, project, .{});
-    defer app.deinit();
+    var session = try @import("session.zig").Session.init(a, io, &env, project, .{});
+    defer session.deinit();
+    const app = session.app.?;
     const current = try app.memory.read(a, "core");
     defer a.free(current.content);
     try std.testing.expectEqualStrings("current core", current.content);
@@ -154,7 +160,8 @@ test "App ignores retired memory layout and preserves its artifacts" {
         try std.testing.expectEqualStrings("retired marker", marker.data);
     }
 }
-test "App protects actual configuration behind HOME and file symlinks" {
+test "session rejects symlinked HOME or config and protects the active config from tools" {
+    const Session = @import("session.zig").Session;
     const a = std.testing.allocator;
     const io = std.testing.io;
     const fake =
@@ -182,8 +189,17 @@ test "App protects actual configuration behind HOME and file symlinks" {
             var env = std.process.Environ.Map.init(a);
             defer env.deinit();
             try env.put("HOME", home);
-            const app = try App.init(a, io, &env, project, .{});
-            defer app.deinit();
+            if (std.mem.eql(u8, home, alias)) {
+                try std.testing.expectError(error.NotDir, Session.init(a, io, &env, project, .{}));
+                continue;
+            }
+            if (linked_file) {
+                try std.testing.expectError(error.SymlinkNotAllowed, Session.init(a, io, &env, project, .{}));
+                continue;
+            }
+            var session = try Session.init(a, io, &env, project, .{});
+            defer session.deinit();
+            const app = session.app.?;
             try std.testing.expect(app.config.value.limits.low_price_input and !app.config.value.imageActive());
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
@@ -198,5 +214,8 @@ test "App protects actual configuration behind HOME and file symlinks" {
                 try std.testing.expectError(error.ProtectedAuthFile, app.executor.execute(allocator, .{ .write_file = .{ .path = path, .content = "not written", .overwrite = true } }, &cancel));
             }
         }
+        const unchanged = try home_dir.readFileAlloc(io, target, a, .limited(fake.len + 1));
+        defer a.free(unchanged);
+        try std.testing.expectEqualStrings(fake, unchanged);
     }
 }

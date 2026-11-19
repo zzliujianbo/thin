@@ -9,12 +9,15 @@ test "large submitted input is owned without an ingress quota" {
     try std.testing.expectEqual(@as(usize, 65537), request.action.submit.text.len);
     try std.testing.expectEqual(@as(u8, 'x'), request.action.submit.text[65536]);
 }
-test "resume management request owns its selected id" {
+test "resume management request owns its selected project and id" {
     var id = "0123456789abcdef0123456789abcdef".*;
-    const request = try Owned.create(std.testing.allocator, 1, 2, 3, .{ .manage = .{ .@"resume" = &id } });
+    var project = "/workspace/project A".*;
+    const request = try Owned.create(std.testing.allocator, 1, 2, 3, .{ .manage = .{ .@"resume" = .{ .id = id, .project = &project } } });
     defer request.deinit();
     @memset(&id, 'f');
-    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", request.action.manage.@"resume");
+    @memset(&project, 'x');
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &request.action.manage.@"resume".id);
+    try std.testing.expectEqualStrings("/workspace/project A", request.action.manage.@"resume".project.?);
 }
 test "asynchronous commands own text independently of the editor and retain identity" {
     var draft: [5]u8 = @splat('x');

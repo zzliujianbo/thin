@@ -5,7 +5,6 @@ const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const r = @import("../core/runtime.zig");
 const Session = @import("../app/session.zig").Session;
-const App = @import("../app/app.zig").App;
 const Store = @import("../app/auth_store.zig").Store;
 const effort = @import("../presentation/activity.zig").ReasoningEffort;
 const a = std.testing.allocator;
