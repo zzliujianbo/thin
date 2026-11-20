@@ -98,11 +98,13 @@ def _check_editor_helper():
 # The --wrap pane is 80 columns. Keep these probes ASCII so bytes, glyphs and
 # cells agree. The first code line exactly fills a row but ends in a *source*
 # newline; it must not join the next indented line.
-BODY_LINE = ''.join(f'body{i:04d}' for i in range(24))
+# Exercise a tab before (not at) a wrap without changing the resize fixture's height.
+BODY_SOURCE = 'key\t0000' + ''.join(f'body{i:04d}' for i in range(1, 24))
+BODY_LINE = BODY_SOURCE.expandtabs(4)
 BODY_NEXT = 'body-after-hard-break'
 CODE_LINES = ('    ' + '0123456789' * 7 + 'ABCDEF', '        return selected')
 CJK_LINE = '中文折行' * 13
-WRAP_REPLY = '\n'.join(('selection-start', BODY_LINE, BODY_NEXT, CJK_LINE, '```', *CODE_LINES,
+WRAP_REPLY = '\n'.join(('selection-start', BODY_SOURCE, BODY_NEXT, CJK_LINE, '```', *CODE_LINES,
                         '```', 'wrap-history-ready'))
 
 

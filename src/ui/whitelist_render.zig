@@ -12,8 +12,8 @@ pub const Row = struct {
     end: usize,
     checkpoint: scan.State,
     complete: bool,
-    /// Following content wrapped to another physical row (possibly in a later batch).
-    /// This describes layout only; `complete` still governs release.
+    /// Printing the following content can wrap natively at this boundary.
+    /// A tab moved off a short row needs an explicit break. Release uses `complete`.
     soft_wrap: bool,
     /// Display cells written, including padding but excluding SGR bytes.
     cells: usize,

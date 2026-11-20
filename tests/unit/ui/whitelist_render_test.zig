@@ -50,15 +50,17 @@ test "tab overflow wraps but explicit boundaries do not" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var writer: output.Writer = .{ .a = a, .columns = 4, .ansi = false };
-    var sink: Sink = .{ .a = a, .writer = &writer, .base = 0, .seed = .{ .end = 0, .state = .{} }, .max_rows = null };
-    writer.sink = .{ .context = &sink, .onRow = Sink.onRow };
-    try writer.emit("abcd\t");
-    try writer.boundary();
-    try writer.emit("e");
-    try writer.finish();
-    try std.testing.expectEqual(@as(usize, 3), sink.rows.items.len);
-    try std.testing.expect(sink.rows.items[0].soft_wrap);
-    try std.testing.expect(!sink.rows.items[1].soft_wrap);
-    try std.testing.expect(!sink.rows.items[2].soft_wrap);
+    for ([_]usize{ 4, 5 }) |columns| {
+        var writer: output.Writer = .{ .a = a, .columns = columns, .ansi = false };
+        var sink: Sink = .{ .a = a, .writer = &writer, .base = 0, .seed = .{ .end = 0, .state = .{} }, .max_rows = null };
+        writer.sink = .{ .context = &sink, .onRow = Sink.onRow };
+        try writer.emit("abcd\t");
+        try writer.boundary();
+        try writer.emit("e");
+        try writer.finish();
+        try std.testing.expectEqual(@as(usize, 3), sink.rows.items.len);
+        try std.testing.expectEqual(columns == 4, sink.rows.items[0].soft_wrap);
+        try std.testing.expect(!sink.rows.items[1].soft_wrap);
+        try std.testing.expect(!sink.rows.items[2].soft_wrap);
+    }
 }

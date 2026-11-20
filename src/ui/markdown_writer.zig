@@ -414,7 +414,9 @@ pub const Writer = struct {
                 self.row_started = false;
                 try self.startReserved(@min(4, self.columns), replay);
             } else {
-                try self.finishRow(.width_wrap);
+                // A tab moves as a unit. If the row is short, its expanded
+                // spaces would not make the terminal wrap at this boundary.
+                try self.finishRow(if (self.col == self.columns) .width_wrap else .forced);
                 try self.startReserved(@min(4, self.columns), null);
             }
             try self.flushPending(false);

@@ -6726,15 +6726,12 @@ const Ui = struct {
             if (source >= rows.len) return; // Synthetic limit diagnostic.
             const row = rows[source];
             const full = row.cells == stream.columnCount();
-            // A first retained row may continue an already retired prefix.
-            const continuation = if (source == 0) stream.base != 0 else rows[source - 1].soft_wrap;
+            // Only a predecessor in this render can participate in a native join.
+            const continuation = source != 0 and rows[source - 1].soft_wrap;
             if (!full and !row.soft_wrap and !continuation) return;
             const wraps = if (row.soft_wrap and source + 1 < rows.len) blk: {
                 const next = rows[source + 1];
-                if (row.start >= row.end or row.end != next.start or next.start >= next.end or next.cells == 0) break :blk false;
-                // Expanded tabs can move as a unit where individual spaces would not wrap.
-                const span = stream.liveSource()[row.start - stream.base .. next.end - stream.base];
-                break :blk std.mem.indexOfScalar(u8, span, '\t') == null;
+                break :blk row.start < row.end and row.end == next.start and next.start < next.end and next.cells != 0;
             } else false;
             try list.append(a, .{ .index = index, .stream = stream, .source_row = source, .full = full, .wraps = wraps });
         }
