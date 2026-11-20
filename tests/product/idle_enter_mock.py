@@ -559,7 +559,7 @@ def deny_inet_sockets():
         raise OSError(ctypes.get_errno(), 'seccomp setup')
 
 
-def first_entry(app, origin, width, response='normal'):
+def first_entry(app, origin, width, response='normal', *, menu=None):
     """First-frame origin/scrollback oracle; never submits a user prompt."""
     with tempfile.TemporaryDirectory(prefix='thin-entry-', dir='/tmp') as base:
         home, project, runtime = (Path(base) / name for name in ('home', 'project', 'r'))
@@ -716,6 +716,48 @@ def first_entry(app, origin, width, response='normal'):
                 tail_index = len(screen.history) + screen.row
                 assert tail_index - entry_index in (1, 2), 'unnatural-entry-height'
                 assert screen.row == min(ROWS - 1, origin + tail_index - entry_index), 'entry-jumped'
+                if menu is not None:
+                    # Wait out the unconfigured startup frame without an empty Enter.
+                    pump(lambda: wire.endswith(FRAME_END) and screen.idle() and
+                         screen.editor_tail().startswith('(fixture-model)'))
+                    initial = screen.row
+                    assert origin < initial < ROWS - 1
+                    prompt = screen.editor_tail()
+
+                    def selected(label):
+                        return any(''.join(row).startswith('> ' + label + ' ')
+                                   for row in screen.grid)
+
+                    def key(data, visible):
+                        mark = len(wire)
+                        os.write(master, data)
+                        pump(lambda: wire[mark:].endswith(FRAME_END) and visible())
+                        assert screen.history == original_history, 'menu scrolled history'
+                        assert [''.join(row) for row in screen.grid[:origin + 1]] == [
+                            line.ljust(width) for line in protected], 'menu changed protected lines'
+                        return screen.row
+
+                    draft = '/'
+                    root = key(b'/', lambda: selected('/model') and screen.editor_tail() == prompt + draft)
+                    assert initial < root < ROWS - 1
+                    deepest = root
+                    if menu in ('filtered', 'settings'):
+                        draft = '/settings'
+                        filtered = key(b'settings', lambda: selected('/settings') and
+                                       screen.editor_tail() == prompt + draft)
+                        assert initial < filtered < root
+                    if menu == 'settings':
+                        panel = key(b'\r', lambda: screen.editor_tail() == 'Settings> ')
+                        assert initial < panel < ROWS - 1
+                        deepest = max(root, panel)
+                        draft = ''
+                    closed = key(b'\x1b', lambda: screen.editor_tail() == prompt + draft and
+                                 not selected('/model') and not selected('/settings'))
+                    occupied = [i + 1 for i in range(initial + 1, deepest + 1)
+                                if ''.join(screen.grid[i]).strip()]
+                    assert closed == initial and not occupied, (
+                        f'{menu} Esc: caret row {closed + 1}, expected {initial + 1}; '
+                        f'nonblank vacated rows {occupied}')
                 if response == 'timeout':
                     mark = len(wire)
                     os.write(master, b'input-proof')
@@ -1066,5 +1108,7 @@ if __name__ == '__main__':
                                     (23, 120, 'normal'), (12, 80, 'early'),
                                     (12, 80, 'timeout')]:
         first_entry(app, origin, width, response)
+    for menu in ('root', 'filtered', 'settings'):
+        first_entry(app, 3, 80, menu=menu)
     for line_count in (1, 2, 3, 80):
         streaming(app, line_count)

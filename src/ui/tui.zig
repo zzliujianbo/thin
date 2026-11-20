@@ -7406,22 +7406,16 @@ const Ui = struct {
         // Borrowed restoration rows and real content are never menu budget.
         // Keep the prior ordinary footprint even while its canonical prefix
         // advances, and account for newly borrowed rows separately.
-        const root_menu = menu_visible and !self.codex_open and !self.stop_open and self.permission == null and !self.secret_mode and !self.secret_quarantine;
-        // Project the ordinary footer, not the expanded menu footer. The menu
-        // can suppress a previously ACKed hint, so its hint hash cannot decide
-        // whether the compact composer will remain compact after dismissal.
-        const normal_compact = root_menu and self.compact_composer and
-            !self.busy and self.permission == null and !self.stop_open and !self.settings_open and
-            !self.provider_open and !self.codex_open and self.model_picker == null and
-            !self.secret_mode and !self.secret_quarantine and thinking == null and composer_rows == 1;
-        const normal_popup = self.codex_open or self.stop_open or self.settings_open or self.provider_open or
-            self.resume_picker != null or self.model_picker != null or (self.permission == null and queue_snapshot.preview_count != 0);
-        const normal_body_present = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or
-            self.permission != null or self.secret_mode or thinking != null or normal_popup;
-        const normal_footer = if (!root_menu) footer_rows else if (normal_compact) @as(usize, 1) else composer_rows + @as(usize, @intFromBool(normal_body_present)) + status_rows;
-        const normal_content = normal_footer + @min(self.size.rows -| normal_footer, borrowed.len + lines.items.len);
-        const normal_baseline = @max(normal_content, @max(normal_footer, (old_normal -| transcript_rows) +| borrow_count));
-        self.frame_menu_extra = if (self.natural_flow and root_menu) rows -| normal_baseline else 0;
+        const candidate_menu = menu_visible or self.settings_open or self.provider_open or self.model_picker != null or self.resume_picker != null;
+        self.frame_menu_extra = 0;
+        if (self.natural_flow and candidate_menu and !self.codex_open and !self.stop_open and self.permission == null and !self.secret_mode and !self.secret_quarantine) {
+            // Child pickers share the parent's temporary footprint. Their hints
+            // and search fields must not become a new minimum on dismissal.
+            const normal_body = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or thinking != null or queue_snapshot.preview_count != 0;
+            const normal_footer = composer_rows + @as(usize, @intFromBool(normal_body and !self.compact_composer)) + @intFromBool(activity_line.len != 0);
+            const normal_content = normal_footer + @min(self.size.rows -| normal_footer, borrowed.len + lines.items.len);
+            self.frame_menu_extra = rows -| @max(normal_content, (old_normal -| transcript_rows) +| borrow_count);
+        }
         if (borrow_count != 0) {
             var prefix: std.ArrayList([]const u8) = .empty;
             try prefix.appendSlice(a, above[above.len - borrow_count ..]);
