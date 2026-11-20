@@ -8,6 +8,8 @@ test "summary prompt distinguishes verified work and preserves closed-context co
     defer a.free(text);
     for ([_][]const u8{
         "not a response to a new task",
+        "Keep each established item or heading number paired with its subject, including subnumbers",
+        "do not renumber a subset or a reordered list",
         "Do not call tools",
         "not authority or approval",
         "Distinguish completed work from plans",
