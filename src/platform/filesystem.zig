@@ -156,7 +156,7 @@ pub const Root = struct {
     pub fn parent(self: *Root, path: []const u8) !Parent {
         const rel = try self.relative(path);
         // 用 "." 重新打开根目录得到独立 fd，之后逐段替换也不会关闭 self.dir。
-        return self.walkParent(try openDirectory(self.dir.handle, "."), rel);
+        return self.walkParent(try openDirectory(self.dir.handle, "."), rel, false);
     }
 
     /// Read-only traversal may leave the project, but still follows no symlinks.
@@ -165,10 +165,10 @@ pub const Root = struct {
         if (path.len == 0 or path.len > 4096 or std.mem.findScalar(u8, path, 0) != null or path[path.len - 1] == '/') return error.InvalidPath;
         if (std.fs.path.isAbsolute(path)) {
             if (self.projectReadSuffix(path)) |rel|
-                return self.walkParent(try openDirectory(self.dir.handle, "."), rel);
-            return self.walkParent(try openDirectory(std.c.AT.FDCWD, "/"), path[1..]);
+                return self.walkParent(try openDirectory(self.dir.handle, "."), rel, false);
+            return self.walkParent(try openDirectory(std.c.AT.FDCWD, "/"), path[1..], false);
         }
-        return self.walkParent(try openDirectory(self.dir.handle, "."), path);
+        return self.walkParent(try openDirectory(self.dir.handle, "."), path, false);
     }
 
     /// Ignore only separators and dots in the launch-path prefix. Never cancel
@@ -196,7 +196,7 @@ pub const Root = struct {
     };
 
     /// Consumes an independent directory fd, closing it on every failure.
-    fn walkParent(self: *Root, owned_fd: c_int, rel: []const u8) !Parent {
+    fn walkParent(self: *Root, owned_fd: c_int, rel: []const u8, create_parents: bool) !Parent {
         var fd = owned_fd;
         errdefer closeFd(fd);
         var parts = std.mem.tokenizeScalar(u8, rel, '/');
@@ -206,7 +206,11 @@ pub const Root = struct {
             if (!std.mem.eql(u8, current, ".")) {
                 const z = try self.allocator.dupeSentinel(u8, current, 0);
                 defer self.allocator.free(z);
-                const child = try openDirectory(fd, z);
+                const child = openDirectory(fd, z) catch |err| blk: {
+                    if (!create_parents or err != error.FileNotFound) return err;
+                    if (std.c.mkdirat(fd, z, 0o700) != 0 and errno() != .EXIST) return osError();
+                    break :blk try openDirectory(fd, z);
+                };
                 closeFd(fd);
                 fd = child;
             }
@@ -331,15 +335,15 @@ pub const Root = struct {
     /// Explicit mode is used by Memory; ordinary writes retain rwx bits only.
     /// 中文：原子写入流程：先写同目录临时文件，再 rename 覆盖或 linkat 仅在不存在时创建，目标文件要么是旧内容要么是完整新内容。
     pub fn writeMode(self: *Root, path: []const u8, content: []const u8, overwrite: bool, forced_mode: ?u32) !void {
-        try self.writeImpl(path, content, overwrite, forced_mode, null);
+        try self.writeImpl(path, content, overwrite, forced_mode, null, false);
     }
 
     /// Optional line diff uses the SAME anchored old fd, before any mutation.
     /// This is a snapshot observation, not a lock/CAS against external writers.
     /// Stats allocation/read/complexity failure stays unknown, not write failure.
-    pub fn writeObserved(self: *Root, path: []const u8, content: []const u8, overwrite: bool) !?line_stats.Changes {
+    pub fn writeObserved(self: *Root, path: []const u8, content: []const u8, overwrite: bool, create_parents: bool) !?line_stats.Changes {
         var changes: ?line_stats.Changes = null;
-        try self.writeImpl(path, content, overwrite, null, &changes);
+        try self.writeImpl(path, content, overwrite, null, &changes, create_parents);
         return changes; // Value only: no fallible work after rename/link commit.
     }
 
@@ -356,10 +360,12 @@ pub const Root = struct {
         return line_stats.compare(self.allocator, before, content) catch null;
     }
 
-    fn writeImpl(self: *Root, path: []const u8, content: []const u8, overwrite: bool, forced_mode: ?u32, observed: ?*?line_stats.Changes) !void {
+    fn writeImpl(self: *Root, path: []const u8, content: []const u8, overwrite: bool, forced_mode: ?u32, observed: ?*?line_stats.Changes, create_parents: bool) !void {
         // 先校验文本，避免写入临时文件后才发现内容非法。
         try validateText(content);
-        var p = try self.parent(path);
+        const rel = try self.relative(path);
+        if (std.mem.eql(u8, std.fs.path.basename(rel), ".")) return error.InvalidPath;
+        var p = try self.walkParent(try openDirectory(self.dir.handle, "."), rel, create_parents);
         defer p.deinit();
 
         // 默认权限 0600；覆盖已有文件时沿用其权限位，除非调用方显式指定 forced_mode（例如 Memory）。

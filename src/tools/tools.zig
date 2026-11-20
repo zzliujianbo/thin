@@ -36,7 +36,7 @@ pub const schemas = [_]p.ToolSchema{
     },
     .{
         .name = "write_file",
-        .description = "Atomically write a UTF-8 file inside the startup project or under /tmp. Parent directory must exist; overwrite=true is required to replace. Read before editing.",
+        .description = "Atomically write a UTF-8 file inside the startup project or under /tmp. Create missing files and parent directories directly. Read an existing file before replacing it with overwrite=true.",
         .parameters_json =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"],"additionalProperties":false}
         ,
@@ -419,6 +419,11 @@ pub const Tools = struct {
         return std.mem.startsWith(u8, path, tmp_write_prefix) and path.len > tmp_write_prefix.len;
     }
 
+    fn protectedPath(absolute: []const u8, protected: []const u8, creating: bool) bool {
+        return std.mem.eql(u8, absolute, protected) or (creating and absolute.len > protected.len and
+            std.mem.startsWith(u8, absolute, protected) and absolute[protected.len] == '/');
+    }
+
     /// Both preparation and direct execution use the same anchored path policy.
     fn checkFileAction(self: *Tools, a: std.mem.Allocator, action: Action) !void {
         const path = switch (action) {
@@ -444,7 +449,7 @@ pub const Tools = struct {
             // /tmp is the explicit external write sink. Rooted operations still
             // reject '..', NUL, symlinks and non-regular targets.
             try validatePath(path);
-            if (self.auth_path) |protected| if (std.mem.eql(u8, absolute, protected)) return error.ProtectedAuthFile;
+            if (self.auth_path) |protected| if (protectedPath(absolute, protected, action == .write_file)) return error.ProtectedAuthFile;
             return;
         }
         const relative = try self.root.relative(path);
@@ -463,6 +468,7 @@ pub const Tools = struct {
                 if (is_write and (std.mem.eql(u8, part, mem.directory_name) or std.mem.eql(u8, part, "mem"))) return error.UseMemoryTool;
                 // Exact project settings path only; ignore dot/slash aliases.
                 if (std.mem.eql(u8, part, settings.file_name)) {
+                    if (action == .write_file) return error.ProtectedSettingsFile;
                     var exact = true;
                     while (parts.next()) |rest| {
                         if (!std.mem.eql(u8, rest, ".")) {
@@ -484,7 +490,7 @@ pub const Tools = struct {
         // Writing the .thin parent itself must not replace the Memory namespace.
         if (in_thin and is_write) return error.UseMemoryTool;
         const protected = self.auth_path orelse return;
-        if (std.mem.eql(u8, absolute, protected)) return error.ProtectedAuthFile;
+        if (protectedPath(absolute, protected, action == .write_file)) return error.ProtectedAuthFile;
     }
 
     fn textReadGuard(self: *Tools) fs.Root.ReadGuard {
@@ -876,7 +882,7 @@ pub const Tools = struct {
                 defer a.free(current);
                 if (!std.mem.eql(u8, before, current)) return error.FileChanged;
                 if (cancel.isRequested()) return error.Canceled;
-                const changes = try file_root.writeObserved(file_path, after, true);
+                const changes = try file_root.writeObserved(file_path, after, true, false);
                 return .{ .text = encoded, .file_stats = .{ .changes = changes orelse applied.changes } };
             },
 
@@ -891,7 +897,7 @@ pub const Tools = struct {
                 const file_root = if (tmp_root) |*root| root else self.root;
                 const file_path = if (tmp_root != null) w.path[tmp_write_prefix.len..] else w.path;
                 // 原子写入以及“已存在需 overwrite=true”的检查由 Root.write 负责。
-                const changes = try file_root.writeObserved(file_path, w.content, w.overwrite);
+                const changes = try file_root.writeObserved(file_path, w.content, w.overwrite, true);
                 return .{ .text = encoded, .file_stats = .{ .changes = changes } };
             },
 

@@ -93,6 +93,11 @@ test "file observations reflect actual returned ranges and pre-write snapshot ch
     const temp = arena.allocator();
     var cancel = p.Cancellation{};
     const Stats = @import("../util/line_stats.zig");
+    const nested_path = "new-dir/child/file.txt";
+    const nested = try tools.execute(temp, .{ .write_file = .{ .path = nested_path, .content = "created" } }, &cancel);
+    try std.testing.expectEqualDeep(Stats.Changes{ .added = 1 }, nested.file_stats.?.changes.?);
+    try std.testing.expectError(error.PathAlreadyExists, tools.execute(temp, .{ .write_file = .{ .path = nested_path, .content = "refused" } }, &cancel));
+    try std.testing.expectEqualStrings("created", (try root.read(temp, nested_path, 0, 100)).data);
     const initial = "a\nb\nc\nd\ne\n";
     const create = try tools.execute(temp, .{ .write_file = .{ .path = "lines.txt", .content = initial } }, &cancel);
     try std.testing.expectEqualDeep(Stats.Changes{ .added = 5 }, create.file_stats.?.changes.?);
@@ -120,7 +125,7 @@ test "file observations reflect actual returned ranges and pre-write snapshot ch
         // parent(0), snapshot(1), before/after lines(2/3), LCS table(4).
         root.allocator = failing.allocator();
         defer root.allocator = a;
-        const unavailable = try root.writeObserved("lines.txt", "new\n", true);
+        const unavailable = try root.writeObserved("lines.txt", "new\n", true, false);
         root.allocator = a;
         try std.testing.expect(unavailable == null);
         const committed = try root.read(temp, "lines.txt", 0, 100);
