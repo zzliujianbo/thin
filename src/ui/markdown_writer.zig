@@ -74,6 +74,8 @@ pub const Writer = struct {
     pending_prefix_start: ?usize = null,
     row_body: bool = false,
     row_prefix: []const u8 = "",
+    /// During onRow, true only when a following cluster or tab needed a new row.
+    row_soft_wrap: bool = false,
     /// Completed-row sink; see RowSink. Default off keeps the old behavior.
     sink: ?RowSink = null,
     /// Number of rows successfully delivered or retained.
@@ -328,7 +330,7 @@ pub const Writer = struct {
                 self.row_started = false;
                 try self.startReserved(@max(1, state.width), replay);
             } else {
-                try self.finishRow();
+                try self.finishRow(.width_wrap);
                 try self.startReserved(@max(1, state.width), null);
             }
             // The moved cluster carries its own source span onto the new row:
@@ -362,11 +364,12 @@ pub const Writer = struct {
     }
 
     /// No call back into finish/flush: detaching a cluster can finish a row.
-    fn finishRow(self: *Writer) !void {
+    fn finishRow(self: *Writer, reason: enum { width_wrap, forced }) !void {
         if (self.budget) |budget| try budget.finish();
         if (self.ansi) {
             if (self.base == .user) {
                 for (self.col..self.columns) |_| try self.byte(' ');
+                self.col = self.columns; // Padding occupies cells in the emitted row too.
             }
             try self.append(theme.reset);
         }
@@ -374,7 +377,11 @@ pub const Writer = struct {
         const row_prefix = self.row_prefix;
         const owned = try self.line.toOwnedSlice(self.a);
         errdefer self.a.free(owned);
-        if (self.sink) |sink| try sink.onRow(sink.context, owned, start, row_prefix) else try self.lines.append(self.a, owned);
+        if (self.sink) |sink| {
+            self.row_soft_wrap = reason == .width_wrap;
+            defer self.row_soft_wrap = false;
+            try sink.onRow(sink.context, owned, start, row_prefix);
+        } else try self.lines.append(self.a, owned);
         self.completed_rows +|= 1;
         self.col = 0;
         self.row_started = false;
@@ -388,7 +395,7 @@ pub const Writer = struct {
     pub fn finish(self: *Writer) !void {
         if (self.ansi and self.base == .user and !self.row_started) try self.startReserved(1, null);
         try self.flushPending(true);
-        try self.finishRow();
+        try self.finishRow(.forced);
     }
     pub fn boundary(self: *Writer) !void {
         if (self.hasContent()) try self.finish();
@@ -407,7 +414,7 @@ pub const Writer = struct {
                 self.row_started = false;
                 try self.startReserved(@min(4, self.columns), replay);
             } else {
-                try self.finishRow();
+                try self.finishRow(.width_wrap);
                 try self.startReserved(@min(4, self.columns), null);
             }
             try self.flushPending(false);
@@ -446,7 +453,7 @@ pub const Writer = struct {
                 if (self.ansi and self.base == .user and !self.row_started) try self.startReserved(1, null);
                 try self.flushPending(true);
                 if (origin) |o| self.markSource(o.start, o.end);
-                try self.finishRow();
+                try self.finishRow(.forced);
             } else if (r.cp == 9) {
                 try self.tab(origin);
             } else {

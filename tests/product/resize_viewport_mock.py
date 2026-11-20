@@ -2,7 +2,8 @@
 """Owned real-emulator resize regression: requires installed tmux, no packages.
 python3 tests/product/resize_viewport_mock.py /absolute/path/to/thin [--wrap|--local-command]
 Uses only an owned foreground tmux server/socket, HOME/project and loopback.
-Checks visible cells/cursor, not pixels or every physical terminal emulator.
+--wrap also checks native selection line breaks in the mock assistant reply
+using tmux's own wrap flags. No clipboard or GUI required.
 Resize is passive by contract: the tmux/SSH client owns reflow of already
 displayed cells, so this fixture no longer waits for an automatic viewport
 restoration. It requires no repaint on size alone and then a fresh frame at the
@@ -94,6 +95,30 @@ def _check_editor_helper():
     assert _logical_editor([prefix + 'ENDQ', 'X'], 0) == 'ENDQ'
 
 
+# The --wrap pane is 80 columns. Keep these probes ASCII so bytes, glyphs and
+# cells agree. The first code line exactly fills a row but ends in a *source*
+# newline; it must not join the next indented line.
+BODY_LINE = ''.join(f'body{i:04d}' for i in range(24))
+BODY_NEXT = 'body-after-hard-break'
+CODE_LINES = ('    ' + '0123456789' * 7 + 'ABCDEF', '        return selected')
+CJK_LINE = '中文折行' * 13
+WRAP_REPLY = '\n'.join(('selection-start', BODY_LINE, BODY_NEXT, CJK_LINE, '```', *CODE_LINES,
+                        '```', 'wrap-history-ready'))
+
+
+def check_native_selection(tm):
+    capture = ('-S', '-200', '-t', 'owned:0.0')
+    physical = tm('capture-pane', '-p', *capture)
+    chunks = [BODY_LINE[i:i + 80] for i in range(0, len(BODY_LINE), 80)]
+    assert '\n' + '\n'.join([*chunks, BODY_NEXT]) + '\n' in physical, 'body cells not at expected physical width'
+    # -J joins only rows tmux marked as wrapped. Identical-looking rows drawn
+    # with CRLF or cursor motion instead remain separate logical lines.
+    logical = tm('capture-pane', '-p', '-J', *capture)
+    assert f'\n{BODY_LINE}\n{BODY_NEXT}\n' in logical, 'body selection changed a soft wrap or source newline'
+    assert f'\n{CJK_LINE}\n' in logical, 'selection split a wrapped CJK sentence'
+    assert '\n' + '\n'.join(CODE_LINES) + '\n' in logical, 'code selection lost a hard newline or indentation'
+
+
 class OwnedService(http.server.BaseHTTPRequestHandler):
     requests = 0
     failed = None
@@ -119,7 +144,7 @@ class OwnedService(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/event-stream')
             self.end_headers()
             chunks = [
-                {'choices': [{'index': 0, 'delta': {'content': 'wrap-history-ready'}, 'finish_reason': None}]},
+                {'choices': [{'index': 0, 'delta': {'content': WRAP_REPLY}, 'finish_reason': None}]},
                 {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 20, 'completion_tokens': 3, 'total_tokens': 23}},
             ]
             for chunk in chunks:
@@ -307,6 +332,9 @@ def run(app, wrap=False, local_command=False):
 
                     wait(history_ready, 'owned history seed did not complete')
                     assert OwnedService.failed is None
+                    if not local_command:
+                        check_native_selection(tm)
+                        print('PASS native-selection: tmux soft-wrapped body, hard breaks and exact code indentation')
                     value = 'wrap-A-' + 'abcdefghij' * 20 + '-WRAP-END'
                     tm('send-keys', '-t', 'owned:0.0', 'C-u')
                     tm('send-keys', '-t', 'owned:0.0', '-l', value)

@@ -37,7 +37,15 @@ const ReferenceRender = struct {
                 covered += 1;
             }
             const start = if (self.rows.items.len == 0) self.base else self.rows.items[self.rows.items.len - 1].end;
-            try self.rows.append(self.a, .{ .text = line, .start = start, .end = cp.end, .checkpoint = cp.state, .complete = !self.preview });
+            try self.rows.append(self.a, .{
+                .text = line,
+                .start = start,
+                .end = cp.end,
+                .checkpoint = cp.state,
+                .complete = !self.preview,
+                .soft_wrap = self.writer.row_soft_wrap,
+                .cells = self.writer.col,
+            });
             self.seed = cp;
             const remaining = self.trace.items.len - covered;
             std.mem.copyForwards(engine.Checkpoint, self.trace.items[0..remaining], self.trace.items[covered..]);

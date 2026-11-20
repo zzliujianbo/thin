@@ -153,6 +153,13 @@ pub const Terminal = struct {
         return .{ .columns = if (dimensions.col == 0) 80 else @min(dimensions.col, 512), .rows = if (dimensions.row == 0) 24 else @min(dimensions.row, 200) };
     }
 
+    /// Native body wraps require the actual right margin, not size()'s fallback or cap.
+    pub fn exactPhysicalColumns(self: Terminal, expected: usize) bool {
+        var dimensions = std.mem.zeroes(c.winsize);
+        return posix.getSize(self.fd, &dimensions) == 0 and
+            dimensions.col != 0 and dimensions.col == expected;
+    }
+
     /// Prove the unclamped physical row count; fallback or unknown sizes are not proof.
     pub fn exactPhysicalRows(self: Terminal, expected: usize) bool {
         var dimensions = std.mem.zeroes(c.winsize);

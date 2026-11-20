@@ -12,6 +12,8 @@ fn asciiCompare(reference: engine.Result, actual: engine.Result) !void {
         try std.testing.expectEqual(x.end, y.end);
         try std.testing.expectEqualDeep(x.checkpoint, y.checkpoint);
         try std.testing.expectEqual(x.complete, y.complete);
+        try std.testing.expectEqual(x.soft_wrap, y.soft_wrap);
+        try std.testing.expectEqual(x.cells, y.cells);
     }
 }
 
@@ -292,6 +294,45 @@ test "UTF8 and CRLF at every split match static rendering" {
         }
     }
 }
+test "Body soft wraps survive one-row batches without consuming the next glyph" {
+    try @import("../ui/text.zig").initLocale();
+    const body = try body_mod.Body.create(std.testing.allocator, 3);
+    defer body.destroy();
+    body.max_rows = 1;
+    try body.append("ABC");
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 1), body.visibleRows().len);
+    try std.testing.expect(!body.visibleRows()[0].soft_wrap);
+    try std.testing.expectEqual(@as(usize, 3), body.visibleRows()[0].cells);
+    try std.testing.expectEqual(@as(usize, 0), body.releaseLimit(1));
+    body.releasePin();
+
+    try body.append("\nab界x\n**end**");
+    try body.finish();
+    const Expected = struct { end: usize, cells: usize, soft_wrap: bool, at_line_start: bool };
+    for ([_]Expected{
+        .{ .end = "ABC\n".len, .cells = 3, .soft_wrap = false, .at_line_start = true },
+        .{ .end = "ABC\nab".len, .cells = 2, .soft_wrap = true, .at_line_start = false }, // 界 needs two columns.
+        .{ .end = "ABC\nab界x\n".len, .cells = 3, .soft_wrap = false, .at_line_start = true },
+        .{ .end = "ABC\nab界x\n**end".len, .cells = 3, .soft_wrap = false, .at_line_start = false },
+    }) |expected| {
+        try body.build();
+        try std.testing.expectEqual(@as(usize, 1), body.visibleRows().len);
+        const row = body.visibleRows()[0];
+        try std.testing.expectEqual(body.committedSourceEnd(), row.start);
+        try std.testing.expectEqual(expected.end, row.end);
+        try std.testing.expectEqual(expected.soft_wrap, row.soft_wrap);
+        try std.testing.expectEqual(expected.cells, row.cells);
+        try std.testing.expectEqual(expected.at_line_start, row.checkpoint.at_line_start);
+        try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+    }
+    // The closing markup is still owned by a metadata-only checkpoint.
+    try body.build();
+    try std.testing.expect(body.hasMetadataProgress());
+    try std.testing.expectEqual(@as(usize, 0), try body.commit(0));
+    try std.testing.expect(body.isDrained());
+}
+
 test "decoder state and row checkpoints survive aborted frames" {
     try @import("../ui/text.zig").initLocale();
     const body = try body_mod.Body.create(std.testing.allocator, 2);

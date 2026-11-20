@@ -16,8 +16,11 @@ const FixtureConnection = struct {
 /// user-facing default is off and is covered by the Reported usage toggle test.
 const layouts_show_report: core_config.Limits = .{ .show_reported_usage = true };
 
+// Unit fixtures have no PTY. Geometry probes must safely report unknown.
+var fixture_terminal: terminal_module.Terminal = .{ .fd = -1, .owned = false, .original = std.mem.zeroes(@FieldType(terminal_module.Terminal, "original")), .original_flags = 0, .active = false };
+
 fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
-    return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = undefined, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
+    return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = &fixture_terminal, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
 }
 
 fn testAcknowledgeFullFrame(ui: *Ui) void {
@@ -832,7 +835,7 @@ fn remoteUi(fake: *FakeRemote, bridge: *bridge_module.Bridge, cancel: *p.Cancell
         .connection = .{ .context = fake, .current_fn = FakeRemote.current, .configure_fn = FakeRemote.configure, .session_client = fake.client() },
         .bridge = bridge,
         .cancel = cancel,
-        .terminal = undefined,
+        .terminal = &fixture_terminal,
         .editor = .{ .allocator = std.testing.allocator },
         .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" },
         .size = .{ .columns = 80, .rows = 24 },

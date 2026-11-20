@@ -163,6 +163,7 @@ class Screen:
         self.grid = [[' '] * columns for _ in range(rows)]
         self.history = []
         self.row = self.col = 0
+        self.wrap_pending = False
         self.pending = b''
 
     def down(self):
@@ -191,6 +192,8 @@ class Screen:
                 assert not (final in (b'h', b'l') and
                             any(x in args.split(b';') for x in (b'?1049', b'?1047', b'?47')))
                 n = int(args) if args.isdigit() else 1
+                if final in (b'A', b'B', b'C', b'D', b'K', b'M'):
+                    self.wrap_pending = False
                 if final == b'A':
                     self.row = max(0, self.row - n)
                 elif final == b'B':
@@ -208,6 +211,8 @@ class Screen:
                 i = m.end()
                 continue
             i += 1
+            if b in (8, 10, 13):
+                self.wrap_pending = False
             if b == 13:
                 self.col = 0
             elif b == 10:
@@ -215,8 +220,14 @@ class Screen:
             elif b == 8:
                 self.col = max(0, self.col - 1)
             elif 32 <= b < 127:
+                # A printable after the rightmost cell wraps; SGR alone does not.
+                if self.wrap_pending:
+                    self.down()
+                    self.col = 0
                 self.grid[self.row][self.col] = chr(b)
-                self.col = min(self.columns - 1, self.col + 1)
+                self.wrap_pending = self.col == self.columns - 1
+                if not self.wrap_pending:
+                    self.col += 1
         self.pending = data[i:]
 
     def text(self):

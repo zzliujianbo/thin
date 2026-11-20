@@ -1089,6 +1089,8 @@ const Ui = struct {
     /// writes publish the candidate as a reusable acknowledged tail snapshot.
     frame_tail_snapshot: ?tail_frame.Snapshot = null,
     tail_snapshot: ?tail_frame.Snapshot = null,
+    frame_native_tail: bool = false,
+    tail_native: bool = false,
     menu_history: ?tail_frame.MenuHistory = null,
     frame_menu_history: ?tail_frame.MenuHistory = null,
     frame_sparse: bool = false,
@@ -6510,6 +6512,7 @@ const Ui = struct {
         self.frame_delivery_reasoning = false;
         if (self.tail_snapshot) |*snapshot| snapshot.deinit();
         self.tail_snapshot = null;
+        self.tail_native = self.frame_fresh and self.frame_native_tail;
         if (self.frame_fresh) {
             self.tail_snapshot = self.frame_tail_snapshot;
         } else if (self.frame_tail_snapshot) |*snapshot| snapshot.deinit();
@@ -6709,6 +6712,70 @@ const Ui = struct {
         return .{ .decoration = decoration, .layout = try composer_layout.layoutWithFirst(a, display_bytes, prefix.len, cols, cols -| text.width(decoration.plain), limit) };
     }
 
+    // Only rows at a physical margin or touching a wrap need sidecar entries.
+    // `index` is first in transcript/active-lines space, then in final wire order.
+    const NativeRow = struct {
+        index: usize,
+        stream: *const body_stream.Body,
+        source_row: usize,
+        full: bool,
+        wraps: bool,
+
+        fn mark(list: *std.ArrayList(NativeRow), a: std.mem.Allocator, stream: *const body_stream.Body, source: usize, index: usize) !void {
+            const rows = stream.visibleRows();
+            if (source >= rows.len) return; // Synthetic limit diagnostic.
+            const row = rows[source];
+            const full = row.cells == stream.columnCount();
+            // A first retained row may continue an already retired prefix.
+            const continuation = if (source == 0) stream.base != 0 else rows[source - 1].soft_wrap;
+            if (!full and !row.soft_wrap and !continuation) return;
+            const wraps = if (row.soft_wrap and source + 1 < rows.len) blk: {
+                const next = rows[source + 1];
+                if (row.start >= row.end or row.end != next.start or next.start >= next.end or next.cells == 0) break :blk false;
+                // Expanded tabs can move as a unit where individual spaces would not wrap.
+                const span = stream.liveSource()[row.start - stream.base .. next.end - stream.base];
+                break :blk std.mem.indexOfScalar(u8, span, '\t') == null;
+            } else false;
+            try list.append(a, .{ .index = index, .stream = stream, .source_row = source, .full = full, .wraps = wraps });
+        }
+
+        fn joins(left: NativeRow, right: NativeRow) bool {
+            return left.wraps and left.index + 1 == right.index and left.stream == right.stream and left.source_row + 1 == right.source_row;
+        }
+    };
+
+    /// Compact only the structured row section. Anchor controls and the cursor /
+    /// contraction suffix can contain their own CRLFs and are opaque here.
+    fn nativeWire(out: *Io.Writer.Allocating, begin: usize, end: usize, marks: []const NativeRow) !void {
+        const raw = out.written();
+        var split = std.mem.splitSequence(u8, raw[begin..end], "\r\n");
+        var at = begin;
+        var index: usize = 0;
+        var pending = marks;
+        var join = false;
+        while (split.next()) |line| : (index += 1) {
+            if (index != 0 and !join) {
+                @memcpy(out.writer.buffer[at..][0..2], "\r\n");
+                at += 2;
+            }
+            join = false;
+            var count = line.len;
+            if (pending.len != 0 and pending[0].index == index) {
+                if (pending[0].full) {
+                    if (!std.mem.endsWith(u8, line, "\x1b[K")) return error.InvalidTailFrame;
+                    count -= "\x1b[K".len;
+                }
+                join = pending.len > 1 and pending[0].joins(pending[1]);
+                pending = pending[1..];
+            }
+            std.mem.copyForwards(u8, out.writer.buffer[at..][0..count], line[0..count]);
+            at += count;
+        }
+        if (pending.len != 0) return error.InvalidTailFrame;
+        std.mem.copyForwards(u8, out.writer.buffer[at..][0 .. raw.len - end], raw[end..]);
+        out.shrinkRetainingCapacity(at + raw.len - end);
+    }
+
     /// Restore borrowed ACKed rows at their original owned coordinates, ahead
     /// of any rows this frame appends, and count them as transcript so the tail
     /// advances past them. The rows stay owned restoration data, never replayed
@@ -6719,6 +6786,7 @@ const Ui = struct {
         clear_end: usize,
         borrowed: *[]const []const u8,
         transcript_rows: *usize,
+        marks: []NativeRow,
     ) !void {
         if (borrowed.*.len == 0) return;
         var rebuilt: std.Io.Writer.Allocating = .init(a);
@@ -6729,11 +6797,16 @@ const Ui = struct {
         }
         try rebuilt.writer.writeAll(out.written()[clear_end..]);
         out.* = rebuilt;
+        for (marks) |*mark| mark.index += borrowed.*.len;
         transcript_rows.* += borrowed.*.len;
         borrowed.* = &.{};
     }
 
     const TailBodyLayout = struct {
+        a: std.mem.Allocator,
+        physical: *std.ArrayList(NativeRow),
+        active_marks: []const NativeRow,
+        transcript_rows: usize,
         body_rows: usize,
         content_body_rows: usize,
         secret_lines: markdown.Rendered,
@@ -6772,6 +6845,13 @@ const Ui = struct {
             const content = layout.lines[leading_gap..];
             const content_rows = content_body_rows -| leading_gap;
             const start = content.len -| content_rows;
+            for (layout.active_marks) |mark| {
+                const source = layout.borrowed_count + mark.index;
+                if (source < leading_gap + start or source - start >= content_body_rows) continue;
+                var mapped = mark;
+                mapped.index = layout.transcript_rows + (source - start);
+                try layout.physical.append(layout.a, mapped);
+            }
             for (0..content_body_rows) |line| {
                 const index = line -| leading_gap;
                 try putStyled(writer, 1 + line, if (line >= leading_gap and start + index < content.len) content[start + index] else "");
@@ -6873,7 +6953,10 @@ const Ui = struct {
         const a = arena.allocator();
         var frame_records: std.ArrayList(FrameRecord) = .empty;
         errdefer self.discardFrameRecords(frame_records.items);
-        const cols = self.size.columns -| 1; // Never trigger terminal autowrap.
+        const cols = self.size.columns -| 1; // UI chrome never triggers terminal autowrap.
+        const native_width = self.natural_flow and self.terminal.exactPhysicalColumns(self.size.columns);
+        var physical: std.ArrayList(NativeRow) = .empty;
+        var active_marks: std.ArrayList(NativeRow) = .empty;
         const state = self.connection.current();
         self.display.seed(state.initial_context);
         self.display.setEffort(state.reasoning_effort);
@@ -7004,7 +7087,8 @@ const Ui = struct {
             };
             try frame_records.append(a, .{ .record_id = record.id, .generation = record.stream_generation });
             const frame_record = &frame_records.items[frame_records.items.len - 1];
-            try record.layout(self.allocator, @max(1, cols));
+            const native = native_width and record.stream != null;
+            try record.layout(self.allocator, if (native) self.size.columns else @max(1, cols));
             const heading = if (record.interrupted) "Interrupted response — preview" else if (record.excerpt) "Display excerpt" else "";
             // Body records keep no full-prefix copy: rows below the ACKed
             // written cursor were retired by the Body and no longer exist, so
@@ -7062,7 +7146,8 @@ const Ui = struct {
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
                 }
-                for (record.lines[prefix..stop]) |line| {
+                for (record.lines[prefix..stop], prefix..) |line, source| {
+                    if (native) try NativeRow.mark(&physical, a, record.stream.?, source, transcript_rows);
                     try putStyled(writer, 1, line);
                     try writer.writeAll("\r\n");
                     transcript_rows += 1;
@@ -7089,6 +7174,9 @@ const Ui = struct {
                 // The record's own rows start here; the leading gap/heading above
                 // are layout decoration and never stand in for source rows.
                 frame_record.tail_line_start = lines.items.len;
+                if (native) {
+                    for (begin..record.lines.len) |source| try NativeRow.mark(&active_marks, a, record.stream.?, source, lines.items.len + (source - begin));
+                }
                 try lines.appendSlice(a, record.lines[begin..]);
                 // A finalized limited stream's tail is only a diagnostic, not
                 // proof that its retained source was completely delivered.
@@ -7122,7 +7210,7 @@ const Ui = struct {
         // A real transcript advance releases the borrowed prefix at its original
         // document coordinates before committing new rows. A menu-only redraw
         // instead keeps it reversible (no scrollback duplication).
-        if (transcript_rows != 0) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows);
+        if (transcript_rows != 0) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows, physical.items);
         {
             const detached_active = if (self.active_tool) |active| if (active.display_key) |identity| self.tool_views.get(identity) == null else true else false;
             if (self.tool_views.entries.items.len != 0 or detached_active) {
@@ -7282,7 +7370,7 @@ const Ui = struct {
         // appears on the next complete ACK.
         const reasoning_resumes = thinking != null and popup_lines.len == 0 and
             self.permission == null and !self.secret_mode and !self.secret_quarantine;
-        if (reasoning_resumes or modal_text != null) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows);
+        if (reasoning_resumes or modal_text != null) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows, physical.items);
         // Transient reasoning owns a downward-growing window inside the tail. It
         // never borrows ACKed rows, so the committed user row above it is never
         // painted over. A pending canonical row in the same frame would also
@@ -7378,12 +7466,19 @@ const Ui = struct {
         } else try next_above.appendSlice(a, above);
         if (release_idle) {
             const old_rows = self.tail_snapshot.?.rows;
-            try next_above.appendSlice(a, old_rows[0 .. old_rows.len - 1]);
+            if (self.tail_native) next_above.clearRetainingCapacity() else try next_above.appendSlice(a, old_rows[0 .. old_rows.len - 1]);
             for (0..break_count) |_| try next_above.append(a, idle_prompt);
         }
         if (transcript_rows != 0) {
             var split = std.mem.splitSequence(u8, out.written()[self.frame_clear_end..], "\r\n");
-            for (0..transcript_rows) |_| try next_above.append(a, split.next() orelse return error.InvalidTailFrame);
+            // MenuHistory has no wrap metadata. Lend only the contiguous suffix
+            // below the last protected group, never a subset of that group.
+            const safe_from = if (physical.items.len != 0) physical.getLast().index + 1 else 0;
+            if (safe_from != 0) next_above.clearRetainingCapacity();
+            for (0..transcript_rows) |i| {
+                const line = split.next() orelse return error.InvalidTailFrame;
+                if (i >= safe_from) try next_above.append(a, line);
+            }
         }
         const above_count = @min(@min(next_above.items.len, self.size.rows -| rows), 200 -| borrowed.len);
         var next_history: ?tail_frame.MenuHistory = try tail_frame.MenuHistory.capture(self.allocator, next_above.items[next_above.items.len - above_count ..], borrowed);
@@ -7450,6 +7545,10 @@ const Ui = struct {
             const popup_span = @min(popup_lines.len, body_rows);
             const content_body_rows = body_rows -| (popup_span + popup_gap);
             visible_from = try self.drawTailBody(writer, .{
+                .a = a,
+                .physical = &physical,
+                .active_marks = active_marks.items,
+                .transcript_rows = transcript_rows,
                 .body_rows = body_rows,
                 .content_body_rows = content_body_rows,
                 .secret_lines = secret_lines,
@@ -7545,7 +7644,7 @@ const Ui = struct {
         const snapshot_allowed = self.permission == null and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
-        const can_diff = anchored and snapshot_allowed and
+        const can_diff = anchored and snapshot_allowed and physical.items.len == 0 and !self.tail_native and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows and
             self.tail_snapshot != null and candidate != null;
         const growing = can_diff and !canonical_output and transcript_rows != 0 and
@@ -7571,9 +7670,12 @@ const Ui = struct {
             else
                 try candidate.?.emitDiff(writer, &self.tail_snapshot.?);
         } else {
+            const tail_begin = out.written().len;
             try writer.writeAll(tail_out.written());
+            if (physical.items.len != 0) try nativeWire(&out, self.frame_clear_end, tail_begin + cursor_offset, physical.items);
         }
 
+        self.frame_native_tail = physical.items.len != 0 and physical.getLast().index >= transcript_rows;
         // frame 指向 arena 内存，arena 所有权交给 frame_arena，直到这帧写完。
         self.frame_idle_breaks = break_count;
         self.frame_idle_prefix_end = if (release_idle) self.frame_clear_end else 0;
