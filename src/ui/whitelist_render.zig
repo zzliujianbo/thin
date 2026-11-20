@@ -19,16 +19,28 @@ pub const Result = struct {
     work: usize,
     metadata: ?Checkpoint,
 };
+const TraceRecord = union(enum) {
+    token: Checkpoint,
+    // Every byte since the previous record (or seed) keeps its scanner state.
+    ascii_end: usize,
+};
 const Sink = struct {
     a: std.mem.Allocator,
     writer: *output.Writer,
     rows: std.ArrayList(Row) = .empty,
-    trace: std.ArrayList(Checkpoint) = .empty,
+    trace: std.ArrayList(TraceRecord) = .empty,
     base: usize,
     seed: Checkpoint,
     preview: bool = false,
     max_rows: ?usize,
     overflow: bool = false,
+    fn emitAscii(self: *Sink, bytes: []const u8, start: usize) !void {
+        const end = start + bytes.len;
+        try self.trace.append(self.a, .{ .ascii_end = end });
+        if (!std.meta.eql(self.writer.style, output.Style{})) try self.writer.setStyle(.{});
+        try self.writer.emitSourced(bytes, start, end, true);
+    }
+
     fn onRow(ctx: *anyopaque, line: []const u8, _: usize, _: []const u8) output.Error!void {
         const self: *Sink = @ptrCast(@alignCast(ctx));
         if (self.max_rows) |max_rows| {
@@ -42,15 +54,28 @@ const Sink = struct {
         var cp = self.seed;
         var covered: usize = 0;
         for (self.trace.items) |item| {
-            if (item.end > end) break;
-            cp = item;
+            switch (item) {
+                .token => |token| {
+                    if (token.end > end) break;
+                    cp = token;
+                },
+                .ascii_end => |run_end| {
+                    // Leave a partially displayed run in the trace; the new
+                    // seed becomes its start for the next row callback.
+                    if (end < run_end) {
+                        cp.end = @max(cp.end, end);
+                        break;
+                    }
+                    cp.end = run_end;
+                },
+            }
             covered += 1;
         }
         const start = if (self.rows.items.len == 0) self.base else self.rows.items[self.rows.items.len - 1].end;
         try self.rows.append(self.a, .{ .text = line, .start = start, .end = cp.end, .checkpoint = cp.state, .complete = !self.preview });
         self.seed = cp;
         const remaining = self.trace.items.len - covered;
-        std.mem.copyForwards(Checkpoint, self.trace.items[0..remaining], self.trace.items[covered..]);
+        std.mem.copyForwards(TraceRecord, self.trace.items[0..remaining], self.trace.items[covered..]);
         self.trace.shrinkRetainingCapacity(remaining);
     }
 };
@@ -102,10 +127,7 @@ fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
             var n: usize = 0;
             while (n < cap and plain(source[offset + n])) : (n += 1) {}
             if (n >= 2) {
-                // Retain the scalar path's source proof at every byte boundary.
-                for (1..n + 1) |i| try sink.trace.append(a, .{ .end = base + offset + i, .state = current });
-                if (!std.meta.eql(writer.style, output.Style{})) try writer.setStyle(.{});
-                try writer.emitSourced(source[offset .. offset + n], base + offset, base + offset + n, true);
+                try sink.emitAscii(source[offset .. offset + n], base + offset);
                 offset += n;
                 continue;
             }
@@ -118,7 +140,7 @@ fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
             .end => break,
             .token => |token| {
                 if (token.end <= base + offset or token.end > base + source.len) return error.MarkdownRenderLimit;
-                try sink.trace.append(a, .{ .end = token.end, .state = token.after });
+                try sink.trace.append(a, .{ .token = .{ .end = token.end, .state = token.after } });
                 current = token.after;
                 offset = token.end - base;
                 if (token.text.len != 0) {

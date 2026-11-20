@@ -146,6 +146,29 @@ test "resume store atomic private writes concurrent read-only view and interrupt
     defer root.allocator.free(recovered_bytes);
     try std.testing.expectEqualStrings("fake authenticated bytes\x00\xff", recovered_bytes);
 }
+test "multi-chunk overwrite checks the tail digest without allocating the old file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var lease = try Lease.create(&root, test_id);
+    defer lease.deinit();
+    const blob = try std.testing.allocator.alloc(u8, 3 * 32 * 1024 + 7);
+    defer std.testing.allocator.free(blob);
+    @memset(blob, 'a');
+    try lease.save(&root, blob);
+    // The old-file digest must not allocate, even on the success path.
+    const original = root.allocator;
+    var scratch: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    root.allocator = fixed.allocator();
+    defer root.allocator = original;
+    try checkPrevious(&root, lease.directory_fd, test_id, lease.expected);
+    blob[blob.len - 1] = 'b';
+    try tmp.dir.writeFile(root.io, .{ .sub_path = ".thin/sessions/" ++ test_id ++ ".session", .data = blob });
+    try std.testing.expectError(error.ResumeConflict, lease.save(&root, "replacement"));
+}
+
 test "resume store detects changed snapshot and refuses unsafe paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

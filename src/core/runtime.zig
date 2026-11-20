@@ -815,14 +815,22 @@ pub const Runtime = struct {
 
     /// 估算当前上下文 token 数（系统提示词 + 工具 schema + 历史），用于决定是否压缩。
     pub fn estimatedTokens(self: *const Runtime) usize {
-        return self.estimator.tokens(context.rawTokens(self.system, self.executor.schemas, self.history.items));
+        return self.estimator.tokens(self.rawInputTokens());
+    }
+
+    fn rawInputTokens(self: *const Runtime) usize {
+        return context.rawTokens(self.system, self.executor.schemas, self.history.items);
     }
 
     /// Startup/after-join callers may read this; NEVER query during another
     /// thread's run. Streaming consumers use value events, not mutable history.
     /// The estimator above remains the ONLY source for safety/compaction checks.
     pub fn contextSnapshot(self: *const Runtime) ContextSnapshot {
-        const estimated = self.estimatedTokens();
+        return self.contextSnapshotFromRaw(self.rawInputTokens());
+    }
+
+    fn contextSnapshotFromRaw(self: *const Runtime, raw: usize) ContextSnapshot {
+        const estimated = self.estimator.tokens(raw);
         return .{
             .tokens = self.last_context_tokens orelse 0,
             .limit = @intCast(self.config.model.context_tokens),
@@ -1407,7 +1415,7 @@ pub const Runtime = struct {
             try checkCanceled(cancel);
             _ = try self.consumeSteering(&input_retained, cancel);
             // 预检：超过压缩阈值则先压缩。
-            self.preflight(cancel, task) catch |err| {
+            const raw = self.preflight(cancel, task) catch |err| {
                 // A bounded pause retains the accepted goal, including a paid
                 // summary that exhausted its output before normal inference.
                 if (err == error.RoundLimit or err == error.OutputLimitReached or inputBudgetPause(err)) try self.retainCurrentInput(&input_retained);
@@ -1419,15 +1427,13 @@ pub const Runtime = struct {
             // A summary/host callback may have received steering. Re-plan with
             // its committed input rather than sending an obsolete request.
             if (try self.consumeSteering(&input_retained, cancel)) continue;
-            try self.emitContext(cancel);
+            try self.emit(.{ .context_snapshot = self.contextSnapshotFromRaw(raw) }, cancel);
             try self.emit(.{ .state = .calling_model }, cancel);
 
             // 单轮临时 arena：响应解析结果只在本轮有效，入历史前需要 clone。
             var result_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer result_arena.deinit();
 
-            // 请求前的 raw token 数，事后用真实 usage 校准估算器。
-            const raw = context.rawTokens(self.system, self.executor.schemas, self.history.items);
             var forward = Forward{ .runtime = self, .cancel = cancel };
             // Before retaining a normal attempt, own the CURRENT protected
             // message: preflight may have replaced history and its arena. Clone
@@ -1439,7 +1445,9 @@ pub const Runtime = struct {
             if (try self.consumeSteering(&input_retained, cancel)) continue;
             task.countRound();
             // 调用模型；协议选择与降级由 selector 处理。
-            const result = self.selector.call(self.checkedModel(), result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
+            // Retention cloned the same bytes; accepted steering above restarts preflight.
+            var gate: SendGate = .{ .runtime = self, .raw = raw };
+            const result = self.selector.call(gate.model(), result_arena.allocator(), try self.request(.normal, self.history.items, cancel), forward.sink()) catch |err| {
                 if (err != error.Canceled) self.last_context_tokens = null;
                 return err;
             };
@@ -1495,12 +1503,19 @@ pub const Runtime = struct {
 
     /// Every actual model invocation (normal, summary AND selector fallback)
     /// crosses this gate, even when the underlying model is an unvalidated fake.
-    fn checkedModel(self: *Runtime) p.Model {
-        return .{ .context = self, .call_fn = checkedCall };
-    }
+    const SendGate = struct {
+        runtime: *Runtime,
+        // Scoped to one synchronous Selector.call: fallback changes only the protocol.
+        raw: usize,
+
+        fn model(self: *SendGate) p.Model {
+            return .{ .context = self, .call_fn = checkedCall };
+        }
+    };
 
     fn checkedCall(ctx: *anyopaque, a: std.mem.Allocator, req: p.Request, sink: p.ModelSink) !p.Outcome {
-        const self: *Runtime = @ptrCast(@alignCast(ctx));
+        const gate: *const SendGate = @ptrCast(@alignCast(ctx));
+        const self = gate.runtime;
         // Sticky process-safety failure wins over cancellation, validation and
         // every normal/summary/fallback invocation, including this same task.
         if (self.poisoned) return error.CleanupFailed;
@@ -1509,7 +1524,7 @@ pub const Runtime = struct {
         const wire = try @import("checkpoint.zig").validateRequestHistoryWire(a, send_req);
         send_req.wire = wire;
         defer a.free(wire);
-        const estimated = self.estimator.tokens(context.rawTokens(req.system, req.tools, req.messages));
+        const estimated = self.estimator.tokens(gate.raw);
         // A normal request is measured from the last real prompt plus its
         // growth; the pure estimate stays as the fallback when no usage is known.
         const measured = if (req.purpose == .normal) self.anchoredTokens(estimated) else estimated;
@@ -1693,27 +1708,29 @@ pub const Runtime = struct {
     }
 
     /// 发起模型调用前检查上下文是否超过压缩阈值，超过则尝试压缩。
-    fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !void {
+    /// Return the raw count of the history that survived preflight, not a send authorization.
+    fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !usize {
         try context.validateInputPolicy(self.config.*);
         const budget = context.inputBudget(self.config.*);
-        const estimated = self.estimatedTokens();
+        const raw = self.rawInputTokens();
+        const estimated = self.estimator.tokens(raw);
         const measured = self.anchoredTokens(estimated);
         if (!self.config.limits.compaction_enabled) {
             if (measured > budget) return context.inputBudgetError(self.config.*);
-            return;
+            return raw;
         }
         // Below the soft trigger and inside the hard budget: nothing to do.
         // Over the hard budget the run always tries a summary first, even when
         // the growth proxy still looks comfortable; refusing here is what made
         // a 72%-full session fail without compacting.
         switch (self.compactionDecision(task, measured, estimated, budget)) {
-            .pass => return,
+            .pass => return raw,
             .skip => |reason| {
                 if (!task.compact_notice_sent) {
                     task.compact_notice_sent = true;
                     try self.emit(.{ .compaction_skipped = .{ .reason = reason } }, cancel);
                 }
-                return;
+                return raw;
             },
             .over_budget => return context.inputBudgetError(self.config.*),
             .attempt => {},
@@ -1755,7 +1772,7 @@ pub const Runtime = struct {
             }
             // Same anchored measure as preflight: a failed summary may continue
             // only when the real prompt still fits the hard budget.
-            const current = self.anchoredTokens(self.estimatedTokens());
+            const current = self.anchoredTokens(self.estimator.tokens(raw));
             if (err == error.NoCompactionCandidate and current <= budget) {
                 // Surface the condition once per task instead of retrying a
                 // summary that has no safe prefix on every model round.
@@ -1763,15 +1780,18 @@ pub const Runtime = struct {
                     task.compact_notice_sent = true;
                     try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 }
-                return;
+                return raw;
             }
             try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
             // Failed compaction never mutates the old history. It may continue
             // only if that old input still fits the hard input budget.
             if (current > budget) return context.inputBudgetError(self.config.*);
+            self.failed_auto_summary = null;
+            return raw;
         };
-        // A committed compaction proves this budget can be summarized.
+        // A committed compaction replaced the history (and may have calibrated the estimator).
         self.failed_auto_summary = null;
+        return self.rawInputTokens();
     }
 
     /// 调用模型生成摘要，替换可压缩的历史。
@@ -1846,7 +1866,8 @@ pub const Runtime = struct {
 
         // 摘要请求只使用 scratch arena，不影响主历史。
         task.summary_attempts +|= 1;
-        const result = self.selector.call(self.checkedModel(), a, summary_request, .{}) catch |err| {
+        var gate: SendGate = .{ .runtime = self, .raw = raw };
+        const result = self.selector.call(gate.model(), a, summary_request, .{}) catch |err| {
             self.last_context_tokens = null;
             return err;
         };

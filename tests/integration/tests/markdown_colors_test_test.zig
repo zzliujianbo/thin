@@ -88,6 +88,16 @@ test "ASCII batching matches independent scalar renderer and checkpoints" {
     try std.testing.expectError(error.MarkdownRenderLimit, engine.render(std.testing.allocator, "abc", 0, .{}, true, 7, true, .normal, 1, 0));
 }
 
+test "ASCII run checkpoints adjacent to styled and grapheme boundaries" {
+    try @import("../ui/text.zig").initLocale();
+    const source = "abcdef**B**ghijklm中nopqrstu\u{301}vwxyz[link](url)123456";
+    // Put the bold glyph before, on, and after the wrap. Compare the row's
+    // absolute checkpoint and its resumed suffix against scalar rendering.
+    for ([_]usize{ 6, 7, 8 }) |columns| for ([_]usize{ 1, 16 }) |max_rows| {
+        try asciiPair(source, 51, .{}, true, columns, 4096, max_rows, .normal);
+    };
+}
+
 test "ordinary ASCII renderer propagates allocation failures" {
     try @import("../ui/text.zig").initLocale();
     var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });

@@ -101,7 +101,9 @@ const ReferenceRender = struct {
 };
 
 fn asciiAllocationCase(a: Allocator) !void {
-    const result = try engine.render(a, "alpha beta gamma delta 12345", 31, .{}, true, 80, true, .normal, 4096, 2);
+    // Force line-buffer growth without relying on per-byte trace allocations.
+    const bytes: [384]u8 = @splat('x');
+    const result = try engine.render(a, &bytes, 31, .{}, true, 512, true, .normal, 4096, 2);
     defer {
         for (result.rows) |row| a.free(row.text);
         a.free(result.rows);

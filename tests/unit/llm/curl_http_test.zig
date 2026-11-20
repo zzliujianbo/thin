@@ -22,19 +22,56 @@ test "curl config quotes backslashes unicode and never interpolates script" {
     }
     try std.testing.expect(found);
 }
+test "typical 1 MiB curl config allocation is close to payload size and propagates OOM" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const prefix = "{\"text\":\"";
+    @memcpy(payload[0..prefix.len], prefix);
+    @memcpy(payload[payload.len - 2 ..], "\"}");
+    for ([_]bool{ false, true }) |stream|
+        try std.testing.checkAllAllocationFailures(a, largeConfigCase, .{ payload, stream });
+}
+
+test "curl config emits exact data-binary bytes at maximum payload escape density" {
+    const raw = "\"\\\n\r\t";
+    const escaped = "\\\"\\\\\\n\\r\\t";
+    var payload: [raw.len * 8192]u8 = undefined;
+    for (0..8192) |i| @memcpy(payload[i * raw.len ..][0..raw.len], raw);
+    for ([_]bool{ false, true }) |stream| {
+        const a = std.testing.allocator;
+        const config = if (stream)
+            try makeStreamConfig(a, "https://origin.invalid/", &.{}, &payload, 1, null, false, null)
+        else
+            try makeConfig(a, "https://origin.invalid/", "fake", &payload, 1);
+        defer wipeFree(a, config);
+        const prefix = "\ndata-binary = \"";
+        const pos = std.mem.indexOf(u8, config, prefix) orelse return error.MissingPayload;
+        var data = config[pos + prefix.len ..];
+        for (0..8192) |_| {
+            try std.testing.expect(std.mem.startsWith(u8, data, escaped));
+            data = data[escaped.len..];
+        }
+        try std.testing.expect(std.mem.startsWith(u8, data, "\"\nmax-time = "));
+    }
+}
+
 test "transport validation rejects controls URL ambiguity and config metasyntax" {
+    const a = std.testing.allocator;
     const payload = "{}";
     for ([_][]const u8{ "file:///etc/passwd", "https://u:p@example.invalid/", "https://example.invalid/?", "https://example.invalid/#", "https://example.invalid/\n", "https://", "https://example.invalid\\evil/" }) |url| {
-        try std.testing.expectError(error.InvalidUrl, validate(url, "fake", payload, 1000));
+        try std.testing.expectError(error.InvalidUrl, makeConfig(a, url, "fake", payload, 1000));
     }
     for ([_][]const u8{ "", "key\r\nheader: injection", "key\x00", "key\x7f", "key\xc2\x85" }) |key| {
-        try std.testing.expectError(error.InvalidKey, validate("https://example.invalid/", key, payload, 1000));
+        try std.testing.expectError(error.InvalidKey, makeConfig(a, "https://example.invalid/", key, payload, 1000));
     }
     for ([_][]const u8{ "", "@/etc/passwd", "\x00", "\x08", "\x0c", "\xff" }) |body| {
-        try std.testing.expectError(error.InvalidPayload, validate("https://example.invalid/", "fake", body, 1000));
+        try std.testing.expectError(error.InvalidPayload, makeConfig(a, "https://example.invalid/", "fake", body, 1000));
     }
-    try std.testing.expectError(error.InvalidTimeout, validate("http://example.invalid/", "fake", payload, 0));
-    try validate("http://127.0.0.1:1234/api", "fake", "{\n\t\"ok\":true\r\n}", 1);
+    try std.testing.expectError(error.InvalidTimeout, makeConfig(a, "http://example.invalid/", "fake", payload, 0));
+    const config = try makeConfig(a, "http://127.0.0.1:1234/api", "fake", "{\n\t\"ok\":true\r\n}", 1);
+    defer wipeFree(a, config);
 }
 test "transport response exact suffix status errors overflow and incomplete rejection" {
     const a = std.testing.allocator;

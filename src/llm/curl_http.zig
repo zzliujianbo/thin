@@ -68,7 +68,7 @@ pub const Client = struct {
         var self = try init(a, io, &filtered);
         errdefer self.deinit();
         if (proxy_url) |url| {
-            try validate(url, "route", "{}", 1);
+            try validateUrl(url);
             self.proxy_url = try a.dupe(u8, url);
         }
         self.explicit_route = true;
@@ -99,7 +99,7 @@ pub const Client = struct {
         if (!allow_system or proxy_url != null) return initRouted(a, io, env, proxy_url);
         const url = systemProxy(env, base_url) orelse return initRouted(a, io, env, null);
         // No proxy credentials in the child environment. Only HTTP(S) URLs.
-        validate(url, "route", "{}", 1) catch return error.InvalidProxyEnvironment;
+        validateUrl(url) catch return error.InvalidProxyEnvironment;
         var selected = std.process.Environ.Map.init(a);
         defer selected.deinit();
         try selected.put(if (std.ascii.startsWithIgnoreCase(base_url, "https://")) "https_proxy" else "http_proxy", url);
@@ -320,22 +320,37 @@ fn controlFree(bytes: []const u8) bool {
     return true;
 }
 
-fn validate(url: []const u8, key: []const u8, payload: []const u8, timeout_ms: u32) !void {
-    if (key.len == 0 or key.len > max_key or !controlFree(key)) return error.InvalidKey;
+fn validateUrl(url: []const u8) !void {
     if (url.len == 0 or url.len > max_field or !controlFree(url) or
         std.mem.indexOfAny(u8, url, " \\") != null) return error.InvalidUrl;
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     if ((!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) or
         uri.host == null or uri.host.?.isEmpty() or uri.user != null or uri.password != null or
         uri.query != null or uri.fragment != null) return error.InvalidUrl;
-    if (timeout_ms == 0) return error.InvalidTimeout;
+}
+
+/// Size of the encoded string contents, excluding the surrounding quotes.
+fn payloadConfigLen(payload: []const u8) !usize {
     if (payload.len == 0 or payload[0] == '@' or
         !std.unicode.utf8ValidateSlice(payload)) return error.InvalidPayload;
     // curl's config escape alphabet is smaller than JSON's: it accepts \n,
     // \r and \t, but NOT JSON's \b, \f or \u0000. Never silently change a body.
-    for (payload) |byte| {
-        if (byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') return error.InvalidPayload;
-    }
+    var extra: usize = 0;
+    for (payload) |byte| switch (byte) {
+        '\n', '\r', '\t', '"', '\\' => extra += 1,
+        else => if (byte < 32) return error.InvalidPayload,
+    };
+    return std.math.add(usize, payload.len, extra) catch error.OutOfMemory;
+}
+
+fn configCapacity(payload_bytes: usize, field_bytes: usize) !usize {
+    // Validated URLs/headers are control-free UTF-8: only quote and backslash
+    // can double. Don't scan them again. 1 KiB covers the literal preamble
+    // (<256), framing for <=16 headers (12 bytes each), route and other option
+    // lines including u32 numbers (<256), and the terminating zero.
+    const fields = std.math.mul(usize, field_bytes, 2) catch return error.OutOfMemory;
+    const overhead = std.math.add(usize, fields, 1024) catch return error.OutOfMemory;
+    return std.math.add(usize, payload_bytes, overhead) catch error.OutOfMemory;
 }
 
 fn field(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
@@ -348,15 +363,15 @@ fn field(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
 /// One fixed allocation, no writer growth or stale reallocations of secrets.
 /// Returned allocation (including unused capacity) is always wiped by caller.
 fn makeConfigRouted(a: std.mem.Allocator, url: []const u8, key: []const u8, payload: []const u8, timeout_ms: u32, explicit_route: bool, proxy_url: ?[]const u8) ![]u8 {
-    try validate(url, key, payload, timeout_ms);
+    if (key.len == 0 or key.len > max_key or !controlFree(key)) return error.InvalidKey;
+    try validateUrl(url);
+    if (timeout_ms == 0) return error.InvalidTimeout;
+    const payload_bytes = try payloadConfigLen(payload);
     const prefix = "authorization: Bearer ";
-    var size: usize = 0;
-    for ([_]usize{ url.len, prefix.len, key.len, payload.len, if (proxy_url) |u| u.len else 0 }) |n| size = std.math.add(usize, size, n) catch return error.OutOfMemory;
-    const capacity = std.math.add(usize, std.math.mul(usize, size, 6) catch return error.OutOfMemory, 4096) catch return error.OutOfMemory;
-    const buffer = try a.alloc(u8, capacity);
+    // The route, if any, was validated and copied by initRouted.
+    const fields = std.math.add(usize, url.len + prefix.len + key.len, if (proxy_url) |u| u.len else 0) catch return error.OutOfMemory;
+    const buffer = try a.alloc(u8, try configCapacity(payload_bytes, fields));
     errdefer wipeFree(a, buffer);
-    // Initialize unused bytes as well; no stale allocator content enters stdin.
-    @memset(buffer, 0);
     var w = std.Io.Writer.fixed(buffer);
     try w.writeAll(
         "silent\nhttp1.1\ngloboff\nretry = 0\n" ++
@@ -382,6 +397,7 @@ fn makeConfigRouted(a: std.mem.Allocator, url: []const u8, key: []const u8, payl
     // Preserve the original allocation for wiping/freeing, and pass only the
     // written prefix to anonymous stdin (the first zero is not curl config).
     // Every accepted field is NUL-free, so this delimiter is unambiguous.
+    @memset(buffer[w.end..], 0);
     return buffer;
 }
 
@@ -397,25 +413,20 @@ fn writeRoute(w: *std.Io.Writer, proxy_url: ?[]const u8) !void {
 }
 
 fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, explicit_route: bool, proxy_url: ?[]const u8) ![]u8 {
-    if (payload.len == 0 or payload[0] == '@' or !std.unicode.utf8ValidateSlice(payload)) return error.InvalidPayload;
-    for (payload) |byte| if (byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') return error.InvalidPayload;
-    try validate(url, "validated-separately", "{}", timeout_ms);
+    const payload_bytes = try payloadConfigLen(payload);
+    try validateUrl(url);
+    if (timeout_ms == 0) return error.InvalidTimeout;
     if (body_limit != null and body_limit.? == 0 or headers.len > 16) return error.InvalidPayload;
     var header_bytes: usize = 0;
     for (headers) |h| {
         if (h.name.len == 0 or h.name.len > 128 or h.value.len > max_key + 32 or !controlFree(h.value)) return error.InvalidHeader;
         if (!headerName(h.name)) return error.InvalidHeader;
-        header_bytes = std.math.add(usize, header_bytes, h.name.len) catch return error.OutOfMemory;
-        header_bytes = std.math.add(usize, header_bytes, h.value.len) catch return error.OutOfMemory;
-        header_bytes = std.math.add(usize, header_bytes, 2) catch return error.OutOfMemory;
+        header_bytes += h.name.len + 2 + h.value.len;
     }
-    if (proxy_url) |proxy| try validate(proxy, "route", "{}", 1);
-    var size: usize = 0;
-    for ([_]usize{ url.len, payload.len, header_bytes, if (proxy_url) |u| u.len else 0 }) |n| size = std.math.add(usize, size, n) catch return error.OutOfMemory;
-    const capacity = std.math.add(usize, std.math.mul(usize, size, 6) catch return error.OutOfMemory, 4096) catch return error.OutOfMemory;
-    const buffer = try a.alloc(u8, capacity);
+    if (proxy_url) |proxy| try validateUrl(proxy);
+    const fields = url.len + header_bytes + (if (proxy_url) |u| u.len else 0);
+    const buffer = try a.alloc(u8, try configCapacity(payload_bytes, fields));
     errdefer wipeFree(a, buffer);
-    @memset(buffer, 0);
     var w = std.Io.Writer.fixed(buffer);
     try w.writeAll("silent\nhttp1.1\ngloboff\nretry = 0\ninclude\nsuppress-connect-headers\nno-buffer\n" ++
         "proto = \"=http,https\"\nproto-redir = \"=https\"\nuser-agent = \"thin\"\nrequest = \"POST\"\n" ++
@@ -431,6 +442,7 @@ fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.
     const connect_ms = @min(timeout_ms, 10000);
     try field(&w, "connect-timeout", try std.fmt.bufPrint(&number, "{d}.{d:0>3}", .{ connect_ms / 1000, connect_ms % 1000 }));
     if (body_limit) |limit| try field(&w, "max-filesize", try std.fmt.bufPrint(&number, "{d}", .{limit}));
+    @memset(buffer[w.end..], 0);
     return buffer;
 }
 

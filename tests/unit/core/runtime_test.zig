@@ -1,15 +1,41 @@
+const RequestGateStub = struct {
+    fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
+        return error.UnexpectedRequest;
+    }
+    fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
+        return error.UnexpectedTool;
+    }
+    fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
+        return error.UnexpectedTool;
+    }
+};
+
+test "preflight shares the complete raw input but send checks the current estimate and threshold" {
+    var dummy: u8 = 0;
+    var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "test", .context_tokens = 65536, .protocol = .chat, .input_price_threshold = 65000 }, .limits = .{ .compaction_enabled = false, .low_price_input = true } };
+    const schemas = &[_]p.ToolSchema{.{ .name = "inspect", .description = "Inspect text", .parameters_json = "{}" }};
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = RequestGateStub.call }, .{ .context = &dummy, .schemas = schemas, .prepare_fn = RequestGateStub.prepare, .execute_fn = RequestGateStub.execute }, .{}, "");
+    defer runtime.deinit();
+    try runtime.history.append(runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "count 字 and ASCII" }} });
+    var cancel: p.Cancellation = .{};
+    var task: Runtime.Task = .{};
+    runtime.estimator.per_mille = 1500;
+    const raw = try runtime.preflight(&cancel, &task);
+    const req = try runtime.request(.normal, runtime.history.items, &cancel);
+    try std.testing.expectEqual(context.rawTokens(req.system, req.tools, req.messages), raw);
+    const estimate = runtime.estimator.tokens(raw);
+    try std.testing.expectEqual(estimate, runtime.contextSnapshotFromRaw(raw).estimated);
+    var gate: Runtime.SendGate = .{ .runtime = &runtime, .raw = raw };
+    config.model.input_price_threshold = @intCast(estimate + cfg.Policy.input_margin_tokens);
+    try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, req, .{})); // exactly fits
+    config.model.input_price_threshold = config.model.input_price_threshold.? - 1;
+    try std.testing.expectError(error.InputBudgetExceeded, gate.model().call(std.testing.allocator, req, .{}));
+    runtime.estimator.per_mille = 1000;
+    try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, req, .{})); // same bytes now fit
+}
+
 test "thinking runtime normal and summary requests map current model" {
-    const Stub = struct {
-        fn call(_: *anyopaque, _: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
-            return error.UnexpectedRequest;
-        }
-        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: p.ToolCall) !Prepared {
-            return error.UnexpectedTool;
-        }
-        fn execute(_: *anyopaque, _: std.mem.Allocator, _: Prepared, _: *const p.Cancellation) !Execution {
-            return error.UnexpectedTool;
-        }
-    };
+    const Stub = RequestGateStub;
     var dummy: u8 = 0;
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } }, .limits = .{ .low_price_input = false } };
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
@@ -28,8 +54,9 @@ test "thinking runtime normal and summary requests map current model" {
     try std.testing.expectEqualStrings(opaque_wire, next.reasoning_effort.?);
     try std.testing.expectEqualStrings("medium", config.model.reasoning_effort.?);
     // Both constructed requests cross the real model gate without network IO.
-    try std.testing.expectError(error.UnexpectedRequest, runtime.checkedModel().call(std.testing.allocator, old_request, .{}));
-    try std.testing.expectError(error.UnexpectedRequest, runtime.checkedModel().call(std.testing.allocator, next, .{}));
+    var gate: Runtime.SendGate = .{ .runtime = &runtime, .raw = context.rawTokens(old_request.system, old_request.tools, old_request.messages) };
+    try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, old_request, .{}));
+    try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, next, .{}));
     control.clear();
     try std.testing.expectEqualStrings(opaque_wire, next.reasoning_effort.?);
     try std.testing.expectEqualStrings("high", (try runtime.request(.normal, &.{}, &cancel)).reasoning_effort.?);
@@ -406,7 +433,8 @@ test "poisoned actual model gate wins over pre-cancellation and invalid request 
         for ([_]p.Purpose{ .normal, .summary }) |purpose| {
             // Poison must win before request history or input validation.
             const req: p.Request = .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = "", .messages = &.{}, .tools = &.{}, .purpose = purpose, .cancellation = &cancel };
-            try std.testing.expectError(error.CleanupFailed, runtime.checkedModel().call(std.testing.allocator, req, .{}));
+            var gate: Runtime.SendGate = .{ .runtime = &runtime, .raw = context.rawTokens(req.system, req.tools, req.messages) };
+            try std.testing.expectError(error.CleanupFailed, gate.model().call(std.testing.allocator, req, .{}));
         }
     }
     try std.testing.expectEqual(@as(usize, 0), stub.calls);

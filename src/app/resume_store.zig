@@ -23,22 +23,51 @@ fn name(buffer: []u8, id: ids.Id, suffix: []const u8) ![:0]u8 {
     return std.fmt.bufPrintSentinel(buffer, "{s}{s}", .{ id, suffix }, 0);
 }
 
-fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {
+const Snapshot = struct { file: std.Io.File, size: usize };
+
+fn openSnapshot(root: *fs.Root, dir: c_int, id: ids.Id) !?Snapshot {
     var buffer: [64]u8 = undefined;
     const path = try name(&buffer, id, ".session");
     const fd = fs.openAt(dir, path, .{ .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
     if (fd < 0) return if (fs.errno() == .NOENT) null else fs.osError();
-    defer fs.closeFd(fd);
+    errdefer fs.closeFd(fd);
     const file = fs.fileFromFd(fd);
     const stat = try file.stat(root.io);
     if (stat.kind != .file) return error.UnsafeResumeFile;
     if (stat.size == 0) return error.InvalidResumeLength;
-    const size = std.math.cast(usize, stat.size) orelse return error.InvalidResumeLength;
-    const bytes = try root.allocator.alloc(u8, std.math.add(usize, size, 1) catch return error.InvalidResumeLength);
-    defer root.allocator.free(bytes);
-    const n = try file.readPositionalAll(root.io, bytes, 0);
-    if (n != stat.size) return error.FileChanged;
-    return try root.allocator.dupe(u8, bytes[0..n]);
+    return .{ .file = file, .size = std.math.cast(usize, stat.size) orelse return error.InvalidResumeLength };
+}
+
+fn checkEnd(root: *fs.Root, snap: Snapshot) !void {
+    var extra: [1]u8 = undefined;
+    if (try snap.file.readPositionalAll(root.io, &extra, snap.size) != 0) return error.FileChanged;
+}
+
+fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {
+    const snap = try openSnapshot(root, dir, id) orelse return null;
+    defer fs.closeFd(snap.file.handle);
+    const bytes = try root.allocator.alloc(u8, snap.size);
+    errdefer root.allocator.free(bytes);
+    if (try snap.file.readPositionalAll(root.io, bytes, 0) != bytes.len) return error.FileChanged;
+    try checkEnd(root, snap);
+    return bytes;
+}
+
+fn checkPrevious(root: *fs.Root, dir: c_int, id: ids.Id, expected: ?[32]u8) !void {
+    const snap = try openSnapshot(root, dir, id) orelse return if (expected != null) error.ResumeConflict else {};
+    defer fs.closeFd(snap.file.handle);
+    const wanted = expected orelse return error.ResumeConflict;
+    var hash = Hash.init(.{});
+    var buf: [32 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < snap.size) {
+        const chunk = buf[0..@min(buf.len, snap.size - offset)];
+        if (try snap.file.readPositionalAll(root.io, chunk, offset) != chunk.len) return error.FileChanged;
+        hash.update(chunk);
+        offset += chunk.len;
+    }
+    try checkEnd(root, snap);
+    if (!std.mem.eql(u8, &hash.finalResult(), &wanted)) return error.ResumeConflict;
 }
 
 const session_metadata = @import("../core/session_metadata.zig");
@@ -229,13 +258,7 @@ pub const Lease = struct {
     pub fn save(self: *Lease, root: *fs.Root, bytes: []const u8) !void {
         if (!self.writable) return error.ResumeReadOnly;
         if (bytes.len == 0) return error.InvalidResumeLength;
-        const old = try readFile(root, self.directory_fd, self.id);
-        defer if (old) |value| root.allocator.free(value);
-        if (self.expected) |expected| {
-            var digest: [32]u8 = undefined;
-            Hash.hash(old orelse return error.ResumeConflict, &digest, .{});
-            if (!std.mem.eql(u8, &digest, &expected)) return error.ResumeConflict;
-        } else if (old != null) return error.ResumeConflict;
+        try checkPrevious(root, self.directory_fd, self.id, self.expected);
         var buffer: [64]u8 = undefined;
         const path = try name(&buffer, self.id, ".session");
         try atomicWrite(root, self.directory_fd, path, bytes, self.expected != null);

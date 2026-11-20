@@ -2,6 +2,21 @@ fn makeConfig(a: std.mem.Allocator, url: []const u8, key: []const u8, payload: [
     return makeConfigRouted(a, url, key, payload, timeout_ms, false, null);
 }
 
+fn largeConfigCase(a: std.mem.Allocator, payload: []const u8, stream: bool) !void {
+    const url = "https://example.invalid/api";
+    const headers = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer fake" }};
+    const config = if (stream)
+        try makeStreamConfig(a, url, &headers, payload, 1250, 1024, true, null)
+    else
+        try makeConfigRouted(a, url, "fake", payload, 1250, true, null);
+    defer wipeFree(a, config);
+    // config.len is the whole allocation, not just the prefix sent to curl.
+    try std.testing.expect(config.len >= payload.len and config.len <= payload.len + 2048);
+    const end = std.mem.indexOfScalar(u8, config, 0) orelse return error.MissingConfigDelimiter;
+    try std.testing.expect(end > payload.len);
+    try std.testing.expect(std.mem.allEqual(u8, config[end..], 0));
+}
+
 fn fakeResult(bytes: []const u8) process.Result {
     return .{ .stdout = bytes, .stderr = "untrusted server diagnostics", .stdout_bytes = bytes.len, .stderr_bytes = 28, .truncated = false, .term = .{ .exited = 0 } };
 }

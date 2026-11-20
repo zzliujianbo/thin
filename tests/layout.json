@@ -2216,9 +2216,14 @@
       "virtual": "src/ui/whitelist_render.zig",
       "production": "src/ui/whitelist_render.zig",
       "support": null,
-      "fragments": [],
+      "fragments": [
+        {
+          "path": "tests/unit/ui/whitelist_render_test.zig",
+          "container": []
+        }
+      ],
       "group": "ui",
-      "unit": false
+      "unit": true
     },
     {
       "virtual": "src/util/display_text.zig",
