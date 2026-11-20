@@ -133,7 +133,9 @@ pub const Parser = struct {
             // 序列中途的 Ctrl-C / Ctrl-D 交给当前输入界面处理；粘贴中则忽略。
             if (!self.pasted and (b == 3 or b == 4)) {
                 self.escape_len = 0;
+                const from_paste = self.escape_paste;
                 self.escape_paste = false;
+                if (from_paste) return self.invalid(sink);
                 return sink.emit(if (b == 3) .cancel else .quit);
             }
 

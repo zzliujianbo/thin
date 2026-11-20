@@ -8530,6 +8530,41 @@ test "Ctrl+D exits the empty idle composer on one press and discards subsequent 
     try std.testing.expectEqualStrings(previous_notice, ui.notice);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
+test "Ctrl+D cannot exit through an escape started in a paste batch" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x1b[200~\x1b[201~\x1b[", sink);
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(!ui.exitAuthorized());
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.exitAuthorized());
+}
+
+test "Ctrl+D waits for the remote stop dialog release receipt" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.remote_epoch = 6;
+    ui.connection.async_actions = actions.channel();
+    try std.testing.expect(ui.beginAsync(.{ .confirming = false }, .release_stop) != null);
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(!ui.exitAuthorized());
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try ui.parser.feed("\x04", sink);
+    try std.testing.expect(ui.exitAuthorized());
+}
+
 test "Ctrl+D cannot exit from a menu, modal or secret quarantine" {
     const Surface = enum { slash_menu, command_mode, model_picker, permission, stop, quarantine };
     for ([_]Surface{ .slash_menu, .command_mode, .model_picker, .permission, .stop, .quarantine }) |surface| {

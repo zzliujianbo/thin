@@ -3238,7 +3238,7 @@ const Ui = struct {
     fn quitIdleComposer(self: *Ui) void {
         std.debug.assert(self.editor.bytes.items.len == 0);
         if (self.busy or self.future != null or self.deferred_submit != null or self.command_mode or
-            self.resume_pending != null or self.normalAsyncPending() or self.remoteSynchronizing()) return;
+            self.resume_pending != null or self.presentationWaiting() or self.remoteSynchronizing()) return;
         const queue = self.queueSnapshot();
         if (queue.active or queue.steering != 0 or queue.follow_up != 0) return;
         self.ctrl_d_exit = true;
