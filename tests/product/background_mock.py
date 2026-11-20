@@ -876,7 +876,7 @@ def run_pty(app, workspace, url, start_server=None):
         for index in range(SERVICES):
             if index != STOPPED_INDEX:
                 owned.probe(str(index))
-        os.write(master, b'\x04\x04')
+        os.write(master, b'\x04')
         pump_until(lambda: child.poll() is not None, 'exit after Ctrl-D')
         assert child.wait(timeout=10) == 0, 'interactive app exit status'
         restored = termios.tcgetattr(slave)

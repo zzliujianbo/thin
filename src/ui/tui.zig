@@ -492,9 +492,7 @@ const ApprovalChoice = enum { allow_once, deny };
 /// block, so switching the selection never shifts either label.
 const approval_allow_label = " Y allow once ";
 const approval_deny_label = " N deny ";
-/// Ctrl+D arms exit for this window; a second press within it confirms.
-const ctrl_d_window_ms: u64 = 2000;
-const ctrl_d_notice = "Press Ctrl+D again to exit";
+
 const Permission = struct {
     id: u64,
     description: []const u8,
@@ -1005,11 +1003,6 @@ const Ui = struct {
 
     /// An explicit quit owns exit authority; local tasks are joined first.
     ctrl_d_exit: bool = false,
-    /// Ctrl+D arms exit until this deadline; any other key cancels the intent.
-    ctrl_d_pending: bool = false,
-    ctrl_d_deadline_ms: u64 = 0,
-    /// Read batch that carried the arming Ctrl+D; its remainder is discarded.
-    ctrl_d_feed: u64 = 0,
     /// 清理未确认（CleanupFailed 等），禁止再次提交，只允许退出并检查。
     poisoned: bool = false,
     /// 是否需要重绘，由事件与按键置位。
@@ -2443,7 +2436,6 @@ const Ui = struct {
                 self.parser.stop_feed = true;
                 self.closeResumePicker();
             },
-            .quit => self.confirmCtrlD(),
             .up, .down => {
                 self.resume_serial +%= 1;
                 picker.move(event_ == .down);
@@ -2759,7 +2751,6 @@ const Ui = struct {
     }
 
     fn hint(self: *Ui, a: std.mem.Allocator, state: Connection.State) ![]const u8 {
-        if (self.ctrl_d_pending) return ctrl_d_notice;
         self.syncNoticeAlias();
         const persistent = !self.noticePublished() and !omitNotice(self.notice) and self.persistentNotice(self.notice);
         if (self.secret_quarantine) return "Esc closes";
@@ -3244,29 +3235,14 @@ const Ui = struct {
         }
     }
 
-    fn requestQuit(self: *Ui) void {
-        // A quit gesture or accepted session-leave action grants authority;
-        // captured signals are checked separately by exitAuthorized.
+    fn quitIdleComposer(self: *Ui) void {
+        std.debug.assert(self.editor.bytes.items.len == 0);
+        if (self.busy or self.future != null or self.deferred_submit != null or self.command_mode or
+            self.resume_pending != null or self.normalAsyncPending() or self.remoteSynchronizing()) return;
+        const queue = self.queueSnapshot();
+        if (queue.active or queue.steering != 0 or queue.follow_up != 0) return;
         self.ctrl_d_exit = true;
-        self.ctrl_d_pending = false;
         self.parser.stop_feed = true;
-        // A remote frontend leaves without canceling the daemon-owned task;
-        // deinit reports the detach. Explicit Ctrl-C still cancels it.
-        if (self.busy and self.remote() == null) self.cancel.cancel();
-    }
-    /// A single Ctrl+D only arms exit and shows a prompt; a second press within
-    /// the window confirms. Any other input cancels the intent.
-    fn confirmCtrlD(self: *Ui) void {
-        if (self.parser.pasted or self.parser.batch_paste) return;
-        const now = self.clock_ms;
-        if (self.ctrl_d_pending and now <= self.ctrl_d_deadline_ms) {
-            self.requestQuit();
-            return;
-        }
-        self.ctrl_d_pending = true;
-        self.ctrl_d_deadline_ms = now +| ctrl_d_window_ms;
-        self.ctrl_d_feed = self.parser.feed_id;
-        self.requestDraw();
     }
     fn exitAuthorized(self: *const Ui) bool {
         return self.ctrl_d_exit or interrupt.signal() != 0;
@@ -3587,7 +3563,6 @@ const Ui = struct {
             return;
         }
         switch (event_) {
-            .quit => self.confirmCtrlD(),
             .paste_start => self.settings_menu.markPaste(),
             .text => |value| {
                 if (value.pasted) self.settings_menu.markPaste() else if (picker.editing) {
@@ -3746,7 +3721,6 @@ const Ui = struct {
     }
     fn proxySubKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
-            .quit => self.confirmCtrlD(),
             .escape, .cancel, .left => self.backToSettings(),
             .up, .down => self.settings_menu.move(event_ == .down, settings_menu_module.proxy_labels.len),
             .paste_start => self.settings_menu.markPaste(),
@@ -3775,7 +3749,6 @@ const Ui = struct {
     }
     fn proxyAddressKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {
-            .quit => self.confirmCtrlD(),
             .escape, .cancel => self.backToProxySubmenu(0),
             // Left is a cursor move while text remains; at the raw origin it
             // cancels without writing, matching the Custom value editor.
@@ -3882,7 +3855,7 @@ const Ui = struct {
         self.publishNotice("Saved proxy models; main route applies in a new session");
     }
     fn settingsKey(self: *Ui, event_: input.Event) !void {
-        if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .left and event_ != .quit) return;
+        if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .left) return;
         if (self.settings_value_picker != null) return self.settingsValueKey(event_);
         if (self.proxy_address_open) return self.proxyAddressKey(event_);
         if (self.proxy_open and (event_ == .left or event_ == .escape or event_ == .cancel)) {
@@ -3898,7 +3871,6 @@ const Ui = struct {
         }
         switch (event_) {
             .escape, .cancel => self.closeSettingsMenu(),
-            .quit => self.confirmCtrlD(),
             .left => try self.backToCommands(.settings),
             .paste_start => self.settings_menu.markPaste(),
             .text => |value| {
@@ -4169,7 +4141,6 @@ const Ui = struct {
                 self.closeProviderPicker();
                 self.notice = "Ready";
             },
-            .quit => self.confirmCtrlD(),
             .paste_start => self.provider_picker.markPaste(),
             .text => |value| if (value.pasted) {
                 self.provider_picker.markPaste();
@@ -4310,21 +4281,14 @@ const Ui = struct {
             }
         }
     }
-    fn expireCtrlD(self: *Ui) void {
-        if (self.ctrl_d_pending and self.clock_ms > self.ctrl_d_deadline_ms) {
-            self.ctrl_d_pending = false;
-            self.requestDraw();
-        }
-    }
     fn modelKey(self: *Ui, event_: input.Event) !void {
-        if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel and event_ != .quit) return;
+        if (self.normalAsyncPending() and event_ != .escape and event_ != .cancel) return;
         const picker = &self.model_picker.?;
         switch (event_) {
             .escape, .cancel => {
                 self.closeModelPicker();
                 self.notice = "Ready";
             },
-            .quit => self.confirmCtrlD(),
             .paste_start => {
                 picker.pasted = true;
                 picker.generation +%= 1;
@@ -4999,7 +4963,6 @@ const Ui = struct {
         self.refreshStop();
         if (!self.stop_open) return;
         switch (event_) {
-            .quit => self.confirmCtrlD(),
             .escape => self.closeStop(),
             .left, .right, .up, .down, .tab => {
                 self.stop_danger = switch (event_) {
@@ -5193,7 +5156,7 @@ const Ui = struct {
     }
 
     fn secretKey(self: *Ui, event_: input.Event) !void {
-        if (self.hasAsync(.configure) and event_ != .escape and event_ != .cancel and event_ != .quit) return;
+        if (self.hasAsync(.configure) and event_ != .escape and event_ != .cancel) return;
         switch (event_) {
             .text => |v| {
                 self.secret.insert(v.value);
@@ -5225,10 +5188,6 @@ const Ui = struct {
             .cancel => {
                 self.endSecret();
                 self.notice = "Setup canceled";
-            },
-            .quit => {
-                self.endSecret();
-                self.confirmCtrlD();
             },
             .enter => {
                 const key_bytes = self.secret.value() orelse {
@@ -5366,21 +5325,15 @@ const Ui = struct {
                 self.frame_permission = null;
                 self.frame_permission_choice = null;
             },
-            .quit => self.confirmCtrlD(),
             else => {},
         }
     }
 
     /// 键盘事件回调（由 input.Parser 调用）。审批可见时优先处理审批按键；粘贴内容永远不能用于批准。
-    fn key(ctx: *anyopaque, event_: input.Event) !void {
+    fn key(ctx: *anyopaque, raw_event: input.Event) !void {
         const self: *Ui = @ptrCast(@alignCast(ctx));
+        var event_ = raw_event;
         if (self.exitAuthorized()) return;
-        if (self.ctrl_d_pending and event_ != .quit) {
-            // The read that armed exit owns its remainder; any later read with
-            // another key cancels the intent instead of exiting.
-            if (self.parser.feed_id == self.ctrl_d_feed) return;
-            self.ctrl_d_pending = false;
-        }
         // Keyboard input must reach the next fresh draw without waiting for the
         // ordinary cadence; it still never interrupts an already-started frame.
         self.urgent_draw = true;
@@ -5401,18 +5354,17 @@ const Ui = struct {
                     self.secret_quarantine = false;
                     self.parser.secretMode(false);
                 },
-                .quit => self.confirmCtrlD(),
                 else => {},
             }
             return;
         }
 
         if (self.codex_open or self.codex_opening) {
-            if (event_ == .quit) self.confirmCtrlD() else if (event_ == .escape and !self.parser.pasted and !self.parser.batch_paste) self.cancelCodexLogin();
+            if (event_ == .escape and !self.parser.pasted and !self.parser.batch_paste) self.cancelCodexLogin();
             return;
         }
         if (self.stop_open) {
-            if (self.parser.batch_paste and event_ != .quit and event_ != .paste_start) return;
+            if (self.parser.batch_paste and event_ != .paste_start) return;
             self.stopKey(event_);
             return;
         }
@@ -5447,6 +5399,12 @@ const Ui = struct {
         if (self.settings_open and self.permission == null) return self.settingsKey(event_);
         if (self.provider_open and self.permission == null) return self.providerKey(event_);
         if (self.model_picker != null and self.permission == null) return self.modelKey(event_);
+        if (event_ == .quit) {
+            if (self.parser.pasted or self.parser.batch_paste) return;
+            if (self.editor.bytes.items.len == 0) return self.quitIdleComposer();
+            if (self.editor.cursor == self.editor.bytes.items.len) return;
+            event_ = .delete; // Reuse normal editing, including draft revision and menu invalidation.
+        }
         switch (event_) {
             .text, .tab, .backspace, .delete, .clear, .kill_start, .kill_end, .kill_word => self.editor_revision +%= 1,
             else => {},
@@ -5530,8 +5488,7 @@ const Ui = struct {
             // Active tasks/queues were handled above; idle modal handlers get
             // first refusal. Ordinary idle Ctrl-C must not erase the composer.
             .cancel => {},
-            // 退出：若任务仍在运行则先取消，等 loop 中 complete 完成后才真正退出。
-            .quit => self.confirmCtrlD(),
+            .quit => unreachable,
             .toggle_reasoning => self.show_reasoning = !self.show_reasoning,
             .cycle_effort => self.cycleEffort(),
             .escape => {},
@@ -6163,7 +6120,6 @@ const Ui = struct {
             // 档位确认到期后自动恢复为上下文百分比，不必等下一次按键。
             // 空闲等待由 baseWaitMs 的档位 deadline 收紧，到期后无需额外唤醒。
             self.expireEffortFlash();
-            self.expireCtrlD();
             self.pumpAsync();
             // Both local and remote output share the bounded event budget;
             // buffered remote deltas must not wait one terminal tick apiece.

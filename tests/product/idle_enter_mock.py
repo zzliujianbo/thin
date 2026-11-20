@@ -506,7 +506,7 @@ def run(app, width, batched):
             assert sum(''.join(row).rstrip(' ') in clipped_statuses for row in screen.grid) == 1, 'status is not unique on screen'
             assert not ''.join(screen.grid[screen.row - 2]).strip(), 'separator above status is not blank'
             assert len(Service.requests) == 1
-            send(b'\x04\x04')
+            send(b'\x04')
             pump_until(lambda: child.poll() is not None)
             assert child.wait(timeout=3) == 0
             assert termios.tcgetattr(slave) == original, 'termios was not restored'
@@ -619,7 +619,7 @@ def first_entry(app, origin, width, response='normal', *, menu=None):
                             time.sleep(.005)
                             os.write(master, reply[2:])
                         elif response == 'early':
-                            os.write(master, reply + b'\x04\x04trailing')
+                            os.write(master, reply + b'\x04trailing')
                         else:
                             os.write(master, reply)
                     continue
@@ -758,6 +758,9 @@ def first_entry(app, origin, width, response='normal', *, menu=None):
                     assert closed == initial and not occupied, (
                         f'{menu} Esc: caret row {closed + 1}, expected {initial + 1}; '
                         f'nonblank vacated rows {occupied}')
+                    if draft:
+                        # Esc closed the picker but preserved its slash draft.
+                        key(b'\x15', screen.idle)
                 if response == 'timeout':
                     mark = len(wire)
                     os.write(master, b'input-proof')
@@ -765,7 +768,9 @@ def first_entry(app, origin, width, response='normal', *, menu=None):
                     mark = len(wire)
                     os.write(master, b'\x15')
                     pump(lambda: FRAME_END in wire[mark:] and screen.idle())
-                os.write(master, b'\x04\x04')
+                pump(lambda: wire.endswith(FRAME_END) and screen.idle() and
+                     screen.editor_tail().startswith('(fixture-model)'))
+                os.write(master, b'\x04')
             pump(lambda: child.poll() is not None)
             assert child.wait(timeout=3) == 0, 'exit-code'
             drain_final()
@@ -1062,7 +1067,7 @@ def streaming(app, line_count):
             assert all(line.strip() or i in allowed_blanks for i, line in enumerate(screen.history)), 'extra blank native padding'
             assert len(requests) == 1
             collect_frames = False
-            os.write(master, b'\x04\x04')
+            os.write(master, b'\x04')
             pump(lambda: child.poll() is not None)
             assert child.wait(timeout=3) == 0
             # Drain the child-owned PTY after exit, including its final write.

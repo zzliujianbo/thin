@@ -23,6 +23,12 @@ fn fixtureUi(bridge: *bridge_module.Bridge, cancel: *p.Cancellation) Ui {
     return .{ .allocator = std.testing.allocator, .io = std.testing.io, .connection = .{ .context = bridge, .current_fn = FixtureConnection.current, .configure_fn = FixtureConnection.configure }, .bridge = bridge, .cancel = cancel, .terminal = &fixture_terminal, .editor = .{ .allocator = std.testing.allocator }, .job = .{ .runtime = undefined, .cancel = cancel, .prompt = "" }, .size = .{ .columns = 80, .rows = 24 } };
 }
 
+fn testExitEmptyComposer(ui: *Ui) !void {
+    try std.testing.expect(!ui.exitAuthorized());
+    try ui.parser.feed("\x04", .{ .context = ui, .emit_fn = Ui.key });
+    try std.testing.expect(ui.exitAuthorized());
+}
+
 fn testAcknowledgeFullFrame(ui: *Ui) void {
     ui.frame_offset = ui.frame.len;
     ui.finishFrame();

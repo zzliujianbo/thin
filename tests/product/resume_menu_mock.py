@@ -202,7 +202,7 @@ def seed(app, home, project, runtime, title, answer, owner):
         ident = wait_checkpoint(project, title).stem
         assert requests[before:] and set(requests[before:]) == {ident}, 'seed header/checkpoint mismatch'
         assert_live_project(home, project, ident, owner)
-        term.send(b'\x04\x04')
+        term.send(b'\x04')
         term.pump(lambda: term.child.poll() is not None, f'{title} exit')
         assert term.child.wait() == 0
     assert read_title(project / '.thin/sessions', ident) == title
@@ -316,7 +316,7 @@ def main(app):
                 assert len(requests) == 6 and continuation_sessions == selected_ids
                 assert marker.read_text() == 'once'
                 assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
-                term.send(b'\x04\x04')
+                term.send(b'\x04')
                 term.pump(lambda: term.child.poll() is not None, 'restored launcher clean exit')
                 assert term.child.wait() == 0
                 assert {i: (sessions / f'{i}.title').read_bytes() for i in ids} == titles_before
@@ -332,7 +332,7 @@ def main(app):
                 term.send(b'/resume\r')
                 term.pump(lambda: b'No saved sessions' in term.data[mark:] and term.idle(),
                           'empty foreground cwd excludes both foreign checkpoints')
-                term.send(b'\x04\x04')
+                term.send(b'\x04')
                 term.pump(lambda: term.child.poll() is not None, 'empty foreground exit')
                 assert term.child.wait() == 0 and len(requests) == 6
             daemon_roundtrip(app, home, project, other, runtime, ids)
@@ -454,7 +454,7 @@ def daemon_roundtrip(app, home, project, other, runtime, foreground_ids):
             select(term, 0, 'warm cross-project A')
             term.pump(lambda: any('seed-one-answer' in line for line in term.lines()) and term.idle(),
                       'warm cross-project history')
-            term.send(b'\x04\x04')
+            term.send(b'\x04')
             term.pump(lambda: term.child.poll() is not None, 'warm launcher exit')
             assert term.child.wait() == 0
         records = [next((home / '.thin/session-index').glob(f'*/{ident}.json')) for ident in ids]
@@ -497,7 +497,7 @@ def daemon_roundtrip(app, home, project, other, runtime, foreground_ids):
             term.send(b'/new\r')
             term.pump(lambda: b'New session; previous session keeps running' in term.data[mark:] and term.idle(),
                       'empty new session ready')
-            term.send(b'\x04\x04')
+            term.send(b'\x04')
             term.pump(lambda: term.child.poll() is not None, 'trailing-HOME connect exit')
             assert len(requests) == 6, '/new must not send an implicit prompt'
             assert term.child.wait() == 0

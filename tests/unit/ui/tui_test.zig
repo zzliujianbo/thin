@@ -1528,7 +1528,7 @@ test "Escape protects draft then cancels active task only from empty input" {
     try ui.parser.feed("\x1b", sink);
     try std.testing.expect(!cancel.isRequested());
     try ui.parser.expireEscape(sink);
-    try std.testing.expect(!cancel.isRequested() and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try std.testing.expect(!cancel.isRequested() and !ui.exitAuthorized());
     try std.testing.expectEqualStrings("draft-next", ui.editor.bytes.items);
     ui.wipeEditor();
     try ui.parser.feed("\x1b", sink);
@@ -1549,7 +1549,7 @@ test "first entry anchor protects history and entry rows through idle exit" {
         for (0..screen.rows) |row| screen.grid[row][0] = @intCast('A' + row);
         screen.row = entry_row;
         ui.entry_origin = .{ .size = ui.size, .row = entry_row };
-        ui.ctrl_d_exit = true;
+        try testExitEmptyComposer(&ui);
         try ui.draw();
         var bytes: [2048]u8 = undefined;
         var writer = Io.Writer.fixed(&bytes);
@@ -1878,7 +1878,7 @@ test "early ctrl d never writes an unseen initial frame" {
     defer ui.deinit();
     ui.entry_origin = .{ .size = ui.size, .row = 4 };
     try ui.draw();
-    ui.ctrl_d_exit = true;
+    try testExitEmptyComposer(&ui);
     try std.testing.expect(ui.initialExitWithoutFrame());
     try ui.drainExit();
     try std.testing.expect(ui.frame.len != 0 and ui.frame_offset == 0);
@@ -1898,7 +1898,7 @@ test "exit blank cleanup reclaims acknowledged edges and preserves startup and s
     _ = try ui.add(.notice, "thin fixture-version\n/fixture\nfixture UTC");
     ui.notice = "fixture-footer";
     ui.observeAdvisories();
-    ui.ctrl_d_exit = true;
+    try testExitEmptyComposer(&ui);
     var screen: @import("../tests/regular_screen.zig").Screen = .{};
     try screen.replay("shell-kept\r\n");
     try ui.draw();
@@ -5063,10 +5063,7 @@ test "exit blank cleanup drains and restores completed transcript on owned PTY" 
     _ = try ui.add(.assistant, "final-exit-reply");
     ui.notice = "pty-footer";
     ui.observeAdvisories();
-    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
-    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
+    try testExitEmptyComposer(&ui);
     try ui.drainExit();
     try std.testing.expect(ui.frame.len == 0 and !ui.dirty);
     try std.testing.expect(ui.records.items[0].output);
@@ -8510,15 +8507,12 @@ test "cancellation alone cannot authorize exit but a parsed quit can" {
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     cancel.cancel();
-    try std.testing.expect(cancel.isRequested() and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try std.testing.expect(cancel.isRequested() and !ui.exitAuthorized());
     try std.testing.expect(ui.settingsIdle());
-    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
-    try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
+    try testExitEmptyComposer(&ui);
     try std.testing.expect(!ui.settingsIdle());
 }
-test "CtrlD discards the remainder and all subsequent input before submission" {
+test "Ctrl+D exits the empty idle composer on one press and discards subsequent input" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -8527,70 +8521,78 @@ test "CtrlD discards the remainder and all subsequent input before submission" {
     const previous_notice = ui.notice;
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("\x04hello\r", sink);
-    // The first Ctrl+D only arms; the rest of its read is discarded.
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try std.testing.expect(ui.exitAuthorized());
     try std.testing.expectEqualStrings(previous_notice, ui.notice);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try std.testing.expect(ui.future == null and !ui.busy and ui.records.items.len == 0);
-    try ui.parser.feed("\x04", sink);
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
     try ui.parser.feed("another\r", sink);
+    try std.testing.expect(ui.future == null and !ui.busy and ui.records.items.len == 0);
     try std.testing.expectEqualStrings(previous_notice, ui.notice);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
 }
-test "CtrlD exit reason survives secret quarantine picker and busy cancellation" {
-    for (0..5) |mode_| {
+test "Ctrl+D cannot exit from a menu, modal or secret quarantine" {
+    const Surface = enum { slash_menu, command_mode, model_picker, permission, stop, quarantine };
+    for ([_]Surface{ .slash_menu, .command_mode, .model_picker, .permission, .stop, .quarantine }) |surface| {
         var cancel = p.Cancellation{};
         var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
         defer bridge.deinit();
         var ui = fixtureUi(&bridge, &cancel);
         defer ui.deinit();
-        switch (mode_) {
-            1 => {
-                ui.secret_mode = true;
-                ui.parser.secretMode(true);
-                ui.secret.insert("fake-exit-secret");
-            },
-            2 => ui.secret_quarantine = true,
-            3 => ui.openModelPicker(),
-            4 => ui.busy = true,
-            else => {},
-        }
         const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-        try ui.parser.feed("\x04", sink);
-        try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
-        // A secret-mode first press also leaves the secret prompt, so the
-        // confirming press must be a separate read.
-        try ui.parser.feed("\x04", sink);
-        try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
-        if (mode_ == 4) try std.testing.expect(cancel.requested.load(.acquire));
-        if (mode_ == 1) {
-            try std.testing.expect(!ui.secret_mode and ui.secret.len == 0);
-            for (ui.secret.bytes) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+        switch (surface) {
+            .slash_menu => {
+                try ui.parser.feed("/", sink);
+                try std.testing.expect(ui.commandMenuVisible());
+            },
+            .command_mode => {
+                try ui.parser.feed("!", sink);
+                try std.testing.expect(ui.command_mode);
+            },
+            .model_picker => ui.openModelPicker(),
+            .permission => ui.permission = .{ .id = 42, .description = try ui.allocator.dupe(u8, "fixture approval"), .clipped = false },
+            .stop => ui.stop_open = true,
+            .quarantine => ui.secret_quarantine = true,
+        }
+        for (0..2) |_| {
+            try ui.parser.feed("\x04", sink);
+            try std.testing.expect(!ui.exitAuthorized() and !cancel.isRequested());
         }
     }
 }
-test "CtrlD intent expires and any other key cancels the exit" {
+test "Ctrl+D deletes forward in ordinary input and does nothing at the end" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
     const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-    try ui.parser.feed("\x04", sink);
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit);
-    // A later read with any other key cancels the intent and is processed.
-    try ui.parser.feed("x", sink);
-    try std.testing.expect(!ui.ctrl_d_pending and !ui.ctrl_d_exit);
-    try std.testing.expectEqualStrings("x", ui.editor.bytes.items);
-    // A press after the window re-arms instead of exiting.
-    try ui.parser.feed("\x04", sink);
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit);
-    ui.clock_ms = ui.ctrl_d_deadline_ms + 1;
-    try ui.parser.feed("\x04", sink);
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit);
-    try ui.parser.feed("\x04", sink);
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
+    try ui.parser.feed("abc\x04", sink);
+    try std.testing.expectEqualStrings("abc", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 3), ui.editor.cursor);
+    try std.testing.expect(!ui.exitAuthorized());
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "again to exit") == null);
+    try ui.parser.feed("\x1b[D\x1b[D\x04", sink);
+    try std.testing.expectEqualStrings("ac", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.editor.cursor);
+    try std.testing.expect(!ui.exitAuthorized());
+}
+test "Ctrl+D on empty input leaves active or queued work alone" {
+    for ([_]bool{ false, true }) |busy| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        ui.busy = busy;
+        if (!busy) _ = try ui.inbox.enqueue(ui.allocator, .follow_up, "queued fixture");
+        for (0..2) |_| {
+            try ui.parser.feed("\x04", .{ .context = &ui, .emit_fn = Ui.key });
+            try std.testing.expect(!ui.exitAuthorized() and !cancel.isRequested() and !ui.stop_open);
+        }
+        try std.testing.expectEqual(busy, ui.busy);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!busy)), ui.inbox.snapshot().follow_up);
+    }
 }
 test "compact slash menu requires acknowledged choice then joins a summary-only job" {
     const cfg = @import("../core/config.zig");
@@ -8665,20 +8667,18 @@ test "bang commands use local job with zero main calls and reject unsafe submiss
     ui.connection = fixture.connection();
     defer ui.deinit();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
-    for (0..6) |case| {
+    for (0..5) |case| {
         ui.wipeEditor();
         _ = try ui.editor.insert(if (case == 0) " ! \t" else "!echo fixture");
         ui.busy = case == 1;
         ui.poisoned = case == 2;
         ui.editor_pasted = case == 3;
         ui.parser.escape_len = if (case == 4) 2 else 0;
-        ui.ctrl_d_exit = case == 5;
         try ui.submit();
         try std.testing.expect(ui.future == null and ui.prompt == null);
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
         ui.busy = false;
         ui.poisoned = false;
-        ui.ctrl_d_exit = false;
         ui.parser.escape_len = 0;
     }
     ui.wipeEditor();
@@ -8703,6 +8703,15 @@ test "bang commands use local job with zero main calls and reject unsafe submiss
     fixture.configured = false;
     try ui.parser.feed("!echo unavailable\r", sink);
     try std.testing.expect(ui.future == null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+
+    fixture.runtime = &runtime;
+    fixture.configured = true;
+    ui.wipeEditor();
+    try testExitEmptyComposer(&ui);
+    _ = try ui.editor.insert("!echo after exit");
+    try ui.submit();
+    try std.testing.expect(ui.future == null and ui.prompt == null);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }
 test "compact command rejects busy pasted poisoned and unconfigured states without a job" {
@@ -9441,12 +9450,15 @@ test "secret prompt masks keys shows destination and erases cancel error and pas
     try ui.parser.feed("\x15", sink);
     try std.testing.expect(!ui.secret_quarantine);
     try ui.parser.feed("/login\r", sink);
+    try std.testing.expect(ui.secret_mode);
     try ui.parser.feed("key\x04exit-tail", sink);
-    try std.testing.expect(ui.ctrl_d_pending and !ui.ctrl_d_exit and !ui.exitAuthorized());
-    try std.testing.expect(!ui.secret_mode and ui.secret.len == 0);
+    try std.testing.expect(!ui.exitAuthorized() and !fixture.configured);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
-    try ui.parser.feed("\x04", sink);
-    try std.testing.expect(ui.ctrl_d_exit and ui.exitAuthorized());
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try ui.parser.feed("\x1b", sink);
+    try ui.parser.expireEscape(sink);
+    try std.testing.expect(!ui.secret_mode and !ui.exitAuthorized());
+    for (ui.secret.bytes) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 test "regression paste-tail Escape timeout cannot withdraw queued FollowUp" {
     try pasteTailEscapeRegression(&.{"\x1b[200~\x1b[201~\x1b"}, false);
@@ -9833,7 +9845,7 @@ test "ordinary submission preserves draft and pending queue after owner change" 
     try std.testing.expectEqual(@as(usize, 1), ui.inbox.snapshot().follow_up);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
     try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
-    try std.testing.expect(!ui.busy and ui.future == null and !ui.ctrl_d_exit and !ui.exitAuthorized());
+    try std.testing.expect(!ui.busy and ui.future == null and !ui.exitAuthorized());
     try std.testing.expect(std.mem.find(u8, ui.notice, "Ctrl-C") != null);
     ui.inbox.pauseClaims(true);
     try std.testing.expect(ui.inbox.cancelClear(ui.inbox.snapshot().revision, &cancel));

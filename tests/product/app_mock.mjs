@@ -269,7 +269,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
       // 请求体上限 1 MiB，然后解析 JSON。
       for await (const chunk of req) { bytes += chunk.length; assert(bytes < 1024*1024); data += chunk; }
       const body = JSON.parse(data);
-      if (!dedicatedMode && body.tool_choice !== 'none' && rounds === 0) {
+      if (kind === 'exit-recorded' || (!dedicatedMode && body.tool_choice !== 'none' && rounds === 0)) {
         const turn = (protocol === 'chat' ? body.messages : body.input).at(-1);
         assert.equal(turn.role,'user');
         assert.deepEqual(turn.content,protocol === 'chat' ? 'fixture-task' : [{type:'input_text',text:'fixture-task'}]);
@@ -726,7 +726,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
       await noSubmissionState(project);
       if (['exit-unconfigured','exit-secret'].includes(kind)) {
         const disk = JSON.parse(await readFile(join(home,'.thin/config.json'),'utf8'));
-        assert.equal(disk.llm.providers.local.api_key,null, 'Ctrl+D secret exit must not save input');
+        assert.equal(disk.llm.providers.local.api_key,null, 'leaving without submitting a key must not save input');
       }
     }
     if (kind === 'exit-recorded') {

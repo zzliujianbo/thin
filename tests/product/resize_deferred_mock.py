@@ -273,11 +273,10 @@ def run(app):
                 before = capture.count(ACK)
                 pump(.24)
                 assert capture.count(ACK) > before, 'animation did not resume after content'
-                Service.finish_gate.set()
-                # Stable post-finish frames end with the idle marker (SGR allowed).
                 start = len(capture)
-                wait(lambda: b'%>' in CSI.sub(b'', bytes(capture[start:])) and ACK in capture[start:], label='completed idle frame')
-                os.write(master, b'\x04\x04')
+                Service.finish_gate.set()
+                wait(lambda: complete_frame(start, b'%>') is not None, label='completed idle frame')
+                os.write(master, b'\x04')
                 child.wait(timeout=5)
                 pump(.05)
                 assert child.returncode == 0

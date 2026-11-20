@@ -25,7 +25,7 @@ Isolation rules:
 Coverage (one case per user-visible requirement):
 1. Bare `thin` works independently in cwd without starting a daemon. A wrong
    control endpoint fails closed instead. Retired flags are rejected.
-2. With a daemon, bare `thin` auto-connects in its cwd. After SIGKILL of the
+2. With a daemon, bare `thin` auto-connects in its cwd. After SIGHUP to the
    frontend, the worker finishes the gated POST; a client launched elsewhere
    can select the completed conversation in `/resume` without new inference.
 3. One writable console: listing and Esc on the original busy view do not
@@ -1345,10 +1345,10 @@ def case_no_service(app, base):
         project.mkdir(mode=0o700)
         control = case.workspace.runtime / 'thin/daemon.sock'
         default = case.client(project, 'default-foreground')
-        default.pump_until(lambda: default.idle_after(0), 'default interactive idle', 30,
+        default.pump_until(lambda: default.idle_after(0, MODEL.encode()), 'default interactive idle', 30,
                            guard=case.model.check)
         assert not os.path.lexists(control), 'plain thin published a daemon socket'
-        default.send(b'\x04\x04')
+        default.send(b'\x04')
         code = default.wait_exit('default exit', 25)
         default.drain()
         assert code == 0, 'ordinary thin exit status %r' % (code,)
@@ -1366,7 +1366,7 @@ def case_no_service(app, base):
         assert_live_project(case.workspace.home, project, ident, 'foreground')
         assert_no_tcp_listener(client.proc.pid)
         assert not os.path.lexists(control) and not session_files(case.workspace.home)
-        client.send(b'\x04\x04')
+        client.send(b'\x04')
         assert client.wait_exit('independent chat exit') == 0
         assert not runtime_sockets(case.workspace.runtime)
         assert case.model.count() == 1
@@ -1426,7 +1426,7 @@ def case_wrong_endpoint(app, base):
         case.close()
 
 
-# Case 2: client killed mid-task, worker completes, picker restores result.
+# Case 2: client hangs up mid-task, worker completes, picker restores result.
 
 def case_detach_continues(app, base):
     case = Case(app, base, 'case2-detach')
@@ -1444,9 +1444,10 @@ def case_detach_continues(app, base):
         client.send_line(DETACH_PROMPT)
         case.wait_prompt(DETACH_PROMPT)
         assert case.model.count(DETACH_PROMPT) == 1, 'expected exactly one gated request'
-        # Drop the front end by killing its process: not Ctrl-C, not a clean exit.
-        client.kill()
-        client.wait(10)
+        # Hang up only the frontend while the daemon's POST is still gated.
+        client.proc.send_signal(signal.SIGHUP)
+        code = client.wait_exit('active frontend hangup', 10)
+        assert code == 128 + signal.SIGHUP, 'unexpected frontend hangup status %r' % code
         assert case.model.count(DETACH_PROMPT) == 1
         case.state['gate'].set()
         wait_checkpoint(project, DETACH_ANSWER)
@@ -1463,7 +1464,7 @@ def case_detach_continues(app, base):
             'attached completed answer', 40, guard=case.model.check)
         assert case.model.count() == 1, 'attach caused new inference'
         assert DETACH_ANSWER in attached.screen_text(), 'completed answer missing after attach'
-        attached.send(b'\x04\x04')
+        attached.send(b'\x04')
         assert attached.wait_exit('attached exit', 25) == 0
         assert [path.stem for path in session_files(project)] == [ident]
         assert not session_files(other_cwd) and not session_files(case.workspace.home)
@@ -1496,6 +1497,9 @@ def case_controller(app, base):
                          'controller busy frame', 30, guard=case.model.check)
         ident = session_id(project)
 
+        # The gated task has an empty but busy composer: Ctrl-D must not
+        # detach or cancel it. The picker interaction proves it is still live.
+        first.send(b'\x04')
         row = case.pick_session(first, project, ident, CONTROLLER_PROMPT)
         esc_mark = first.mark()
         first.send(b'\x1b')
@@ -1529,7 +1533,7 @@ def case_controller(app, base):
         assert wait_checkpoint(project, 'first-console-ok').stem == ident
         assert case.model.count() == 3, 'extra inference after refused switch'
         for client in (second, first):
-            client.send(b'\x04\x04')
+            client.send(b'\x04')
             assert client.wait_exit('controller exit', 25) == 0
         return {'case': 'controller', 'id': ident, 'requests': case.model.count()}
     finally:
@@ -1562,7 +1566,7 @@ def case_offline_approval(app, base):
 
         # No client connected: the approval must stay pending, never self-grant.
         client.kill()
-        client.wait(10)
+        assert client.wait(10) == -signal.SIGKILL
         time.sleep(2.5)
         assert victim.is_file() and victim.read_text() == 'owned\n', \
             'offline approval was auto-granted'
@@ -1620,7 +1624,7 @@ def case_offline_approval(app, base):
         calls, results = tool_history(body)
         assert len(calls) == 1 and calls[0]['id'] == 'approval-tool-1', 'duplicate execution'
         assert results.get('approval-tool-1') is not None
-        attached.send(b'\x04\x04')
+        attached.send(b'\x04')
         assert attached.wait_exit('approval exit', 25) == 0
         return {'case': 'approval', 'id': ident, 'requests': case.model.count()}
     finally:
@@ -1651,7 +1655,7 @@ def case_daemon_reclaim(app, base):
                           'service start answer', 40, guard=case.model.check)
         service_pid, service_port = wait_service_ready(project)
         assert case.model.count(SERVICE_PROMPT) == 2
-        client.send(b'\x04\x04')
+        client.send(b'\x04')
         assert client.wait_exit('reclaim client exit', 25) == 0
 
         workers = children_of(daemon.proc.pid)
@@ -1775,7 +1779,7 @@ def case_streaming(app, base, daemon=False):
         client.pump_until(lambda: client.idle_after(mark, b'K1599'), 'stream final idle', 20,
                           guard=case.model.check)
         assert case.model.count() == 1, 'stream recovery repeated inference'
-        client.send(b'\x04\x04')
+        client.send(b'\x04')
         assert client.wait_exit('stream frontend exit', 20) == 0
         return {'case': 'stream-daemon' if daemon else 'stream-foreground',
                 'requests': 1, 'chunks': len(sent), 'visible_updates': updates,

@@ -413,7 +413,19 @@ def run(app, wrap=False, local_command=False):
                 assert OwnedService.requests == expected_requests, 'unexpected resize/draft/helper HTTP'
                 assert OwnedService.failed is None, f'owned loopback assertion failed: {OwnedService.failed}'
                 assert cfg.read_text() == json.dumps(config), 'resize changed settings'
-                tm('send-keys', '-t', 'owned:0.0', 'C-u', 'C-d', 'C-d')
+                tm('send-keys', '-t', 'owned:0.0', 'C-u')
+
+                def empty_prompt():
+                    state = pane_state(80, 24)
+                    if state is None:
+                        return False
+                    y, x, flag, dead = state
+                    lines = lines_now()
+                    return (flag == 1 and not dead and 0 <= y < len(lines) and
+                            lines[y].rstrip().endswith('%>') and x == len(lines[y].rstrip()) + 1)
+
+                wait(empty_prompt, 'draft did not clear at the idle caret')
+                tm('send-keys', '-t', 'owned:0.0', 'C-d')
 
                 def exited_cleanly():
                     dead, status, signal, pid = tm('display-message', '-p', '-t', 'owned:0.0', '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_pid}').strip().split('|')

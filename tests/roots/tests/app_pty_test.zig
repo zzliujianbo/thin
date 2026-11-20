@@ -1283,15 +1283,6 @@ fn checkConfirmationRow(view: *const regular.Screen, question: []const u8, selec
     }
 }
 
-/// Exit is a two-press gesture: the first full frame proves the arm, then the
-/// confirming press arrives in a separate read.
-fn quitTwice(d: *Driver) !void {
-    const start = d.used;
-    try d.send("\x04");
-    try d.waitText(start, "Press Ctrl+D again to exit");
-    try d.send("\x04");
-}
-
 // Approval choices own the composer row; both Y/N labels must fit there and
 // never be committed to native scrollback.
 fn checkApprovalRow(view: *const regular.Screen) !void {
@@ -1909,6 +1900,9 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
     }
     try queuedKey(d, a, "keep-steer\r", &.{ "Steering", "keep-steer" });
     try queuedDraft(d, a, "");
+    // Empty editor with Steering pending: repeated Ctrl+D must leave the
+    // queue intact and accept the following explicit FollowUp.
+    try d.send("\x04\x04");
     try queuedKey(d, a, if (withdraw) "old-follow\x1b\r" else "keep-follow\x1b\r", &.{ "FollowUp", if (withdraw) "old-follow" else "keep-follow" });
     try queuedDraft(d, a, "");
     if (withdraw) {
@@ -1944,7 +1938,7 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         // Each probe must cause an observable safe-selection transition.
         // Consecutive writes are NOT application read boundaries: without
         // these semantic ACKs a stop_feed tail could discard the later Esc.
-        try queuedKey(d, a, "\x1b[B", &.{"> Stop and clear"});
+        try queuedKey(d, a, "\x04\x04\x1b[B", &.{"> Stop and clear"});
         try queuedKey(d, a, "\x03\x03\r", &.{"> Continue"});
         try queuedKey(d, a, "\x1b[B", &.{"> Stop and clear"});
         try queuedKey(d, a, "\x1b[200~\r\x03\x1b[201~", &.{"> Continue"});
@@ -1991,7 +1985,7 @@ fn queuedScenario(d: *Driver, init: std.process.Init, mode: []const u8, project:
         try queuedIdle(d, a, probe_start);
         try queuedGate(d, a, project, "done");
     }
-    try quitTwice(d);
+    try d.send("\x04");
     try d.finish(0);
 }
 
@@ -2451,7 +2445,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, expect);
         const at = std.mem.indexOf(u8, d.output[start..d.used], expect).?;
         try d.waitIdle(start + at + expect.len);
-        // Common exit below confirms Ctrl+D, checks restoration and reports
+        // Common idle exit below checks restoration and reports
         // the saved checkpoint ID on stderr without dumping terminal output.
     } else if (std.mem.eql(u8, mode, "auth-missing") or std.mem.eql(u8, mode, "auth-empty")) {
         // A generated disk default is not an activated selection. Do not enter
@@ -2569,8 +2563,10 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try check(providers.row > 0);
         try check(!providers.visible("Configure provider"));
         start = d.used;
-        try d.send("\x1b[D"); // Provider -> root, not a cursor movement.
-        try d.waitFrame(start, "");
+        // Ctrl+D cannot exit the empty provider picker. Left must still
+        // navigate to its parent, not move an ordinary editor cursor.
+        try d.send("\x04\x04\x1b[D");
+        try d.waitVisibleFrame(start, "Configure provider");
         const root = try d.screen();
         try check(root.visible("/model") and root.visible("/login") and !root.visible("Provider> "));
         start = d.used;
@@ -2711,11 +2707,23 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.quiet(100);
     } else if (std.mem.eql(u8, mode, "exit-secret")) {
         try d.openAuth();
-        try d.send("fixture-secret-never-log");
-        try d.quiet(100);
+        const secret = d.used;
+        // Empty secret input isn't the ordinary empty composer. The next
+        // edit must still reach the masked field, never chat or the transcript.
+        try d.send("\x04\x04fixture-secret-never-log");
+        try d.waitVisibleFrame(secret, "API key> ***");
+        const closed = d.used;
+        try d.send("\x1b");
+        try d.waitIdle(closed);
     } else if (std.mem.eql(u8, mode, "exit-recorded")) {
+        // At end Ctrl+D preserves the draft; before X it deletes forward.
+        // The model fixture also checks the exact submitted user message.
+        try d.send("fixture-tas\x04Xk");
+        try queuedDraft(&d, a, "fixture-tasXk");
+        try d.send("\x1b[D\x1b[D\x04");
+        try queuedDraft(&d, a, "fixture-task");
         const start = d.used;
-        try d.send("fixture-task\r");
+        try d.send("\r");
         try d.waitText(start, "fixture-answer");
         try d.waitIdle(start);
     } else if (std.mem.eql(u8, mode, "exit-busy") or std.mem.eql(u8, mode, "exit-busy-tool")) {
@@ -2729,7 +2737,19 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
             try queuedFile(&d, a, project, "exit-busy-arrived");
             try d.waitBusy(start);
         }
-        // Ctrl+D at the shared tail below cancels and joins before restoration.
+        try waitAcceptedBusy(&d, start);
+        // The busy editor must still respond after both presses. An idle
+        // redraw after an implicit cancellation cannot satisfy the spinner row.
+        const probe = d.used;
+        try d.send("\x04\x04busy-probe");
+        try d.waitVisibleFrame(probe, "~ busy-probe");
+        const cleared = d.used;
+        try d.send("\x15");
+        try waitAcceptedBusy(&d, cleared);
+        const canceled = d.used;
+        try d.send("\x1b");
+        try d.waitText(canceled, "Canceled; prior side effects remain");
+        try d.waitIdle(canceled);
     } else if (std.mem.eql(u8, mode, "auth-activate")) {
         // 待激活配置指向本地 fixture。/login 使用独立的掩码输入，取消不能保存或污染聊天输入。
         try d.waitText(0, "/login");
@@ -3314,7 +3334,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, "REC FAILED");
         try d.waitText(start, "log-fixture-answer");
         try d.waitIdle(start);
-        try quitTwice(&d);
+        try d.send("\x04");
         try d.finish(0);
         const final = try d.screen();
         try check(final.count(regular.prior) == 1 and final.count("log-fixture-answer") == 1);
@@ -3416,6 +3436,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         // 取消后应能继续使用：再次提交 resume 并等待完成。
         const next = d.used;
         try d.send("resume\r");
+        try d.waitText(next, "fixture-answer");
         try d.waitIdle(next);
     } else {
         // 默认（交互）模式：验证 Unicode 输出；缩放只更新尺寸并作废旧帧权限，
@@ -3453,11 +3474,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     // Remainder of the SAME read after Ctrl+D must not submit anything.
     const exit_start = d.used;
     if (std.mem.eql(u8, mode, "exit-batched")) {
-        // The first press owns the rest of its read; the second read confirms.
         try d.send("\x04post-quit-must-not-submit\r");
-        try d.waitText(exit_start, "Press Ctrl+D again to exit");
-        try d.send("\x04");
-    } else try quitTwice(&d);
+    } else try d.send("\x04");
     try d.finish(0);
     if (before_exit) |before| {
         const final = try d.screen();
