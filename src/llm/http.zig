@@ -36,9 +36,10 @@ pub const Client = struct {
     /// Guards request ownership and the timestamp, not merely pool traversal.
     request_mutex: Io.Mutex = .init,
     last_request_finish: ?Io.Timestamp = null,
-    /// Only explicitly listed identities use curl's verified CONNECT + target
-    /// TLS. Direct requests retain the native pool and never read proxy env.
+    /// Explicit and system proxy routes use curl's verified CONNECT + target TLS.
     proxy_http: ?curl.Client = null,
+    explicit_policy: bool = false,
+    https_target: bool = false,
     /// OpenCode routing identity, stable across requests. The application can
     /// replace the local headless fallback with its immutable session ID.
     session_id: ?[32]u8 = null,
@@ -51,6 +52,13 @@ pub const Client = struct {
         var empty = std.process.Environ.Map.init(allocator);
         defer empty.deinit();
         return initWithEnv(allocator, io, config, key, &empty);
+    }
+
+    fn initProxy(a: std.mem.Allocator, io: Io, config: *const cfg.Config, env: *const std.process.Environ.Map) !?curl.Client {
+        const url = if (config.proxyFor(config.selected_provider, config.model.name)) |route| try route.url(a) else null;
+        defer if (url) |value| a.free(value);
+        if (url == null and (config.proxy != null or curl.Client.systemProxy(env, config.provider.base_url) == null)) return null;
+        return try curl.Client.initModel(a, io, env, config.provider.base_url, url, config.proxy == null);
     }
 
     pub fn initWithEnv(allocator: std.mem.Allocator, io: Io, config: *const cfg.Config, key: []const u8, env: *const std.process.Environ.Map) !Client {
@@ -69,12 +77,10 @@ pub const Client = struct {
             std.crypto.secureZero(u8, authorization);
             allocator.free(authorization);
         }
-        const proxy_http: ?curl.Client = if (config.proxyFor(config.selected_provider, config.model.name)) |route| blk: {
-            const url = try route.url(allocator);
-            defer allocator.free(url);
-            break :blk try curl.Client.initRouted(allocator, io, env, url);
-        } else null;
+        const proxy_http = try initProxy(allocator, io, config, env);
         return .{
+            .explicit_policy = config.proxy != null,
+            .https_target = std.ascii.startsWithIgnoreCase(config.provider.base_url, "https://"),
             .allocator = allocator,
             .io = io,
             .config = config,
@@ -90,12 +96,8 @@ pub const Client = struct {
         if (source.acquire_fn == null) return error.MissingCredentialSource;
         const authorization = try allocator.alloc(u8, 0);
         errdefer allocator.free(authorization);
-        const proxy_http: ?curl.Client = if (config.proxyFor(config.selected_provider, config.model.name)) |route| blk: {
-            const url = try route.url(allocator);
-            defer allocator.free(url);
-            break :blk try curl.Client.initRouted(allocator, io, env, url);
-        } else null;
-        return .{ .allocator = allocator, .io = io, .config = config, .authorization = authorization, .codex_source = source, .proxy_http = proxy_http, .http = .{ .allocator = allocator, .io = io } };
+        const proxy_http = try initProxy(allocator, io, config, env);
+        return .{ .explicit_policy = config.proxy != null, .https_target = true, .allocator = allocator, .io = io, .config = config, .authorization = authorization, .codex_source = source, .proxy_http = proxy_http, .http = .{ .allocator = allocator, .io = io } };
     }
 
     /// Independent mutable client for one child Runtime. The frozen parent
@@ -108,25 +110,14 @@ pub const Client = struct {
             if (isCodexConfig(config) or std.mem.eql(u8, config.provider.base_url, codex_base)) return error.UnsupportedProtocol;
             if (!std.mem.startsWith(u8, self.authorization, "Bearer ") or self.authorization.len == "Bearer ".len) return error.InvalidApiKey;
         }
-        // The child config must resolve to the same explicit proxy route that
-        // this client already froze; never silently switch direct <-> proxied.
-        const expected = if (config.proxyFor(config.selected_provider, config.model.name)) |route| try route.url(allocator) else null;
-        defer if (expected) |url| allocator.free(url);
-        if (expected == null) {
-            if (self.proxy_http != null) return error.ProxyRouteChanged;
-        } else {
-            const transport = if (self.proxy_http) |*value| value else return error.ProxyRouteChanged;
-            if (transport.poisoned) return error.CleanupFailed;
-            const actual = transport.proxy_url orelse return error.ProxyRouteChanged;
-            if (!std.mem.eql(u8, expected.?, actual)) return error.ProxyRouteChanged;
-        }
+        try self.checkProxyRoute(config);
         const authorization = try allocator.dupe(u8, self.authorization);
         errdefer {
             std.crypto.secureZero(u8, authorization);
             allocator.free(authorization);
         }
         const proxy_http: ?curl.Client = if (self.proxy_http) |*transport|
-            try curl.Client.initRouted(allocator, io, &transport.env, transport.proxy_url)
+            try transport.cloneRoute(allocator, io)
         else
             null;
         return .{
@@ -135,6 +126,8 @@ pub const Client = struct {
             .config = config,
             .authorization = authorization,
             .codex_source = self.codex_source,
+            .explicit_policy = self.explicit_policy,
+            .https_target = self.https_target,
             .proxy_http = proxy_http,
             .http = .{ .allocator = allocator, .io = io },
             .session_id = self.session_id,
@@ -216,7 +209,7 @@ pub const Client = struct {
         if (!std.mem.eql(u8, request.scope.connection, self.config.provider.base_url) or
             !std.mem.eql(u8, request.scope.model, self.config.model.name)) return error.ReplayScopeMismatch;
         try self.checkProxyCleanup();
-        try self.checkProxyRoute();
+        try self.checkProxyRoute(self.config);
         // 开始传输前已取消则直接返回，不启动 worker。
         if (request.cancellation) |cancel| if (cancel.isRequested())
             return failure(.canceled, "canceled", null, false);
@@ -326,8 +319,13 @@ pub const Client = struct {
 
     /// Configuration is borrowed read-only. If a caller nevertheless replaces
     /// its route, refuse the stale client rather than silently sending direct.
-    fn checkProxyRoute(self: *const Client) !void {
-        const route = self.config.proxyFor(self.config.selected_provider, self.config.model.name);
+    fn checkProxyRoute(self: *const Client, config: *const cfg.Config) !void {
+        if ((config.proxy != null) != self.explicit_policy) return error.ProxyRouteChanged;
+        if (!self.explicit_policy) {
+            if (std.ascii.startsWithIgnoreCase(config.provider.base_url, "https://") != self.https_target) return error.ProxyRouteChanged;
+            return;
+        }
+        const route = config.proxyFor(config.selected_provider, config.model.name);
         if (route) |selected| {
             const transport = if (self.proxy_http) |*t| t else return error.ProxyRouteChanged;
             const actual = transport.proxy_url orelse return error.ProxyRouteChanged;
@@ -343,6 +341,7 @@ pub const Client = struct {
 
     const ProxyBody = struct {
         job: *Job,
+        codec: p.WireCodec,
         decoder: *sse.Decoder,
         allocator: std.mem.Allocator,
         error_body: std.ArrayList(u8) = .empty,
@@ -360,7 +359,7 @@ pub const Client = struct {
             if (head.status != 200) {
                 return self.error_body.appendSlice(self.allocator, bytes);
             }
-            if (!head.is_sse) return error.ExpectedSse;
+            if (!head.acceptsStream(self.codec)) return error.ExpectedSse;
             self.decoder.feed(bytes) catch |err| switch (err) {
                 error.OutOfMemory, error.Canceled => return err,
                 else => return error.InvalidModelEvent,
@@ -387,7 +386,7 @@ pub const Client = struct {
         };
         var decoder = sse.Decoder.init(job.client.allocator, null, .{ .context = &stream, .emit_fn = Stream.feed });
         defer decoder.deinit();
-        var body: ProxyBody = .{ .job = job, .decoder = &decoder, .allocator = a };
+        var body: ProxyBody = .{ .job = job, .codec = codec, .decoder = &decoder, .allocator = a };
         const remaining: u32 = @intCast(@max(1, @as(i64, job.client.config.limits.request_timeout_ms) - job.start.untilNow(job.client.io, .awake).toMilliseconds()));
         const head = transport.streamPost(a, address, headers[0..count], payload, @max(1, remaining), null, .{ .context = &body, .write_fn = ProxyBody.write, .check_fn = ProxyBody.check }, job.request.cancellation orelse &uncanceled) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled, error.CleanupFailed, error.RequestTimeout => return err,
@@ -396,7 +395,7 @@ pub const Client = struct {
             else => return failure(.transport, @errorName(err), if (body.head) |h| h.status else null, stream.observed()),
         };
         if (head.status != 200) return classifyHttpError(job.allocator, head.status, body.error_body.items);
-        if (!head.is_sse) return failure(.protocol, "response was not text/event-stream", head.status, false);
+        if (!head.acceptsStream(codec)) return failure(.protocol, "response was not text/event-stream", head.status, false);
         decoder.finish() catch |err| return failure(.protocol, @errorName(err), head.status, stream.observed());
         return stream.finish() catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -517,6 +516,10 @@ pub const Client = struct {
         // Content-Type 可能带有 charset 等参数，只比较主类型 text/event-stream。
         var types = std.mem.splitScalar(u8, content_type, ';');
         const is_sse = std.ascii.eqlIgnoreCase(std.mem.trim(u8, types.first(), " \t"), "text/event-stream");
+        // Classify before reader() invalidates the head's borrowed strings.
+        const stream_head: curl.StreamHead = .{ .status = status, .is_sse = is_sse, .missing_type = response.head.content_type == null };
+        if (status == 200 and !stream_head.acceptsStream(codec))
+            return failure(.protocol, "unexpected content-type", status, false);
         // 响应体读取缓冲区（8KB）。
         var transfer: [8192]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -532,10 +535,6 @@ pub const Client = struct {
             }
             return classifyHttpError(job.allocator, status, error_body);
         }
-
-        // 成功状态码但不是 SSE：端点不符合流式协议预期，直接报协议错误。
-        if (!is_sse)
-            return failure(.protocol, common.rawText(job.allocator, content_type, common.raw_max) orelse "unexpected content-type", status, false);
 
         // 根据协议创建对应的流解析器，解析器的事件通过 sink 转发出去。
         const sink = p.ModelSink{ .context = job, .emit_fn = Job.emit };

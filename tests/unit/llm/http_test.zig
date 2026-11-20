@@ -206,6 +206,24 @@ test "completed worker cannot publish late tools or hide usage at the final dead
     cancel.cancel();
     try std.testing.expect(job.complete(response).failure.kind == .canceled);
 }
+test "child keeps the parent's system proxy and refuses a different destination scheme" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HTTPS_PROXY", "http://127.0.0.1:7890");
+    try env.put("NO_PROXY", "localhost");
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://example.invalid" }, .model = .{ .name = "fixture", .context_tokens = 32768 } };
+    var parent = try Client.initWithEnv(a, std.testing.io, &config, "fake", &env);
+    defer parent.deinit();
+    try env.put("HTTPS_PROXY", "http://127.0.0.1:1");
+    var child = try parent.cloneForConfig(a, std.testing.io, &config);
+    defer child.deinit();
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", child.proxy_http.?.env.get("https_proxy").?);
+    try std.testing.expectEqualStrings("localhost", child.proxy_http.?.env.get("no_proxy").?);
+    config.provider.base_url = "http://example.invalid";
+    try std.testing.expectError(error.ProxyRouteChanged, parent.cloneForConfig(a, std.testing.io, &config));
+}
+
 test "model proxy route cannot silently reuse a stale direct client after alias change" {
     var config: cfg.Config = .{
         .provider = .{ .base_url = "https://example.invalid/v1" },
@@ -215,16 +233,16 @@ test "model proxy route cannot silently reuse a stale direct client after alias 
     };
     var client = try Client.init(std.testing.allocator, std.testing.io, &config, "fake");
     defer client.deinit();
-    try client.checkProxyRoute();
+    try client.checkProxyRoute(&config);
     config.selected_provider = "listed";
-    try std.testing.expectError(error.ProxyRouteChanged, client.checkProxyRoute());
+    try std.testing.expectError(error.ProxyRouteChanged, client.checkProxyRoute(&config));
     var listed = try Client.init(std.testing.allocator, std.testing.io, &config, "fake");
     defer listed.deinit();
-    try listed.checkProxyRoute();
+    try listed.checkProxyRoute(&config);
     config.proxy.?.port = 7891;
-    try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute());
+    try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute(&config));
     config.selected_provider = "other";
-    try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute());
+    try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute(&config));
 }
 test "OpenCode routing headers are stable explicit and absent on other services" {
     for (cfg.providers.Id.all) |id| {

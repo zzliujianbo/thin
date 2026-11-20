@@ -1533,7 +1533,7 @@ const Ui = struct {
                 };
                 self.publishNotice(switch (pending.purpose) {
                     .proxy => "Saved proxy models; main route applies in a new session",
-                    .proxy_address => if (action.proxy_address.len == 0) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session",
+                    .proxy_address => proxyAddressNotice(action.proxy_address.len == 0),
                     else => "Settings saved",
                 });
             },
@@ -3689,7 +3689,11 @@ const Ui = struct {
             self.notice = "Out of memory; address editor not opened";
         };
     }
-    /// Empty input removes the proxy through the same owner callback. The UI
+    fn proxyAddressNotice(cleared: bool) []const u8 {
+        return if (cleared) "Cleared proxy override; new sessions use system settings" else "Saved proxy address; main route applies in a new session";
+    }
+
+    /// Empty input removes the proxy override through the same owner callback. The UI
     /// never mutates its own endpoint: a failed save keeps the old value.
     fn saveProxyAddress(self: *Ui, state: Connection.State) void {
         if (!state.global_settings_available) {
@@ -3697,8 +3701,9 @@ const Ui = struct {
             return;
         }
         const raw = std.mem.trim(u8, self.editor.bytes.items, " \t");
+        const invalid_address = "Invalid proxy address; use host:port, [IPv6]:port, or clear for system settings";
         const parsed = core_config.parseProxyEndpoint(raw) catch {
-            self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+            self.notice = invalid_address;
             return;
         };
         const save = self.connection.proxy_address_fn orelse {
@@ -3708,16 +3713,16 @@ const Ui = struct {
         var buffer: [settings_menu_module.endpoint_buffer_bytes]u8 = undefined;
         const value: []const u8 = if (parsed) |endpoint| blk: {
             if (endpoint.address.len == 0 or endpoint.port == 0) {
-                self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+                self.notice = invalid_address;
                 return;
             }
             if (std.mem.findScalar(u8, endpoint.address, ':') != null)
                 break :blk std.fmt.bufPrint(&buffer, "[{s}]:{d}", .{ endpoint.address, endpoint.port }) catch {
-                    self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+                    self.notice = invalid_address;
                     return;
                 };
             break :blk std.fmt.bufPrint(&buffer, "{s}:{d}", .{ endpoint.address, endpoint.port }) catch {
-                self.notice = "Invalid proxy address; use host:port, [IPv6]:port, or empty to disable";
+                self.notice = invalid_address;
                 return;
             };
         } else "";
@@ -3735,9 +3740,8 @@ const Ui = struct {
         };
         // The owner publishes; then the submenu shows the saved endpoint.
         self.display.context = self.connection.current().initial_context;
-        const disabled = parsed == null;
         self.backToProxySubmenu(0);
-        self.publishNotice(if (disabled) "Empty disables proxy; a new session applies it" else "Saved proxy address; main route applies in a new session");
+        self.publishNotice(proxyAddressNotice(parsed == null));
     }
     fn proxySubKey(self: *Ui, event_: input.Event) !void {
         switch (event_) {

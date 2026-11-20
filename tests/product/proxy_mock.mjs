@@ -1,4 +1,4 @@
-// Owned HTTP CONNECT + destination TLS only. Never print bodies/headers/keys.
+// Owned HTTP forwarding and CONNECT + destination TLS. Never print bodies/headers/keys.
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -10,7 +10,8 @@ import { join, resolve } from 'node:path';
 if (!process.argv[2] || process.platform !== 'linux') throw Error('Usage: node proxy_mock.mjs <Zig test binary>');
 const home = mkdtempSync(join(tmpdir(), 'thin-proxy-'));
 const sockets = new Set(), servers = [], counts = new Map(), failures = [];
-let child, watchdog, connects = 0, rejectedProxyRequests = 0, tlsTunnels = 0, handshakes = 0, interrupted = false;
+const explicit = { connects: 0, tlsTunnels: 0 }, envProxy = { connects: 0, tlsTunnels: 0, forwards: 0 };
+let child, watchdog, rejectedProxyRequests = 0, handshakes = 0, interrupted = false;
 const marker = join(home, 'delta-observed');
 const track = s => { sockets.add(s); s.on('error', () => {}); s.once('close', () => sockets.delete(s)); return s; };
 const fail = label => { if (failures.length < 16) failures.push(label); };
@@ -47,7 +48,7 @@ function handler(req, res) {
       if (anthropic) { assert.equal(req.headers['x-api-key'] === 'fake-proxy-key', true); assert.equal(req.headers['anthropic-version'], '2023-06-01'); }
       else assert.equal(req.headers.authorization === 'Bearer fake-proxy-key', true);
       assert.equal(body.model, 'raw/id');
-      assert.equal(Boolean(req.socket.encrypted), scenario !== 'alias-direct');
+      assert.equal(Boolean(req.socket.encrypted), !['alias-direct', 'env-http', 'env-bypass'].includes(scenario));
       assert.equal(body.stream, true);
       assert(Array.isArray(body.tools) && body.tools.length === 1);
       assert.equal(req.headers.accept, 'text/event-stream');
@@ -89,8 +90,8 @@ try {
     else fail('unowned-forward-proxy');
     req.resume(); res.writeHead(403); res.end();
   });
-  proxy.on('connect', (req, downstream, head) => {
-    ++connects;
+  const connect = stats => (req, downstream, head) => {
+    ++stats.connects;
     if (req.headers.authorization || req.headers['proxy-authorization']) fail('CONNECT-auth');
     if (req.url === `127.0.0.1:${httpPort}`) { ++rejectedProxyRequests; downstream.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); return; }
     if (req.url !== `127.0.0.1:${tlsPort}` && req.url !== `localhost:${tlsPort}`) { fail('unowned-CONNECT'); downstream.destroy(); return; }
@@ -103,13 +104,29 @@ try {
         if (prefix.length < 3) return;
         downstream.off('data', inspect);
         if (prefix[0] !== 0x16 || prefix[1] !== 0x03) { fail('non-TLS-tunnel'); downstream.destroy(); upstream.destroy(); return; }
-        ++tlsTunnels; upstream.write(prefix); downstream.pipe(upstream); upstream.pipe(downstream);
+        ++stats.tlsTunnels; upstream.write(prefix); downstream.pipe(upstream); upstream.pipe(downstream);
       };
       downstream.on('data', inspect); if (head.length) inspect(head);
     });
     downstream.once('close', () => upstream.destroy()); upstream.once('close', () => downstream.destroy());
-  });
+  };
+  proxy.on('connect', connect(explicit));
   const proxyPort = await listen(proxy);
+  const envServer = http.createServer((req, res) => {
+    const path = '/env-http/chat/completions';
+    if (req.url !== `http://127.0.0.1:${httpPort}${path}`) {
+      fail('unexpected-env-forward'); req.resume(); res.writeHead(403); res.end(); return;
+    }
+    ++envProxy.forwards;
+    // Never resolve or dial a caller-supplied URL, even on a regression.
+    const upstream = http.request({ hostname: '127.0.0.1', port: httpPort, path, method: req.method, headers: req.headers, agent: false }, origin => {
+      res.writeHead(origin.statusCode, origin.headers); origin.pipe(res);
+    });
+    upstream.on('error', () => { fail('env-forward-upstream'); res.destroy(); });
+    req.pipe(upstream);
+  });
+  envServer.on('connect', connect(envProxy));
+  const envPort = await listen(envServer);
   // Reserve an owned closed port for deterministic connection refusal.
   const down = net.createServer(); await new Promise(ok => down.listen(0, '127.0.0.1', ok));
   const downPort = down.address().port; await new Promise(ok => down.close(ok));
@@ -117,15 +134,16 @@ try {
     PATH: '/usr/bin:/bin', LANG: 'C.UTF-8', HOME: home,
     THIN_PROXY_HTTP: `http://127.0.0.1:${httpPort}`, THIN_PROXY_HTTPS: `https://127.0.0.1:${tlsPort}`,
     THIN_PROXY_MISMATCH: `https://localhost:${tlsPort}`, THIN_PROXY_PORT: String(proxyPort), THIN_PROXY_DOWN_PORT: String(downPort),
-    THIN_PROXY_CA: cert, THIN_PROXY_WRONG_CA: wrongCert, THIN_PROXY_DELTA_MARKER: marker,
+    THIN_ENV_PROXY: `http://127.0.0.1:${envPort}`, THIN_PROXY_CA: cert, THIN_PROXY_WRONG_CA: wrongCert, THIN_PROXY_DELTA_MARKER: marker,
   } });
   const code = await new Promise((ok, no) => { child.once('error', no); child.once('close', (code, signal) => ok(signal ? 1 : code)); });
   child = undefined; // Already reaped: never signal its cached PID/PGID.
-  console.log('proxy fixture counts:', JSON.stringify(Object.fromEntries([...counts].sort())), JSON.stringify({ connects, rejectedProxyRequests, tlsTunnels, handshakes, failures: failures.length }));
-  const expected = { 'alias-direct': 1, anthropic: 2, chat: 2, disconnect: 1, responses: 2, timeout: 1, cancel: 1 };
+  console.log('proxy fixture counts:', JSON.stringify(Object.fromEntries([...counts].sort())), JSON.stringify({ ...explicit, rejectedProxyRequests, envProxy, handshakes, failures: failures.length }));
+  const expected = { 'alias-direct': 1, anthropic: 2, chat: 2, disconnect: 1, responses: 2, timeout: 1, cancel: 1, 'env-http': 1, 'env-https': 1, 'env-bypass': 1 };
   assert.deepEqual(Object.fromEntries([...counts].sort()), Object.fromEntries(Object.entries(expected).sort()), 'origin requests exactly once, negative TLS/down zero HTTP');
-  assert.equal(connects, 11); // 6 normal + 2 TLS negatives + 3 partial; HTTP alias uses forward form.
-  assert.equal(rejectedProxyRequests, 1); assert.equal(tlsTunnels, 11); assert.equal(handshakes, 1);
+  assert.equal(explicit.connects, 11); // 6 normal + 2 TLS negatives + 3 partial; HTTP alias uses forward form.
+  assert.equal(rejectedProxyRequests, 1); assert.equal(explicit.tlsTunnels, 11); assert.equal(handshakes, 1);
+  assert.deepEqual(envProxy, { connects: 3, tlsTunnels: 3, forwards: 1 }); // trusted, wrong CA, wrong hostname; bypass never reaches proxy.
   assert.deepEqual(failures, []); assert.equal(interrupted, false); assert.equal(code, 0);
 } finally {
   clearTimeout(watchdog); kill();

@@ -1644,7 +1644,7 @@ pub const Session = struct {
         try self.persistSettings(&declaration, .proxy_models);
     }
 
-    /// Settings-editor endpoint save. Empty input disables the proxy; a new
+    /// Settings-editor endpoint save. Empty input restores system routing; a new
     /// host/port keeps the current exact allowlist. The active primary client
     /// stays frozen, while auxiliary owners follow the latest declaration.
     fn setProxyAddress(raw: *anyopaque, address: []const u8) !void {

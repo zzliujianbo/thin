@@ -30,8 +30,7 @@ fn transportEnv(a: std.mem.Allocator, good_ca: bool) !std.process.Environ.Map {
     try env.put("HOME", try envValue("HOME"));
     try env.put("CURL_CA_BUNDLE", try envValue(if (good_ca) "THIN_PROXY_CA" else "THIN_PROXY_WRONG_CA"));
     // Hostile ambient values must neither bypass listed routes nor capture direct ones.
-    const proxy = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{try proxyPort(false)});
-    defer a.free(proxy);
+    const proxy = try origin("THIN_ENV_PROXY", "http", "127.0.0.1");
     for ([_][]const u8{ "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy" }) |name| try env.put(name, proxy);
     try env.put("NO_PROXY", "*");
     try env.put("no_proxy", "*");

@@ -9124,7 +9124,7 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     try std.testing.expectEqual(@as(usize, 0), fixture.proxy_len);
     try std.testing.expectEqual(@as(usize, 0), SelectionFixture.current(&fixture).proxy_models.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.proxy_saves);
-    try std.testing.expect(publishedNotice(&ui, "Empty disables proxy"));
+    try std.testing.expect(publishedNotice(&ui, "new sessions use system settings"));
     try std.testing.expect(!ui.proxy_address_open and ui.proxy_sub_open);
 }
 test "proxy address saves only when the endpoint fits the reserved columns" {

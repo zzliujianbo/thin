@@ -31,7 +31,7 @@ const StreamTestSink = struct {
 
 fn streamAllocationCase(a: std.mem.Allocator) !void {
     const headers = [_]std.http.Header{.{ .name = "authorization", .value = "Bearer fake-\\\"key" }};
-    const config = try makeStreamConfig(a, "https://origin.invalid/v1/messages", &headers, "{\"x\":\"中文\\n\"}", 11000, 1024, "http://127.0.0.1:7890");
+    const config = try makeStreamConfig(a, "https://origin.invalid/v1/messages", &headers, "{\"x\":\"中文\\n\"}", 11000, 1024, true, "http://127.0.0.1:7890");
     defer wipeFree(a, config);
     try std.testing.expect(std.mem.indexOf(u8, config, "proxy = \"http://127.0.0.1:7890\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config, "noproxy = \"\"") != null);

@@ -178,6 +178,21 @@ test "curl stream origin headers interim responses and every split deliver exact
         try std.testing.expectEqualStrings("data: 中文\n\n", sink.data.items);
     }
 }
+test "only Codex accepts a missing stream media type, never an explicitly wrong type" {
+    for ([_][]const u8{ "", "Content-Type:\r\n", "Content-Type: application/json\r\n", "Content-Type: text/event-stream\r\n" }, 0..) |header, i| {
+        var sink: StreamTestSink = .{};
+        defer sink.data.deinit(std.testing.allocator);
+        var parser: StreamParser = .{ .body_limit = 100, .sink = .{ .context = &sink, .write_fn = StreamTestSink.write } };
+        try StreamParser.write(&parser, "HTTP/1.1 200 OK\r\n");
+        try StreamParser.write(&parser, header);
+        try StreamParser.write(&parser, "\r\nx");
+        const head = sink.head.?;
+        try std.testing.expectEqual(i == 0 or i == 3, head.acceptsStream(.codex_responses));
+        for ([_]protocol.WireCodec{ .responses, .chat, .anthropic }) |codec|
+            try std.testing.expectEqual(i == 3, head.acceptsStream(codec));
+    }
+}
+
 test "curl stream bounds and ambiguous malformed headers fail closed" {
     const heads = [_][]const u8{
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\ncontent-type: text/plain\r\n\r\n",
@@ -199,6 +214,28 @@ test "curl stream bounds and ambiguous malformed headers fail closed" {
     var large: StreamParser = .{ .body_limit = 2, .sink = .{ .context = &sink, .write_fn = StreamTestSink.write } };
     try std.testing.expectError(error.InvalidHttpHead, StreamParser.write(&large, &huge));
 }
+test "system model proxy selects by scheme and freezes only safe environment" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HTTPS_PROXY", "http://127.0.0.1:1");
+    try env.put("https_proxy", "http://127.0.0.1:2");
+    try env.put("HTTP_PROXY", "http://127.0.0.1:3");
+    try env.put("REQUEST_METHOD", "GET");
+    try env.put("ALL_PROXY", "http://127.0.0.1:4");
+    try env.put("NO_PROXY", "localhost");
+    try std.testing.expect(Client.systemProxy(&env, "http://example.test") == null);
+    var client = try Client.initModel(a, std.testing.io, &env, "https://example.test", null, true);
+    defer client.deinit();
+    try env.put("https_proxy", "http://name:secret@example.test");
+    try std.testing.expectError(error.InvalidProxyEnvironment, Client.initModel(a, std.testing.io, &env, "https://example.test", null, true));
+    var clone = try client.cloneRoute(a, std.testing.io);
+    defer clone.deinit();
+    try std.testing.expectEqualStrings("http://127.0.0.1:2", clone.env.get("https_proxy").?);
+    try std.testing.expectEqualStrings("localhost", clone.env.get("no_proxy").?);
+    try std.testing.expect(clone.env.get("ALL_PROXY") == null and clone.env.get("http_proxy") == null);
+}
+
 test "explicit inference routes ignore ambient proxy and no_proxy and clone trust roots" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();

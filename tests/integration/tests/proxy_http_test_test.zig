@@ -53,6 +53,42 @@ test "proxy: exact alias isolation and native direct ignores environment proxies
     defer listed.deinit();
     try t.expect((try listed.model().call(a, request(c, .chat), .{})) == .failure);
 }
+test "proxy: absent config selects uppercase environment proxy by scheme and honors NO_PROXY" {
+    var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
+    defer backend.deinit();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const proxy = try origin("THIN_ENV_PROXY", "http", "127.0.0.1");
+    const down = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{try proxyPort(true)});
+    const Case = struct { name: []const u8, http: bool = false, bypass: bool = false, wrong_ca: bool = false, mismatch: bool = false };
+    for ([_]Case{
+        .{ .name = "env-http", .http = true },
+        .{ .name = "env-bypass", .http = true, .bypass = true },
+        .{ .name = "env-https" },
+        .{ .name = "env-wrong-ca", .wrong_ca = true },
+        .{ .name = "env-hostname", .mismatch = true },
+    }) |case| {
+        var c = try config(a, case.name, .chat, case.http, case.mismatch);
+        c.proxy = null;
+        var env = std.process.Environ.Map.init(t.allocator);
+        defer env.deinit();
+        try env.put("HOME", try envValue("HOME"));
+        try env.put("CURL_CA_BUNDLE", try envValue(if (case.wrong_ca) "THIN_PROXY_WRONG_CA" else "THIN_PROXY_CA"));
+        // Only the matching uppercase variable can reach the recording proxy.
+        try env.put("HTTP_PROXY", if (case.http) proxy else down);
+        try env.put("HTTPS_PROXY", if (case.http) down else proxy);
+        try env.put("NO_PROXY", if (case.bypass) "127.0.0.1" else "127.0.0.2");
+        var client = try Client.initWithEnv(t.allocator, backend.io(), &c, "fake-proxy-key", &env);
+        defer client.deinit();
+        const out = try client.model().call(a, request(c, .chat), .{});
+        if (case.wrong_ca or case.mismatch) {
+            try t.expect(out == .failure);
+        } else {
+            try t.expect((try successful(out)).finish == .stop);
+        }
+    }
+}
 test "proxy: down wrong CA hostname fail closed and partial streams never succeed or replay" {
     var backend = Io.Threaded.init(t.allocator, .{ .concurrent_limit = .limited(8) });
     defer backend.deinit();

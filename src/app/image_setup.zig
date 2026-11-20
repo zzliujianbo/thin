@@ -61,6 +61,7 @@ pub fn create(a: std.mem.Allocator, io: std.Io, config: cfg.Config, env: *const 
         .api_key = key,
         .request_timeout_ms = config.limits.request_timeout_ms,
         .proxy_url = proxy,
+        .allow_system = config.proxy == null,
         .context_tokens = context_tokens,
     }) catch |err| switch (err) {
         error.OutOfMemory => return err,

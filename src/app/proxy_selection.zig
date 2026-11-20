@@ -28,7 +28,7 @@ pub fn apply(a: std.mem.Allocator, config: *cfg.Config, name: []const u8, enable
     return true;
 }
 
-/// Replace only the endpoint. An empty address disables the proxy by removing
+/// Replace only the endpoint. An empty address restores system routing by removing
 /// the whole declaration, including its previous allowlist; a non-empty one
 /// keeps the current exact members (or starts empty). Identical host/port is an
 /// intentional no-write no-op. Mutates an arena-owned clone only.

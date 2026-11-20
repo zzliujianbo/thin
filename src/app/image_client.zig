@@ -12,6 +12,7 @@ pub const Options = struct {
     model: []const u8 = image.model_id,
     request_timeout_ms: u32,
     proxy_url: ?[]const u8 = null,
+    allow_system: bool = false,
     context_tokens: ?u64 = null,
 };
 
@@ -44,7 +45,7 @@ pub const Client = struct {
         errdefer owned.free(self.key);
         self.endpoint = try std.fmt.allocPrint(owned, "{s}/chat/completions", .{std.mem.trimEnd(u8, options.base_url, "/")});
         errdefer owned.free(self.endpoint);
-        self.transport = try http.Client.initRouted(owned, io, env, options.proxy_url);
+        self.transport = try http.Client.initModel(owned, io, env, options.base_url, options.proxy_url, options.allow_system);
         self.io = io;
         self.timeout_ms = options.request_timeout_ms;
         self.context_tokens = options.context_tokens;
@@ -69,7 +70,7 @@ pub const Client = struct {
         errdefer owned.free(copy.key);
         copy.endpoint = try owned.dupe(u8, self.endpoint);
         errdefer owned.free(copy.endpoint);
-        copy.transport = try http.Client.initRouted(owned, self.io, &self.transport.env, self.transport.proxy_url);
+        copy.transport = try self.transport.cloneRoute(owned, self.io);
         copy.io = self.io;
         copy.timeout_ms = self.timeout_ms;
         copy.context_tokens = self.context_tokens;

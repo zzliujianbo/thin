@@ -1,4 +1,4 @@
-//! Private curl transport for auxiliary JSON and explicitly proxied model SSE.
+//! Private curl transport for auxiliary JSON and proxied model SSE.
 //! No shell interpolation, config discovery,
 //! inherited credential environment, redirect following, or inference retries.
 //! Client is single-owner/non-concurrent. As with platform/process.zig, no other
@@ -12,10 +12,17 @@ const Input = @import("../platform/anonymous_input.zig").Input;
 const script = "exec /usr/bin/curl --disable --config -";
 const max_field = 8192;
 const max_key = 16384;
-/// Shared private curl transport: explicit inference routing never inherits
-/// proxy/no_proxy variables. The legacy auxiliary transport seam may still
-/// opt into its filtered environment for owned transport tests.
-pub const StreamHead = struct { status: u16, is_sse: bool };
+pub const StreamHead = struct {
+    status: u16,
+    is_sse: bool,
+    missing_type: bool = false,
+
+    // The official Codex endpoint can stream Responses events without a MIME
+    // header. Never override an explicitly non-SSE (including empty) type.
+    pub fn acceptsStream(self: StreamHead, codec: protocol.WireCodec) bool {
+        return self.is_sse or (self.missing_type and codec == .codex_responses);
+    }
+};
 pub const BodySink = struct {
     context: *anyopaque,
     write_fn: *const fn (*anyopaque, StreamHead, []const u8) anyerror!void,
@@ -66,6 +73,45 @@ pub const Client = struct {
         }
         self.explicit_route = true;
         return self;
+    }
+
+    fn firstNonempty(env: *const std.process.Environ.Map, lower: []const u8, upper: []const u8) ?[]const u8 {
+        if (env.get(lower)) |v| if (v.len != 0) return v;
+        if (env.get(upper)) |v| if (v.len != 0) return v;
+        return null;
+    }
+
+    /// Select only the variable for the destination scheme. Don't let curl inherit
+    /// ALL_PROXY, or interpret an incoming CGI Proxy header as HTTP_PROXY.
+    pub fn systemProxy(env: *const std.process.Environ.Map, base_url: []const u8) ?[]const u8 {
+        if (std.ascii.startsWithIgnoreCase(base_url, "https://")) return firstNonempty(env, "https_proxy", "HTTPS_PROXY");
+        if (std.ascii.startsWithIgnoreCase(base_url, "http://")) {
+            if (env.get("REQUEST_METHOD") != null) {
+                const v = env.get("http_proxy") orelse return null;
+                return if (v.len == 0) null else v;
+            }
+            return firstNonempty(env, "http_proxy", "HTTP_PROXY");
+        }
+        return null;
+    }
+
+    pub fn initModel(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, base_url: []const u8, proxy_url: ?[]const u8, allow_system: bool) !Client {
+        if (!allow_system or proxy_url != null) return initRouted(a, io, env, proxy_url);
+        const url = systemProxy(env, base_url) orelse return initRouted(a, io, env, null);
+        // No proxy credentials in the child environment. Only HTTP(S) URLs.
+        validate(url, "route", "{}", 1) catch return error.InvalidProxyEnvironment;
+        var selected = std.process.Environ.Map.init(a);
+        defer selected.deinit();
+        try selected.put(if (std.ascii.startsWithIgnoreCase(base_url, "https://")) "https_proxy" else "http_proxy", url);
+        if (firstNonempty(env, "no_proxy", "NO_PROXY")) |v| try selected.put("no_proxy", v);
+        if (env.get("CURL_CA_BUNDLE")) |ca| try selected.put("CURL_CA_BUNDLE", ca);
+        return init(a, io, &selected);
+    }
+
+    pub fn cloneRoute(self: *const Client, a: std.mem.Allocator, io: std.Io) !Client {
+        if (self.poisoned) return error.CleanupFailed;
+        if (self.explicit_route) return initRouted(a, io, &self.env, self.proxy_url);
+        return init(a, io, &self.env);
     }
 
     pub fn init(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Client {
@@ -137,7 +183,7 @@ pub const Client = struct {
     pub fn streamPost(self: *Client, a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, sink: BodySink, cancel: *const protocol.Cancellation) !StreamHead {
         if (self.poisoned) return error.CleanupFailed;
         try checkCancel(self.io, cancel);
-        const config = try makeStreamConfig(a, url, headers, payload, timeout_ms, body_limit, self.proxy_url);
+        const config = try makeStreamConfig(a, url, headers, payload, timeout_ms, body_limit, self.explicit_route, self.proxy_url);
         defer wipeFree(a, config);
         var parser: StreamParser = .{ .sink = sink, .body_limit = body_limit };
         try checkCancel(self.io, cancel);
@@ -350,7 +396,7 @@ fn writeRoute(w: *std.Io.Writer, proxy_url: ?[]const u8) !void {
     try field(w, "noproxy", if (proxy_url == null) "*" else "");
 }
 
-fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, proxy_url: ?[]const u8) ![]u8 {
+fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, explicit_route: bool, proxy_url: ?[]const u8) ![]u8 {
     if (payload.len == 0 or payload[0] == '@' or !std.unicode.utf8ValidateSlice(payload)) return error.InvalidPayload;
     for (payload) |byte| if (byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') return error.InvalidPayload;
     try validate(url, "validated-separately", "{}", timeout_ms);
@@ -374,7 +420,7 @@ fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.
     try w.writeAll("silent\nhttp1.1\ngloboff\nretry = 0\ninclude\nsuppress-connect-headers\nno-buffer\n" ++
         "proto = \"=http,https\"\nproto-redir = \"=https\"\nuser-agent = \"thin\"\nrequest = \"POST\"\n" ++
         "header = \"content-type: application/json\"\nheader = \"accept-encoding: identity\"\n");
-    try writeRoute(&w, proxy_url);
+    if (explicit_route) try writeRoute(&w, proxy_url);
     try field(&w, "url", url);
     var header: [max_key + 162]u8 = undefined;
     defer std.crypto.secureZero(u8, &header);
@@ -433,7 +479,7 @@ const StreamParser = struct {
                     }
                 }
                 self.used = 0;
-                if (status >= 200) self.head = .{ .status = status, .is_sse = is_sse };
+                if (status >= 200) self.head = .{ .status = status, .is_sse = is_sse, .missing_type = !seen_type };
             }
         }
         if (offset == bytes.len) return;
