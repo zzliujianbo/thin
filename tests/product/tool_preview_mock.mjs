@@ -95,8 +95,8 @@ async function run(mode, url) {
   const config = JSON.stringify({
 
     llm:{default:'local/fixture-model',providers:{local:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:32768}}}}},
-    // Explicit opt-out: fixture has no external metadata/known input price.
-    limits:{low_price_input:false,request_timeout_ms:20000,command_timeout_ms:3000},
+    // This normal tool turn uses a local model with no pricing metadata.
+    limits:{request_timeout_ms:20000,command_timeout_ms:3000},
   },null,2)+'\n';
   const configPath = join(home,'.thin/config.json');
   await writeFile(configPath,config,{mode:0o600});

@@ -1132,7 +1132,6 @@ pub const SessionHost = struct {
             .cycle_effort => self.handleCycleEffort(a, request, connection_id),
             .login => self.handleLogin(a, request, connection_id),
             .preference => self.handlePreference(a, request, connection_id),
-            .setting => self.handleSetting(a, request, connection_id),
             .image_model => self.handleImageModel(a, request, connection_id),
             .proxy_model => self.handleProxyModel(a, request, connection_id),
             .proxy_address => self.handleProxyAddress(a, request, connection_id),
@@ -1872,8 +1871,6 @@ pub const SessionHost = struct {
             try out.field("known", context.known);
             try out.endObject();
         } else try out.field("context", @as(?u8, null));
-        try out.field("low_price_input", state.low_price_input);
-        try out.field("low_price_input_enabled", state.low_price_input_enabled);
         try out.field("image_enabled", state.image_enabled);
         try out.field("image_model", state.image_model);
         // Proxy projection: presence of a configuration is the only enable
@@ -1898,7 +1895,6 @@ pub const SessionHost = struct {
 
         try out.beginObject("limits");
         try out.field("command_timeout_ms", state.limits.command_timeout_ms);
-        try out.field("low_price_input", state.limits.low_price_input);
         try out.field("request_timeout_ms", state.limits.request_timeout_ms);
         try out.field("compaction_enabled", state.limits.compaction_enabled);
         try out.field("show_reported_usage", state.limits.show_reported_usage);
@@ -2019,20 +2015,6 @@ pub const SessionHost = struct {
         const raw_value = request.optionalU64("value") catch return errorReply(a, request.id, error.BadRequest);
         const value: ?u32 = if (raw_value) |parsed| @intCast(@min(parsed, std.math.maxInt(u32))) else null;
         const callback = self.connection.preference_fn orelse return errorReply(a, request.id, error.Unsupported);
-        callback(self.connection.context, key, value) catch |err| return errorReply(a, request.id, err);
-        self.refreshConnection();
-        var out = protocol.Out.init(a);
-        defer out.deinit();
-        try out.ok(request.id);
-        return replyFrame(&out);
-    }
-
-    fn handleSetting(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
-        self.requireIdleControl(request, connection_id) catch |err| return errorReply(a, request.id, err);
-        const key_name = request.stringField("key", 64) catch |err| return errorReply(a, request.id, err);
-        const key = std.meta.stringToEnum(tui.Connection.Setting, key_name) orelse return errorReply(a, request.id, error.InvalidInput);
-        const value = request.boolField("value", false) catch return errorReply(a, request.id, error.BadRequest);
-        const callback = self.connection.setting_fn orelse return errorReply(a, request.id, error.Unsupported);
         callback(self.connection.context, key, value) catch |err| return errorReply(a, request.id, err);
         self.refreshConnection();
         var out = protocol.Out.init(a);

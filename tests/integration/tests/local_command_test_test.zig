@@ -1,4 +1,4 @@
-test "local command unknown price keeps output, pairs checkpoint and next normal stays gated" {
+test "local command keeps output and restored history can reach the primary client without pricing" {
     var fake: Fake = .{};
     const config = configuration();
     var runtime = try fake.init(&config, false);
@@ -28,8 +28,8 @@ test "local command unknown price keeps output, pairs checkpoint and next normal
     try std.testing.expect(!std.mem.eql(u8, restored.messages()[1].blocks[1].tool_call.id, restored.messages()[4].blocks[1].tool_call.id));
     try paired(&restored);
     const next = try restored.run("continue", &cancel);
-    try std.testing.expectEqual(error.UnknownInputPriceThreshold, next.detail.?);
-    try std.testing.expectEqual(@as(usize, 0), fake.primary);
+    try std.testing.expectEqual(error.NoPrimaryClient, next.detail.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.primary);
     // Independently encode the canonical next-normal history without sending it.
     const encoded = try chat.encode(a, .{ .scope = .{ .connection = "https://offline.invalid", .model = "offline", .protocol = .chat }, .system = restored.system, .messages = restored.messages(), .tools = &schemas, .purpose = .normal });
     defer a.free(encoded);

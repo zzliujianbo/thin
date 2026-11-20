@@ -571,10 +571,17 @@ test "refused cancel clear refreshes and reports QueueChanged" {
 test "settings requests route to worker epoch or connect setup project" {
     const a = testing.allocator;
     const ops = [_]protocol.Op{
-        .settings,      .model_select,   .effort,
-        .cycle_effort,  .login,          .preference,
-        .setting,       .image_model,    .proxy_model,
-        .proxy_address, .refresh_models, .poll_metadata,
+        .settings,
+        .model_select,
+        .effort,
+        .cycle_effort,
+        .login,
+        .preference,
+        .image_model,
+        .proxy_model,
+        .proxy_address,
+        .refresh_models,
+        .poll_metadata,
     };
 
     var worker = try pairOf(a);
@@ -964,7 +971,7 @@ test "decoded display items outlive their wire documents" {
         try testing.expect(blocks[3].tool_result.truncated);
     }
 }
-test "real host settings reply projects providers flags price states and pending effort" {
+test "real host settings reply projects providers flags and pending effort" {
     const a = testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1045,10 +1052,6 @@ test "real host settings reply projects providers flags price states and pending
         }
     }
 
-    // Active price protection is not the configured switch, and the pending
-    // default effort keeps the owner's `pending_effort` name.
-    try std.testing.expect(client.pubcfg.low_price_active);
-    try std.testing.expect(!client.pubcfg.low_price_enabled);
     try std.testing.expectEqual(shared.ReasoningEffort.medium, client.pubcfg.pending_effort.?);
 
     // rebuild/currentFn really publish every parsed field to the UI state.
@@ -1059,7 +1062,6 @@ test "real host settings reply projects providers flags price states and pending
     try std.testing.expect(state.model_disabled[1] and !state.model_context_official[1]);
     try std.testing.expectEqual(@as(usize, 2), state.model_providers.len);
     try std.testing.expectEqualStrings("native", state.model_providers[0].name);
-    try std.testing.expect(state.low_price_input and !state.low_price_input_enabled);
     try std.testing.expectEqual(shared.ReasoningEffort.medium, state.pending_default_effort.?);
 
     // The real limits object carries the owner's request/task budgets, so the

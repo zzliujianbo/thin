@@ -92,7 +92,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
         primary:provider('primary',MAIN_KEY,{[MAIN]:{protocol:'chat',context_tokens:32768,
           output_tokens:8192,reasoning:{format:'standard',map:{off:'none',high:'high'}}}}),
       }},
-      limits:{command_timeout_ms:123456,low_price_input:false,
+      limits:{command_timeout_ms:123456,
         request_timeout_ms:10000,compaction_enabled:true,show_reported_usage:true},
     };
     previousBytes = JSON.stringify(expected);
@@ -165,7 +165,7 @@ export async function settingsValuesRegressions({app, pty, execute, send}) {
       for (const line of log.trim().split('\n')) JSON.parse(line);
     }
     assert.deepEqual((await readdir(project)).sort(),['.thin',...phases.map(n=>`settings-values-release-${n}`)].sort());
-    console.log('PASS settings/values: four preferences and shared request timeout; seven-row root; stage/cancel/invalid unchanged; output caps absent; zero menu HTTP; warm socket and canonical bash verified');
+    console.log('PASS settings/values: four preferences and shared request timeout; six-row root; stage/cancel/invalid unchanged; output caps absent; zero menu HTTP; warm socket and canonical bash verified');
   } catch (error) {
     // Never print assertion operands containing config/wire/terminal secrets.
     const safe = new Error('settings values fixture failed');

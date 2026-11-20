@@ -1,137 +1,14 @@
-test "exact decimal price schedules never round an increase or negative price into flat" {
-    const Case = struct { cost: []const u8, threshold: ?u32 = null, flat: ?u32 = null };
-    for ([_]Case{
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
-        .{ .cost = "{\"input\":1.0000000000000001,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
-        .{ .cost = "{\"input\":1e-999,\"output\":2e-999,\"tiers\":[{\"input\":2e-999,\"output\":2e-999,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
-        .{ .cost = "{\"input\":2e-999,\"output\":2e-999,\"tiers\":[{\"input\":1e-999,\"output\":2e-999,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
-        .{ .cost = "{\"input\":1,\"output\":1.0,\"tiers\":[{\"input\":10e-1,\"output\":100.00e-2,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":1.0,\"output\":1,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
-        .{ .cost = "{\"input\":0.0010e-996,\"output\":2e-999,\"tiers\":[{\"input\":10e-1000,\"output\":200e-1001,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
-        .{ .cost = "{\"input\":-1e-999,\"output\":2}" },
-        .{ .cost = "{\"input\":1,\"output\":-1e-999}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":-1e-999}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":-0}" },
-        .{ .cost = "{\"input\":1e100001,\"output\":2}" },
-        .{ .cost = "{\"input\":1e-100001,\"output\":2}" },
-        .{ .cost = "{\"input\":1e100000,\"output\":2e-100000}", .flat = 1000000 },
-        .{ .cost = "{\"input\":0,\"output\":0.0,\"tiers\":[{\"input\":0e999,\"output\":0.000e-999,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2.0000000000000001,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
-        .{ .cost = "{\"input\":0,\"output\":0,\"tiers\":[{\"input\":1e-999,\"output\":0,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
-        // Old f64 parsing missed the first increase and reported only 200K.
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":2,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":200000}}]}", .threshold = 100000 },
-        // Same-size conflicts and unordered monotonicity must also use exact comparison.
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":200000}},{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000,\"future_schedule\":{}}}]}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1.0000000000000001,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000,\"future_schedule\":{}}}]}", .threshold = 100000 },
-        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":-1e-999,\"tiers\":[{\"input\":2,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .threshold = 100000 },
-    }) |case| {
-        var listing = try priceListing(case.cost);
-        defer listing.deinit(t.allocator);
-        const row = listing.directory.rows[0];
-        try t.expectEqual(case.threshold, row.dev_input_price_threshold);
-        try t.expectEqual(case.flat, row.dev_input_price_flat_limit);
-    }
-}
-test "verified flat price exact route and conservative threshold precedence" {
-    var cache: m.Cache = .{};
-    defer cache.deinit(t.allocator);
-    const row = try cache.directory.upsert(t.allocator, .opencode_go, "raw/id");
-    row.dev_protocol = .anthropic;
-    row.dev_present = true;
-    row.dev_input_price_flat_limit = 1000000;
-    const entry = m.restoreEntry(&cache, .opencode_go, "raw/id").?;
-    try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&cache, entry));
-    var wrong = entry;
-    wrong.provider = .opencode_zen;
-    try t.expect(m.inputPriceFlatLimitFor(&cache, wrong) == null);
-    wrong = entry;
-    wrong.model.name = "opencode-go/raw/id";
-    try t.expect(m.inputPriceFlatLimitFor(&cache, wrong) == null);
-    wrong = entry;
-    for ([_]@import("../core/protocol.zig").Protocol{ .auto, .chat, .responses }) |api| {
-        wrong.model.protocol = api;
-        try t.expect(m.inputPriceFlatLimitFor(&cache, wrong) == null);
-    }
-    row.protocol = .chat;
-    try t.expect(m.inputPriceFlatLimitFor(&cache, entry) == null);
-    row.protocol = .auto;
-    row.dev_input_price_threshold = 100000;
-    try t.expect(m.inputPriceFlatLimitFor(&cache, entry) == null);
-    row.dev_input_price_threshold = null;
-    for ([_]?u32{ null, 0, 16777217 }) |invalid| {
-        row.dev_input_price_flat_limit = invalid;
-        try t.expect(m.inputPriceFlatLimitFor(&cache, entry) == null);
-    }
-    row.dev_input_price_flat_limit = 16777216;
-    try t.expectEqual(@as(?u32, 16777216), m.inputPriceFlatLimitFor(&cache, entry));
-}
-test "verified flat price current roundtrip merge publication clearing and bounds" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    var public: m.Listing = .{ .dev_done = true };
-    defer public.deinit(t.allocator);
-    const row = try public.directory.upsert(t.allocator, .opencode_go, "raw/id");
-    row.dev_protocol = .anthropic;
-    row.dev_present = true;
-    row.dev_input_price_flat_limit = 1000000;
-    var joined: m.Listing = .{};
-    defer joined.deinit(t.allocator);
-    try m.mergeDev(t.allocator, &joined, &public);
-    try t.expectEqual(@as(?u32, 1000000), joined.directory.rows[0].dev_input_price_flat_limit);
-    var official = try m.parseListing(t.allocator, "{\"data\":[{\"id\":\"raw/id\",\"protocol\":\"anthropic\",\"context_window\":1000000}]}", .opencode_go);
-    defer official.deinit(t.allocator);
-    try m.mergeOfficial(t.allocator, &joined, &official, .opencode_go);
-    try t.expectEqual(@as(?u32, 1000000), joined.directory.rows[0].dev_input_price_flat_limit);
-    var saved = try m.commitAt(&root, m.bit(.opencode_go), joined, 1000);
-    defer saved.deinit(t.allocator);
-    const entry = m.restoreEntry(&saved, .opencode_go, "raw/id").?;
-    var loaded = try m.load(&root);
-    defer loaded.deinit(t.allocator);
-    try t.expectEqual(saved.directory.count, loaded.directory.count);
-    try t.expectEqualDeep(saved.refresh, loaded.refresh);
-    try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&loaded, entry));
-    var invalid = public;
-    invalid.directory = try public.directory.clone(t.allocator);
-    defer invalid.deinit(t.allocator);
-    invalid.directory.rows[0].dev_input_price_flat_limit = 16777217;
-    try t.expectError(error.InvalidMetadata, m.commitAt(&root, 0, invalid, 1010));
-    var after_invalid = try m.load(&root);
-    defer after_invalid.deinit(t.allocator);
-    try t.expectEqualDeep(saved.refresh, after_invalid.refresh);
-    try t.expectEqual(saved.directory.count, after_invalid.directory.count);
-    var cleared = joined;
-    cleared.directory = try joined.directory.clone(t.allocator);
-    defer cleared.deinit(t.allocator);
-    try m.mergeDev(t.allocator, &cleared, &m.Listing{ .dev_done = true });
-    try t.expect(cleared.directory.rows[0].dev_input_price_flat_limit == null);
-    var removed = try m.commitAt(&root, 0, .{ .dev_done = true }, 1020);
-    defer removed.deinit(t.allocator);
-    try t.expect(m.inputPriceFlatLimitFor(&removed, entry) == null);
-    try t.expectEqual(@as(?u32, 1000000), removed.directory.rows[0].tokens);
-    for ([_]u32{m.cache_version}) |version| {
-        for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
-            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"raw/id\",\"dev_input_price_flat_limit\":{s}}}]}}", .{ version, token });
-            defer t.allocator.free(body);
-            try root.writeMode(m.file_name, body, true, 0o600);
-            if (m.load(&root)) |_| return error.AcceptedInvalidFlatLimit else |_| {}
-        }
-    }
-}
-test "flat price current evidence and independent generations preserve post-claim cooldown" {
+test "independent generations preserve post-claim cooldown" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     try root.writeMode(m.file_name,
-        \\{"version":16,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_input_price_threshold":200000,"dev_input_price_flat_limit":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{},{"generation":14,"last_success_ms":800,"successful":false}]}
+        \\{"version":17,"models":[{"provider":"opencode_go","id":"raw/id","dev_protocol":"anthropic","dev_present":true,"dev_context_tokens":1000000}],"refresh":[{"generation":11},{"generation":12},{"generation":13},{},{"generation":14,"last_success_ms":800,"successful":false}]}
     , true, 0o600);
     var migrated = try m.load(&root);
     defer migrated.deinit(t.allocator);
-    try t.expectEqual(@as(?u32, 1000000), migrated.directory.rows[0].dev_input_price_flat_limit);
-    try t.expectEqual(@as(?u32, 200000), migrated.directory.rows[0].dev_input_price_threshold);
+    try t.expectEqual(@as(?u32, 1000000), migrated.directory.rows[0].dev_context_tokens);
     try t.expectEqual(@as(u64, 14), migrated.refresh[4].generation);
     try t.expectEqual(@as(?u64, 800), migrated.refresh[4].last_success_ms);
     var claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
@@ -139,18 +16,20 @@ test "flat price current evidence and independent generations preserve post-clai
     try t.expectEqual(m.dev_bit, claimed.mask);
     try t.expectEqual(@as(u64, 15), claimed.generations[4]);
     for (0..3) |index| try t.expectEqual(@as(u64, 11) + index, claimed.generations[index]);
-    // No successful publication: the persisted v12 attempt still enforces cooldown.
+    // No successful publication: the persisted attempt still enforces cooldown.
     try t.expectEqual(@as(u8, 0), try claimMask(&root, m.dev_bit, false, 1001, .{}));
-    var public = try priceListing("{\"input\":1,\"output\":2}");
+    var public = try m.parseDev(t.allocator,
+        \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000}}}}}
+    );
     defer public.deinit(t.allocator);
     var stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 0, 14 }, 1010);
     defer stale.cache.deinit(t.allocator);
     try t.expectEqual(@as(u8, 0), stale.accepted);
-    try t.expectEqual(@as(?u32, 1000000), stale.cache.directory.rows[0].dev_input_price_flat_limit);
+    try t.expectEqual(@as(?u32, 1000000), stale.cache.directory.rows[0].dev_context_tokens);
     var invalid = public;
     invalid.directory = try public.directory.clone(t.allocator);
     defer invalid.deinit(t.allocator);
-    invalid.directory.rows[0].dev_input_price_flat_limit = 16777217;
+    invalid.directory.rows[0].dev_context_tokens = 16777217;
     try t.expectError(error.InvalidMetadata, m.commitClaimedAt(&root, 0, invalid, claimed.generations, 1020));
     var unchanged = try m.load(&root);
     defer unchanged.deinit(t.allocator);
@@ -166,191 +45,7 @@ test "flat price current evidence and independent generations preserve post-clai
     try t.expectEqualDeep(published.cache.refresh, loaded.refresh);
     try t.expectEqual(published.cache.directory.count, loaded.directory.count);
     const entry = m.restoreEntry(&loaded, .opencode_go, "claude-haiku-5-5").?;
-    try t.expectEqual(@as(?u32, 1000000), m.inputPriceFlatLimitFor(&loaded, entry));
-}
-test "price threshold exact fixture independent of official context and output" {
-    var listing = try m.parseDev(t.allocator, @embedFile("models_dev_fixture.json"));
-    const public_index = listing.directory.find(.opencode_go, "claude-haiku-5-5").?;
-    try t.expectEqual(@as(?u32, 100000), listing.directory.rows[public_index].dev_input_price_threshold);
-    defer listing.deinit(t.allocator);
-    var official = try m.parseListing(t.allocator, "{\"data\":[{\"id\":\"claude-haiku-5-5\",\"protocol\":\"anthropic\",\"context_window\":1000000}]}", .opencode_go);
-    defer official.deinit(t.allocator);
-    try m.mergeOfficial(t.allocator, &listing, &official, .opencode_go);
-    var cache: m.Cache = .{ .directory = listing.directory };
-    const entry = m.restoreEntry(&cache, .opencode_go, "claude-haiku-5-5").?;
-    try t.expectEqual(@as(?u32, 100000), m.inputPriceThresholdFor(&cache, entry));
-    try t.expectEqual(@as(?u32, 1000000), m.contextFor(&cache, entry));
-    try t.expectEqual(@as(?u32, 16384), m.outputFor(&cache, entry));
-    var wrong = entry;
-    wrong.provider = .opencode_zen;
-    try t.expect(m.inputPriceThresholdFor(&cache, wrong) == null);
-    wrong = entry;
-    wrong.model.name = "opencode-go/claude-haiku-5-5";
-    try t.expect(m.inputPriceThresholdFor(&cache, wrong) == null);
-    wrong = entry;
-    for ([_]@import("../core/protocol.zig").Protocol{ .auto, .chat, .responses }) |api| {
-        wrong.model.protocol = api;
-        try t.expect(m.inputPriceThresholdFor(&cache, wrong) == null);
-    }
-    cache.directory.rows[public_index].protocol = .chat;
-    try t.expect(m.inputPriceThresholdFor(&cache, entry) == null);
-    var foreign = try m.parseDev(t.allocator,
-        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"cost":{"input":0.1,"output":0.5,"tiers":[{"input":0.5,"output":2.5,"tier":{"type":"context","size":100000}}]}}}},"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{}}}}
-    );
-    defer foreign.deinit(t.allocator);
-    cache.directory = foreign.directory;
-    try t.expect(m.inputPriceThresholdFor(&cache, entry) == null);
-}
-test "price threshold malformed ancillary retains capabilities and strict duplicates" {
-    for ([_][]const u8{
-        "null",                                            "[]",                                                                                                                            "42",                               "{}",
-        "{\"input\":\"0.1\",\"output\":0.5}",              "{\"input\":-1,\"output\":0.5}",                                                                                                 "{\"input\":1e999,\"output\":0.5}", "{\"input\":0.1,\"output\":0.5,\"tiers\":{}}",
-        "{\"input\":0.1,\"output\":0.5,\"tiers\":[null]}", "{\"input\":0.1,\"output\":0.5,\"tiers\":[{\"input\":\"0.5\",\"output\":2.5,\"tier\":{\"type\":\"context\",\"size\":100000}}]}",
-    }) |cost| {
-        var listing = try priceListing(cost);
-        defer listing.deinit(t.allocator);
-        const row = listing.directory.rows[0];
-        try t.expect(row.dev_input_price_threshold == null);
-        try t.expectEqual(@as(?u32, 1000000), row.dev_context_tokens);
-        try t.expectEqual(@as(?u32, 16384), row.dev_output_tokens);
-    }
-    for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "null", "true", "{}", "[]" }) |size| {
-        const cost = try std.fmt.allocPrint(t.allocator, "{{\"input\":0.1,\"output\":0.5,\"tiers\":[{{\"input\":0.5,\"output\":2.5,\"tier\":{{\"type\":\"context\",\"size\":{s}}}}}]}}", .{size});
-        defer t.allocator.free(cost);
-        var listing = try priceListing(cost);
-        defer listing.deinit(t.allocator);
-        try t.expect(listing.directory.rows[0].dev_input_price_threshold == null);
-    }
-    for ([_][]const u8{
-        "{\"input\":0.1,\"input\":0.2}",
-        "{\"tiers\":[],\"tiers\":[]}",
-        "{\"tiers\":[{\"input\":1,\"input\":2}]}",
-        "{\"tiers\":[{\"tier\":{\"size\":1,\"size\":2}}]}",
-        "{\"tiers\":[{\"tier\":{\"type\":\"context\",\"type\":\"context\"}}]}",
-    }) |cost| try t.expectError(error.InvalidModelsDev, priceListing(cost));
-}
-test "price threshold unknown adapter stays unknown while tiers beyond the former limit derive authority" {
-    const body = try std.fmt.allocPrint(t.allocator, "{{\"opencode-go\":{{\"models\":{{\"same\":{{\"limit\":{{\"output\":8192}},\"cost\":{s}}}}}}}}}", .{price_cost});
-    defer t.allocator.free(body);
-    var unknown = try m.parseDev(t.allocator, body);
-    defer unknown.deinit(t.allocator);
-    try t.expect(unknown.directory.rows[0].dev_input_price_threshold == null);
-    var cost: std.ArrayList(u8) = .empty;
-    defer cost.deinit(t.allocator);
-    try cost.appendSlice(t.allocator, "{\"input\":0,\"output\":0,\"tiers\":[");
-    for (0..129) |i| {
-        if (i != 0) try cost.append(t.allocator, ',');
-        try cost.appendSlice(t.allocator, "{\"input\":1,\"output\":1,\"tier\":{\"type\":\"context\",\"size\":1}}");
-    }
-    try cost.appendSlice(t.allocator, "]}");
-    var bounded = try priceListing(cost.items);
-    defer bounded.deinit(t.allocator);
-    try t.expectEqual(@as(?u32, 1), bounded.directory.rows[0].dev_input_price_threshold);
-    try t.expectEqual(@as(?u32, 16384), bounded.directory.rows[0].dev_output_tokens);
-}
-test "price threshold current generation success manual refresh and stale isolation" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    const legacy =
-        \\{"version":16,"directory_mask":4,"models":[{"provider":"opencode_go","id":"claude-haiku-5-5","context_window":1000000,"output_tokens":8192,"dev_output_tokens":16384,"dev_input_price_threshold":123,"protocol":"anthropic","dev_protocol":"anthropic","available":true,"dev_present":true}],"refresh":[{"generation":11,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":12,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{"generation":13,"last_attempt_ms":900,"last_success_ms":900,"successful":true},{},{"generation":14,"last_attempt_ms":900,"last_success_ms":900,"successful":true}]}
-    ;
-    try root.writeMode(m.file_name, legacy, true, 0o600);
-    var migrated = try m.load(&root);
-    defer migrated.deinit(t.allocator);
-    try t.expectEqual(@as(?u32, 123), migrated.directory.rows[0].dev_input_price_threshold);
-    try t.expectEqual(@as(?u32, 8192), migrated.directory.rows[0].output_tokens);
-    try t.expectEqual(@as(?u64, 900), migrated.refresh[4].last_success_ms);
-    try t.expectEqual(@as(u64, 14), migrated.refresh[4].generation);
-    try t.expectEqual(@as(u8, 0), m.eligible(&migrated, m.bit(.opencode_go), 1000, .{}));
-    var first = try m.claimAt(&root, m.dev_bit, true, 1000, .{});
-    defer first.cache.deinit(t.allocator);
-    try t.expectEqual(m.dev_bit, first.mask);
-    try t.expectEqual(@as(u64, 15), first.generations[4]);
-    try t.expectEqual(@as(u64, 11), first.generations[0]);
-    try t.expectEqual(@as(u64, 12), first.generations[1]);
-    try t.expectEqual(@as(u64, 13), first.generations[2]);
-    var cooldown = try m.claimAt(&root, m.dev_bit, false, 1001, .{});
-    defer cooldown.cache.deinit(t.allocator);
-    try t.expectEqual(@as(u8, 0), cooldown.mask);
-    var newer = try m.claimAt(&root, m.dev_bit, true, 1000, .{});
-    defer newer.cache.deinit(t.allocator);
-    var public = try priceListing(price_cost);
-    defer public.deinit(t.allocator);
-    var accepted = try m.commitClaimedAt(&root, 0, public, newer.generations, 1010);
-    defer accepted.cache.deinit(t.allocator);
-    try t.expectEqual(m.dev_bit, accepted.accepted);
-    const entry = m.restoreEntry(&accepted.cache, .opencode_go, "claude-haiku-5-5").?;
-    try t.expectEqual(@as(?u32, 100000), m.inputPriceThresholdFor(&accepted.cache, entry));
-    var delayed_listing = try priceListing("{}");
-    defer delayed_listing.deinit(t.allocator);
-    var delayed = try m.commitClaimedAt(&root, 0, delayed_listing, first.generations, 1020);
-    defer delayed.cache.deinit(t.allocator);
-    try t.expectEqual(@as(u8, 0), delayed.accepted);
-    try t.expectEqual(@as(?u32, 100000), m.inputPriceThresholdFor(&delayed.cache, entry));
-    var loaded = try m.load(&root);
-    defer loaded.deinit(t.allocator);
-    try t.expectEqual(@as(?u32, 100000), m.inputPriceThresholdFor(&loaded, entry));
-    try t.expectEqual(@as(?u32, 1000000), loaded.directory.rows[0].tokens);
-    var cleared: m.Listing = .{};
-    defer cleared.deinit(t.allocator);
-    var clear_source = try priceListing("{}");
-    defer clear_source.deinit(t.allocator);
-    try m.mergeDev(t.allocator, &cleared, &clear_source);
-    var removed = try m.commitAt(&root, 0, cleared, 1030);
-    defer removed.deinit(t.allocator);
-    try t.expect(m.inputPriceThresholdFor(&removed, entry) == null);
-    try t.expectEqual(@as(?u32, 8192), m.outputFor(&removed, entry));
-}
-test "price threshold current strict cache tokens and invalid publication rollback" {
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    var root = try rootFor(tmp.dir);
-    defer root.deinit();
-    for ([_]u32{m.cache_version}) |version| {
-        for ([_][]const u8{ "0", "-1", "16777217", "4294967296", "1.0", "1e5", "\"100000\"", "true", "{}", "[]" }) |token| {
-            const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":{d},\"models\":[{{\"provider\":\"opencode_go\",\"id\":\"same\",\"dev_input_price_threshold\":{s}}}]}}", .{ version, token });
-            defer t.allocator.free(body);
-            try root.writeMode(m.file_name, body, true, 0o600);
-            if (m.load(&root)) |_| return error.AcceptedInvalidThreshold else |_| {}
-        }
-    }
-    try root.writeMode(m.file_name, "{\"version\":16}", true, 0o600);
-    var public = try priceListing(price_cost);
-    defer public.deinit(t.allocator);
-    var saved = try m.commitAt(&root, 0, public, 1000);
-    defer saved.deinit(t.allocator);
-    var invalid = public;
-    invalid.directory = try public.directory.clone(t.allocator);
-    defer invalid.deinit(t.allocator);
-    invalid.directory.rows[0].dev_input_price_threshold = 16777217;
-    try t.expectError(error.InvalidMetadata, m.commitAt(&root, 0, invalid, 1100));
-    var after = try m.load(&root);
-    defer after.deinit(t.allocator);
-    try t.expectEqualDeep(saved.refresh, after.refresh);
-    try t.expectEqual(saved.directory.count, after.directory.count);
-    const saved_index = saved.directory.find(.opencode_go, "claude-haiku-5-5").?;
-    const after_index = after.directory.find(.opencode_go, "claude-haiku-5-5").?;
-    try t.expectEqualDeep(saved.directory.rows[saved_index], after.directory.rows[after_index]);
-}
-test "price threshold unordered tiers earliest increase conflicts invalid and boundaries" {
-    const Case = struct { tiers: []const u8, expected: ?u32 };
-    for ([_]Case{
-        .{ .tiers = "[]", .expected = null },
-        .{ .tiers = "[{\"input\":0.5,\"output\":2.5,\"tier\":{\"type\":\"context\",\"size\":200000}},{\"input\":0.1,\"output\":1,\"tier\":{\"type\":\"context\",\"size\":100000}}]", .expected = 100000 },
-        .{ .tiers = "[{\"input\":0.1,\"output\":0.5,\"tier\":{\"type\":\"context\",\"size\":1}},{\"input\":0.2,\"output\":0.5,\"tier\":{\"type\":\"context\",\"size\":16777216}}]", .expected = 16777216 },
-        .{ .tiers = "[{\"input\":0.2,\"output\":0.5,\"tier\":{\"type\":\"context\",\"size\":1}}]", .expected = 1 },
-        .{ .tiers = "[{\"input\":0,\"output\":0.5,\"tier\":{\"type\":\"context\",\"size\":100000}}]", .expected = null },
-        .{ .tiers = "[{\"input\":0.2,\"output\":0.5,\"tier\":{\"type\":\"other\",\"size\":100000}}]", .expected = null },
-        .{ .tiers = "[{\"input\":0.2,\"output\":0.5,\"tier\":{\"type\":\"context\",\"size\":100000}},{\"input\":0.3,\"output\":0.5,\"tier\":{\"type\":\"context\",\"size\":100000}}]", .expected = null },
-    }) |case| {
-        const cost = try std.fmt.allocPrint(t.allocator, "{{\"input\":0.1,\"output\":0.5,\"tiers\":{s}}}", .{case.tiers});
-        defer t.allocator.free(cost);
-        var listing = try priceListing(cost);
-        defer listing.deinit(t.allocator);
-        try t.expectEqual(case.expected, listing.directory.rows[0].dev_input_price_threshold);
-    }
+    try t.expectEqual(@as(?u32, 1000000), m.contextFor(&loaded, entry));
 }
 test "publication generations reject delayed sources independently and distinguish same-ms claims" {
     var tmp = t.tmpDir(.{});
@@ -408,12 +103,12 @@ test "publication current generation strict tokens exhaustion and durable timing
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"1\"", "1.0", "1e3", "-1", "9223372036854775808", "null" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":16,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":17,\"refresh\":[{{\"generation\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidGeneration else |_| {}
     }
-    const exhausted = "{\"version\":16,\"refresh\":[{\"generation\":9223372036854775807},{},{},{},{}]}";
+    const exhausted = "{\"version\":17,\"refresh\":[{\"generation\":9223372036854775807},{},{},{},{}]}";
     try root.writeMode(m.file_name, exhausted, true, 0o600);
     var before = try m.load(&root);
     defer before.deinit(t.allocator);
@@ -422,7 +117,7 @@ test "publication current generation strict tokens exhaustion and durable timing
     defer after.deinit(t.allocator);
     try t.expectEqualDeep(before.refresh, after.refresh);
     try t.expectEqual(before.directory.count, after.directory.count);
-    try root.writeMode(m.file_name, "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":65536,\"available\":true}],\"refresh\":[{\"last_attempt_ms\":100,\"last_success_ms\":110,\"successful\":true},{},{},{},{}]}", true, 0o600);
     var claimed = try m.claimAt(&root, m.bit(.deepseek), true, 120, .{});
     defer claimed.cache.deinit(t.allocator);
     try t.expectEqual(@as(u64, 1), claimed.generations[0]);
@@ -489,12 +184,12 @@ test "refresh timing timestamps require bounded nonnegative integer JSON tokens"
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     for ([_][]const u8{ "\"123\"", "1.0", "1e3", "-1", "253402300800000" }) |token| {
-        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":16,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"version\":17,\"refresh\":[{{\"last_attempt_ms\":{s}}},{{}},{{}},{{}},{{}}]}}", .{token});
         defer t.allocator.free(body);
         try root.writeMode(m.file_name, body, true, 0o600);
         if (m.load(&root)) |_| return error.AcceptedInvalidTimestamp else |_| {}
     }
-    try root.writeMode(m.file_name, "{\"version\":16,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{},{}]}", true, 0o600);
+    try root.writeMode(m.file_name, "{\"version\":17,\"refresh\":[{\"last_attempt_ms\":0},{\"last_success_ms\":253402300799999},{},{},{}]}", true, 0o600);
     var valid = try m.load(&root);
     defer valid.deinit(t.allocator);
     try t.expectEqual(@as(?u64, 0), valid.refresh[0].last_attempt_ms);
@@ -524,7 +219,6 @@ test "Codex cache and independent source generation preserve authenticated listi
     const entry = m.dynamicEntry(&loaded, .openai_codex, "new/id").?;
     try t.expectEqual(@as(?u32, 64000), m.contextFor(&loaded, entry));
     try t.expect(m.outputFor(&loaded, entry) == null);
-    try t.expect(m.inputPriceFlatLimitFor(&loaded, entry) == null);
     const row = loaded.directory.rows[loaded.directory.find(.openai_codex, "new/id").?];
     try t.expectEqual(@as(?bool, true), row.input_image);
     try t.expectEqual(@as(?@import("../presentation/activity.zig").ReasoningEffort, .high), row.default_reasoning);
@@ -646,7 +340,7 @@ test "output cache current schema rejects unbounded values transactionally" {
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "1048577", "4294967296", "1.5", "\"100\"", "-1" }) |invalid_output| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":16,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{invalid_output});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":17,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"output_tokens\":{s}}}]}}", .{invalid_output});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.commit(&root, 0, .{})) |value| {
@@ -802,14 +496,14 @@ test "official row fields survive public-only directory publication" {
     defer root.deinit();
     // Cached declarations still require the only canonical wire spellings.
     for ([_][]const u8{
-        "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
-        "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
-        "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
+        "{\"version\":17,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-level\",\"reasoning\":{\"map\":{\"high\":\"intensive\"}}}]}",
+        "{\"version\":17,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"bad-off\",\"reasoning\":{\"map\":{\"off\":\"disabled\"}}}]}",
+        "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"bad-off\",\"reasoning\":{\"format\":\"deepseek\",\"map\":{\"off\":\"none\"}}}]}",
     }) |invalid| {
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = invalid });
         try t.expectError(error.InvalidMetadata, m.load(&root));
     }
-    const legacy = "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
+    const legacy = "{\"version\":17,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true,\"reasoning\":{\"map\":{\"high\":\"high\"}}}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     var cache = try commitOwned(&root, 0, try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"reasoning_options":[{"type":"effort","values":["low"]}]}}}}
@@ -988,7 +682,7 @@ test "context public replaces preset fallback but preserves compatible official 
     defer tmp.cleanup();
     var root = try rootFor(tmp.dir);
     defer root.deinit();
-    const legacy = "{\"version\":16,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
+    const legacy = "{\"version\":17,\"models\":[{\"provider\":\"opencode_zen\",\"id\":\"gpt-5.2\",\"protocol\":\"responses\",\"context_window\":100000,\"available\":true}]}";
     try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = legacy });
     var public = try m.parseDev(t.allocator,
         \\{"opencode":{"npm":"@ai-sdk/openai","models":{"gpt-5.2":{"limit":{"context":262144}}}}}
@@ -1024,7 +718,7 @@ test "context current invalid cache values and invalid commit roll back durable 
     defer root.deinit();
     var buffer: [1024]u8 = undefined;
     for ([_][]const u8{ "0", "16777217", "4294967296", "1.5", "1e5", "\"100\"", "-1", "true", "{}", "[]" }) |invalid_context| {
-        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":16,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{invalid_context});
+        const body = try std.fmt.bufPrint(&buffer, "{{\"version\":17,\"models\":[{{\"provider\":\"deepseek\",\"id\":\"same\",\"dev_context_tokens\":{s}}}]}}", .{invalid_context});
         try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = body });
         const before = try root.dir.statFile(root.io, m.file_name, .{});
         if (m.claim(&root, m.dev_bit, false)) |value| {
@@ -1042,7 +736,7 @@ test "context current invalid cache values and invalid commit roll back durable 
         defer t.allocator.free(after.data);
         try t.expectEqualStrings(body, after.data);
     }
-    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":16}" });
+    try root.dir.writeFile(root.io, .{ .sub_path = m.file_name, .data = "{\"version\":17}" });
     var listing = try m.parseDev(t.allocator,
         \\{"deepseek":{"npm":"@ai-sdk/openai-compatible","models":{"same":{"limit":{"context":65536,"output":4096}}}}}
     );
@@ -1062,7 +756,7 @@ test "foreign profile cannot manufacture a preset across reload or empty listing
     var root = try rootFor(tmp.dir);
     defer root.deinit();
     var public = try m.parseDev(t.allocator,
-        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
+        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
     );
     defer public.deinit(t.allocator);
     var committed = try m.commitAt(&root, 0, public, 1000);
@@ -1082,6 +776,4 @@ test "foreign profile cannot manufacture a preset across reload or empty listing
     try t.expect(m.dynamicEntry(&reloaded, .opencode_go, "claude-haiku-5-5") == null);
     try t.expect(m.contextFor(&reloaded, entry) == null);
     try t.expect(m.outputFor(&reloaded, entry) == null);
-    try t.expect(m.inputPriceThresholdFor(&reloaded, entry) == null);
-    try t.expect(m.inputPriceFlatLimitFor(&reloaded, entry) == null);
 }

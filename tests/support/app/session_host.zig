@@ -144,16 +144,16 @@ const FakeLimitsView = struct {
     }
 };
 
-const SettingSink = struct {
+const PreferenceSink = struct {
     calls: usize = 0,
-    last_key: ?tui.Connection.Setting = null,
-    last_value: bool = false,
+    last_key: ?settings_preferences.Key = null,
+    last_value: ?u32 = null,
 
-    fn set(context: *anyopaque, key: tui.Connection.Setting, enabled: bool) anyerror!void {
-        const self: *SettingSink = @ptrCast(@alignCast(context));
+    fn set(context: *anyopaque, key: settings_preferences.Key, value: ?u32) anyerror!void {
+        const self: *PreferenceSink = @ptrCast(@alignCast(context));
         self.calls += 1;
         self.last_key = key;
-        self.last_value = enabled;
+        self.last_value = value;
     }
 };
 

@@ -1,101 +1,25 @@
-test "pending model has no low price marker while global defaults and explicit optout stay unchanged" {
-    for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        var buffer: [4096]u8 = undefined;
-        const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-        const raw = try std.mem.concat(a, u8, &.{ "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"api_key_env\":\"MISSING_LOCAL_FIXTURE_KEY\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"limits\":", limits, "}" });
-        defer a.free(raw);
-        try save(home, raw);
-        var env = std.process.Environ.Map.init(a);
-        defer env.deinit();
-        try env.put("HOME", home);
-        var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
-        defer session.deinit();
-        const state = session.connection().current();
-        try std.testing.expectEqual(std.mem.find(u8, limits, "false") == null, session.global_config.?.value.limits.low_price_input);
-        try std.testing.expect(!state.low_price_input);
-        try std.testing.expect(state.runtime == null); // Still pending, no inference.
-    }
-}
-test "current model marker needs enabled known price step rather than flat unknown or a model name" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [4096]u8 = undefined;
-    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-    try save(home,
-        \\{"llm":{"default":"route/fixture","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-local-only","models":{"fixture":{"protocol":"chat","context_tokens":1000000}}}}}}
-    );
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("HOME", home);
-    var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
-    defer session.deinit();
-    try std.testing.expect(session.app != null);
-    const active = &session.app.?.config.value;
-    const context = @import("../core/context.zig");
-    const cases = [_]struct { name: []const u8, step: ?u32, flat: ?u32, marker: bool }{
-        .{ .name = "deepseek-flash", .step = null, .flat = 1000000, .marker = false },
-        .{ .name = "claude-haiku-5-5", .step = 100000, .flat = null, .marker = true },
-        .{ .name = "claude-haiku-5-5", .step = null, .flat = null, .marker = false },
-        .{ .name = "unrelated-name", .step = 100000, .flat = null, .marker = true },
-    };
-    for (cases) |case| for ([_]bool{ false, true }) |enabled| {
-        // Synthetic resolved capabilities, never written to disk or fetched.
-        active.model.name = case.name;
-        active.model.input_price_threshold = case.step;
-        active.model.input_price_flat_limit = case.flat;
-        active.limits.low_price_input = enabled;
-        const budget = context.inputBudget(active.*);
-        const state = session.connection().current();
-        try std.testing.expectEqual(enabled and case.marker, state.low_price_input);
-        try std.testing.expectEqual(@as(u32, 1000000), state.context_limit);
-        try std.testing.expectEqual(enabled, active.limits.low_price_input);
-        try std.testing.expectEqual(budget, context.inputBudget(active.*));
-        if (enabled and case.step == null and case.flat == null)
-            try std.testing.expectError(error.UnknownInputPriceThreshold, context.validateInputPolicy(active.*));
-    };
-    active.limits.low_price_input = true;
-    active.selection_pending = true;
-    try std.testing.expect(!session.connection().current().low_price_input);
-}
-test "restored known price history has no L without ready runtime for missing key or readonly lease" {
+test "missing key or read-only lease restores history and context without a runtime" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
     const declaration =
-        \\{"llm":{"default":"go/fixture","providers":{"go":{"base_url":"https://opencode.ai/zen/go/v1","api_key_env":"MARKER_FIXTURE_KEY","models":{"fixture":{"protocol":"chat","context_tokens":65536}}}}}}
+        \\{"llm":{"default":"local/fixture","providers":{"local":{"base_url":"https://fixture.invalid/v1","api_key_env":"RESTORE_FIXTURE_KEY","models":{"fixture":{"protocol":"chat","context_tokens":65536}}}}}}
     ;
     try save(home, declaration);
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    try env.put("MARKER_FIXTURE_KEY", "fake-owned-marker-key");
-    {
-        var store = try Store.openExisting(a, io, home);
-        defer store.deinit();
-        var listing = try metadata.parseListing(a, "{\"data\":[{\"id\":\"fixture\",\"protocol\":\"chat\",\"context_window\":65536}]}", .opencode_go);
-        defer listing.deinit(a);
-        listing.dev_done = true;
-        const row = &listing.directory.rows[0];
-        row.dev_present = true;
-        row.dev_protocol = .chat;
-        row.dev_context_tokens = 65536;
-        row.dev_input_price_threshold = 20000;
-        var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
-        defer committed.deinit(a);
-    }
+    try env.put("RESTORE_FIXTURE_KEY", "fake-restore-key");
     var id: @import("session_id.zig").Id = undefined;
     {
         var source = try Session.initWithOptions(a, io, &env, home, .{}, .{});
         defer source.deinit();
         id = source.session_id;
         const app = source.app.?;
-        try std.testing.expect(source.connection().current().low_price_input);
-        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "owned marker history" }} });
-        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .assistant, .blocks = &.{.{ .text = "owned marker answer" }} });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "owned history" }} });
+        try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .assistant, .blocks = &.{.{ .text = "owned answer" }} });
         try std.testing.expect(try source.saveOnExit());
     }
     {
@@ -104,14 +28,14 @@ test "restored known price history has no L without ready runtime for missing ke
         try std.testing.expect(holder.app != null and holder.resume_lease.?.writable);
         var readonly = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
         defer readonly.deinit();
-        try expectInactiveHistoryWithoutLowPriceMarker(&readonly, true);
+        try expectInactiveHistory(&readonly, true);
     }
     var missing_env = std.process.Environ.Map.init(a);
     defer missing_env.deinit();
     try missing_env.put("HOME", home);
     var missing = try Session.initWithOptions(a, io, &missing_env, home, .{}, .{ .resume_session = id });
     defer missing.deinit();
-    try expectInactiveHistoryWithoutLowPriceMarker(&missing, false);
+    try expectInactiveHistory(&missing, false);
 }
 test "publication current capabilities stay isolated by model and route" {
     const resolver = @import("model_resolver.zig");
@@ -129,23 +53,20 @@ test "publication current capabilities stay isolated by model and route" {
     row.dev_protocol = .responses;
     row.dev_context_tokens = 1000000;
     row.dev_output_tokens = 128000;
-    row.dev_input_price_threshold = 200000;
     cache.directory_mask = metadata.bit(.opencode_go);
     const current = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "fresh", false);
     try std.testing.expectEqual(.responses, current.model.protocol);
     try std.testing.expectEqual(@as(u32, 1000000), current.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 128000), current.model.output_tokens);
-    try std.testing.expectEqual(@as(?u32, 200000), current.model.input_price_threshold);
     // Explicit route/context on another raw ID cannot inherit fresh's capabilities.
     const isolated = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "conflict", false);
     try std.testing.expectEqual(.responses, isolated.model.protocol);
     try std.testing.expectEqual(@as(u32, 65536), isolated.model.context_tokens);
     try std.testing.expect(isolated.model.output_tokens == null);
-    try std.testing.expect(isolated.model.input_price_threshold == null);
     try std.testing.expectError(error.UnknownModelProtocol, resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "manual", false));
     const probe = try resolver.resolve(parsed.arena.allocator(), parsed.value, &cache, "go", "probe", false);
     try std.testing.expectEqual(.auto, probe.model.protocol);
-    try std.testing.expect(probe.model.input_price_threshold == null);
+    try std.testing.expect(probe.model.output_tokens == null);
 }
 test "publication Session current capability changes do not reject history loading" {
     var tmp = std.testing.tmpDir(.{});
@@ -617,7 +538,6 @@ test "llm Session dynamic history loads after lost window and delisting without 
             row.dev_present = true;
             row.dev_protocol = .chat;
             row.dev_output_tokens = output;
-            row.dev_input_price_threshold = if (output != null) 200000 else null;
             listing.dev_done = true;
             var committed = try metadata.commit(&store.root, metadata.bit(.opencode_go), listing);
             defer committed.deinit(a);
@@ -630,7 +550,6 @@ test "llm Session dynamic history loads after lost window and delisting without 
             const app = source.app.?;
             try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
             try std.testing.expectEqual(output, app.config.value.model.output_tokens);
-            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, app.config.value.model.input_price_threshold);
             try app.runtime.history.append(app.runtime.arena.allocator(), .{ .role = .user, .blocks = &.{.{ .text = "frozen dynamic canonical fixture" }} });
             // Publish an ordinary in-session checkpoint; saveOnExit is a
             // terminal one-shot and must not be invoked twice on this owner.
@@ -646,14 +565,13 @@ test "llm Session dynamic history loads after lost window and delisting without 
             row.dev_present = true;
             row.dev_protocol = .chat;
             row.dev_output_tokens = 4096;
-            row.dev_input_price_threshold = 100000;
             listing.dev_done = true;
             var committed = try metadata.commit(&source.store.root, metadata.bit(.opencode_go), listing);
             defer committed.deinit(a);
             source.metadata_cache.deinit(a);
             source.metadata_cache = try metadata.load(&source.store.root);
             try source.connection().selectModel("cached.protochat");
-            try std.testing.expectEqual(if (output != null) @as(?u32, 200000) else null, source.app.?.config.value.model.input_price_threshold);
+            try std.testing.expectEqual(output, source.app.?.config.value.model.output_tokens);
             try std.testing.expect(try source.saveOnExit());
             try std.testing.expectEqualStrings("fake-frozen-go", source.global_config.?.value.registry.?.find("go").?.connection.api_key.?);
         }

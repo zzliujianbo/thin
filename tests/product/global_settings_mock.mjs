@@ -149,7 +149,7 @@ async function proxyFixture(name, url, configured) {
       }},
     }},
     ...(configured ? {proxy:{address, port, models}} : {}),
-    limits:{low_price_input:true, request_timeout_ms:3000},
+    limits:{request_timeout_ms:3000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
   await writeFile(configPath, config, {mode:0o600});
@@ -171,7 +171,7 @@ async function fixture(name, url) {
       'family/native-review':{protocol:'chat', context_tokens:32768},
     }},
     }},
-    limits:{low_price_input:true, request_timeout_ms:3000},
+    limits:{request_timeout_ms:3000},
   }, null, 2) + '\n';
   const configPath = join(home, '.thin/config.json');
   await writeFile(configPath, config, {mode:0o600});
@@ -190,12 +190,12 @@ async function unchanged(f) {
 // Canonical defaults materialized by core/config.zig writeDisk. Each value is
 // an authored expectation, never derived from the file under test.
 const limitsDefaults = {
-  command_timeout_ms:300000, low_price_input:true,
+  command_timeout_ms:300000,
   request_timeout_ms:300000, compaction_enabled:true,
   show_reported_usage:false,
 };
 
-async function values(f, low) {
+async function values(f, compaction) {
   const expected = JSON.parse(f.config);
   // Mirror only known core/config.zig writeDisk canonical defaults, never
   // derive expected fields from the saved file (unknown additions must fail).
@@ -204,7 +204,7 @@ async function values(f, low) {
   for (const provider of Object.values(expected.llm.providers)) {
     Object.assign(provider, {api_key:null, api_key_env:'', chat_max_tokens:false, kind:null, ...provider});
   }
-  expected.limits = {...limitsDefaults, ...expected.limits, low_price_input:low};
+  expected.limits = {...limitsDefaults, ...expected.limits, compaction_enabled:compaction};
   // Whole-object equality excludes changes to models, routes, credential
   // declarations, other limits, or any field beyond these explicit defaults.
   assert.deepEqual(JSON.parse(await readFile(f.configPath, 'utf8')), expected);
@@ -277,8 +277,8 @@ try {
   await unchanged(n);
   await untouched(n.configPath, unconfigured);
   await thinHome(n.home, ['config.json']);
-  // Reverse preferences in a retired file must be ignored, including low-price.
-  const existing = '{ "version": 1, "low_price_input": false }\n';
+  // The retired file cannot override the current compaction preference.
+  const existing = '{ "version": 1, "compaction_enabled": false }\n';
   await writeFile(n.settings, existing, {mode:0o600});
   const baseline = await snapshot(n.settings);
   await run('settings-global-unconfigured', n.home, n.project, url);

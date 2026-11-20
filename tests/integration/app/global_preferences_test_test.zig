@@ -1,9 +1,9 @@
-test "global config switches survive model selection and session restart without a settings source" {
+test "global request timeout survives model selection and session restart independently of settings.json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    const legacy = "{\"low_price_input\":false}";
+    const legacy = "{\"request_timeout_ms\":7777}";
     try seed(home, plain, legacy);
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -12,18 +12,17 @@ test "global config switches survive model selection and session restart without
         var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
         defer session.deinit();
         // The retired settings file is ignored, even if it disagrees.
-        try std.testing.expect(session.connection().current().low_price_input_enabled);
-        try toggle(&session, .low_price_input, false);
-        try std.testing.expect(!session.connection().current().low_price_input_enabled);
-        try std.testing.expect(!session.global_config.?.value.limits.low_price_input);
         const connection = session.connection();
+        try std.testing.expectEqual((cfg.Limits{}).request_timeout_ms, connection.current().limits.request_timeout_ms);
+        try connection.preference_fn.?(connection.context, .request_timeout_ms, 12_000);
+        try std.testing.expectEqual(@as(u32, 12_000), session.global_config.?.value.limits.request_timeout_ms);
         try connection.select_model_fn.?(connection.context, "route/second");
-        try std.testing.expect(!session.app.?.config.value.limits.low_price_input);
+        try std.testing.expectEqual(@as(u32, 12_000), session.app.?.config.value.limits.request_timeout_ms);
         const disk = try read(home, cfg.file_name);
         defer a.free(disk);
         var parsed = try cfg.parse(a, disk);
         defer cfg.release(&parsed);
-        try std.testing.expect(!parsed.value.limits.low_price_input);
+        try std.testing.expectEqual(@as(u32, 12_000), parsed.value.limits.request_timeout_ms);
         try std.testing.expectEqualStrings("route/second", parsed.value.registry.?.default);
         try std.testing.expectEqualStrings("fake-owned-only", parsed.value.registry.?.find("route").?.connection.api_key.?);
         try std.testing.expectEqual(@as(?u32, 65536), parsed.value.registry.?.find("route").?.patchFor("first").?.context_tokens);
@@ -33,12 +32,11 @@ test "global config switches survive model selection and session restart without
     }
     var restarted = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer restarted.deinit();
-    try std.testing.expect(!restarted.connection().current().low_price_input_enabled);
     const config = restarted.app.?.config.value;
-    try std.testing.expect(!config.limits.low_price_input);
+    try std.testing.expectEqual(@as(u32, 12_000), config.limits.request_timeout_ms);
     try std.testing.expectEqualStrings("second", config.model.name);
 }
-test "history restore adopts current config switches rather than archived budget or tool prefix" {
+test "history restore uses the current timeout and preserves assistant replay and context usage" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
@@ -68,13 +66,13 @@ test "history restore adopts current config switches rather than archived budget
         defer store.deinit();
         var declaration = try store.loadExisting();
         defer cfg.release(&declaration);
-        declaration.value.limits.low_price_input = false;
+        declaration.value.limits.request_timeout_ms = 12_000;
         try store.save(declaration.value);
     }
     var restored = try Session.initWithOptions(a, io, &env, home, .{}, .{ .resume_session = id });
     defer restored.deinit();
     const state = restored.connection().current();
-    try std.testing.expect(!state.low_price_input_enabled);
+    try std.testing.expectEqual(@as(u32, 12_000), state.limits.request_timeout_ms);
     const history = restored.app.?.runtime.messages();
     try std.testing.expectEqual(@as(usize, 2), history.len);
     try std.testing.expect(history[1].replay != null);
@@ -122,20 +120,20 @@ test "obsolete settings file is ignored and preserved even when malformed" {
     defer tmp.cleanup();
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
-    const bad = "{\"low_price_input\":\"bad\"}";
+    const bad = "{not valid json";
     try seed(home, plain, bad);
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
     var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
     defer session.deinit();
-    const state = session.connection().current();
-    try std.testing.expect(state.global_settings_available and state.low_price_input_enabled);
-    try toggle(&session, .low_price_input, false);
+    const connection = session.connection();
+    try std.testing.expect(connection.current().global_settings_available);
+    try connection.preference_fn.?(connection.context, .request_timeout_ms, 12_000);
     const bytes = try read(home, "settings.json");
     defer a.free(bytes);
     try std.testing.expectEqualStrings(bad, bytes);
     var restarted = try Session.init(a, io, &env, home, .{});
     defer restarted.deinit();
-    try std.testing.expect(!restarted.app.?.config.value.limits.low_price_input);
+    try std.testing.expectEqual(@as(u32, 12_000), restarted.app.?.config.value.limits.request_timeout_ms);
 }

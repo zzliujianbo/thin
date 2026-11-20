@@ -507,10 +507,8 @@ const Permission = struct {
 
 /// UI-owned callbacks; the application owns the runtime and configuration lifetime.
 pub const Connection = struct {
-    pub const Setting = enum { low_price_input };
     pub const ModelChoice = settings_model_module.Choice;
     image_fn: ?*const fn (*anyopaque, ModelChoice) anyerror!void = null,
-    setting_fn: ?*const fn (*anyopaque, Setting, bool) anyerror!void = null,
     preference_fn: ?*const fn (*anyopaque, preference.Key, ?u32) anyerror!void = null,
     /// Exact proxy-model routing toggle: the owner saves the list and
     /// republishes its snapshot. Settings only; no network request here.
@@ -587,10 +585,6 @@ pub const Connection = struct {
         codex_login: corecodex.View = .{},
         allow_custom_models: bool = true,
         context_limit: u32 = 0,
-        /// Owner snapshot: known tiered-price protection active for this model,
-        /// not the global toggle; never inferred from token usage.
-        low_price_input: bool = false,
-        low_price_input_enabled: bool = true,
         image_enabled: bool = false,
         image_models: []const core_config.Model = &.{},
         image_model: ?[]const u8 = null,
@@ -733,7 +727,7 @@ fn finishExit(terminal: *terminal_module.Terminal, result: u8, read_signal: *con
 const pending_session_notice = "Waiting for session...";
 
 /// TUI 的全部状态。只在 UI 线程（run/loop）中访问；后台 Job 只通过 bridge 与之通信。
-const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, configure, codex_login, model, effort, preference, setting, image, proxy, proxy_address, refresh };
+const AsyncPurpose = enum { submit, enqueue, withdraw, manage, approve, cancel, cancel_clear, open_stop, release_stop, configure, codex_login, model, effort, preference, image, proxy, proxy_address, refresh };
 const AsyncPending = struct {
     ticket: u64,
     purpose: AsyncPurpose,
@@ -1521,7 +1515,7 @@ const Ui = struct {
                 self.effort_flash = .{ .level = next, .until_ms = self.clock_ms +| 5000 };
                 self.notice = "Ready";
             },
-            .preference, .setting, .image, .proxy, .proxy_address => {
+            .preference, .image, .proxy, .proxy_address => {
                 self.display.context = self.connection.current().initial_context;
                 self.frame_settings_generation = null;
                 const same_menu = self.settings_open and self.settings_menu.generation == pending.settings_generation;
@@ -3490,7 +3484,7 @@ const Ui = struct {
         self.notice = "Ready";
     }
     fn backToSettings(self: *Ui) void {
-        const parent: usize = if (self.settings_model_picker == .image) 4 else if (self.anyProxyOpen()) 5 else 1;
+        const parent: usize = if (self.settings_model_picker == .image) 3 else if (self.anyProxyOpen()) 4 else 0;
         if (self.settingsModelOpen()) self.wipeEditor();
         if (self.proxyEditorBorrowed()) self.endProxyEditor();
         self.displayed_picker_fingerprint = null;
@@ -3964,7 +3958,7 @@ const Ui = struct {
                     self.notice = "Global settings unavailable; changes disabled";
                     return;
                 }
-                if (!self.settingsQueryOpen() and self.settings_menu.selected == 4) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 3) {
                     self.wipeEditor();
                     self.settings_model_picker = .image;
                     self.settings_menu.clear();
@@ -3974,7 +3968,7 @@ const Ui = struct {
                     self.notice = "Ready";
                     return;
                 }
-                if (!self.settingsQueryOpen() and self.settings_menu.selected == 5) {
+                if (!self.settingsQueryOpen() and self.settings_menu.selected == 4) {
                     self.backToProxySubmenu(0);
                     return;
                 }
@@ -3985,42 +3979,27 @@ const Ui = struct {
                         } else if (key_ == .show_reported_usage) {
                             _ = self.savePreference(key_, @intFromBool(!state.limits.show_reported_usage));
                         } else self.openSettingsValue(key_, state);
-                        return;
                     }
+                    return;
                 }
                 self.bridge.reset() catch {
                     self.notice = "Settings require a drained session bridge";
                     return;
                 };
-                if (self.settingsModelOpen()) {
-                    const save = self.connection.image_fn orelse {
-                        self.notice = "Global settings unavailable; changes disabled";
-                        return;
-                    };
-                    const selected = settings_model_module.choice(state.image_models, state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
-                    if (self.connection.async_actions != null) {
-                        _ = self.beginAsync(.{ .image = selected }, .image);
-                        return;
-                    }
-                    save(self.connection.context, selected) catch |err| {
-                        self.notice = self.describeError(err);
-                        return;
-                    };
-                    self.backToSettings();
-                } else {
-                    const save = self.connection.setting_fn orelse {
-                        self.notice = "Global settings unavailable; changes disabled";
-                        return;
-                    };
-                    if (self.connection.async_actions != null) {
-                        _ = self.beginAsync(.{ .setting = .{ .key = .low_price_input, .value = !state.low_price_input_enabled } }, .setting);
-                        return;
-                    }
-                    save(self.connection.context, .low_price_input, !state.low_price_input_enabled) catch |err| {
-                        self.notice = self.describeError(err);
-                        return;
-                    };
+                const save = self.connection.image_fn orelse {
+                    self.notice = "Global settings unavailable; changes disabled";
+                    return;
+                };
+                const selected = settings_model_module.choice(state.image_models, state.model_providers, self.editor.bytes.items, self.settings_menu.selected) orelse return;
+                if (self.connection.async_actions != null) {
+                    _ = self.beginAsync(.{ .image = selected }, .image);
+                    return;
                 }
+                save(self.connection.context, selected) catch |err| {
+                    self.notice = self.describeError(err);
+                    return;
+                };
+                self.backToSettings();
                 // Owner publishes, UI never speculates or mutates the snapshot.
                 // Schema rewrites may explicitly invalidate context.
                 const updated = self.connection.current();
@@ -5608,7 +5587,7 @@ const Ui = struct {
         return switch (result.status) {
             .success => "Ready",
             .canceled => "Canceled; prior side effects remain",
-            .paused => if (result.model_failure == .output_limit or r.inputBudgetPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
+            .paused => if (result.model_failure == .output_limit or r.compactionPause(result.detail)) "Paused" else "Paused at round limit; send a message to continue",
             .failed => "Failed",
         };
     }
@@ -5707,7 +5686,7 @@ const Ui = struct {
         if (result.status == .success and result.duration_ms == null) return true;
         // Ordinary round-limit pauses already have user-facing wording; do not
         // expose their internal error name. Policy and output pauses keep detail.
-        if (result.status == .paused and result.model_failure != .output_limit and !r.inputBudgetPause(result.detail)) {
+        if (result.status == .paused and result.model_failure != .output_limit and !r.compactionPause(result.detail)) {
             var concise: std.Io.Writer.Allocating = .init(self.allocator);
             defer concise.deinit();
             concise.writer.writeAll(terminalNotice(result)) catch return false;
@@ -6723,7 +6702,7 @@ const Ui = struct {
         // is owned by the fast animation slot, one step per painted frame.
         const streaming = view.streaming and working;
         const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .show_reported_usage = state.limits.show_reported_usage, .command = self.command_mode });
+        const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .busy = working, .streaming = streaming, .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .show_reported_usage = state.limits.show_reported_usage, .command = self.command_mode });
         // Modal authorization/secret layouts stay fixed. Idle LF debt first
         // obtains a single-row composer ACK even if a newer long draft arrived.
         const limit: usize = if (self.permission != null or self.stop_open or self.idle_breaks != 0) 1 else @min(composer_layout.max_rows, @max(1, self.size.rows -| 5));
@@ -6965,7 +6944,7 @@ const Ui = struct {
             // Only the prompt, never that now-deleted draft, becomes history.
             const view = self.display.view(self.clock_ms);
             const flash = if (self.effort_flash) |pending| if (self.clock_ms < pending.until_ms) pending.level else null else null;
-            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .low_price_input = state.low_price_input, .show_reported_usage = state.limits.show_reported_usage, .command = self.command_mode });
+            const decoration = try presentation.prompt(a, state.model, view.context, cols, .{ .now_ms = self.clock_ms, .phase = @intCast(self.fast_step), .rate_band = view.rate_band, .reasoning_effort = view.reasoning_effort, .effort_flash = flash, .show_reported_usage = state.limits.show_reported_usage, .command = self.command_mode });
             idle_prompt = try std.fmt.allocPrint(a, "{s}{s}\x1b[K", .{ decoration.styled, theme.reset });
             try writer.writeAll(idle_prompt);
             // Entry is the ACKed composer's bottom row, not the tail's top.
@@ -7241,7 +7220,6 @@ const Ui = struct {
         const provider_rows = if (self.provider_open) try provider_picker_module.rows(a, self.provider_picker, self.provider_choices, state.configured_providers, cols, candidate_limit) else provider_picker_module.Rows{ .lines = &.{} };
         self.frame_provider_generation = null;
         const settings_snapshot: settings_menu_module.Snapshot = .{
-            .low_price_input_enabled = state.low_price_input_enabled,
             .image_enabled = state.image_enabled,
             .image_model = state.image_model,
             .proxy_configured = state.proxy_configured,

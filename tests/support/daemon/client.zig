@@ -341,9 +341,6 @@ const HostSettingsView = struct {
         state.model_disabled = self.disabled;
         state.model_providers = self.providers;
         state.pending_default_effort = .medium;
-        // Active protection and the global switch are different facts.
-        state.low_price_input = true;
-        state.low_price_input_enabled = false;
         return state;
     }
 };

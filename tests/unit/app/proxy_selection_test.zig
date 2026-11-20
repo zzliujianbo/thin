@@ -23,7 +23,7 @@ test "proxy allowlist appends exact IDs removes only matches and preserves order
 test "proxy allowlist grows beyond the former declaration bound" {
     const a = std.testing.allocator;
     var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main","models":{"main":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false},"proxy":{"address":"127.0.0.1","port":1}}
+        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main","models":{"main":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"request_timeout_ms":12345},"proxy":{"address":"127.0.0.1","port":1}}
     );
     defer cfg.release(&parsed);
     const arena = parsed.arena.allocator();
@@ -57,7 +57,7 @@ test "proxy endpoint edit keeps members and unrelated settings" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.proxy.?.models.len);
     try std.testing.expectEqualStrings("p/raw/id", parsed.value.proxy.?.models[0]);
     try std.testing.expectEqualStrings("fake-main", parsed.value.registry.?.find("p").?.connection.api_key.?);
-    try std.testing.expect(!parsed.value.limits.low_price_input);
+    try std.testing.expectEqual(@as(u32, 12345), parsed.value.limits.request_timeout_ms);
     try cfg.validate(parsed.value);
     // Clearing removes the declaration and its members; repeating it is a no-op.
     try std.testing.expect(try applyAddress(arena, &parsed.value, " \t "));
@@ -68,7 +68,7 @@ test "proxy endpoint edit keeps members and unrelated settings" {
 test "proxy endpoint edit creates an empty declaration and rejects invalid input" {
     const a = std.testing.allocator;
     var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main","models":{"main":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"p/main","providers":{"p":{"base_url":"https://fixture.invalid/v1","api_key":"fake-main","models":{"main":{"protocol":"chat","context_tokens":65536}}}}}}
     );
     defer cfg.release(&parsed);
     const arena = parsed.arena.allocator();

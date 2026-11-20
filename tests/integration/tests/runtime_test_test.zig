@@ -485,12 +485,14 @@ test "Runtime local budget rejection recovers first and established turns for ev
         var cancel = p.Cancellation{};
         const oversized: [16000]u8 = @splat('x');
         const first = try runtime.run(&oversized, &cancel);
+        try std.testing.expectEqual(r.Status.failed, first.status);
         try std.testing.expectEqual(error.ContextTooLarge, first.detail.?);
         try std.testing.expectEqual(@as(usize, 0), runtime.messages().len);
         try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);
         try std.testing.expectEqual(r.Status.success, (try runtime.run("Do the task", &cancel)).status);
         const before = runtime.messages().len;
         const rejected = try runtime.run(&oversized, &cancel);
+        try std.testing.expectEqual(r.Status.failed, rejected.status);
         try std.testing.expectEqual(error.ContextTooLarge, rejected.detail.?);
         try std.testing.expectEqual(before, runtime.messages().len);
         try std.testing.expectEqualStrings("Do the task", runtime.messages()[0].blocks[0].text);
@@ -637,7 +639,7 @@ test "permission ids do not wrap into a non-monotonic host id" {
 test "Runtime unlimited default and parsed config exceed fifty rounds after checkpoint restore" {
     const a = std.testing.allocator;
     const inputs = [_][]const u8{
-        "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":32768,\"protocol\":\"chat\"}}}}},\"limits\":{\"low_price_input\":false}}",
+        "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":32768,\"protocol\":\"chat\"}}}}}}",
     };
     for (0..2) |variant| {
         var parsed = try cfg.parse(a, inputs[0]);
@@ -1353,7 +1355,7 @@ test "manual compaction empty or no candidate is zero-request and Busy is not ac
 test "frozen output metadata provenance never changes physical input checks" {
     const t = std.testing;
     const prefix = "{\"llm\":{\"default\":\"local/fake\",\"providers\":{\"local\":{\"base_url\":\"http://localhost\",\"models\":{\"fake\":{\"context_tokens\":131072,\"protocol\":\"chat\"}}}}},\"limits\":";
-    var parsed = try cfg.parse(t.allocator, prefix ++ "{\"low_price_input\":false}}");
+    var parsed = try cfg.parse(t.allocator, prefix ++ "{}}");
     defer cfg.release(&parsed);
     try t.expectEqual(@as(u32, 4096), cfg.Policy.safety_tokens);
     for ([_][]const u8{ "{\"max_output_tokens\":null}", "{\"max_output_tokens\":4096}", "{\"summary_tokens\":100}", "{\"unknown_input_tokens\":100}" }) |limits| {
@@ -1361,7 +1363,7 @@ test "frozen output metadata provenance never changes physical input checks" {
         defer t.allocator.free(json);
         try t.expectError(error.UnknownField, cfg.parse(t.allocator, json));
     }
-    var legacy = try cfg.parse(t.allocator, prefix ++ "{\"low_price_input\":false,\"max_input_tokens\":100000,\"input_margin_tokens\":5000,\"max_rounds\":50,\"task_timeout_ms\":100}}");
+    var legacy = try cfg.parse(t.allocator, prefix ++ "{\"max_input_tokens\":100000,\"input_margin_tokens\":5000,\"max_rounds\":50,\"task_timeout_ms\":100}}");
     defer cfg.release(&legacy);
     try t.expectEqualDeep(parsed.value.limits, legacy.value.limits);
     var canonical: std.Io.Writer.Allocating = .init(t.allocator);
@@ -1376,10 +1378,8 @@ test "frozen output metadata provenance never changes physical input checks" {
         config.model.output_tokens = capacity;
         try cfg.validate(config);
         try t.expectEqual(@as(usize, 126975), context.inputBudget(config));
-        for ([_]p.Purpose{ .normal, .summary }) |purpose| {
-            try context.checkInputFor(config, purpose, 126975);
-            try t.expectError(error.ContextTooLarge, context.checkInputFor(config, purpose, 126976));
-        }
+        try context.checkInput(config, 126975);
+        try t.expectError(error.ContextTooLarge, context.checkInput(config, 126976));
         try t.expectEqual(capacity, config.model.output_tokens);
     }
     try t.expectEqual(@as(?u32, null), config.model.persisted().output_tokens);
@@ -1396,7 +1396,7 @@ test "frozen output metadata provenance never changes physical input checks" {
     try t.expectError(error.ContextTooLarge, context.checkInput(config, estimator.tokens(std.math.maxInt(usize))));
     config.model.context_tokens = 1;
     try t.expectEqual(@as(usize, 0), context.inputBudget(config));
-    try t.expectError(error.ContextTooLarge, context.checkInputFor(config, .summary, 0));
+    try t.expectError(error.ContextTooLarge, context.checkInput(config, 0));
 }
 test "model output capacity stays frozen across rounds without changing effort" {
     const Fixture = struct {

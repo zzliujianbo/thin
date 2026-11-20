@@ -5,8 +5,6 @@ pub const Failure = enum {
     other,
     cleanup_failed,
     unsafe_to_continue,
-    input_budget_exceeded,
-    unknown_input_price_threshold,
     /// Compaction failures that must keep their own wording instead of
     /// degrading to the generic remote failure on the other side of the wire.
     insufficient_compaction,
@@ -25,8 +23,6 @@ pub const Failure = enum {
         return switch (err) {
             error.CleanupFailed => .cleanup_failed,
             error.UnsafeToContinue => .unsafe_to_continue,
-            error.InputBudgetExceeded => .input_budget_exceeded,
-            error.UnknownInputPriceThreshold => .unknown_input_price_threshold,
             error.InsufficientCompaction => .insufficient_compaction,
             error.CompactionImpossible => .compaction_impossible,
             error.InvalidSummary => .invalid_summary,
@@ -47,8 +43,6 @@ pub const Failure = enum {
         return switch (self) {
             .cleanup_failed => error.CleanupFailed,
             .unsafe_to_continue => error.UnsafeToContinue,
-            .input_budget_exceeded => error.InputBudgetExceeded,
-            .unknown_input_price_threshold => error.UnknownInputPriceThreshold,
             .insufficient_compaction => error.InsufficientCompaction,
             .compaction_impossible => error.CompactionImpossible,
             .invalid_summary => error.InvalidSummary,

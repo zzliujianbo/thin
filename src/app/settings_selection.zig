@@ -8,7 +8,6 @@ pub fn activeClone(a: std.mem.Allocator, active: cfg.Config, declaration: cfg.Co
     var candidate = active;
     candidate.registry = declaration.registry;
     candidate.image = declaration.image;
-    candidate.limits.low_price_input = declaration.limits.low_price_input;
     candidate.limits.compaction_enabled = declaration.limits.compaction_enabled;
     candidate.limits.show_reported_usage = declaration.limits.show_reported_usage;
     candidate.limits.command_timeout_ms = declaration.limits.command_timeout_ms;

@@ -4,14 +4,6 @@ const fs = @import("../platform/filesystem.zig");
 const cfg = @import("../core/config.zig");
 const t = std.testing;
 
-const price_cost = "{\"input\":0.1,\"output\":0.5,\"tiers\":[{\"input\":0.5,\"output\":2.5,\"tier\":{\"type\":\"context\",\"size\":100000}}]}";
-
-fn priceListing(cost: []const u8) !m.Listing {
-    const body = try std.fmt.allocPrint(t.allocator, "{{\"opencode-go\":{{\"npm\":\"@ai-sdk/anthropic\",\"models\":{{\"claude-haiku-5-5\":{{\"limit\":{{\"context\":1000000,\"output\":16384}},\"cost\":{s}}}}}}}}}", .{cost});
-    defer t.allocator.free(body);
-    return m.parseDev(t.allocator, body);
-}
-
 fn rootFor(dir: std.Io.Dir) !fs.Root {
     var path: [4096]u8 = undefined;
     const len = try dir.realPath(t.io, &path);

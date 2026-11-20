@@ -26,8 +26,6 @@ test "model profiles keep field and budget safety at the upper bounds" {
     model.output_tokens = null;
     model.context_tokens = std.math.maxInt(u32);
     model.output_tokens = std.math.maxInt(u32);
-    model.input_price_threshold = std.math.maxInt(u32);
-    model.input_price_flat_limit = std.math.maxInt(u32);
     try validateModel(model);
     model.context_tokens = 1;
     try std.testing.expectError(error.InvalidBudget, validateModel(model));
@@ -37,12 +35,10 @@ test "runtime-only config clones retain derived maps but cannot write disk" {
     active.model.reasoning = .{ .map = .{ .high = "high" } };
     active.model.reasoning_effort = "high";
     active.model.reasoning_source = .metadata;
-    active.model.input_price_threshold = 100000;
     var copied = try clone(std.testing.allocator, active);
     defer release(&copied);
     try std.testing.expectEqualStrings("high", copied.value.model.reasoning.?.map.high.?);
     try std.testing.expectEqualStrings("high", copied.value.model.reasoning_effort.?);
-    try std.testing.expectEqual(@as(?u32, 100000), copied.value.model.input_price_threshold);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try std.testing.expectError(error.MissingRegistry, writeDisk(copied.value, &out.writer));
@@ -71,29 +67,31 @@ test "current config round trips and rejects unknown root fields" {
 test "current config allocation failures release parse clone and disk candidates" {
     try checkConfigAllocationFailures(currentConfigAllocationCase);
 }
-test "low price input defaults enabled and explicit optout survives disk roundtrip" {
+test "legacy low_price_input booleans leave no policy or disk field" {
     const a = std.testing.allocator;
-    const prefixes = [_][]const u8{
-        "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":32768}}}}},\"limits\":",
-    };
-    for (prefixes) |prefix| for ([_][]const u8{ "{}", "{\"low_price_input\":true}", "{\"low_price_input\":false}" }) |limits| {
-        const raw = try std.mem.concat(a, u8, &.{ prefix, limits, "}" });
-        defer a.free(raw);
-        var parsed = try parse(a, raw);
+    const prefix = image_test_prefix ++ ",\"limits\":{\"compaction_enabled\":false";
+    inline for (.{ "", ",\"low_price_input\":true", ",\"low_price_input\":false" }) |legacy| {
+        var parsed = try parse(a, prefix ++ legacy ++ "}}");
         defer release(&parsed);
-        const enabled = std.mem.find(u8, limits, "false") == null;
-        try std.testing.expectEqual(enabled, parsed.value.limits.low_price_input);
-        // Unknown price metadata does not prevent parsing or selection.
-        try std.testing.expect(parsed.value.model.input_price_threshold == null);
-        var cloned = try clone(a, parsed.value);
-        defer release(&cloned);
+        try std.testing.expectEqualDeep(Limits{ .compaction_enabled = false }, parsed.value.limits);
         var out: std.Io.Writer.Allocating = .init(a);
         defer out.deinit();
-        try writeDisk(cloned.value, &out.writer);
+        try writeDisk(parsed.value, &out.writer);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "low_price_input") == null);
         var again = try parse(a, out.written());
         defer release(&again);
-        try std.testing.expectEqual(enabled, again.value.limits.low_price_input);
-    };
+        try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
+    }
+}
+test "legacy price config exception is boolean only and scoped to limits" {
+    const a = std.testing.allocator;
+    const prefix = image_test_prefix ++ ",\"limits\":{\"low_price_input\":";
+    inline for (.{ "null", "0", "\"false\"", "{}", "[]" }) |value| {
+        try std.testing.expectError(error.UnexpectedToken, parse(a, prefix ++ value ++ "}}"));
+    }
+    try std.testing.expectError(error.DuplicateField, parse(a, prefix ++ "true,\"low_price_input\":false}}"));
+    try std.testing.expectError(error.UnknownField, parse(a, prefix ++ "true,\"input_price_threshold\":17}}"));
+    try std.testing.expectError(error.UnknownField, parse(a, image_test_prefix ++ ",\"low_price_input\":false}"));
 }
 test "thinking declarations strict owned config validation and protocol incompatibility" {
     const t = std.testing;
@@ -261,7 +259,6 @@ test "explicit protocol reasoning and limits overrides own their strings" {
     const patch = parsed.value.registry.?.find("p").?.patchFor("custom").?;
     try std.testing.expectEqual(protocol.Protocol.responses, patch.protocol.?);
     try std.testing.expectEqualStrings("high", patch.reasoning_effort.?);
-    try std.testing.expect(parsed.value.limits.low_price_input);
 }
 test "retired round limits are accepted on ingress but never serialized" {
     const a = std.testing.allocator;
@@ -330,8 +327,6 @@ test "positive capabilities and operational limits" {
     }
     c.model.context_tokens = std.math.maxInt(u32);
     c.model.output_tokens = std.math.maxInt(u32);
-    c.model.input_price_threshold = std.math.maxInt(u32);
-    c.model.input_price_flat_limit = std.math.maxInt(u32);
     try validate(c);
     try std.testing.expectEqual(@as(u32, 0), Policy.safetyTokens(2));
     try std.testing.expectEqual(@as(u32, 512), Policy.safetyTokens(4096));

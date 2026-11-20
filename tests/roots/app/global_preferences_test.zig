@@ -20,7 +20,3 @@ fn read(home: []const u8, name: []const u8) ![]const u8 {
     defer store.deinit();
     return try store.root.readBinaryGuarded(a, name, null, null);
 }
-fn toggle(session: *Session, setting: @import("../ui/tui.zig").Connection.Setting, enabled: bool) !void {
-    const connection = session.connection();
-    try connection.setting_fn.?(connection.context, setting, enabled);
-}

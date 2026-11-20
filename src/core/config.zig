@@ -52,19 +52,12 @@ pub const Model = struct {
     /// Known output capability, not a user request cap. Null means unknown.
     output_tokens: ?u32 = null,
     output_source: ReasoningSource = .explicit,
-    /// Exact compatible price-step metadata; never a user declaration or window.
-    input_price_threshold: ?u32 = null,
-    /// Verified range with no context-length price increase; null is unknown.
-    /// This is not a price step or a guarantee about time/cache-based prices.
-    input_price_flat_limit: ?u32 = null,
 
     /// Derived maps/output limits and wire effort live in cache, not config
     /// declarations. The global logical preference is stored separately in Registry.
     /// This prevents a fetched profile becoming an explicit override.
     pub fn persisted(self: Model) Model {
         var result = self;
-        result.input_price_threshold = null;
-        result.input_price_flat_limit = null;
         if (self.output_source == .metadata) result.output_tokens = null;
         if (self.reasoning_source == .metadata) {
             result.reasoning = null;
@@ -75,7 +68,6 @@ pub const Model = struct {
 };
 
 pub const Policy = struct {
-    pub const input_margin_tokens = 5000;
     pub const safety_tokens = 4096;
 
     /// Preserve the normal reserve without excluding smaller verified windows.
@@ -93,9 +85,6 @@ pub const Policy = struct {
 pub const Limits = struct {
     /// 单条命令的默认超时（毫秒）。
     command_timeout_ms: u32 = 300000,
-    /// Enabled by default; explicit false opts out of the first known price step.
-    /// Unknown metadata fails closed before any inference, never guesses 100K.
-    low_price_input: bool = true,
     /// 单次模型请求的超时（毫秒）。
     request_timeout_ms: u32 = 300000,
     /// Disable only automatic compaction; manual /compact and hard preflight remain.
@@ -398,6 +387,11 @@ fn decode(comptime T: type, a: std.mem.Allocator, value: std.json.Value) !T {
         var migrated: std.json.ObjectMap = .{};
         var it = original.iterator();
         while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "low_price_input")) {
+                // Legacy configs may carry this switch, but only as a JSON boolean.
+                if (entry.value_ptr.* != .bool) return error.UnexpectedToken;
+                continue;
+            }
             if (!isRetiredLimit(entry.key_ptr.*)) try migrated.put(a, entry.key_ptr.*, entry.value_ptr.*);
         }
         return std.json.parseFromValueLeaky(T, a, .{ .object = migrated }, json_options);
@@ -815,8 +809,6 @@ pub fn validateModel(model: Model) !void {
         if (tokens == 0) return error.InvalidBudget;
     }
     if (model.context_tokens < 2) return error.InvalidBudget;
-    if (model.input_price_threshold) |tokens| if (tokens == 0) return error.InvalidBudget;
-    if (model.input_price_flat_limit) |tokens| if (tokens == 0) return error.InvalidBudget;
 }
 
 /// Reads only the explicit file; never consults environment variables.

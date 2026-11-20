@@ -19,7 +19,7 @@ const FIRST_FOUR = ['read_file','write_file','bash','memory'];
 // Base capability: image, when selected, stays at index 4. No settings gate
 // adds or removes the optional tools.
 const defaults = {
-  command_timeout_ms:300000, low_price_input:false,
+  command_timeout_ms:300000,
   request_timeout_ms:10000, compaction_enabled:true,
   show_reported_usage:true,
 };

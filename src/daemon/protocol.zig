@@ -49,7 +49,6 @@ pub const ErrorCode = enum {
     input_too_large,
     queue_full,
     queue_empty,
-    input_budget,
     unsupported,
     canceled,
     permission_expired,
@@ -83,7 +82,6 @@ pub fn errorCode(err: anyerror) ErrorCode {
         error.InputTooLarge, error.OutOfMemory => .input_too_large,
         error.InboxFull, error.QueueFull => .queue_full,
         error.QueueEmpty, error.RunSealed => .queue_empty,
-        error.InputBudgetExceeded, error.UnknownInputPriceThreshold => .input_budget,
         error.Unsupported => .unsupported,
         error.Canceled => .canceled,
         error.PermissionExpired, error.InvalidPermission => .permission_expired,
@@ -175,8 +173,6 @@ pub fn failureCode(err: anyerror) []const u8 {
     return switch (err) {
         error.CleanupFailed => "cleanup_failed",
         error.UnsafeToContinue => "unsafe_to_continue",
-        error.InputBudgetExceeded => "input_budget_exceeded",
-        error.UnknownInputPriceThreshold => "unknown_input_price_threshold",
         error.InsufficientCompaction => "insufficient_compaction",
         error.CompactionImpossible => "compaction_impossible",
         error.InvalidSummary => "invalid_summary",
@@ -220,7 +216,6 @@ pub const Op = enum {
     cycle_effort,
     login,
     preference,
-    setting,
     image_model,
     /// Proxy allowlist mutation: one exact provider/raw model id plus an
     /// explicit enable flag. Never carries an endpoint or a credential.

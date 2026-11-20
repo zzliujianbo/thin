@@ -133,7 +133,7 @@ const Fake = struct {
     }
 };
 fn configValue() cfg.Config {
-    return .{ .provider = .{ .base_url = "http://offline.invalid" }, .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    return .{ .provider = .{ .base_url = "http://offline.invalid" }, .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .chat } };
 }
 
 fn enqueueOom(a: std.mem.Allocator) !void {

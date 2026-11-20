@@ -43,7 +43,7 @@ test "models.dev parser keeps catalog IDs, derives SDK protocols, and isolates b
 test "models.dev foreign rows never create presets or fill conflicting exact routes" {
     const a = std.testing.allocator;
     var absent = try parseDirectory(a,
-        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"cost":{"input":1,"output":2},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
+        \\{"foreign":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000,"output":8192},"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high"]}]}}}}
     );
     defer absent.deinit(a);
     try std.testing.expect(absent.find(.opencode_go, "claude-haiku-5-5") == null);
@@ -242,46 +242,6 @@ test "models.dev absent and unknown provider adapters never borrow a protocol" {
 }
 test "models.dev directory allocation failures release parser scratch" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, directoryAllocationCheck, .{});
-}
-test "models.dev complete flat price schedules differ from missing or malformed pricing" {
-    const a = std.testing.allocator;
-    const Case = struct { cost: []const u8, flat: ?u32 = null, step: ?u32 = null };
-    for ([_]Case{
-        .{ .cost = "{\"input\":1,\"output\":2}", .flat = 1000000 },
-        .{ .cost = "{\"input\":0,\"output\":0,\"tiers\":[]}", .flat = 1000000 },
-        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":0.1,\"cache_write\":0.2,\"reasoning\":2,\"input_audio\":3,\"output_audio\":4}", .flat = 1000000 },
-        .{ .cost = "{\"input\":1,\"output\":2,\"context_over_200k\":{\"input\":2,\"output\":3}}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"future_price_schedule\":{}}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":{\"input\":3}}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"cache_read\":0.1,\"cache_read\":0.2}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"cache_read\":0.5,\"tier\":{\"type\":\"context\",\"size\":100000}}]}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"context_over_200k\":{},\"tiers\":[{\"input\":2,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .step = 100000 },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":1,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .flat = 1000000 },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":2,\"output\":2,\"tier\":{\"type\":\"context\",\"size\":100000}}]}", .step = 100000 },
-        .{ .cost = "null" },
-        .{ .cost = "{}" },
-        .{ .cost = "{\"input\":1}" },
-        .{ .cost = "{\"input\":-1,\"output\":2}" },
-        .{ .cost = "{\"input\":1e100001,\"output\":2}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":null}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":2}]}" },
-        .{ .cost = "{\"input\":1,\"output\":2,\"tiers\":[{\"input\":2,\"output\":3,\"tier\":{\"type\":\"future\",\"size\":100000}}]}" },
-    }) |case| {
-        const body = try std.mem.concat(a, u8, &.{ "{\"opencode-go\":{\"npm\":\"@ai-sdk/anthropic\",\"models\":{\"flat\":{\"limit\":{\"context\":1000000},\"cost\":", case.cost, "}}}}" });
-        defer a.free(body);
-        var result = try parseDirectory(a, body);
-        defer result.deinit(a);
-        try std.testing.expectEqual(case.step, result.rows[0].dev_input_price_threshold);
-        try std.testing.expectEqual(case.flat, result.rows[0].dev_input_price_flat_limit);
-    }
-    var incomplete = try parseDirectory(a,
-        \\{"opencode-go":{"models":{"flat":{"limit":{"context":1000000},"cost":{"input":1,"output":2}}}},"opencode":{"npm":"@ai-sdk/openai","models":{"flat":{"cost":{"input":1,"output":2}}}}}
-    );
-    defer incomplete.deinit(a);
-    for (incomplete.rows[0..incomplete.count]) |row| {
-        try std.testing.expect(row.dev_input_price_threshold == null);
-        try std.testing.expect(row.dev_input_price_flat_limit == null);
-    }
 }
 test "models.dev malformed options and explicit invalid adapters are model-local unknowns" {
     const body =

@@ -50,46 +50,6 @@ test "provider reasoning source resolver uses official and preserves manual over
     try std.testing.expectEqualStrings("user-high", selection.model.reasoning.?.map.high.?);
     try std.testing.expectEqual(cfg.ReasoningSource.explicit, selection.model.reasoning_source);
 }
-test "price proof resolves exact direct flat routes and clears on proxy protocol or raw ID changes" {
-    const a = std.testing.allocator;
-    var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"ds/deepseek-flash","providers":{"ds":{"base_url":"https://api.deepseek.com","models":{"deepseek-flash":{"protocol":"chat","context_tokens":2000000},"deepseek-flash-future":{"protocol":"chat","context_tokens":2000000}}},"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","models":{"deepseek-flash":{"protocol":"chat","context_tokens":2000000}}}}}}
-    );
-    defer cfg.release(&parsed);
-    var cache: metadata.Cache = .{};
-    defer cache.deinit(std.testing.allocator);
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const flat = try resolve(arena.allocator(), parsed.value, &cache, "ds", "deepseek-flash", false);
-    try std.testing.expectEqual(@as(u32, 2000000), flat.model.context_tokens);
-    try std.testing.expectEqual(@as(?u32, 1000000), flat.model.input_price_flat_limit);
-    try std.testing.expect(flat.model.input_price_threshold == null);
-    const proxy = try resolve(arena.allocator(), parsed.value, &cache, "proxy", "deepseek-flash", false);
-    try std.testing.expect(proxy.model.input_price_flat_limit == null);
-    const future = try resolve(arena.allocator(), parsed.value, &cache, "ds", "deepseek-flash-future", false);
-    try std.testing.expect(future.model.input_price_flat_limit == null);
-    var candidate = parsed.value;
-    candidate.provider = flat.connection;
-    candidate.model = flat.model;
-    candidate.model.protocol = .responses;
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expect(candidate.model.input_price_flat_limit == null);
-    const row = try cache.directory.upsert(std.testing.allocator, .deepseek, "deepseek-flash");
-    row.dev_protocol = .chat;
-    row.dev_input_price_threshold = 100000;
-    candidate.model = flat.model;
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expectEqual(@as(?u32, 100000), candidate.model.input_price_threshold);
-    try std.testing.expect(candidate.model.input_price_flat_limit == null);
-    row.dev_input_price_threshold = null;
-    row.dev_input_price_flat_limit = 500000;
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expectEqual(@as(?u32, 500000), candidate.model.input_price_flat_limit);
-    candidate.provider = proxy.connection;
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expect(candidate.model.input_price_flat_limit == null);
-    try std.testing.expect(candidate.model.input_price_threshold == null);
-}
 test "registry resolution merges fields but never borrows identity from a custom endpoint" {
     const a = std.testing.allocator;
     var parsed = try cfg.parse(a,
@@ -104,7 +64,6 @@ test "registry resolution merges fields but never borrows identity from a custom
     row.tokens = 1000000;
     row.dev_protocol = .responses;
     row.dev_output_tokens = 128000;
-    row.dev_input_price_threshold = 200000;
     cache.directory_mask = metadata.bit(.opencode_go);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -112,21 +71,6 @@ test "registry resolution merges fields but never borrows identity from a custom
     try std.testing.expectEqual(@as(u32, 200000), selected.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 128000), selected.model.output_tokens);
     try std.testing.expectEqual(.responses, selected.model.protocol);
-    try std.testing.expectEqual(@as(?u32, 200000), selected.model.input_price_threshold);
-    var candidate = parsed.value;
-    candidate.provider = selected.connection;
-    candidate.model = selected.model;
-    candidate.model.protocol = .chat;
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expectEqual(@as(?u32, null), candidate.model.input_price_threshold);
-    candidate.model = selected.model;
-    candidate.model.name = "other";
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expectEqual(@as(?u32, null), candidate.model.input_price_threshold);
-    candidate.model = selected.model;
-    candidate.provider = parsed.value.registry.?.find("custom").?.connection;
-    applyInputThreshold(&cache, &candidate);
-    try std.testing.expectEqual(@as(?u32, null), candidate.model.input_price_threshold);
     try std.testing.expect(!selected.context_official);
     try std.testing.expectError(error.UnknownModelProtocol, resolve(arena.allocator(), parsed.value, &cache, "custom", "shared", false));
     // Mutating cache ownership cannot poison an exported candidate.

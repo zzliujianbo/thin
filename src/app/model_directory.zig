@@ -60,10 +60,6 @@ pub const Record = struct {
     dev_output_tokens: ?u32 = null,
     /// Exact models.dev limit.context; never an official window.
     dev_context_tokens: ?u32 = null,
-    /// Earliest exact-route public context price increase; not a context window.
-    dev_input_price_threshold: ?u32 = null,
-    /// Verified span with no context input-price increase; not inferred from absence.
-    dev_input_price_flat_limit: ?u32 = null,
     available: ?bool = null,
     /// Null means input modalities were not advertised or were malformed.
     input_image: ?bool = null,

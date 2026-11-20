@@ -42,7 +42,6 @@ test "session resolves the registry default from the exact cached directory with
     row.tokens = 1000000;
     row.dev_protocol = .responses;
     row.dev_output_tokens = 128000;
-    row.dev_input_price_threshold = 200000;
     row.dev_present = true;
     listing.directory_mask = metadata.bit(.opencode_go);
     listing.dev_done = true;
@@ -55,18 +54,13 @@ test "session resolves the registry default from the exact cached directory with
     try std.testing.expectEqual(@as(u32, 1000000), app.config.value.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 128000), app.config.value.model.output_tokens);
     try std.testing.expectEqual(.metadata, app.config.value.model.output_source);
-    try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.config.value.registry.?.providers[0].models.len);
     try std.testing.expect(app.environment.get("FAKE_GO_KEY") == null);
     const saved = try app.runtime.exportCheckpoint();
-    // Loading history must not be rejected by a changed input policy; current
-    // capabilities still govern any subsequent send.
-    app.config.value.limits.low_price_input = false;
+    // Restoring history must not roll back the current context window.
     app.config.value.model.context_tokens = 100000;
     try app.runtime.restoreCheckpoint(saved);
-    try std.testing.expect(!app.runtime.config.limits.low_price_input);
     try std.testing.expectEqual(@as(u32, 100000), app.runtime.config.model.context_tokens);
-    try std.testing.expectEqual(@as(?u32, 200000), app.config.value.model.input_price_threshold);
     try std.testing.expectEqual(@as(usize, 0), app.runtime.messages().len);
 }
 test "unknown registry default leaves the session pending without changing settings or selecting another model" {

@@ -212,7 +212,7 @@ test "owned assistant blocks retain canonical text" {
     try std.testing.expect(!item.display_truncated);
 }
 test "wire failure codes round-trip the details the local TUI classifies" {
-    for ([_]anyerror{ error.CleanupFailed, error.UnsafeToContinue, error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.NoCompactionCandidate }) |err| {
+    for ([_]anyerror{ error.CleanupFailed, error.UnsafeToContinue, error.InsufficientCompaction, error.NoCompactionCandidate }) |err| {
         const code = Failure.fromError(err);
         try std.testing.expectEqual(err, code.toError().?);
     }

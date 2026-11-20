@@ -33,7 +33,6 @@ test "HTTP proxy exact alias routing owned clone and sparse roundtrip" {
     try t.expectEqualStrings("https://fixture.invalid/v1", disk.value.provider.base_url);
     try t.expectEqualStrings("other/new/raw/id", disk.value.registry.?.default);
     try t.expectEqualStrings("p/vendor/raw/id", p.value.registry.?.default);
-    try t.expectEqual(@as(?u32, null), disk.value.model.input_price_threshold);
     for ([_][]const u8{ "}", ",\"proxy\":null}" }) |suffix| {
         const bytes = try std.mem.concat(a, u8, &.{ proxy_prefix, suffix });
         defer a.free(bytes);
@@ -283,14 +282,14 @@ test "global reasoning preference setter owns rejects aliases and preserves decl
     try t.expectError(error.MissingRegistry, cfg.setRegistryReasoningEffort(a, &runtime, "high"));
 
     // Disk authority remains manual patches, never active metadata.
-    copy.value.model = .{ .name = "metadata-only", .context_tokens = 100000, .protocol = .responses, .reasoning_effort = "high", .reasoning = .{ .map = .{ .high = "metadata-wire" } }, .reasoning_source = .metadata, .output_tokens = 9999, .output_source = .metadata, .input_price_threshold = 50000, .input_price_flat_limit = 90000 };
+    copy.value.model = .{ .name = "metadata-only", .context_tokens = 100000, .protocol = .responses, .reasoning_effort = "high", .reasoning = .{ .map = .{ .high = "metadata-wire" } }, .reasoning_source = .metadata, .output_tokens = 9999, .output_source = .metadata };
     const persisted = copy.value.model.persisted();
     try t.expect(persisted.reasoning == null and persisted.reasoning_effort == null);
-    try t.expect(persisted.output_tokens == null and persisted.input_price_threshold == null and persisted.input_price_flat_limit == null);
+    try t.expect(persisted.output_tokens == null);
     var out: std.Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
     try cfg.writeDisk(copy.value, &out.writer);
-    for ([_][]const u8{ "metadata-only", "metadata-wire", "9999", "input_price_threshold", "input_price_flat_limit" }) |forbidden| {
+    for ([_][]const u8{ "metadata-only", "metadata-wire", "9999" }) |forbidden| {
         try t.expect(std.mem.find(u8, out.written(), forbidden) == null);
     }
     var disk = try cfg.parse(t.allocator, out.written());

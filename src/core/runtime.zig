@@ -170,12 +170,9 @@ pub const Terminal = struct {
 /// Only the owner calls contextSnapshot while running; consumers get values.
 pub const ContextSnapshot = struct { tokens: u64, limit: u64, known: bool = true, estimated: u64 = 0 };
 
-pub fn inputBudgetPause(detail: ?anyerror) bool {
-    const err = detail orelse return false;
-    // Compaction-only errors belong here too: the run stopped because of the
-    // input policy, not because the conversation itself failed.
-    return switch (err) {
-        error.InputBudgetExceeded, error.UnknownInputPriceThreshold => true,
+/// Preserve the user's input after a summary failed; physical overflow is a failure.
+pub fn compactionPause(detail: ?anyerror) bool {
+    return switch (detail orelse return false) {
         error.InsufficientCompaction, error.InvalidSummary, error.SummaryRequestedTool, error.SummaryFailed => true,
         else => false,
     };
@@ -713,10 +710,6 @@ pub const Runtime = struct {
             .output_tokens = self.config.model.output_tokens,
             .output_source = self.config.model.output_source,
             .output_budget_frozen = true,
-            .input_budget_frozen = true,
-            .input_price_threshold = self.config.model.input_price_threshold,
-            .input_price_flat_limit = self.config.model.input_price_flat_limit,
-            .low_price_input = self.config.limits.low_price_input,
             .permission_id = self.permission_id,
             .tool_stats = if (self.tool_stats.items.len == 0) null else self.tool_stats.items,
         };
@@ -951,7 +944,7 @@ pub const Runtime = struct {
             .command => |text| self.commandInner(text, cancel, &task),
         };
         result catch |err| {
-            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or inputBudgetPause(err)) .paused else .failed;
+            task.terminal.status = if (self.poisoned) .failed else if (err == error.Canceled) .canceled else if (err == error.RoundLimit or err == error.OutputLimitReached or compactionPause(err)) .paused else .failed;
             task.terminal.detail = err;
             if (err == error.OutputLimitReached) task.terminal.model_failure = .output_limit;
         };
@@ -1066,16 +1059,13 @@ pub const Runtime = struct {
             // failure that never happened.
             if (err == error.CompactionImpossible) {
                 try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
-                return context.inputBudgetError(self.config.*);
+                return error.ContextTooLarge;
             }
             if (err == error.NoCompactionCandidate) {
-                const normal_budget = context.inputBudget(self.config.*);
-                const budget = if (normal_budget != 0) normal_budget else context.inputBudgetFor(self.config.*, .summary);
-                if (self.estimatedTokens() > budget) {
-                    const exceeded = context.inputBudgetError(self.config.*);
+                context.checkInput(self.config.*, self.estimatedTokens()) catch |exceeded| {
                     try self.emit(.{ .compaction_failed = .{ .err = exceeded } }, cancel);
                     return exceeded;
-                }
+                };
                 try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
                 return;
             }
@@ -1420,7 +1410,7 @@ pub const Runtime = struct {
             const raw = self.preflight(cancel, task) catch |err| {
                 // A bounded pause retains the accepted goal, including a paid
                 // summary that exhausted its output before normal inference.
-                if (err == error.RoundLimit or err == error.OutputLimitReached or inputBudgetPause(err)) try self.retainCurrentInput(&input_retained);
+                if (err == error.RoundLimit or err == error.OutputLimitReached or compactionPause(err)) try self.retainCurrentInput(&input_retained);
                 return err;
             };
             try checkCanceled(cancel);
@@ -1530,7 +1520,7 @@ pub const Runtime = struct {
         // A normal request is measured from the last real prompt plus its
         // growth; the pure estimate stays as the fallback when no usage is known.
         const measured = if (req.purpose == .normal) self.anchoredTokens(estimated) else estimated;
-        try context.checkInputFor(self.config.*, req.purpose, measured);
+        try context.checkInput(self.config.*, measured);
         // Display-only work must not alter Selector observation/fallback/accounting.
         if (req.purpose != .normal) return self.callModel(a, send_req, sink);
         var uncanceled: p.Cancellation = .{};
@@ -1712,13 +1702,12 @@ pub const Runtime = struct {
     /// 发起模型调用前检查上下文是否超过压缩阈值，超过则尝试压缩。
     /// Return the raw count of the history that survived preflight, not a send authorization.
     fn preflight(self: *Runtime, cancel: *p.Cancellation, task: *Task) !usize {
-        try context.validateInputPolicy(self.config.*);
         const budget = context.inputBudget(self.config.*);
         const raw = self.rawInputTokens();
         const estimated = self.estimator.tokens(raw);
         const measured = self.anchoredTokens(estimated);
         if (!self.config.limits.compaction_enabled) {
-            if (measured > budget) return context.inputBudgetError(self.config.*);
+            try context.checkInput(self.config.*, measured);
             return raw;
         }
         // Below the soft trigger and inside the hard budget: nothing to do.
@@ -1734,7 +1723,7 @@ pub const Runtime = struct {
                 }
                 return raw;
             },
-            .over_budget => return context.inputBudgetError(self.config.*),
+            .over_budget => return error.ContextTooLarge,
             .attempt => {},
         }
         // Publish the measure that decided this compaction. The displayed value
@@ -1758,7 +1747,7 @@ pub const Runtime = struct {
             // the shortest retained tail already exceeds the budget. No summary
             // text could have been accepted, so report the budget itself rather
             // than a failure of a request that never happened.
-            if (err == error.CompactionImpossible) return context.inputBudgetError(self.config.*);
+            if (err == error.CompactionImpossible) return error.ContextTooLarge;
             if (task.summary_attempts != attempts) {
                 // A failed paid compaction must not fall through to normal
                 // inference or another automatic summary.
@@ -1787,7 +1776,7 @@ pub const Runtime = struct {
             try self.emit(.{ .compaction_failed = .{ .err = err } }, cancel);
             // Failed compaction never mutates the old history. It may continue
             // only if that old input still fits the hard input budget.
-            if (current > budget) return context.inputBudgetError(self.config.*);
+            try context.checkInput(self.config.*, current);
             self.failed_auto_summary = null;
             return raw;
         };
@@ -1802,13 +1791,6 @@ pub const Runtime = struct {
 
     fn compact(self: *Runtime, cancel: *p.Cancellation, task: *Task, planning: CompactionPlanning) !void {
         try checkCanceled(cancel);
-        // Manual summary may repair history despite unknown price metadata, but
-        // it never authorizes a subsequent normal request.
-        context.validateInputPolicy(self.config.*) catch |err| {
-            if (planning != .manual or err != error.UnknownInputPriceThreshold) return err;
-        };
-        const normal_budget = context.inputBudget(self.config.*);
-        const commit_budget = if (normal_budget != 0) normal_budget else context.inputBudgetFor(self.config.*, .summary);
         const previous_context = self.last_context_tokens;
         const previous_history = self.history.items.ptr;
         defer if (self.history.items.ptr == previous_history) {
@@ -1836,9 +1818,9 @@ pub const Runtime = struct {
         // fixed prompt plus the shortest retained tail is a lower bound for any
         // result. Proving it already exceeds the budget saves a paid summary on
         // history that can never be compacted below the limit, such as one huge
-        // retained tool result or a price tier the retained part already crosses.
+        // retained tool result.
         if (selection.minimum_tokens) |floor| {
-            if (floor > commit_budget) return error.CompactionImpossible;
+            if (floor > context.inputBudget(self.config.*)) return error.CompactionImpossible;
         }
         const instruction = try context.summaryInstruction(a, selection, planning_messages);
         const view = try context.summaryView(a, selection, planning_messages);
@@ -1859,7 +1841,7 @@ pub const Runtime = struct {
         // inference attempt. Input/protocol rejection is not a paid summary
         // failure and must preserve its explicit error and recovery semantics.
         summary_request.codec = try cfg.wireCodec(effective, summary_request.scope.protocol);
-        try context.checkInputFor(effective, .summary, self.estimator.tokens(raw));
+        try context.checkInput(effective, self.estimator.tokens(raw));
         try @import("checkpoint.zig").validateRequestHistory(a, summary_request);
 
         // Compaction is not a user-facing model round. Failed and successful
@@ -1878,11 +1860,9 @@ pub const Runtime = struct {
         const response = switch (result.outcome) {
             .success => |r| r,
             .failure => |f| {
-                if (self.config.limits.low_price_input) {
-                    task.terminal.model_failure = f.kind;
-                    task.terminal.http_status = f.http_status;
-                    task.terminal.setFailureText(f.message);
-                }
+                task.terminal.model_failure = f.kind;
+                task.terminal.http_status = f.http_status;
+                task.terminal.setFailureText(f.message);
                 return switch (f.kind) {
                     .canceled => error.Canceled,
                     .output_limit => error.OutputLimitReached,

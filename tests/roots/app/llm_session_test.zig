@@ -17,25 +17,19 @@ fn save(home: []const u8, text: []const u8) !void {
     try store.root.writeMode(cfg.file_name, text, false, 0o600);
 }
 
-fn expectInactiveHistoryWithoutLowPriceMarker(session: *Session, read_only: bool) !void {
-    const context = @import("../core/context.zig");
+fn expectInactiveHistory(session: *Session, read_only: bool) !void {
     try std.testing.expect(session.app == null and session.read_only == read_only);
     const config = &session.pending.?.value;
     try std.testing.expect(!config.selection_pending);
-    try std.testing.expectEqual(@as(?u32, 20000), config.model.input_price_threshold);
-    const budget = context.inputBudget(config.*);
     const connection = session.connection();
     const state = connection.current();
-    try std.testing.expect(state.runtime == null and !state.low_price_input);
-    try std.testing.expect(state.low_price_input_enabled and config.limits.low_price_input);
+    try std.testing.expect(state.runtime == null);
     try std.testing.expectEqual(@as(u32, 65536), state.context_limit);
     try std.testing.expectEqual(@as(u64, 65536), state.initial_context.?.limit);
-    try std.testing.expectEqual(budget, context.inputBudget(config.*));
-    try context.validateInputPolicy(config.*);
     const history = connection.initial_history_fn.?(connection.context);
     try std.testing.expectEqual(@as(usize, 2), history.len);
-    try std.testing.expectEqualStrings("owned marker history", history[0].blocks[0].text);
-    try std.testing.expectEqualStrings("owned marker answer", history[1].blocks[0].text);
+    try std.testing.expectEqualStrings("owned history", history[0].blocks[0].text);
+    try std.testing.expectEqualStrings("owned answer", history[1].blocks[0].text);
 }
 
 const PublicationFetch = struct {

@@ -171,31 +171,6 @@ pub fn outputFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
     return rowOutput(cache.directory.rows[index], entry.model.protocol);
 }
 
-/// Independent low-price input policy capability, using the same exact raw ID
-/// and concrete-route compatibility checks as outputFor. Never votes or aliases.
-pub fn inputPriceThresholdFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
-    if (entry.provider == .openai_codex) return null;
-    const index = cache.directory.find(entry.provider, entry.model.name) orelse return null;
-    const row = cache.directory.rows[index];
-    const api = entry.model.protocol;
-    if (!compatibleRoute(row, api)) return null;
-    if (row.dev_protocol != api) return null;
-    return validContext(row.dev_input_price_threshold);
-}
-
-/// Verified flat span on the exact concrete route. A compatible tier threshold
-/// always takes precedence; absence of a threshold is not evidence of flat cost.
-pub fn inputPriceFlatLimitFor(cache: *const Cache, entry: catalog.Entry) ?u32 {
-    if (entry.provider == .openai_codex) return null;
-    const index = cache.directory.find(entry.provider, entry.model.name) orelse return null;
-    const row = cache.directory.rows[index];
-    const api = entry.model.protocol;
-    if (!compatibleRoute(row, api)) return null;
-    if (row.dev_protocol != api) return null;
-    if (validContext(row.dev_input_price_threshold) != null) return null;
-    return validContext(row.dev_input_price_flat_limit);
-}
-
 /// Shared cache-only resolver. Session owns freezing an accepted task's budget.
 pub fn applyOutput(cache: *const Cache, config: *cfg.Config) void {
     if (config.model.output_source == .explicit and config.model.output_tokens != null) return;
@@ -286,8 +261,6 @@ pub fn mergeOfficial(a: std.mem.Allocator, target: *Listing, source: *const List
             dest.dev_reasoning = previous.dev_reasoning;
             dest.dev_output_tokens = previous.dev_output_tokens;
             dest.dev_context_tokens = previous.dev_context_tokens;
-            dest.dev_input_price_threshold = previous.dev_input_price_threshold;
-            dest.dev_input_price_flat_limit = previous.dev_input_price_flat_limit;
             dest.dev_present = previous.dev_present;
         }
     }
@@ -305,8 +278,6 @@ pub fn mergeDev(a: std.mem.Allocator, target: *Listing, source: *const Listing) 
         row.dev_reasoning = null;
         row.dev_output_tokens = null;
         row.dev_context_tokens = null;
-        row.dev_input_price_threshold = null;
-        row.dev_input_price_flat_limit = null;
         row.dev_present = false;
     }
     for (source.directory.rows[0..source.directory.count], 0..) |source_row, index| {
@@ -316,8 +287,6 @@ pub fn mergeDev(a: std.mem.Allocator, target: *Listing, source: *const Listing) 
         row.dev_reasoning = source_row.dev_reasoning;
         row.dev_output_tokens = source_row.dev_output_tokens;
         row.dev_context_tokens = source_row.dev_context_tokens;
-        row.dev_input_price_threshold = source_row.dev_input_price_threshold;
-        row.dev_input_price_flat_limit = source_row.dev_input_price_flat_limit;
         row.dev_present = true;
     }
     target.directory.deinit(a);
@@ -676,8 +645,6 @@ const ModelRecord = struct {
     output_tokens: ?u32 = null,
     dev_output_tokens: ?u32 = null,
     dev_context_tokens: ?u32 = null,
-    dev_input_price_threshold: ?u32 = null,
-    dev_input_price_flat_limit: ?u32 = null,
     available: ?bool = null,
     input_image: ?bool = null,
     default_reasoning: ?activity.ReasoningEffort = null,
@@ -733,7 +700,7 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
 
 /// Only current-schema data loads; older schemas are rebuilt by a refresh
 /// claim, while future and malformed documents stay rejected.
-pub const cache_version: u32 = 16;
+pub const cache_version: u32 = 17;
 
 const Document = struct {
     version: u32 = cache_version,
@@ -780,7 +747,7 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             if (raw.value.object.get("models")) |models| {
                 if (models == .array) for (models.array.items) |model| {
                     if (model != .object) return error.InvalidMetadata;
-                    for ([_][]const u8{ "context_window", "dev_context_tokens", "dev_input_price_threshold", "dev_input_price_flat_limit" }) |key| {
+                    for ([_][]const u8{ "context_window", "dev_context_tokens" }) |key| {
                         if (model.object.get(key)) |value| switch (value) {
                             .null => {},
                             .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
@@ -811,8 +778,6 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
         const row = try result.directory.upsert(a, record.provider, record.id);
         row.tokens = record.context_window;
         row.dev_context_tokens = record.dev_context_tokens;
-        row.dev_input_price_threshold = record.dev_input_price_threshold;
-        row.dev_input_price_flat_limit = record.dev_input_price_flat_limit;
         if (record.output_tokens != null and validOutput(record.output_tokens) == null) return error.InvalidMetadata;
         if (record.dev_output_tokens != null and validOutput(record.dev_output_tokens) == null) return error.InvalidMetadata;
         row.output_tokens = record.output_tokens;
@@ -872,8 +837,6 @@ fn save(root: *fs.Root, cache: Cache) !void {
         if (row.default_reasoning == .unknown or row.default_reasoning == .unspecified) return error.InvalidMetadata;
         if (row.tokens != null and validContext(row.tokens) == null) return error.InvalidMetadata;
         if (row.dev_context_tokens != null and validContext(row.dev_context_tokens) == null) return error.InvalidMetadata;
-        if (row.dev_input_price_threshold != null and validContext(row.dev_input_price_threshold) == null) return error.InvalidMetadata;
-        if (row.dev_input_price_flat_limit != null and validContext(row.dev_input_price_flat_limit) == null) return error.InvalidMetadata;
         if (row.output_tokens != null and validOutput(row.output_tokens) == null) return error.InvalidMetadata;
         if (row.dev_output_tokens != null and validOutput(row.dev_output_tokens) == null) return error.InvalidMetadata;
     }
@@ -886,8 +849,6 @@ fn save(root: *fs.Root, cache: Cache) !void {
         .output_tokens = row.output_tokens,
         .dev_output_tokens = row.dev_output_tokens,
         .dev_context_tokens = row.dev_context_tokens,
-        .dev_input_price_threshold = row.dev_input_price_threshold,
-        .dev_input_price_flat_limit = row.dev_input_price_flat_limit,
         .available = row.available,
         .input_image = row.input_image,
         .default_reasoning = row.default_reasoning,
@@ -997,8 +958,6 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
             row.dev_reasoning = null;
             row.dev_output_tokens = null;
             row.dev_context_tokens = null;
-            row.dev_input_price_threshold = null;
-            row.dev_input_price_flat_limit = null;
             row.dev_present = false;
         }
     }
@@ -1020,8 +979,6 @@ fn commitLocked(root: *fs.Root, previous: Cache, succeeded: u8, listing: Listing
             row.dev_reasoning = source.dev_reasoning;
             row.dev_output_tokens = source.dev_output_tokens;
             row.dev_context_tokens = source.dev_context_tokens;
-            row.dev_input_price_threshold = source.dev_input_price_threshold;
-            row.dev_input_price_flat_limit = source.dev_input_price_flat_limit;
             row.dev_present = true;
         }
     }

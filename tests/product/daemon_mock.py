@@ -143,15 +143,15 @@ SERVICE_MARKER = 'daemon-svc.marker'
 # ---------------------------------------------------------------------------
 
 # Real idle composer decorations, as rendered by src/ui/presentation.zig's
-# `prompt()`: `> ` with no model selected, and `(model) 0.0%> ` /
-# `(model) L1.6%> ` / `(model) high> ` / `0.0%> ` once one is. The slot in front
+# `prompt()`: `> ` with no model selected, and `(model)0.0%> ` /
+# `(model)high> ` / `0.0%> ` once one is. The slot in front
 # of the marker is a transient effort-confirmation level name or the retained
-# context (`?%`, `>100%`, `N.N%`), optionally prefixed by the low-price `L`.
+# context (`?%`, `>100%`, `N.N%`).
 # The busy marker replaces the `>` with the non-ASCII activity spinner, which
 # this bounded VT subset never stores, so a busy composer can never reach the
 # same shape.
-_VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
-               r'xhigh|max|\?))')
+_VALUE_SLOT = (r'(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
+               r'xhigh|max|\?)')
 _IDLE_COMPOSER = re.compile(
     r'^(?:> |(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?> )$')
 
@@ -633,7 +633,6 @@ def assert_screen_idle_contract():
     # Floating tail: the composer row is written above the physical bottom.
     assert state(['(fixture-model)0.0%> '], 0).idle(), 'floating configured composer'
     assert state(['> '], 0).idle(), 'floating unconfigured composer'
-    assert state(['(fixture-model)L1.6%> '], 0).idle(), 'low-price composer'
     assert state(['(fixture-model)high> '], 0).idle(), 'effort confirmation composer'
     # Bottom placement keeps working.
     assert state([''] * 7 + ['(fixture-model)0.0%> '], 7).idle(), 'bottom composer'
@@ -654,7 +653,7 @@ def write_config(home, url, limits=None):
     path = Path(home) / '.thin' / 'config.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     base_limits = {
-        'low_price_input': False, 'request_timeout_ms': 60000,
+        'request_timeout_ms': 60000,
         'command_timeout_ms': 10000,
     }
     config = {

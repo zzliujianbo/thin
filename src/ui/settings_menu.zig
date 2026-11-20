@@ -7,14 +7,13 @@ const cfg = @import("../core/config.zig");
 pub const Key = @import("../core/settings.zig").Key;
 pub const Menu = provider.Picker;
 pub const labels = [_][]const u8{
-    "Low-price input", "Auto compaction", "Command timeout", "Request timeout",
+    "Auto compaction", "Command timeout", "Request timeout",
     "Image model",     "Proxy",           "Reported usage",
 };
 /// Bounded endpoint text buffer: host/port, [IPv6]:port or a borrowed address.
 pub const endpoint_buffer_bytes = cfg.max_proxy_endpoint_bytes + 8;
 pub const count = labels.len;
 pub const Snapshot = struct {
-    low_price_input_enabled: bool = true,
     image_enabled: bool = false,
     image_model: ?[]const u8 = null,
     /// Owner-published proxy host/port state; never inferred from the model list.
@@ -28,10 +27,10 @@ pub const Snapshot = struct {
 };
 pub fn preferenceKey(selected: usize) ?Key {
     return switch (selected) {
-        1 => .compaction_enabled,
-        2 => .command_timeout_ms,
-        3 => .request_timeout_ms,
-        6 => .show_reported_usage,
+        0 => .compaction_enabled,
+        1 => .command_timeout_ms,
+        2 => .request_timeout_ms,
+        5 => .show_reported_usage,
         else => null,
     };
 }
@@ -49,25 +48,23 @@ pub fn formatEndpoint(buffer: *[endpoint_buffer_bytes]u8, state: Snapshot) ![]co
 /// Borrowed display values; rows renders exact copied numeric values, with units.
 pub fn value(state: Snapshot, selected: usize) []const u8 {
     return switch (selected) {
-        0 => if (state.low_price_input_enabled) "on" else "off",
-        4 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
+        0 => if (state.limits.compaction_enabled) "on" else "off",
+        1, 2 => "s",
+        3 => if (!state.image_enabled) "Off" else state.image_model orelse "Not set",
         // rows formats the exact endpoint text; empty means "formatted there".
-        5 => if (state.proxy_address == null) "Not configured" else "",
-        1 => if (state.limits.compaction_enabled) "on" else "off",
-        6 => if (state.limits.show_reported_usage) "on" else "off",
-        2, 3 => "s",
+        4 => if (state.proxy_address == null) "Not configured" else "",
+        5 => if (state.limits.show_reported_usage) "on" else "off",
         else => "",
     };
 }
 pub fn description(selected: usize) []const u8 {
     return switch (selected) {
-        0 => "Protect input from price surcharges; unknown pricing pauses. Flat pricing: no L.",
-        1 => "Automatic compaction only; manual /compact and hard preflight remain available.",
-        2 => "Command timeout in s (up to 3 decimals).",
-        3 => "All inference requests in s (up to 3 decimals).",
-        4 => "Read images through a separate helper returning text. Off unless explicitly selected.",
-        5 => "Configure the proxy address and exact model routes. A new session applies it.",
-        6 => "Show the provider-reported usage inside the model parentheses.",
+        0 => "Automatic compaction only; manual /compact and hard preflight remain available.",
+        1 => "Command timeout in s (up to 3 decimals).",
+        2 => "All inference requests in s (up to 3 decimals).",
+        3 => "Read images through a separate helper returning text. Off unless explicitly selected.",
+        4 => "Configure the proxy address and exact model routes. A new session applies it.",
+        5 => "Show the provider-reported usage inside the model parentheses.",
         else => "",
     };
 }
@@ -78,8 +75,8 @@ pub const Rows = struct {
 };
 fn renderedValue(state: Snapshot, selected: usize, buffer: *[32]u8) ![]const u8 {
     return switch (selected) {
-        2 => try time.format(buffer, state.limits.command_timeout_ms),
-        3 => try time.format(buffer, state.limits.request_timeout_ms),
+        1 => try time.format(buffer, state.limits.command_timeout_ms),
+        2 => try time.format(buffer, state.limits.request_timeout_ms),
         else => value(state, selected),
     };
 }
@@ -100,13 +97,13 @@ pub fn rows(a: std.mem.Allocator, menu: Menu, state: Snapshot, columns: usize, m
     for (start..start + visible) |index| {
         var buffer: [32]u8 = undefined;
         var endpoint: [endpoint_buffer_bytes]u8 = undefined;
-        const v = if (index == 5) try formatEndpoint(&endpoint, state) else try renderedValue(state, index, &buffer);
+        const v = if (index == 4) try formatEndpoint(&endpoint, state) else try renderedValue(state, index, &buffer);
         const gap = label_width - text.width(label(index));
         const raw = try std.fmt.allocPrint(a, "{s}{s}{s}  {s}", .{ if (index == selected) "> " else "  ", label(index), padding[0..gap], v });
         defer a.free(raw);
         // Image/Proxy only open a submenu; their current value is not being
         // saved. All saving root rows keep the full check.
-        if (index == selected) complete = if (index == 4 or index == 5)
+        if (index == selected) complete = if (index == 3 or index == 4)
             2 + text.width(label(index)) <= columns
         else
             text.width(raw) <= columns;

@@ -186,7 +186,7 @@ async function run(mode) {
     const config = JSON.stringify({
 
       llm:{default:'owned/fixture-model',providers:{owned:{base_url:url,api_key_env:'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol:'chat',context_tokens:65536}}}}},
-      limits:{low_price_input:false,request_timeout_ms:30000,command_timeout_ms:45000},
+      limits:{request_timeout_ms:30000,command_timeout_ms:45000},
     },null,2)+'\n';
     const configPath = join(home,'.thin/config.json'); await writeFile(configPath,config,{mode:0o600});
     child = spawn(pty,[],{cwd:project,detached:true,stdio:['ignore','pipe','pipe'],env:{

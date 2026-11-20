@@ -1,7 +1,7 @@
 test "bold prompt preserves every color and resets before the editor at every width" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "", "模型-name" }) |model| for ([_]usize{ 1, 7, 12, 80 }) |columns| for ([_]bool{ false, true }) |busy| for ([_]?shared.ReasoningEffort{ null, .high }) |flash| {
-        const motion: PromptActivity = .{ .busy = busy, .now_ms = 120, .phase = 7, .reasoning_effort = .high, .low_price_input = true, .effort_flash = flash };
+        const motion: PromptActivity = .{ .busy = busy, .now_ms = 120, .phase = 7, .reasoning_effort = .high, .effort_flash = flash };
         const rendered = try prompt(a, model, .{ .tokens = 25, .limit = 100 }, columns, motion);
         defer rendered.deinit(a);
         const layout = try promptLayout(a, model, .{ .tokens = 25, .limit = 100 }, columns, motion);
@@ -29,9 +29,9 @@ test "bold prompt preserves every color and resets before the editor at every wi
         try std.testing.expect(!bold);
     };
 }
-test "unselected model prompt shows no preset ID policy marker or percentage" {
+test "unselected model prompt shows no preset ID or percentage" {
     for ([_]usize{ 1, 12, 80 }) |columns| {
-        const rendered = try prompt(std.testing.allocator, "", .{ .tokens = 0, .limit = 1000000 }, columns, .{ .low_price_input = true });
+        const rendered = try prompt(std.testing.allocator, "", .{ .tokens = 0, .limit = 1000000 }, columns, .{});
         defer rendered.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("> ", rendered.plain);
         try expectPromptStyle("> ", rendered.styled);
@@ -383,64 +383,52 @@ test "context percent thresholds follow displayed rounding without animation or 
         }
     }
 }
-test "low price marker shares the full static context color and optout removes it" {
+test "reported usage stays muted at every occupancy and phase" {
     const a = std.testing.allocator;
-    const cases = [_]struct { snapshot: ?shared.ContextSnapshot, label: []const u8, color: []const u8 }{
-        .{ .snapshot = null, .label = "?%", .color = theme.reset },
-        .{ .snapshot = .{ .tokens = 10, .limit = 100, .known = false }, .label = "?%", .color = theme.reset },
-        .{ .snapshot = .{ .tokens = 0, .limit = 100 }, .label = "0.0%", .color = theme.success },
-        .{ .snapshot = .{ .tokens = 24949, .limit = 100000 }, .label = "24.9%", .color = theme.success },
-        .{ .snapshot = .{ .tokens = 24950, .limit = 100000 }, .label = "25.0%", .color = "\x1b[38;5;220m" },
-        .{ .snapshot = .{ .tokens = 49949, .limit = 100000 }, .label = "49.9%", .color = "\x1b[38;5;220m" },
-        .{ .snapshot = .{ .tokens = 49950, .limit = 100000 }, .label = "50.0%", .color = theme.failure },
-        .{ .snapshot = .{ .tokens = std.math.maxInt(u64), .limit = 1 }, .label = ">100%", .color = theme.failure },
+    const cases = [_]struct { snapshot: ?shared.ContextSnapshot, label: []const u8 }{
+        .{ .snapshot = null, .label = "?%" },
+        .{ .snapshot = .{ .tokens = 10, .limit = 100, .known = false }, .label = "?%" },
+        .{ .snapshot = .{ .tokens = 0, .limit = 100 }, .label = "0.0%" },
+        .{ .snapshot = .{ .tokens = 24949, .limit = 100000 }, .label = "24.9%" },
+        .{ .snapshot = .{ .tokens = 24950, .limit = 100000 }, .label = "25.0%" },
+        .{ .snapshot = .{ .tokens = 49949, .limit = 100000 }, .label = "49.9%" },
+        .{ .snapshot = .{ .tokens = 49950, .limit = 100000 }, .label = "50.0%" },
+        .{ .snapshot = .{ .tokens = std.math.maxInt(u64), .limit = 1 }, .label = ">100%" },
     };
-    for (cases) |case| for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |busy| for ([_]usize{ 0, 11 }) |phase| {
-        const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high, .low_price_input = enabled });
+    for (cases) |case| for ([_]bool{ false, true }) |busy| for ([_]usize{ 0, 11 }) |phase| {
+        const value = try prompt(a, "fixture", case.snapshot, 79, .{ .busy = busy, .now_ms = 80, .phase = phase, .rate_band = .fast, .reasoning_effort = .high });
         defer value.deinit(a);
-        const suffix = if (enabled)
-            try std.fmt.allocPrint(a, " {s}L{s}{s}{s}{s}){s}{s}{s} ", .{ case.color, theme.reset, theme.muted, case.label, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" })
-        else
-            try std.fmt.allocPrint(a, " {s}{s}{s}){s}{s}{s} ", .{ theme.muted, case.label, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
+        const suffix = try std.fmt.allocPrint(a, " {s}{s}{s}){s}{s}{s} ", .{ theme.muted, case.label, theme.reset, if (busy) theme.command_pulse[1] else "", if (busy) activity.spinner(80) else ">", if (busy) theme.reset else "" });
         defer a.free(suffix);
         try expectPromptSuffix(value.styled, suffix);
-        const label = try std.mem.concat(a, u8, &.{ "L", case.label });
-        defer a.free(label);
-        try std.testing.expectEqual(enabled, std.mem.find(u8, value.plain, label) != null);
-        try std.testing.expect(std.mem.find(u8, value.plain, "L ") == null);
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
     };
     for (0..80) |columns| {
-        const value = try prompt(a, "a very long model name", .{ .tokens = 10, .limit = 100 }, columns, .{ .low_price_input = true, .busy = true, .streaming = true });
+        const value = try prompt(a, "a very long model name", .{ .tokens = 10, .limit = 100 }, columns, .{ .busy = true, .streaming = true });
         defer value.deinit(a);
         try std.testing.expect(text.width(value.plain) <= @max(columns, 2));
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
-        if (std.mem.findScalar(u8, value.plain, 'L') != null) try std.testing.expect(std.mem.find(u8, value.plain, "L10.0%") != null);
     }
 }
-test "model closes before adjacent policy and percentage while punctuation stays default" {
+test "model and percentage share parentheses while punctuation stays default" {
     const a = std.testing.allocator;
-    const value = try prompt(a, "deepseek-flash", .{ .tokens = 16, .limit = 1000 }, 79, .{ .reasoning_effort = .high, .low_price_input = true });
+    const value = try prompt(a, "deepseek-flash", .{ .tokens = 16, .limit = 1000 }, 79, .{ .reasoning_effort = .high });
     defer value.deinit(a);
-    try std.testing.expectEqualStrings("(deepseek-flash L1.6%)> ", value.plain);
+    try std.testing.expectEqualStrings("(deepseek-flash 1.6%)> ", value.plain);
     const model_color = comptime theme.effortColor(.high);
-    try expectPromptStyle("(" ++ model_color ++ "deepseek-flash" ++ theme.reset ++ " " ++ theme.success ++ "L" ++ theme.reset ++ theme.muted ++ "1.6%" ++ theme.reset ++ ")> ", value.styled);
-    const optout = try prompt(a, "deepseek-flash", .{ .tokens = 16, .limit = 1000 }, 79, .{ .low_price_input = false });
-    defer optout.deinit(a);
-    try std.testing.expectEqualStrings("(deepseek-flash 1.6%)> ", optout.plain);
-    const compact = try prompt(a, "x", .{ .tokens = 16, .limit = 1000 }, 13, .{ .low_price_input = true });
+    try expectPromptStyle("(" ++ model_color ++ "deepseek-flash" ++ theme.reset ++ " " ++ theme.muted ++ "1.6%" ++ theme.reset ++ ")> ", value.styled);
+    const compact = try prompt(a, "x", .{ .tokens = 16, .limit = 1000 }, 13, .{});
     defer compact.deinit(a);
-    try std.testing.expectEqualStrings("(L1.6%)> ", compact.plain);
-    try expectPromptStyle("(" ++ theme.success ++ "L" ++ theme.reset ++ theme.muted ++ "1.6%" ++ theme.reset ++ ")> ", compact.styled);
+    try std.testing.expectEqualStrings("(1.6%)> ", compact.plain);
+    try expectPromptStyle("(" ++ theme.muted ++ "1.6%" ++ theme.reset ++ ")> ", compact.styled);
 }
-test "low price marker stays context colored during effort flashes" {
+test "reported usage stays muted during effort flashes" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |busy| {
-        const value = try prompt(a, "fixture", .{ .tokens = 50, .limit = 100 }, 79, .{ .busy = busy, .reasoning_effort = .medium, .effort_flash = .medium, .phase = 7, .low_price_input = true });
+        const value = try prompt(a, "fixture", .{ .tokens = 50, .limit = 100 }, 79, .{ .busy = busy, .reasoning_effort = .medium, .effort_flash = .medium, .phase = 7 });
         defer value.deinit(a);
-        try std.testing.expect(std.mem.find(u8, value.plain, "L50.0%)medium") != null);
-        try std.testing.expect(std.mem.find(u8, value.styled, theme.failure ++ "L" ++ theme.reset) != null);
-        try std.testing.expect(std.mem.find(u8, value.plain, "L ") == null);
+        try std.testing.expect(std.mem.find(u8, value.plain, " 50.0%)medium") != null);
+        try std.testing.expect(std.mem.find(u8, value.styled, theme.muted ++ "50.0%" ++ theme.reset) != null);
         try std.testing.expectEqual(text.width(value.plain), @import("markdown_writer.zig").displayWidth(value.styled));
     }
 }
@@ -833,9 +821,6 @@ test "reported usage can be hidden without dropping the anchored estimate" {
     const unknown = try prompt(a, "fixture", null, 79, .{ .show_reported_usage = false });
     defer unknown.deinit(a);
     try std.testing.expectEqualStrings("(fixture)> ", unknown.plain);
-    const low = try prompt(a, "fixture", snapshot, 79, .{ .show_reported_usage = false, .low_price_input = true });
-    defer low.deinit(a);
-    try std.testing.expectEqualStrings("(fixture)L88.6%> ", low.plain);
     const flash = try prompt(a, "fixture", snapshot, 79, .{ .show_reported_usage = false, .effort_flash = .medium });
     defer flash.deinit(a);
     try std.testing.expectEqualStrings("(fixture)medium> ", flash.plain);

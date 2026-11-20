@@ -4398,8 +4398,8 @@ test "input policy pauses stay red in conversation and out of the footer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     ui.notice = "Ready";
-    for ([_]anyerror{ error.InputBudgetExceeded, error.UnknownInputPriceThreshold, error.InsufficientCompaction }) |detail| {
-        try std.testing.expect(r.inputBudgetPause(detail));
+    for ([_]anyerror{ error.InvalidSummary, error.InsufficientCompaction }) |detail| {
+        try std.testing.expect(r.compactionPause(detail));
         const result: r.Terminal = .{ .status = .paused, .detail = detail };
         ui.last_terminal = result;
         ui.notice = Ui.terminalNotice(result);
@@ -4426,14 +4426,14 @@ test "neutral footer keeps capability pending but not queue counts or storage fa
     state.pending_default_effort = .medium;
     ui.notice = "Ready";
     // The deliberate policy pause is conversation detail only.
-    var result: r.Terminal = .{ .status = .paused, .detail = error.InputBudgetExceeded };
+    var result: r.Terminal = .{ .status = .paused, .detail = error.InsufficientCompaction };
     ui.last_terminal = result;
     ui.notice = Ui.terminalNotice(result);
     ui.queueTerminalNotice(result);
     const expected = "Default thinking: medium; awaiting model capabilities | Saved thinking level not applied: model capabilities unknown";
     try std.testing.expectEqualStrings(expected, try ui.hint(arena.allocator(), state));
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, "Paused: InputBudgetExceeded") != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Paused: InsufficientCompaction") != null);
     testAcknowledgeFullFrame(&ui);
     _ = try ui.inbox.enqueue(std.testing.allocator, .follow_up, "retained queued input");
     try std.testing.expect(ui.remote() == null);
@@ -4863,29 +4863,25 @@ test "pending restored history stays visible with an unmatched tool result and u
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "retained answer") != null);
 }
-test "composer reflects owner low price policy without reading runtime configuration" {
+test "composer shows owner usage and preserves typed input" {
     try text.initLocale();
-    for ([_]bool{ false, true }) |enabled| {
-        var cancel: p.Cancellation = .{};
-        var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
-        defer bridge.deinit();
-        var fixture = SelectionFixture{ .low_price_input = enabled };
-        defer fixture.deinit();
-        var ui = fixtureUi(&bridge, &cancel);
-        defer ui.deinit();
-        ui.connection = fixture.connection();
-        const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
-        try ui.parser.feed("typed", sink);
-        try ui.draw();
-        const prefix = if (enabled) theme.success ++ "L" else theme.muted ++ "3.1%";
-        try std.testing.expect(std.mem.find(u8, ui.frame, prefix) != null);
-        try std.testing.expect(std.mem.find(u8, ui.frame, "L ") == null);
-        try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
-        try std.testing.expectEqual(@as(usize, 5), ui.editor.cursor);
-        var screen: @import("../tests/regular_screen.zig").Screen = .{};
-        try screen.replay(ui.frame);
-        try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], if (enabled) " L3.1%)> typed" else " 3.1%)> typed") != null);
-    }
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture: SelectionFixture = .{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("typed", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, theme.muted ++ "3.1%") != null);
+    try std.testing.expectEqualStrings("typed", ui.editor.bytes.items);
+    try std.testing.expectEqual(@as(usize, 5), ui.editor.cursor);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try screen.replay(ui.frame);
+    try std.testing.expect(std.mem.find(u8, &screen.grid[screen.row], " 3.1%)> typed") != null);
 }
 test "model only default color prompt has no headers cache or status and preserves cursor" {
     var cancel: p.Cancellation = .{};
@@ -5675,7 +5671,7 @@ test "approval choices must fit in full before narrow windows can authorize" {
 test "editor tabs expand before clipping and cursor placement but submit unchanged" {
     try text.initLocale();
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -5725,7 +5721,7 @@ test "unselected startup prompts login and model with no placeholder ID or budge
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
-    var fixture: SelectionFixture = .{ .name = "", .model_providers = &.{}, .low_price_input = true, .settings_notice = "Saved thinking level not applied" };
+    var fixture: SelectionFixture = .{ .name = "", .model_providers = &.{}, .settings_notice = "Saved thinking level not applied" };
     defer fixture.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
@@ -5968,7 +5964,7 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try std.testing.expect(!fixture.state.image_enabled);
     try std.testing.expect((Connection.State{ .runtime = null, .model = "", .base_url = "" }).image_models.len == 0);
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 4;
+    ui.settings_menu.selected = 3;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
@@ -5990,7 +5986,7 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(fixture.state.image_enabled and ui.settings_model_picker != .image and ui.settings_menu.selected == 4);
+    try std.testing.expect(fixture.state.image_enabled and ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
     try std.testing.expectEqual(@as(usize, 0), ui.editor.bytes.items.len);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
@@ -6000,14 +5996,14 @@ test "Image settings default Off isolated callbacks search Back and explicit Off
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
-    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 4);
+    try std.testing.expect(!fixture.state.image_enabled and ui.settings_menu.selected == 3);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\rquery\x1b[D\r", sink); // Root open discards the entire tail.
     try std.testing.expect(ui.settings_model_picker == .image and ui.editor.bytes.items.len == 0);
     try ui.parser.feed("query\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 4 and ui.editor.bytes.items.len == 0);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 3 and ui.editor.bytes.items.len == 0);
 }
 test "Image settings fresh ACK pending partial resize changed candidates paste failed saves" {
     try text.initLocale();
@@ -6020,7 +6016,7 @@ test "Image settings fresh ACK pending partial resize changed candidates paste f
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 4;
+    ui.settings_menu.selected = 3;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -6077,7 +6073,7 @@ test "Image picker refuses saves while global settings are unavailable" {
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 4;
+    ui.settings_menu.selected = 3;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -6094,7 +6090,7 @@ test "Image picker refuses saves while global settings are unavailable" {
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 4);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
 }
 test "Image list offers Off without providers and never invents search identities or accepts paste" {
     try text.initLocale();
@@ -6125,7 +6121,7 @@ test "Image list offers Off without providers and never invents search identitie
     try std.testing.expect(ui.model_picker == null);
     testAcknowledgeFullFrame(&ui);
     try Ui.key(&ui, .escape);
-    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .image and ui.settings_menu.selected == 4);
+    try std.testing.expect(ui.settings_open and ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r", sink);
@@ -6268,7 +6264,7 @@ test "settings TUI custom seconds stages equivalent milliseconds" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 2;
+    ui.settings_menu.selected = 1;
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
@@ -6304,7 +6300,7 @@ test "Reported usage is off by default and the root toggle shows only the report
     try std.testing.expect(!idle.visible("48.3%"));
     testAcknowledgeFullFrame(&ui);
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 6;
+    ui.settings_menu.selected = 5;
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -6312,7 +6308,7 @@ test "Reported usage is off by default and the root toggle shows only the report
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(fixture.state.limits.show_reported_usage);
-    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 6);
+    try std.testing.expect(ui.settings_open and ui.settings_menu.selected == 5);
     ui.closeSettingsMenu();
     try std.testing.expect(!ui.settings_open);
     try ui.draw();
@@ -6332,7 +6328,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 1;
+    ui.settings_menu.selected = 0;
     try ui.draw();
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -6340,7 +6336,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expect(!fixture.state.limits.compaction_enabled);
-    ui.settings_menu.selected = 2;
+    ui.settings_menu.selected = 1;
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 60000);
     try ui.draw();
@@ -6367,7 +6363,7 @@ test "settings numeric child consumes ACK before failed save and preserves paren
     try ui.parser.feed("\r\r\x1b[B", sink);
     try std.testing.expectEqual(@as(usize, 3), fixture.calls);
     try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.command_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 2 and ui.settings_open);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 1 and ui.settings_open);
     try std.testing.expectEqualStrings("unchanged-primary", fixture.state.model);
 }
 test "settings custom request timeout stages before a second fresh ACK and preserves parent" {
@@ -6382,7 +6378,7 @@ test "settings custom request timeout stages before a second fresh ACK and prese
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 3;
+    ui.settings_menu.selected = 2;
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
@@ -6403,7 +6399,7 @@ test "settings custom request timeout stages before a second fresh ACK and prese
     try ui.parser.feed("\r\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqual(@as(u32, 8192), fixture.state.limits.request_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 3);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 2);
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 300000);
     try ui.draw();
@@ -6411,7 +6407,7 @@ test "settings custom request timeout stages before a second fresh ACK and prese
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqual(@as(u32, 300000), fixture.state.limits.request_timeout_ms);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 3);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_menu.selected == 2);
 }
 test "settings shared request timeout rejects pasted numbers and preserves parent" {
     try text.initLocale();
@@ -6424,7 +6420,7 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     ui.connection = fixture.connection();
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 3;
+    ui.settings_menu.selected = 2;
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     try ui.draw();
@@ -6439,7 +6435,7 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     try ui.parser.feed("\x1b[D\r", sink);
     try std.testing.expect(!ui.settings_value_picker.?.editing);
     try ui.parser.feed("\x1b[D\r", sink);
-    try std.testing.expect(ui.settings_value_picker == null and ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
+    try std.testing.expect(ui.settings_value_picker == null and ui.settings_model_picker != .image and ui.settings_menu.selected == 2);
     ui.openSettingsValue(.request_timeout_ms, fixture.state);
     ui.settings_menu.selected = try preferenceOption(ui.settings_value_picker.?, 60000);
     try ui.draw();
@@ -6447,7 +6443,7 @@ test "settings shared request timeout rejects pasted numbers and preserves paren
     try ui.parser.feed("\r", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     try std.testing.expectEqual(@as(u32, 60000), fixture.state.limits.request_timeout_ms);
-    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 3);
+    try std.testing.expect(ui.settings_model_picker != .image and ui.settings_menu.selected == 2);
 }
 test "settings callbacks owner publication ACK batch and cursor" {
     try text.initLocale();
@@ -6460,13 +6456,12 @@ test "settings callbacks owner publication ACK batch and cursor" {
             return self.state;
         }
         fn configure(_: *anyopaque, _: []const u8) !void {}
-        fn save(raw: *anyopaque, setting: Connection.Setting, enabled: bool) !void {
+        fn save(raw: *anyopaque, key: preference.Key, value: ?u32) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.fail) return error.SaveFailed;
-            switch (setting) {
-                .low_price_input => self.state.low_price_input_enabled = enabled,
-            }
+            try std.testing.expectEqual(preference.Key.compaction_enabled, key);
+            self.state.limits.compaction_enabled = value.? != 0;
             self.state.initial_context = .{ .tokens = 42, .limit = 100 };
         }
     };
@@ -6476,7 +6471,7 @@ test "settings callbacks owner publication ACK batch and cursor" {
     defer bridge.deinit();
     var ui = fixtureUi(&bridge, &cancel);
     defer ui.deinit();
-    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .setting_fn = Fixture.save };
+    ui.connection = .{ .context = &fixture, .current_fn = Fixture.current, .configure_fn = Fixture.configure, .preference_fn = Fixture.save };
     const sink: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
     try ui.parser.feed("/settings\r\r", sink);
     try std.testing.expect(ui.settings_open);
@@ -6492,7 +6487,7 @@ test "settings callbacks owner publication ACK batch and cursor" {
     testAcknowledgeFullFrame(&ui);
     try ui.parser.feed("\r\r\x1b[B", sink);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect(!fixture.state.low_price_input_enabled and ui.settings_menu.selected == 0);
+    try std.testing.expect(!fixture.state.limits.compaction_enabled and ui.settings_menu.selected == 0);
     try std.testing.expectEqual(@as(u32, 42), ui.display.context.?.tokens);
     try ui.parser.feed("\r", sink); // The consumed ACK cannot save twice.
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
@@ -7405,7 +7400,6 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     try std.testing.expectEqual(shared.ReasoningEffort.low, session.connection().current().reasoning_effort);
     try std.testing.expectEqual(before.context_tokens, session.app.?.config.value.model.context_tokens);
     try std.testing.expectEqual(before.output_tokens, session.app.?.config.value.model.output_tokens);
-    try std.testing.expectEqual(before.input_price_threshold, session.app.?.config.value.model.input_price_threshold);
     try std.testing.expectEqual(before.protocol, session.app.?.config.value.model.protocol);
     // The adopted map must be owned, not borrowed from movable cache storage.
     session.metadata_cache.deinit(a);
@@ -8600,7 +8594,7 @@ test "CtrlD intent expires and any other key cancels the exit" {
 }
 test "compact slash menu requires acknowledged choice then joins a summary-only job" {
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -8659,7 +8653,7 @@ test "compact slash menu requires acknowledged choice then joins a summary-only 
     try std.testing.expect(!ui.last_terminal.?.context_snapshot.?.known);
 }
 test "bang commands use local job with zero main calls and reject unsafe submissions" {
-    var config = core_config.Config{ .provider = .{ .base_url = "http://localhost/unused" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var config = core_config.Config{ .provider = .{ .base_url = "http://localhost/unused" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -8866,7 +8860,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     // Settings-root draft: the child must never destroy it.
     _ = try ui.editor.insert("draft");
     try ui.draw();
@@ -8945,7 +8939,7 @@ test "settings proxy submenu toggles one acknowledged row and keeps parent draft
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.escape);
     try std.testing.expect(!ui.proxy_sub_open and !ui.proxy_address_open and ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 5), ui.settings_menu.selected);
+    try std.testing.expectEqual(@as(usize, 4), ui.settings_menu.selected);
     try std.testing.expectEqualStrings("draft", ui.editor.bytes.items);
 }
 test "proxy picker owns its query while the parent submenu stays marked" {
@@ -8963,7 +8957,7 @@ test "proxy picker owns its query while the parent submenu stays marked" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9008,7 +9002,7 @@ test "settings proxy submenu reports a missing endpoint instead of stalling" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9070,7 +9064,7 @@ test "proxy address enables model toggles and empty removes proxy configuration"
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     // Root 6 -> second level -> Address, prefilled empty when nothing is set.
@@ -9161,7 +9155,7 @@ test "proxy address saves only when the endpoint fits the reserved columns" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9205,7 +9199,7 @@ test "proxy address refuses invalid, canceled, pasted and unacknowledged saves" 
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 5;
+    ui.settings_menu.selected = 4;
     try ui.draw();
     testAcknowledgeFullFrame(&ui);
     try ui.settingsKey(.enter);
@@ -9472,7 +9466,7 @@ test "regression idle Custom Ctrl-C cancels child before parent via parser" {
     defer ui.deinit();
     ui.connection = fixture.connection();
     ui.openSettingsMenu();
-    ui.settings_menu.selected = 2;
+    ui.settings_menu.selected = 1;
     ui.openSettingsValue(.command_timeout_ms, fixture.state);
     ui.settings_menu.selected = try customPreferenceOption(ui.settings_value_picker.?);
     ui.settings_value_picker.?.beginCustom();
@@ -9486,7 +9480,7 @@ test "regression idle Custom Ctrl-C cancels child before parent via parser" {
     try std.testing.expectEqual(@as(usize, 0), ui.settings_value_picker.?.input_len);
     try ui.parser.feed("\x03", sink);
     try std.testing.expect(ui.settings_value_picker == null and ui.settings_open);
-    try std.testing.expectEqual(@as(usize, 2), ui.settings_menu.selected);
+    try std.testing.expectEqual(@as(usize, 1), ui.settings_menu.selected);
     try ui.parser.feed("\x03", sink);
     try std.testing.expect(!ui.settings_open and !ui.stop_open and !cancel.isRequested());
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
@@ -9513,7 +9507,7 @@ test "regression idle selectors Ctrl-C reaches child modal via parser" {
         try std.testing.expect(!ui.settingsModelOpen() and ui.model_picker == null and !ui.provider_open);
         if (kind == 0) {
             try std.testing.expect(ui.settings_open);
-            try std.testing.expectEqual(@as(usize, 4), ui.settings_menu.selected);
+            try std.testing.expectEqual(@as(usize, 3), ui.settings_menu.selected);
             try std.testing.expectEqualStrings("", ui.editor.bytes.items);
         }
         try std.testing.expect(!ui.stop_open and !cancel.isRequested());
@@ -9847,7 +9841,7 @@ test "ordinary submission preserves draft and pending queue after owner change" 
 }
 test "queued launch waits for joined success preserves draft and restores OOM without duplicate history" {
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -9880,7 +9874,7 @@ test "queued launch waits for joined success preserves draft and restores OOM wi
 }
 test "configure enables same-process submit without sending secrets or commands" {
     const cfg = @import("../core/config.zig");
-    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    var config = cfg.Config{ .provider = .{ .base_url = "http://localhost/fixture" }, .model = .{ .name = "fixture-model", .context_tokens = 32768, .protocol = .chat } };
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
     defer bridge.deinit();
@@ -13001,8 +12995,8 @@ test "remote paused failure text publishes once without queue footer" {
     defer bridge.deinit();
     var ui = remoteUi(&fake, &bridge, &cancel);
     defer ui.deinit();
-    var terminal: session_client.Terminal = .{ .status = .paused, .failure = .input_budget_exceeded };
-    const message = "input budget exceeded: request would cost $0.42";
+    var terminal: session_client.Terminal = .{ .status = .paused, .failure = .insufficient_compaction };
+    const message = "context remained too large after compaction";
     @memcpy(terminal.failure_message[0..message.len], message);
     terminal.failure_message_len = message.len;
     fake.item = try session_client.ownEvent(std.testing.allocator, 12, .{ .finished = terminal.toRuntime() });
@@ -13011,12 +13005,12 @@ test "remote paused failure text publishes once without queue footer" {
     try ui.pumpRemote();
     try ui.finishReadyTask();
     try std.testing.expectEqualStrings(message, ui.last_terminal.?.failureText());
-    try std.testing.expectEqual(@as(?anyerror, error.InputBudgetExceeded), ui.last_terminal.?.detail);
+    try std.testing.expectEqual(@as(?anyerror, error.InsufficientCompaction), ui.last_terminal.?.detail);
     try std.testing.expectEqual(@as(?u16, null), ui.last_terminal.?.http_status);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
     try std.testing.expectEqual(Kind.notice, ui.records.items[0].kind);
     try std.testing.expectEqual(NoticeLevel.failure, ui.records.items[0].notice_level);
-    try std.testing.expectEqualStrings("Paused: input budget exceeded: request would cost $0.42", ui.records.items[0].body.items);
+    try std.testing.expectEqualStrings("Paused: context remained too large after compaction", ui.records.items[0].body.items);
     ui.notice = "Ready";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

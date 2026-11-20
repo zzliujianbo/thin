@@ -456,7 +456,7 @@ test "idle refresh publishes restored context after login without requests" {
         try env.put("CONTEXT_FIXTURE_KEY", "fake-source-key");
         try tmp.dir.createDir(io, ".thin", .default_dir);
         try tmp.dir.writeFile(io, .{ .sub_path = ".thin/config.json", .data =
-            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"CONTEXT_FIXTURE_KEY","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}},"limits":{"low_price_input":false}}
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"CONTEXT_FIXTURE_KEY","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}}}
         });
         const id = try ids.generate(io);
         {
@@ -1869,7 +1869,7 @@ test "settings reply publishes only the five user limits and never internal clea
         var fake = FakeLimitsView{
             .prev_fn = host.connection.current_fn,
             .prev_context = host.connection.context,
-            .limits = .{ .command_timeout_ms = 4_000, .request_timeout_ms = 12_000, .low_price_input = false, .compaction_enabled = false, .show_reported_usage = false },
+            .limits = .{ .command_timeout_ms = 4_000, .request_timeout_ms = 12_000, .compaction_enabled = false, .show_reported_usage = false },
         };
         defer {
             host.connection.current_fn = fake.prev_fn;
@@ -1884,8 +1884,7 @@ test "settings reply publishes only the five user limits and never internal clea
         var doc = try parseJson(a, frame);
         defer doc.deinit();
         const limits = doc.value.object.get("limits").?.object;
-        try std.testing.expectEqual(@as(usize, 5), limits.count());
-        try std.testing.expect(!limits.get("low_price_input").?.bool);
+        try std.testing.expectEqual(@as(usize, 4), limits.count());
         try std.testing.expect(!limits.get("compaction_enabled").?.bool);
         try std.testing.expect(!limits.get("show_reported_usage").?.bool);
         try std.testing.expect(limits.get("cleanup_grace_ms") == null);
@@ -1934,42 +1933,42 @@ test "a re-attach on the same socket invalidates cached settings frames by epoch
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"epoch\":2") != null);
     }
 
-    var sink = SettingSink{};
+    var sink = PreferenceSink{};
     // A cached frame from the replaced epoch is refused before any owner
     // callback runs: no mutation and no persistence.
     {
-        host.connection.setting_fn = SettingSink.set;
+        host.connection.preference_fn = PreferenceSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":42,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":42,\"op\":\"preference\",\"epoch\":1,\"key\":\"command_timeout_ms\",\"value\":7500}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
         try std.testing.expectEqual(@as(usize, 0), sink.calls);
     }
     // The current epoch on the same socket is allowed and reaches the owner.
     {
-        host.connection.setting_fn = SettingSink.set;
+        host.connection.preference_fn = PreferenceSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":43,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":true}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":43,\"op\":\"preference\",\"epoch\":2,\"key\":\"command_timeout_ms\",\"value\":7500}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") == null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
-        try std.testing.expectEqual(tui.Connection.Setting.low_price_input, sink.last_key.?);
-        try std.testing.expect(sink.last_value);
+        try std.testing.expectEqual(settings_preferences.Key.command_timeout_ms, sink.last_key.?);
+        try std.testing.expectEqual(@as(?u32, 7500), sink.last_value);
     }
     // A different socket still has no authority, even with the live epoch.
     {
-        host.connection.setting_fn = SettingSink.set;
+        host.connection.preference_fn = PreferenceSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":44,\"op\":\"setting\",\"epoch\":2,\"key\":\"low_price_input\",\"value\":false}", 8);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":44,\"op\":\"preference\",\"epoch\":2,\"key\":\"command_timeout_ms\",\"value\":4000}", 8);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "stale_control") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);
     }
     // A missing epoch never degrades to socket-only authority.
     {
-        host.connection.setting_fn = SettingSink.set;
+        host.connection.preference_fn = PreferenceSink.set;
         host.connection.context = &sink;
-        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":45,\"op\":\"setting\",\"key\":\"low_price_input\",\"value\":false}", 7);
+        const frame = try dispatchJson(host, a, "{\"v\":5,\"id\":45,\"op\":\"preference\",\"key\":\"command_timeout_ms\",\"value\":4000}", 7);
         defer a.free(frame);
         try std.testing.expect(std.mem.indexOf(u8, frame, "\"ok\":false") != null);
         try std.testing.expectEqual(@as(usize, 1), sink.calls);

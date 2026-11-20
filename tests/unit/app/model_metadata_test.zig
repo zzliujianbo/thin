@@ -226,7 +226,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const a = std.testing.allocator;
-    for (0..18) |version| {
+    for (0..cache_version + 2) |version| {
         if (version == cache_version) continue;
         const body = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":[]}}", .{version});
         defer a.free(body);
@@ -247,11 +247,11 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
     }
     for ([_][]const u8{
-        "{\"version\":16,\"attempted\":0}",
-        "{\"version\":16,\"records\":[]}",
-        "{\"version\":16,\"unknown\":false}",
-        "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
-        "{\"version\":16,\"refresh\":[{\"unknown\":0},{},{},{},{}]}",
+        "{\"version\":17,\"attempted\":0}",
+        "{\"version\":17,\"records\":[]}",
+        "{\"version\":17,\"unknown\":false}",
+        "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"unknown\":1}]}",
+        "{\"version\":17,\"refresh\":[{\"unknown\":0},{},{},{},{}]}",
     }) |body| {
         try root.writeMode(file_name, body, true, 0o600);
         const before = try root.dir.statFile(root.io, file_name, .{});
@@ -407,10 +407,10 @@ test "metadata rejects malformed availability and duplicate cache records withou
     var root = try testRoot(tmp.dir);
     defer root.deinit();
     const cases = [_]struct { body: []const u8, err: anyerror }{
-        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
-        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
-        .{ .body = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
+        .{ .body = "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":1}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":\"true\"}]}", .err = error.UnexpectedToken },
+        .{ .body = "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true,\"available\":false}]}", .err = error.DuplicateField },
+        .{ .body = "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":true},{\"provider\":\"deepseek\",\"id\":\"deepseek-flash\",\"context_window\":null,\"available\":false}]}", .err = error.InvalidMetadata },
     };
     for (cases) |case| {
         try root.dir.writeFile(root.io, .{ .sub_path = file_name, .data = case.body });
@@ -548,7 +548,6 @@ test "provider reasoning source is fixed by verified provider" {
         row.dev_reasoning = try directory.Profile.from(.{ .format = format, .map = .{ .off = if (id == .deepseek) "off" else "none", .low = "low" } });
         row.dev_context_tokens = 123456;
         row.dev_output_tokens = 8192;
-        row.dev_input_price_flat_limit = 123456;
         const entry = restoreEntry(&cache, id, "source-test").?;
         var config: cfg.Config = .{ .provider = catalog.connection(id), .model = entry.model };
         const official = id == .deepseek or id == .openai_codex;
@@ -591,7 +590,6 @@ test "provider reasoning source is fixed by verified provider" {
         if (id == .deepseek) {
             try t.expectEqual(@as(?u32, 123456), contextFor(&cache, entry));
             try t.expectEqual(@as(?u32, 8192), outputFor(&cache, entry));
-            try t.expectEqual(@as(?u32, 123456), inputPriceFlatLimitFor(&cache, entry));
         }
     }
 }
@@ -632,7 +630,7 @@ test "provider reasoning source official route ignores public protocol" {
 test "provider reasoning source ignores stale public cache and public refresh for DeepSeek" {
     const t = std.testing;
     var cache = try parseCache(t.allocator,
-        \\{"version":16,"models":[{"provider":"deepseek","id":"refresh-test","protocol":"chat","dev_protocol":"chat","dev_present":true,"dev_reasoning":{"format":"deepseek","map":{"off":"off","low":"low"}}}]}
+        \\{"version":17,"models":[{"provider":"deepseek","id":"refresh-test","protocol":"chat","dev_protocol":"chat","dev_present":true,"dev_reasoning":{"format":"deepseek","map":{"off":"off","low":"low"}}}]}
     );
     defer cache.deinit(t.allocator);
     var listing: Listing = .{ .directory = try cache.directory.clone(t.allocator) };

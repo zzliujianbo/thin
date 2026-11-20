@@ -43,7 +43,7 @@ fn config(a: std.mem.Allocator, scenario: []const u8, protocol: p.Protocol, dire
         .selected_provider = if (direct) "other" else "listed",
         .model = .{ .name = "raw/id", .protocol = protocol, .context_tokens = 32768, .output_tokens = if (protocol == .anthropic) 128 else null },
         .proxy = .{ .address = "127.0.0.1", .port = try proxyPort(false), .models = &.{"listed/raw/id"} },
-        .limits = .{ .low_price_input = false, .request_timeout_ms = 4000 },
+        .limits = .{ .request_timeout_ms = 4000 },
     };
 }
 fn request(c: cfg.Config, protocol: p.Protocol) p.Request {

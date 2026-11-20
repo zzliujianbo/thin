@@ -33,11 +33,6 @@ pub const State = struct {
     output_tokens: ?u32 = null,
     output_source: cfg.ReasoningSource = .explicit,
     output_budget_frozen: bool = false,
-    /// Archived input metadata for display/resave, not a trusted runtime policy.
-    input_budget_frozen: bool = false,
-    input_price_threshold: ?u32 = null,
-    input_price_flat_limit: ?u32 = null,
-    low_price_input: bool = false,
     permission_id: u64,
     poisoned: bool = false,
     /// Observer continuity only; the Runtime never treats these as authority.
@@ -162,16 +157,25 @@ fn shape(comptime T: type, v: j.Value) !void {
     }
 }
 
+fn discardRetiredField(fields: *std.json.ObjectMap, name: []const u8, comptime T: type) !void {
+    const value = fields.get(name) orelse return;
+    try shape(T, value);
+    _ = fields.swapRemove(name);
+}
+
 pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
     var tree = try strictJson(a, bytes);
     defer tree.deinit();
     // v2 formerly persisted these policy fields at the top level. Validate
     // their original types before removing only these known retired keys.
     if (tree.value == .object) {
-        if (tree.value.object.get("max_input_tokens")) |v| try shape(?u32, v);
-        if (tree.value.object.get("input_margin_tokens")) |v| try shape(u32, v);
-        _ = tree.value.object.swapRemove("max_input_tokens");
-        _ = tree.value.object.swapRemove("input_margin_tokens");
+        const fields = &tree.value.object;
+        try discardRetiredField(fields, "max_input_tokens", ?u32);
+        try discardRetiredField(fields, "input_margin_tokens", u32);
+        try discardRetiredField(fields, "input_budget_frozen", bool);
+        try discardRetiredField(fields, "input_price_threshold", ?u32);
+        try discardRetiredField(fields, "input_price_flat_limit", ?u32);
+        try discardRetiredField(fields, "low_price_input", bool);
         // Display-only metadata added later: an older checkpoint simply has no
         // such rows, and must still resume.
         if (!tree.value.object.contains("tool_stats")) try tree.value.object.put(tree.arena.allocator(), "tool_stats", .null);

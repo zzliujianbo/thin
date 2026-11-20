@@ -308,7 +308,6 @@ fn configuration() cfg.Config {
     return .{
         .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat },
-        .limits = .{ .low_price_input = false },
     };
 }
 /// Invert the adaptive reserve for a finite positive test input budget.

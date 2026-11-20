@@ -136,10 +136,10 @@ test "compaction policy summary input room is independent of output capacity" {
         for ([_]?u32{ null, 20, 65536 }) |capacity| {
             config.model.output_tokens = capacity;
             const room = window - cfg.Policy.safety_tokens;
-            try std.testing.expectEqual(@as(usize, room - 1), c.inputBudgetFor(config, .summary));
-            try c.checkInputFor(config, .summary, room - 1);
-            try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, room));
-            try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, std.math.maxInt(usize)));
+            try std.testing.expectEqual(@as(usize, room - 1), c.inputBudget(config));
+            try c.checkInput(config, room - 1);
+            try std.testing.expectError(error.ContextTooLarge, c.checkInput(config, room));
+            try std.testing.expectError(error.ContextTooLarge, c.checkInput(config, std.math.maxInt(usize)));
             try std.testing.expectEqual(capacity, config.model.output_tokens);
         }
     }

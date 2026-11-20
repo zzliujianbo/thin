@@ -2,8 +2,6 @@ test "session failure exact error round trips and aliases" {
     const cases = [_]struct { code: Failure, err: anyerror }{
         .{ .code = .cleanup_failed, .err = error.CleanupFailed },
         .{ .code = .unsafe_to_continue, .err = error.UnsafeToContinue },
-        .{ .code = .input_budget_exceeded, .err = error.InputBudgetExceeded },
-        .{ .code = .unknown_input_price_threshold, .err = error.UnknownInputPriceThreshold },
         .{ .code = .insufficient_compaction, .err = error.InsufficientCompaction },
         .{ .code = .compaction_impossible, .err = error.CompactionImpossible },
         .{ .code = .invalid_summary, .err = error.InvalidSummary },

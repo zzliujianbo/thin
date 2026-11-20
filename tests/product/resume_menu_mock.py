@@ -221,9 +221,7 @@ def main(app):
             runtime.mkdir(mode=0o700)
             # Only our loopback URL has credentials, so it cannot claim any
             # official metadata source. Keep rejecting unexpected GETs.
-            # The local mock has no real price evidence; production defaults are unchanged.
-            config = {'limits': {'low_price_input': False},
-                      'llm': {'default': 'local/fixture-model',
+            config = {'llm': {'default': 'local/fixture-model',
                       'providers': {'local': {'kind': 'opencode_zen', 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                       'api_key_env': 'THIN_FIXTURE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}}
             config_path = home / '.thin/config.json'

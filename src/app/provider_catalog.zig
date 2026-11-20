@@ -62,20 +62,6 @@ pub const entries = [_]Entry{
     go("cat-jam-free", .chat),
 };
 
-/// Official pricing documents a flat context-length schedule within 1M for
-/// these two exact direct Chat routes (not reseller routes or name prefixes).
-/// Source: https://api-docs.deepseek.com/quick_start/pricing/
-/// Peak/off-peak and cache-hit prices still vary: this only covers length.
-/// Keep the proven range separate from the first tier surcharge threshold.
-/// Exact fetched surcharge thresholds take precedence in model_resolver.
-/// Unknown/future IDs deliberately have no fallback.
-pub fn flatPriceLimit(entry: Entry) ?u32 {
-    if (entry.provider != .deepseek or entry.model.protocol != .chat) return null;
-    if (std.mem.eql(u8, entry.model.name, "deepseek-flash") or
-        std.mem.eql(u8, entry.model.name, "deepseek-v4-pro")) return 1000000;
-    return null;
-}
-
 pub fn connection(id: Id) cfg.Provider {
     return .{ .kind = id, .base_url = id.baseUrl(), .chat_max_tokens = true };
 }

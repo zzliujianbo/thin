@@ -117,7 +117,7 @@ test "image Settings stale credential OOM and CAS failure publish nothing" {
 }
 test "image official id-only listing authorizes exact availability not invented main capabilities" {
     const source =
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"official":{"base_url":"https://api.deepseek.com","api_key_env":"VISION_OWN_KEY","models":{}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"official":{"base_url":"https://api.deepseek.com","api_key_env":"VISION_OWN_KEY","models":{}}}},"limits":{"safety_tokens":100}}
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -147,7 +147,7 @@ test "image official id-only listing authorizes exact availability not invented 
 }
 test "image official Anthropic base uses the same availability and cached limits as its Chat route" {
     const source =
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"anthropic":{"base_url":"https://api.deepseek.com/anthropic","api_key_env":"VISION_OWN_KEY","models":{}},"manual":{"base_url":"https://api.deepseek.com/anthropic","api_key_env":"VISION_OWN_KEY","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"anthropic":{"base_url":"https://api.deepseek.com/anthropic","api_key_env":"VISION_OWN_KEY","models":{}},"manual":{"base_url":"https://api.deepseek.com/anthropic","api_key_env":"VISION_OWN_KEY","models":{"deepseek-flash":{}}}}},"limits":{"safety_tokens":100}}
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

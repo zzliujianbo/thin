@@ -92,47 +92,13 @@ pub fn rawTokens(system: []const u8, tools: []const p.ToolSchema, messages: []co
 
 /// Reserve minimal response room for hard input preflight. This does not set
 /// a model output allowance; output length belongs to the provider.
-fn windowInputBudget(config: cfg.Config) usize {
+pub fn inputBudget(config: cfg.Config) usize {
     return @as(usize, config.model.context_tokens) -| cfg.Policy.safetyTokens(config.model.context_tokens) -| 1;
 }
 
-pub fn inputBudget(config: cfg.Config) usize {
-    return inputBudgetFor(config, .normal);
-}
-
-/// Summary exempts price policy but still respects physical context room.
-pub fn inputBudgetFor(config: cfg.Config, purpose: p.Purpose) usize {
-    const window = windowInputBudget(config);
-    if (purpose != .normal or !config.limits.low_price_input) return window;
-    const price_limit = if (config.model.input_price_threshold) |step|
-        (if (config.model.input_price_flat_limit) |flat| @min(step, flat) else step)
-    else
-        config.model.input_price_flat_limit orelse return 0;
-    return @min(window, @as(usize, price_limit) -| cfg.Policy.input_margin_tokens);
-}
-
-/// Enabled policy is conservative estimation, never an exact billing promise.
-/// Missing price metadata must not silently restore the full model window.
-/// A positively verified flat-price range is known metadata, not a missing tier.
-pub fn validateInputPolicy(config: cfg.Config) !void {
-    if (config.limits.low_price_input and config.model.input_price_threshold == null and
-        config.model.input_price_flat_limit == null) return error.UnknownInputPriceThreshold;
-    if (inputBudget(config) == 0) return inputBudgetError(config);
-}
-
-pub fn inputBudgetError(config: cfg.Config) anyerror {
-    return if (config.limits.low_price_input) error.InputBudgetExceeded else error.ContextTooLarge;
-}
-
 pub fn checkInput(config: cfg.Config, estimated_input: usize) !void {
-    return checkInputFor(config, .normal, estimated_input);
-}
-
-pub fn checkInputFor(config: cfg.Config, purpose: p.Purpose, estimated_input: usize) !void {
-    if (purpose == .normal) try validateInputPolicy(config);
-    if (estimated_input > windowInputBudget(config)) return error.ContextTooLarge;
-    if (inputBudgetFor(config, purpose) == 0 or estimated_input > inputBudgetFor(config, purpose))
-        return if (purpose == .summary) error.ContextTooLarge else inputBudgetError(config);
+    const budget = inputBudget(config);
+    if (budget == 0 or estimated_input > budget) return error.ContextTooLarge;
 }
 
 /// 按百分比计算阈值（向下取整）。
@@ -243,11 +209,7 @@ fn planWithMode(a: std.mem.Allocator, config: cfg.Config, estimator: Estimator, 
     // 中文：最新的 assistant 及其完整工具结果组始终保留，因此切分点不能超过它。
     const max_cut = latest_assistant orelse return error.NoCompactionCandidate;
     var retained = rawTokens(system, tools, messages);
-    const target_budget = if (mode == .manual and inputBudget(config) == 0)
-        inputBudgetFor(config, .summary)
-    else
-        inputBudget(config);
-    const target = threshold(target_budget, cfg.Policy.compaction_target_percent);
+    const target = threshold(inputBudget(config), cfg.Policy.compaction_target_percent);
 
     var best: ?usize = null;
     var cut: usize = 1;

@@ -459,9 +459,6 @@ pub const PromptActivity = struct {
     /// Transient level confirmation: temporarily replaces the context percentage
     /// in the prefix with the chosen level name; the owner expires it.
     effort_flash: ?shared.ReasoningEffort = null,
-    /// Owner says tiered-price protection is active for the selected model;
-    /// not merely the global toggle, and never inferred from latest usage.
-    low_price_input: bool = false,
     /// Show the provider-reported total inside the model parentheses. The
     /// estimate remains visible when this is false. Product callers always pass
     /// the configured flag, whose default is off.
@@ -516,26 +513,24 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
     // The provider-reported value stays inside the model parentheses; the
     // estimate (or a transient effort level) follows the closing parenthesis
     // immediately, with no separator space. Hiding the report leaves the
-    // model parentheses and the coloured value; the price marker moves outside.
+    // model parentheses and the coloured value.
     const show_reported = motion.show_reported_usage;
-    const low = if (motion.low_price_input and (show_reported or value.len != 0)) "L" else "";
     const marker = if (motion.busy) activity.spinner(motion.now_ms) else if (motion.command) "!" else ">";
     const reserve: usize = @min(@as(usize, 24), columns / 3);
-    const inside_width = if (show_reported) 1 + low.len + label_ctx.reported.len else 0;
-    const outside_width = if (show_reported) value.len else low.len + value.len;
-    const room: usize = columns -| (reserve + 4 + inside_width + outside_width);
+    const inside_width = if (show_reported) 1 + label_ctx.reported.len else 0;
+    const room: usize = columns -| (reserve + 4 + inside_width + value.len);
     const label = try singleLine(a, model, if (columns < 12) 0 else room);
     defer a.free(label);
-    const percent_width = if (show_reported) 4 + low.len + label_ctx.reported.len + value.len else 2 + low.len + value.len;
+    const percent_width = if (show_reported) 4 + label_ctx.reported.len + value.len else 2 + value.len;
     const percent_only = columns >= 12 and label.len == 0 and percent_width + reserve <= columns;
     const plain = if (label.len != 0 and show_reported)
-        try std.fmt.allocPrint(a, "({s} {s}{s}){s}{s} ", .{ label, low, label_ctx.reported, value, marker })
+        try std.fmt.allocPrint(a, "({s} {s}){s}{s} ", .{ label, label_ctx.reported, value, marker })
     else if (label.len != 0)
-        try std.fmt.allocPrint(a, "({s}){s}{s}{s} ", .{ label, low, value, marker })
+        try std.fmt.allocPrint(a, "({s}){s}{s} ", .{ label, value, marker })
     else if (percent_only and show_reported)
-        try std.fmt.allocPrint(a, "({s}{s}){s}{s} ", .{ low, label_ctx.reported, value, marker })
+        try std.fmt.allocPrint(a, "({s}){s}{s} ", .{ label_ctx.reported, value, marker })
     else if (percent_only)
-        try std.fmt.allocPrint(a, "{s}{s}{s} ", .{ low, value, marker })
+        try std.fmt.allocPrint(a, "{s}{s} ", .{ value, marker })
     else
         try std.fmt.allocPrint(a, "{s} ", .{marker});
     errdefer a.free(plain);
@@ -565,18 +560,8 @@ fn promptLayout(a: std.mem.Allocator, model: []const u8, snapshot: ?shared.Conte
             if (show_reported) try out.writer.writeAll(" ");
             ordinal += 1;
         }
-        if (show_reported) {
-            if (low.len != 0) {
-                try out.writer.print("{s}L{s}", .{ context_color, theme.reset });
-                ordinal += 1;
-            }
-            try out.writer.print("{s}{s}{s}", .{ theme.muted, label_ctx.reported, theme.reset });
-        }
+        if (show_reported) try out.writer.print("{s}{s}{s}", .{ theme.muted, label_ctx.reported, theme.reset });
         if (parenthesized) try out.writer.writeAll(")");
-        if (!show_reported and low.len != 0) {
-            try out.writer.print("{s}L{s}", .{ context_color, theme.reset });
-            ordinal += 1;
-        }
         if (value.len != 0) {
             if (slot_flow) {
                 try flowText(&out.writer, value, palette, motion.phase, &ordinal);

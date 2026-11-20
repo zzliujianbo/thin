@@ -330,7 +330,6 @@ const Supervisor = struct {
             .cycle_effort,
             .login,
             .preference,
-            .setting,
             .image_model,
             .proxy_model,
             .proxy_address,

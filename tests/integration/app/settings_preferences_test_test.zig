@@ -245,7 +245,7 @@ test "preferences restored missing provider preserves pending history while savi
         try std.testing.expect(try source.saveOnExit());
     }
     const replacement =
-        \\{"llm":{"default":"other/next","providers":{"other":{"base_url":"https://replacement.invalid/v1","api_key":"fake-replacement-only","models":{"next":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"other/next","providers":{"other":{"base_url":"https://replacement.invalid/v1","api_key":"fake-replacement-only","models":{"next":{"protocol":"chat","context_tokens":65536}}}}}}
     ;
     {
         var store = try Store.open(a, io, home);
@@ -265,7 +265,6 @@ test "preferences restored missing provider preserves pending history while savi
     try std.testing.expectEqualStrings("route/first", selection);
     for (main_edits) |edit| try set(&restored, edit.key, edit.value);
     try set(&restored, .request_timeout_ms, 60000);
-    try connection.setting_fn.?(connection.context, .low_price_input, true);
     try std.testing.expect(restored.app == null and restored.pending.?.value.selection_pending);
     try std.testing.expectEqualStrings("", restored.pending.?.value.provider.base_url);
     try std.testing.expectEqualStrings(selection, connection.current().selection_name.?);
@@ -277,7 +276,6 @@ test "preferences restored missing provider preserves pending history while savi
     try std.testing.expectEqualStrings("other/next", saved.value.registry.?.default);
     try std.testing.expectError(error.InvalidConfig, cfg.validatePendingSettings(saved.value));
     try std.testing.expectEqual(@as(u32, 60000), saved.value.limits.request_timeout_ms);
-    try std.testing.expect(saved.value.limits.low_price_input);
     const before = try disk(&restored);
     defer a.free(before);
     // An unresolved route does not excuse an invalid frozen model window.

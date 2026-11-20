@@ -71,7 +71,7 @@ export async function reviewRegressions({app, pty, execute}) {
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       await writeFile(join(home, '.thin/config.json'), JSON.stringify({
         llm: {default:'local/fixture',providers:{local:{base_url:`http://127.0.0.1:${server.address().port}`,api_key:KEY,models:{fixture:{protocol:'chat',context_tokens:32768}}}}},
-        limits: {low_price_input: false, request_timeout_ms: 5000},
+        limits: {request_timeout_ms: 5000},
       }), {mode: 0o600});
       const launchHome = kind === 'symlink-home' ? alias : home;
       const result = await execute(pty, [], {

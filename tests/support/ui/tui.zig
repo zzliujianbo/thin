@@ -344,7 +344,6 @@ const SelectionFixture = struct {
     name: []const u8 = "fixture-old",
     owned: ?[]u8 = null,
     limit: u32 = 32768,
-    low_price_input: bool = false,
     settings_notice: ?[]const u8 = null,
     effort: shared.ReasoningEffort = .off,
     levels: shared.activity.EffortSet = .{ .mask = 0x3f },
@@ -446,7 +445,7 @@ const SelectionFixture = struct {
     }
     fn current(raw: *anyopaque) Connection.State {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .low_price_input = self.low_price_input, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_address = self.proxy_address, .proxy_port = self.proxy_port, .proxy_models = self.proxy_list[0..self.proxy_len], .limits = layouts_show_report };
+        return .{ .runtime = null, .model = self.name, .selection_name = if (std.mem.eql(u8, self.name, "fixture-old")) "fixture/fixture-old" else if (std.mem.eql(u8, self.name, "fixture-next")) "fixture/fixture-next" else self.name, .models = self.profiles_override orelse &profiles, .model_providers = self.model_providers, .model_disabled = self.disabled_models, .provider = self.provider_hint, .configured_providers = self.configured_providers, .context_limit = self.limit, .settings_notice = self.settings_notice, .initial_context = .{ .tokens = 1000, .limit = self.limit }, .base_url = "http://localhost/unused", .reasoning_effort = self.effort, .effort_levels = self.levels, .pending_default_effort = self.pending_default, .proxy_configured = self.proxy_configured, .proxy_address = self.proxy_address, .proxy_port = self.proxy_port, .proxy_models = self.proxy_list[0..self.proxy_len], .limits = layouts_show_report };
     }
     fn configure(_: *anyopaque, _: []const u8) !void {
         return error.TestSelectionOnly;

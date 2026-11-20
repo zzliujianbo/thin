@@ -45,13 +45,13 @@ CSI = re.compile(rb'\x1b\[([0-9;?]*)([@-~])')
 ROWS = 24
 
 # Real idle composer decorations, as rendered by src/ui/presentation.zig's
-# `prompt()`: `> ` with no model selected, and `(model) 0.0%> ` /
-# `(model) L1.6%> ` / `(model) high> ` once one is. The slot in front of the
+# `prompt()`: `> ` with no model selected, and `(model)0.0%> ` /
+# `(model)high> ` once one is. The slot in front of the
 # marker is a transient effort-confirmation level name or the retained context
-# (`?%`, `>100%`, `N.N%`), optionally prefixed by the low-price `L`. The busy
+# (`?%`, `>100%`, `N.N%`). The busy
 # marker replaces the `>` with one of the known activity spinner glyphs.
-_VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
-               r'xhigh|max|\?))')
+_VALUE_SLOT = (r'(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
+               r'xhigh|max|\?)')
 _IDLE_COMPOSER = re.compile(
     r'^(?:> |(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?> )$')
 SPINNER_CHARS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -263,7 +263,7 @@ def run(app, width, batched):
         assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
         (home / '.thin').mkdir(parents=True)
         project.mkdir()
-        config = {'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
+        config = {'llm': {'default': 'local/fixture-model', 'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'request_timeout_ms': 10000}}
         config_path = home / '.thin/config.json'
         config_bytes = json.dumps(config).encode()
         config_path.write_bytes(config_bytes)
@@ -570,7 +570,7 @@ def first_entry(app, origin, width, response='normal'):
                   'providers': {'local': {'base_url': 'http://127.0.0.1:1/v1',
                   'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model':
                   {'protocol': 'chat', 'context_tokens': 32768}}}}},
-                  'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
+                  'limits': {'request_timeout_ms': 10000}}
         config_path = home / '.thin/config.json'
         config_path.write_text(json.dumps(config))
         config_path.chmod(0o600)
@@ -844,7 +844,7 @@ def streaming(app, line_count):
                   'providers': {'local': {'base_url': f'http://127.0.0.1:{server.server_port}/v1',
                   'api_key_env': 'THIN_IDLE_KEY', 'models': {'fixture-model':
                   {'protocol': 'chat', 'context_tokens': 32768}}}}},
-                  'limits': {'low_price_input': False, 'request_timeout_ms': 10000}}
+                  'limits': {'request_timeout_ms': 10000}}
         path = home / '.thin/config.json'
         path.write_text(json.dumps(config))
         path.chmod(0o600)

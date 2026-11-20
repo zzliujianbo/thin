@@ -49,7 +49,6 @@ const Fixture = struct {
             .{ .name = "opencode-go", .connection = go },
             .{ .name = "opencode-zen", .connection = zen },
         } };
-        config.limits.low_price_input = false;
         config.limits.command_timeout_ms = 12345;
         try store.save(config);
         return .{ .tmp = tmp, .home = home, .project = project, .env = env };

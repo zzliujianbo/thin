@@ -9,6 +9,6 @@ fn proxyAllocationCase(a: std.mem.Allocator) !void {
 }
 
 fn allocationCase(a: std.mem.Allocator) !void {
-    const rendered = try rows(a, .{ .selected = 5 }, .{}, 40, 10);
+    const rendered = try rows(a, .{ .selected = 4 }, .{}, 40, 10);
     defer freeRows(a, rendered);
 }

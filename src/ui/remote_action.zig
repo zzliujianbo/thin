@@ -10,7 +10,6 @@ const activity = @import("../presentation/activity.zig");
 const Choice = @import("settings_model_picker.zig").Choice;
 const codex_login = @import("../core/codex_login.zig");
 
-pub const Setting = enum { low_price_input };
 pub const Action = union(enum) {
     submit: struct { kind: session.TaskKind, text: []const u8 },
     cancel,
@@ -26,7 +25,6 @@ pub const Action = union(enum) {
     effort: activity.ReasoningEffort,
     cycle_effort,
     preference: struct { key: settings.Key, value: ?u32 },
-    setting: struct { key: Setting, value: bool },
     image: Choice,
     proxy: struct { model: []const u8, enabled: bool },
     proxy_address: []const u8,

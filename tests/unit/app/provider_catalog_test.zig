@@ -1,19 +1,3 @@
-test "documented flat price ranges are limited to exact direct DeepSeek Chat routes" {
-    for (entries) |entry| {
-        if (entry.provider == .deepseek and entry.model.protocol == .chat) {
-            try std.testing.expectEqual(@as(?u32, 1000000), flatPriceLimit(entry));
-        } else try std.testing.expect(flatPriceLimit(entry) == null);
-    }
-    var changed = find("deepseek/deepseek-flash").?;
-    changed.model.name = "deepseek-flash-future";
-    try std.testing.expect(flatPriceLimit(changed) == null);
-    changed = find("deepseek/deepseek-flash").?;
-    changed.model.protocol = .responses;
-    try std.testing.expect(flatPriceLimit(changed) == null);
-    changed = find("deepseek/deepseek-flash").?;
-    changed.provider = .opencode_go;
-    try std.testing.expect(flatPriceLimit(changed) == null);
-}
 test "provider presets select exact protocols and keep Zen and Go separate" {
     for (entries, 0..) |entry, index| {
         const config: cfg.Config = .{ .provider = connection(entry.provider), .model = entry.model };

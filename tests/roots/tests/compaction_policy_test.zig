@@ -80,7 +80,7 @@ fn configuration() cfg.Config {
         .output_tokens = 65536,
         .reasoning_effort = "high",
         .reasoning = .{ .format = .standard, .map = .{ .high = "high" } },
-    }, .limits = .{ .low_price_input = false } };
+    } };
 }
 
 fn windowForInputBudget(budget: u32) u32 {

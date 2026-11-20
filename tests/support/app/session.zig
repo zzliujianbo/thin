@@ -1,13 +1,13 @@
 const session_test_config =
-    \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"SESSION_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":65536,"output_tokens":4096},"next":{"protocol":"chat","context_tokens":131072,"output_tokens":8192}}},"other":{"base_url":"https://other.invalid/v1","api_key_env":"SESSION_TEST_KEY","models":{"other":{"protocol":"chat","context_tokens":32768,"output_tokens":2048}}}}},"limits":{"low_price_input":false}}
+    \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"SESSION_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":65536,"output_tokens":4096},"next":{"protocol":"chat","context_tokens":131072,"output_tokens":8192}}},"other":{"base_url":"https://other.invalid/v1","api_key_env":"SESSION_TEST_KEY","models":{"other":{"protocol":"chat","context_tokens":32768,"output_tokens":2048}}}}}}
 ;
 
 const session_test_unavailable =
-    \\{"llm":{"default":"other/other","providers":{"archive":{"base_url":"https://archive.invalid/v1","models":{"next":{"protocol":"chat","context_tokens":131072}}},"other":{"base_url":"https://other.invalid/v1","models":{"other":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+    \\{"llm":{"default":"other/other","providers":{"archive":{"base_url":"https://archive.invalid/v1","models":{"next":{"protocol":"chat","context_tokens":131072}}},"other":{"base_url":"https://other.invalid/v1","models":{"other":{"protocol":"chat","context_tokens":32768}}}}}}
 ;
 
 const session_test_missing_alias =
-    \\{"llm":{"default":"other/saved","providers":{"other":{"base_url":"https://other.invalid/v1","api_key_env":"SESSION_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+    \\{"llm":{"default":"other/saved","providers":{"other":{"base_url":"https://other.invalid/v1","api_key_env":"SESSION_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":32768}}}}}}
 ;
 
 fn persistedEffortForTest(session: *Session) !presentation.ReasoningEffort {
@@ -82,8 +82,6 @@ fn seedSessionTestHistory(session: *Session) !void {
         .context_tokens = 65536,
         .output_tokens = 4096,
         .output_budget_frozen = true,
-        .input_budget_frozen = true,
-        .input_price_threshold = 100000,
         .permission_id = 19,
         .messages = &.{
             .{ .role = .user, .blocks = &.{.{ .text = "saved question" }} },
@@ -105,7 +103,7 @@ fn expectSessionTestHistory(session: *Session) !void {
 }
 
 const session_codex_metadata_config =
-    \\{"llm":{"default":"chatgpt/gpt-fixture","providers":{"chatgpt":{"base_url":"https://chatgpt.com/backend-api/codex","kind":"openai_codex","codex_oauth":{"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_at_ms":123456789},"models":{"gpt-fixture":{"protocol":"responses","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+    \\{"llm":{"default":"chatgpt/gpt-fixture","providers":{"chatgpt":{"base_url":"https://chatgpt.com/backend-api/codex","kind":"openai_codex","codex_oauth":{"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_at_ms":123456789},"models":{"gpt-fixture":{"protocol":"responses","context_tokens":32768}}}}}}
 ;
 
 fn releaseLease(session: *Session) void {
@@ -120,13 +118,13 @@ const legacyMetadataTestMask = metadata.bit(.deepseek) | metadata.bit(.opencode_
 fn writeOfficialMetadataTestConfig(dir: std.Io.Dir, id: ProviderId) !void {
     try writeSessionTestConfig(dir, switch (id) {
         .deepseek =>
-        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","chat_max_tokens":true}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","chat_max_tokens":true}}}}
         ,
         .opencode_go =>
-        \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","chat_max_tokens":true}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","chat_max_tokens":true}}}}
         ,
         .opencode_zen =>
-        \\{"llm":{"default":"opencode-zen/minimax-m2.7","providers":{"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen","chat_max_tokens":true}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-zen/minimax-m2.7","providers":{"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen","chat_max_tokens":true}}}}
         ,
         .openai_codex => return error.UnexpectedFixtureProvider,
     });
@@ -195,7 +193,7 @@ const MetadataPublicationFixture = struct {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try writeSessionTestConfig(tmp.dir,
-            \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","api_key":"fake-owned-publication","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+            \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","api_key":"fake-owned-publication","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}}}
         );
         var path: [4096]u8 = undefined;
         const home = path[0..try tmp.dir.realPath(io, &path)];
@@ -356,15 +354,15 @@ fn publicReasoningFixture(listing: *metadata.Listing, name: []const u8) void {
 }
 
 const proxy_session_config =
-    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"review/raw/id":{"protocol":"chat","context_tokens":32768},"native/raw":{"protocol":"chat","context_tokens":32768},"unknown/raw":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"PROXY_MISSING_KEY","models":{"m":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/review/raw/id"]}}
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"review/raw/id":{"protocol":"chat","context_tokens":32768},"native/raw":{"protocol":"chat","context_tokens":32768},"unknown/raw":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"PROXY_MISSING_KEY","models":{"m":{"protocol":"chat","context_tokens":65536}}}}},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/review/raw/id"]}}
 ;
 
 const proxy_helper_config =
-    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"chat","context_tokens":32768},"review/raw/id":{"protocol":"chat","context_tokens":32768}}},"img":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"PROXY_IMG_KEY","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"image":{"model":"img/deepseek-flash"},"limits":{"low_price_input":false},"proxy":{"address":"127.0.0.1","port":18080,"models":["aux/review/raw/id"]}}
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-main-key","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"chat","context_tokens":32768},"review/raw/id":{"protocol":"chat","context_tokens":32768}}},"img":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"PROXY_IMG_KEY","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"image":{"model":"img/deepseek-flash"},"proxy":{"address":"127.0.0.1","port":18080,"models":["aux/review/raw/id"]}}
 ;
 
 const proxy_pending_config =
-    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key_env":"PROXY_MAIN_MISSING","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"chat","context_tokens":32768},"other/raw":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/native/raw"]}}
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key_env":"PROXY_MAIN_MISSING","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"aux":{"base_url":"https://aux.invalid/v1","api_key_env":"PROXY_AUX_KEY","models":{"native/raw":{"protocol":"chat","context_tokens":32768},"other/raw":{"protocol":"chat","context_tokens":65536}}}}},"proxy":{"address":"10.0.0.9","port":3128,"models":["aux/native/raw"]}}
 ;
 
 fn readSessionConfigBytes(dir: std.Io.Dir) ![]u8 {

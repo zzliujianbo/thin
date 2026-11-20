@@ -56,13 +56,7 @@ const Frame = struct { begin: usize, end: usize, complete: bool };
 const ComposerKind = enum { none, effort, normal };
 
 /// contextLabel emits ?%, >100%, or canonical tenths in 0.0..100.0%.
-/// The policy marker, when enabled, precedes the value (never its percent).
-fn normalLabel(label_: []const u8, low_price: bool) bool {
-    var label = label_;
-    if (low_price) {
-        if (!std.mem.startsWith(u8, label, "L")) return false;
-        label = label[1..];
-    }
+fn normalLabel(label: []const u8) bool {
     if (std.mem.eql(u8, label, "?%") or std.mem.eql(u8, label, ">100%")) return true;
     if (label.len < 4 or label.len > 6 or label[label.len - 3] != '.' or
         !std.ascii.isDigit(label[label.len - 2]) or label[label.len - 1] != '%') return false;
@@ -78,7 +72,7 @@ fn normalLabel(label_: []const u8, low_price: bool) bool {
 
 /// A prompt contributes exactly one separator space. Cursor position and all
 /// cells after it matter: trimEnd would discard typed spaces or hide a draft.
-fn composerKind(view: *const regular.Screen, model: []const u8, effort: []const u8, low_price: bool) ComposerKind {
+fn composerKind(view: *const regular.Screen, model: []const u8, effort: []const u8) ComposerKind {
     if (view.row >= view.rows or view.row >= view.grid.len or view.col >= view.columns or view.wrap) return .none;
     const line = &view.grid[view.row];
     const text = line[0..view.col];
@@ -87,25 +81,17 @@ fn composerKind(view: *const regular.Screen, model: []const u8, effort: []const 
         !std.mem.eql(u8, text[1..][0..model.len], model) or
         !std.mem.endsWith(u8, text, "> ")) return .none;
     // The provider report is hidden by default, which closes the model
-    // parentheses right after the name; the price marker then moves outside.
+    // parentheses right after the name.
     const close = std.mem.indexOfScalarPos(u8, text, model.len + 1, ')') orelse return .none;
     const reported_hidden = close == model.len + 1;
     if (!reported_hidden) {
         if (text[model.len + 1] != ' ') return .none;
-        var reported = text[model.len + 2 .. close];
-        if (low_price) {
-            if (!std.mem.startsWith(u8, reported, "L")) return .none;
-            reported = reported[1..];
-        }
-        if (!normalLabel(reported, false)) return .none;
+        if (!normalLabel(text[model.len + 2 .. close])) return .none;
     }
-    var value = text[close + 1 .. text.len - 2];
-    // With the report hidden, an active low-price marker sits outside the
-    // parentheses, immediately before the estimate or effort level.
-    if (reported_hidden and low_price and std.mem.startsWith(u8, value, "L")) value = value[1..];
+    const value = text[close + 1 .. text.len - 2];
     if (value.len != 0) {
         if (std.mem.eql(u8, value, effort)) return .effort;
-        if (!normalLabel(value, false)) return .none;
+        if (!normalLabel(value)) return .none;
     }
     return .normal;
 }
@@ -143,12 +129,12 @@ const FrameScanner = struct {
     fn findEffort(self: *FrameScanner, bytes: []const u8, start: usize, model: []const u8, effort: []const u8) !?Frame {
         if (self.witness) |frame| return frame;
         while (true) {
-            const previously_effort = composerKind(self.view, model, effort, false) == .effort;
+            const previously_effort = composerKind(self.view, model, effort) == .effort;
             const frame = (try self.next(bytes)) orelse return null;
             // An unrelated ACK that merely retains an old effort is not proof
             // of this action. Require an actual transition to the exact slot.
             if (frame.complete and frame.begin >= start and !previously_effort and
-                composerKind(self.view, model, effort, false) == .effort)
+                composerKind(self.view, model, effort) == .effort)
             {
                 self.witness = frame;
                 return frame;
@@ -376,7 +362,7 @@ const Driver = struct {
 
     fn effortIdleReady(self: *Driver, start: usize, model: []const u8, effort: []const u8, allow_normal: bool, scanner: *?FrameScanner) !bool {
         const view = (try self.acknowledgedScreen(start)) orelse return false;
-        const kind = composerKind(view, model, effort, false);
+        const kind = composerKind(view, model, effort);
         if (kind == .none) return false;
         if (allow_normal) return true; // Only used after a completed reply.
         if (scanner.* == null) scanner.* = try FrameScanner.init(self.columns);
@@ -397,7 +383,7 @@ const Driver = struct {
         while (now() < until) {
             try self.drain(20);
             if (try self.acknowledgedScreen(start)) |view| {
-                if (composerKind(view, model, effort, false) != .none) return;
+                if (composerKind(view, model, effort) != .none) return;
             }
             if (!self.owned) return error.EarlyExit;
         }
@@ -662,7 +648,7 @@ fn settingsColorFrame(bytes: []const u8, level: []const u8) !bool {
     const slot = bytes[at + model_end.len ..];
     const report_at = std.mem.indexOf(u8, slot, muted) orelse return false;
     const report_end = std.mem.findScalarPos(u8, slot, report_at + muted.len, '\x1b') orelse return false;
-    if (!normalLabel(slot[report_at + muted.len .. report_end], false)) return false;
+    if (!normalLabel(slot[report_at + muted.len .. report_end])) return false;
     if (!std.mem.startsWith(u8, slot[report_end..], reset_bold ++ ")")) return false;
     const tail = slot[report_end + reset_bold.len + 1 ..];
     // Effort confirmation: muted report, then the level in its own colour.
@@ -677,14 +663,14 @@ fn settingsColorFrame(bytes: []const u8, level: []const u8) !bool {
     var end = green.len;
     while (end < tail.len and (std.ascii.isDigit(tail[end]) or tail[end] == '.')) : (end += 1) {}
     if (end == green.len or !std.mem.startsWith(u8, tail[end..], "%" ++ reset_bold ++ ">\x1b[0m ")) return false;
-    if (!normalLabel(tail[green.len .. end + 1], false)) return false;
+    if (!normalLabel(tail[green.len .. end + 1])) return false;
     const percent = std.fmt.parseFloat(f64, tail[green.len..end]) catch return false;
     return percent < 25;
 }
 
 fn settingsColor(d: *Driver, start: usize, level: []const u8) !void {
     const view = (try d.acknowledgedScreen(start)) orelse return error.SettingsColorMismatch;
-    if (composerKind(view, "fixture-model", level, false) == .none) return error.SettingsColorMismatch;
+    if (composerKind(view, "fixture-model", level) == .none) return error.SettingsColorMismatch;
     if (d.effort_witness_start == start) if (d.effort_witness) |frame| {
         // In the expiry fallback this is the actual effort frame, not a later
         // percent frame or some unrelated earlier occurrence of the color.
@@ -698,7 +684,7 @@ fn settingsColor(d: *Driver, start: usize, level: []const u8) !void {
     defer scanner.deinit();
     var latest_color: ?bool = null;
     while (try scanner.next(bytes)) |frame| {
-        if (!frame.complete or frame.begin < start or composerKind(scanner.view, "fixture-model", level, false) == .none) continue;
+        if (!frame.complete or frame.begin < start or composerKind(scanner.view, "fixture-model", level) == .none) continue;
         const raw = bytes[frame.begin..frame.end];
         // A sparse frame may not repaint the footer at all. Preserve the last
         // validated footer repaint, but never an unacknowledged raw match.
@@ -717,14 +703,14 @@ fn settingsKey(d: *Driver, bytes: []const u8) !void {
     try d.waitFrame(start, "\x1b[?25l");
 }
 
-fn settingsValues(d: *Driver, low: []const u8) !void {
-    var low_buffer: [100]u8 = undefined;
-    const low_text = try std.fmt.bufPrint(&low_buffer, "Low-price input  {s}", .{low});
+fn settingsValues(d: *Driver, compaction: []const u8) !void {
+    var buffer: [100]u8 = undefined;
+    const selected = try std.fmt.bufPrint(&buffer, "> Auto compaction  {s}", .{compaction});
     const until = now() + 10000;
     while (now() < until) {
         try d.drain(20);
         if (try d.acknowledgedScreen(d.settings_key_start)) |view| {
-            if (view.visible(low_text) and view.visible("> Low-price input")) return;
+            if (view.visible(selected)) return;
         }
         if (!d.owned) return error.EarlyExit;
     }
@@ -752,14 +738,14 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     }
     try settingsKey(d, "\x1b[B");
     const next = try d.screen();
-    try check(next.visible("> Auto compaction"));
+    try check(next.visible("> Command timeout"));
     try settingsKey(d, "\x1b[A");
     try settingsValues(d, after);
     // Left returns to the root command list with settings selected. Tab
     // completes it, and a separately acknowledged Enter opens it again.
     try settingsKey(d, "\x1b[D");
     const root = try d.screen();
-    try check(root.visible("> /settings") and root.visible("/model") and !root.visible("Low-price input"));
+    try check(root.visible("> /settings") and root.visible("/model") and !root.visible("Auto compaction"));
     try settingsKey(d, "\t");
     const completed = try d.screen();
     try check(completed.visible("/settings"));
@@ -769,8 +755,7 @@ fn globalSettings(d: *Driver, mode: []const u8) !void {
     try d.send("\x1b");
     try d.waitIdle(start);
     const closed = try d.screen();
-    try check(!closed.visible("Low-price input") and !closed.visible("Auto compaction"));
-    // No fabricated L assertion: unknown pricing has no authoritative tier.
+    try check(!closed.visible("Auto compaction") and !closed.visible("Command timeout"));
     // Reopening checks the owner's published values after Esc, not UI intent.
     try settingsKey(d, "/settings\r");
     try settingsValues(d, after);
@@ -826,7 +811,7 @@ fn imageModel(d: *Driver, init: std.process.Init, project: []const u8) !void {
     try d.waitIdle(start);
     try settingsScreen(d, a, &.{"3.1%"}, &.{"?%"});
     try settingsKey(d, "/settings\r");
-    // Resolve the seven-row root by label and wait for every navigation ACK.
+    // Resolve the Settings root by label and wait for every navigation ACK.
     try settingsValueSelect(d, a, "Image model");
     try settingsScreen(d, a, &.{ "> Image model", "Image model      Off" }, &.{});
     try settingsKey(d, "\r");
@@ -1009,12 +994,12 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
     try settingsKey(d, "/settings\r");
     // A batched command plus Enter may be processed in one read; require the
     // replayed Settings root before sending navigation keys.
-    try settingsScreen(d, a, &.{ "Low-price input", "Auto compaction" }, &.{});
+    try settingsScreen(d, a, &.{ "> Auto compaction", "Command timeout" }, &.{});
     try settingsValueSelect(d, a, "Proxy");
-    try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{});
+    try settingsScreen(d, a, &.{ "> Proxy", "Auto compaction" }, &.{});
     try settingsKey(d, "\r");
     if (configured) {
-        // Root 7 opens the second level on Address. Its editor is prefilled
+        // Proxy opens the second level on Address. Its editor is prefilled
         // with the saved endpoint; an abandoned draft writes nothing.
         try settingsScreen(d, a, &.{ "> Address", "Models" }, &.{ "Search> ", "Address> " });
         try settingsKey(d, "\r");
@@ -1065,7 +1050,7 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         try settingsKey(d, "\x1b[D");
         try settingsScreen(d, a, &.{"> Models"}, &.{"Search> "});
         try settingsKey(d, "\x1b");
-        try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
+        try settingsScreen(d, a, &.{ "> Proxy", "Auto compaction" }, &.{"Search> "});
         try settingsProxyGate(d, a, project, "root-return");
         // Reopen lands on Address; Models then opens the list again.
         try settingsKey(d, "\r");
@@ -1110,7 +1095,7 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         // Models is a second level; one more Escape reaches the root row that
         // owns it, so both branches leave from the same screen.
         try settingsKey(d, "\x1b");
-        try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
+        try settingsScreen(d, a, &.{ "> Proxy", "Auto compaction" }, &.{"Search> "});
     } else {
         // Models is the blocked child: opening without root.proxy shows the
         // fixed notice and Enter reports the missing endpoint instead of
@@ -1172,17 +1157,17 @@ fn settingsProxy(d: *Driver, init: std.process.Init, mode: []const u8, project: 
         // Esc leaves the second level for the root row, which now reports the
         // removed endpoint instead of a stale host:port.
         try settingsKey(d, "\x1b");
-        try settingsScreen(d, a, &.{ "> Proxy", "Not configured", "Low-price input" }, &.{"Address> "});
+        try settingsScreen(d, a, &.{ "> Proxy", "Not configured", "Auto compaction" }, &.{"Address> "});
         try settingsProxyGate(d, a, project, "reopened");
     }
     // Both branches end on the Settings root with Proxy selected: one Escape
     // closes Settings and needs its own acknowledged screen.
-    try settingsScreen(d, a, &.{ "> Proxy", "Low-price input" }, &.{"Search> "});
+    try settingsScreen(d, a, &.{ "> Proxy", "Auto compaction" }, &.{"Search> "});
     const start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
     const closed = try d.screen();
-    try check(!closed.visible("Low-price input") and !closed.visible("Search> "));
+    try check(!closed.visible("Auto compaction") and !closed.visible("Search> "));
 }
 
 fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8) !void {
@@ -1193,8 +1178,8 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try d.waitText(start, "values-warmup-answer");
     try d.waitIdle(start);
     try settingsKey(d, "/settings\r");
-    try settingsScreen(d, a, &.{ "> Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model" }, &.{ "Output limit", "Task timeout" });
-    try settingsValueMenuOrder(d, a, &.{ "Low-price input", "Auto compaction", "Command timeout", "Request timeout", "Image model", "Proxy", "Reported usage" });
+    try settingsScreen(d, a, &.{ "> Auto compaction", "Command timeout", "Request timeout", "Image model" }, &.{ "Low-price input", "Output limit", "Task timeout" });
+    try settingsValueMenuOrder(d, a, &.{ "Auto compaction", "Command timeout", "Request timeout", "Image model", "Proxy", "Reported usage" });
     try settingsValueGate(d, a, project, "opened");
     try settingsValueOpen(d, a, "Auto compaction"); // Boolean toggle, no numeric picker.
     try settingsScreen(d, a, &.{ "> Auto compaction", "Auto compaction  off" }, &.{});
@@ -1258,7 +1243,7 @@ fn settingsValuesJourney(d: *Driver, init: std.process.Init, project: []const u8
     try settingsValueGate(d, a, project, "task");
 
     try settingsKey(d, "\x1b[D"); // Settings -> root commands.
-    try settingsScreen(d, a, &.{"> /settings"}, &.{"Low-price input"});
+    try settingsScreen(d, a, &.{"> /settings"}, &.{"Auto compaction"});
     start = d.used;
     try d.send("\x1b");
     try d.waitIdle(start);
@@ -2062,7 +2047,7 @@ fn frameSelfCheck() !void {
         try check((try d.acknowledgedScreen(0)) == null);
         try selfAppend(d, low[n..]);
         const view = (try d.acknowledgedScreen(normal.len)) orelse return error.SelfCheckMissingAck;
-        try check(composerKind(view, "fixture-model", "low", false) == .effort);
+        try check(composerKind(view, "fixture-model", "low") == .effort);
     }
 
     // Exact prompt suffix + cursor, not trimEnd: typed spaces, a multi-character
@@ -2076,12 +2061,12 @@ fn frameSelfCheck() !void {
     }) |bad| {
         try selfCapture(d, &.{bad});
         const view = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-        try check(composerKind(view, "fixture-model", "low", false) == .none);
+        try check(composerKind(view, "fixture-model", "low") == .none);
     }
     try selfCapture(d, &.{low});
     const view = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
     view.wrap = true;
-    try check(composerKind(view, "fixture-model", "low", false) == .none);
+    try check(composerKind(view, "fixture-model", "low") == .none);
 
     const valid = [_][]const u8{ "?%", "0.0%", "9.0%", "99.9%", "100.0%", ">100%" };
     const invalid = [_][]const u8{ "9%", "999.999%", "100.1%", "101.0%", "00.0%", "-1.0%", "+1.0%", "1e1%", "NaN%", "1.2.3%", "x9.0%", "9.0%x", "9.0L%", "L9.0%" };
@@ -2090,29 +2075,15 @@ fn frameSelfCheck() !void {
         const bytes = try std.fmt.bufPrint(&buffer, "{s}(fixture-model {s})> {s}", .{ prefix, label, suffix });
         try selfCapture(d, &.{bytes});
         const current = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-        try check((composerKind(current, "fixture-model", "low", false) == .normal) == (i < valid.len));
+        try check((composerKind(current, "fixture-model", "low") == .normal) == (i < valid.len));
     }
-    try check(normalLabel("L9.0%", true) and normalLabel("L?%", true) and normalLabel("L>100%", true));
-    try check(!normalLabel("9.0L%", true) and !normalLabel("9.0%", true) and !normalLabel("LL9.0%", true));
-    try selfCapture(d, &.{prefix ++ "(fixture-model L9.0%)> " ++ suffix});
-    const marked = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-    try check(composerKind(marked, "fixture-model", "low", true) == .normal);
-    try check(composerKind(marked, "fixture-model", "low", false) == .none);
-    // Hiding the report closes the model parentheses and moves L outside.
+    // With the report hidden, the estimate or effort follows the model name.
     try selfCapture(d, &.{prefix ++ "(fixture-model)9.0%> " ++ suffix});
     const hidden = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-    try check(composerKind(hidden, "fixture-model", "low", false) == .normal);
-    try selfCapture(d, &.{prefix ++ "(fixture-model)L9.0%> " ++ suffix});
-    const hidden_marked = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-    try check(composerKind(hidden_marked, "fixture-model", "low", true) == .normal);
-    try check(composerKind(hidden_marked, "fixture-model", "low", false) == .none);
-    try selfCapture(d, &.{prefix ++ "(fixture-model)Llow> " ++ suffix});
+    try check(composerKind(hidden, "fixture-model", "low") == .normal);
+    try selfCapture(d, &.{prefix ++ "(fixture-model)low> " ++ suffix});
     const hidden_effort = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-    try check(composerKind(hidden_effort, "fixture-model", "low", true) == .effort);
-    try selfCapture(d, &.{prefix ++ "(fixture-model L9.0%)low> " ++ suffix});
-    const marked_effort = (try d.acknowledgedScreen(0)) orelse return error.SelfCheckMissingAck;
-    try check(composerKind(marked_effort, "fixture-model", "low", true) == .effort);
-    try check(composerKind(marked_effort, "fixture-model", "low", false) == .none);
+    try check(composerKind(hidden_effort, "fixture-model", "low") == .effort);
 
     // One drain can deliver both the actual flash and its expiry. Historical
     // ACKs, a wrong effort, and a partial frame cannot stand in for the flash.
@@ -2432,7 +2403,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
     d.waitIdleUntil(0, startup_until) catch |err| {
         if (!d.owned) std.debug.print("error: ChildStatus{d}\n", .{d.status});
         // Only fixed identifiers from our owned child, never captured content.
-        for ([_][]const u8{ "InvalidConfig", "UnknownField", "DefaultModelUnavailable", "UnknownInputPriceThreshold", "InvalidProvider", "InvalidModel", "NotDir", "SymlinkNotAllowed", "SpawnFailed", "CleanupFailed", "ParentGone", "MissingOwnerFd", "InvalidOwnerFd", "MissingOwnerPid", "PeerPidMismatch", "PeerUidMismatch", "PeerCredentialsUnavailable", "TtyRequired", "ForegroundRequired", "AccessDenied", "FileNotFound", "NameTooLong", "InvalidPath", "DirectoryMoved", "InsecureRuntimeBase", "IdentityChanged", "SocketPathTooLong", "Timeout" }) |code| {
+        for ([_][]const u8{ "InvalidConfig", "UnknownField", "DefaultModelUnavailable", "InvalidProvider", "InvalidModel", "NotDir", "SymlinkNotAllowed", "SpawnFailed", "CleanupFailed", "ParentGone", "MissingOwnerFd", "InvalidOwnerFd", "MissingOwnerPid", "PeerPidMismatch", "PeerUidMismatch", "PeerCredentialsUnavailable", "TtyRequired", "ForegroundRequired", "AccessDenied", "FileNotFound", "NameTooLong", "InvalidPath", "DirectoryMoved", "InsecureRuntimeBase", "IdentityChanged", "SocketPathTooLong", "Timeout" }) |code| {
             if (std.mem.indexOf(u8, d.output[0..d.used], code) != null) std.debug.print("error: {s}\n", .{code});
         }
         return err;
@@ -3300,7 +3271,7 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         const medium_screen = try d.screens.allocator().create(regular.Screen);
         medium_screen.* = .{ .columns = d.columns };
         try medium_screen.replay(d.output[0..medium_frame.end]);
-        try check(composerKind(medium_screen, "fixture-next", "medium", false) == .effort);
+        try check(composerKind(medium_screen, "fixture-next", "medium") == .effort);
         // The transient effort confirmation then expires back to the ordinary
         // percentage prompt; only after observing it should this wait for idle.
         try d.waitIdle(start);

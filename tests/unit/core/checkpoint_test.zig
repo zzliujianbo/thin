@@ -41,6 +41,43 @@ test "checkpoint reads retired v2 budget fields without re-emitting them" {
     defer a.free(bad);
     try std.testing.expectError(error.InvalidType, decode(a, bad));
 }
+test "checkpoint discards legacy price snapshots and preserves all current state" {
+    const a = std.testing.allocator;
+    var state = fixture(.chat);
+    state.output_tokens = 8192;
+    state.output_budget_frozen = true;
+    const current = try encode(a, state);
+    defer a.free(current);
+    for ([_][]const u8{
+        "\"input_budget_frozen\":true,\"input_price_threshold\":100000,\"input_price_flat_limit\":null,\"low_price_input\":true",
+        "\"input_budget_frozen\":false,\"input_price_threshold\":null,\"input_price_flat_limit\":4294967295,\"low_price_input\":false",
+    }) |fields| {
+        const old = try std.mem.concat(a, u8, &.{ "{", fields, ",", current[1..] });
+        defer a.free(old);
+        const migrated = try decode(a, old);
+        defer migrated.deinit();
+        try std.testing.expectEqualDeep(state, migrated.value);
+        const saved = try encode(a, migrated.value);
+        defer a.free(saved);
+        try std.testing.expectEqualStrings(current, saved);
+    }
+}
+test "checkpoint legacy price exceptions reject malformed values and unknown neighbors" {
+    const a = std.testing.allocator;
+    const current = try encode(a, fixture(.chat));
+    defer a.free(current);
+    for ([_][]const u8{
+        "\"input_budget_frozen\":0",        "\"low_price_input\":null",
+        "\"input_price_threshold\":\"12\"", "\"input_price_flat_limit\":4294967296",
+    }) |field| {
+        const bad = try std.mem.concat(a, u8, &.{ "{", field, ",", current[1..] });
+        defer a.free(bad);
+        try std.testing.expectError(error.InvalidType, decode(a, bad));
+    }
+    const unknown = try std.mem.concat(a, u8, &.{ "{\"low_price_input\":true,\"input_price_limit\":12,", current[1..] });
+    defer a.free(unknown);
+    try std.testing.expectError(error.UnknownField, decode(a, unknown));
+}
 test "checkpoint keeps display-only tool counters and reads old files without them" {
     const a = std.testing.allocator;
     var state = fixture(.chat);
@@ -183,7 +220,6 @@ test "checkpoint display accepts representable stale budgets and provenance but 
     for ([_]u32{ 0, 16 * 1024 * 1024 + 1, std.math.maxInt(u32) }) |tokens| {
         state.context_tokens = tokens;
         state.output_tokens = tokens;
-        state.input_price_threshold = tokens;
         const bytes = try encode(a, state);
         defer a.free(bytes);
         const parsed = try decode(a, bytes);

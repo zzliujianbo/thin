@@ -638,7 +638,7 @@ pub const Session = struct {
 
     pub fn connection(self: *Session) tui.Connection {
         self.installObserver();
-        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .setting_fn = setSetting, .preference_fn = setPreference, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
+        return .{ .context = self, .task_begin_fn = taskBegin, .task_joined_fn = taskJoined, .current_fn = current, .configure_fn = configure, .configure_provider_fn = configureProvider, .select_model_fn = selectModel, .set_effort_fn = setEffort, .cycle_effort_fn = cycleEffort, .preference_fn = setPreference, .image_fn = setImage, .proxy_fn = setProxyModel, .proxy_address_fn = setProxyAddress, .initial_history_fn = initialHistory, .refresh_models_fn = refreshModels, .poll_models_fn = pollModels, .codex_login_fn = codexLogin, .peek_background_fn = peekBackgroundCallback, .take_background_fn = takeBackgroundCallback };
     }
 
     /// Called once, before any producer exists; never exposed by per-frame state.
@@ -869,11 +869,7 @@ pub const Session = struct {
             // an unknown raw ID cannot inherit another model's capabilities.
             .allow_custom_models = config.registry == null and allowsCustomModels(config.provider),
             .context_limit = if (unselected or config.selection_pending) 0 else config.model.context_tokens,
-            // L reports active protection against a known price step, not
-            // the global switch. Flat/unknown/pending models have no marker.
-            .low_price_input = self.app != null and !unselected and !config.selection_pending and config.limits.low_price_input and config.model.input_price_threshold != null,
             .limits = config.limits,
-            .low_price_input_enabled = config.limits.low_price_input,
             .image_enabled = config.imageActive(),
             .image_models = self.display_image_models,
             .image_model = if (config.imageActive()) config.image.model else null,
@@ -1439,7 +1435,7 @@ pub const Session = struct {
     }
 
     /// Image has a fixed documented Chat request; it does not borrow the main
-    /// model's generative protocol/window eligibility or low-price budget.
+    /// model's generative protocol/window eligibility.
     fn buildImageModels(self: *Session, global: cfg.Config) ![]cfg.Model {
         var models: std.ArrayList(cfg.Model) = .empty;
         errdefer {
@@ -1581,18 +1577,6 @@ pub const Session = struct {
             self.global_config = value;
             candidate.* = null;
         }
-    }
-
-    fn setSetting(raw: *anyopaque, setting: tui.Connection.Setting, enabled: bool) !void {
-        const self: *Session = @ptrCast(@alignCast(raw));
-        try self.guardSelection();
-        // Persist only the owned declaration, never resolved/history metadata.
-        var declaration = try cfg.clone(self.allocator, self.global_config.?.value);
-        defer cfg.release(&declaration);
-        switch (setting) {
-            .low_price_input => declaration.value.limits.low_price_input = enabled,
-        }
-        try self.persistSettings(&declaration, .none);
     }
 
     fn setPreference(raw: *anyopaque, key: settings_preferences.Key, value: ?u32) !void {

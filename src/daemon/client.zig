@@ -139,7 +139,6 @@ fn wireError(code: protocol.ErrorCode) anyerror {
         .input_too_large => error.InputTooLarge,
         .queue_full => error.QueueFull,
         .queue_empty => error.QueueEmpty,
-        .input_budget => error.InputBudgetExceeded,
         .unsupported => error.Unsupported,
         .canceled => error.Canceled,
         .permission_expired => error.PermissionExpired,
@@ -334,8 +333,6 @@ const Pub = struct {
     effort_levels: shared.activity.EffortSet = .{},
     configured: u8 = 0,
     read_only: bool = false,
-    low_price_enabled: bool = true,
-    low_price_active: bool = false,
     image_enabled: bool = false,
     image_model: ?[]const u8 = null,
     /// Public proxy state: whether the owner has a proxy allowlist, the exact
@@ -817,8 +814,6 @@ pub const Client = struct {
         state.configured_providers = cfg.configured;
         state.allow_custom_models = cfg.allow_custom;
         state.context_limit = cfg.context_limit;
-        state.low_price_input = cfg.low_price_active;
-        state.low_price_input_enabled = cfg.low_price_enabled;
         state.image_enabled = cfg.image_enabled;
         state.image_models = try cloneModels(arena, cfg.image_models);
         state.image_model = if (cfg.image_model) |name| try arena.dupe(u8, name) else null;
@@ -904,9 +899,6 @@ pub const Client = struct {
             .effort => |effort| try setEffortFn(self, effort),
             .cycle_effort => return .{ .effort = try cycleEffortFn(self) },
             .preference => |v| try preferenceFn(self, v.key, v.value),
-            .setting => |v| try settingFn(self, switch (v.key) {
-                .low_price_input => .low_price_input,
-            }, v.value),
             .image => |choice| try imageFn(self, choice),
             .proxy => |v| try proxyFn(self, v.model, v.enabled),
             .proxy_address => |address| try proxyAddressFn(self, address),
@@ -1171,10 +1163,6 @@ pub const Client = struct {
         if (read.field(view, "effort_levels")) |value| next.effort_levels = parseEfforts(value);
         if (read.field(view, "configured")) |value| next.configured = parseConfigured(value);
         next.read_only = read.flag(view, "read_only", false);
-        // `low_price_input` is the active protection marker, not the switch;
-        // `low_price_input_enabled` is the configured global switch.
-        next.low_price_active = read.flag(view, "low_price_input", false);
-        next.low_price_enabled = read.flag(view, "low_price_input_enabled", next.low_price_active);
         next.image_enabled = read.flag(view, "image_enabled", false);
         next.image_model = read.text(view, "image_model");
         next.proxy_configured = read.flag(view, "proxy_configured", false);
@@ -2552,19 +2540,6 @@ pub const Client = struct {
         self.rebuild();
     }
 
-    fn settingFn(context: *anyopaque, setting: tui.Connection.Setting, enabled: bool) anyerror!void {
-        const self = fromContext(context);
-        var req = try self.settingsRequest(.setting);
-        defer req.deinit();
-        try req.put("key", @tagName(setting));
-        try req.put("value", enabled);
-        var resp = try req.exchange(quick_timeout_ms);
-        defer resp.deinit();
-        self.dirty = true;
-        self.refreshSettings();
-        self.rebuild();
-    }
-
     fn imageFn(context: *anyopaque, choice: settings_model_picker.Choice) anyerror!void {
         const self = fromContext(context);
         try self.imageSelection(choice);
@@ -2766,9 +2741,6 @@ fn parseLimits(value: std.json.Value, base: core_config.Limits) core_config.Limi
         if (object.get(name)) |entry| {
             if (valueU64(entry)) |number| @field(limits, name) = @intCast(@min(number, std.math.maxInt(u32)));
         }
-    }
-    if (object.get("low_price_input")) |entry| {
-        if (valueBool(entry)) |flag| limits.low_price_input = flag;
     }
     if (object.get("compaction_enabled")) |entry| {
         if (valueBool(entry)) |flag| limits.compaction_enabled = flag;

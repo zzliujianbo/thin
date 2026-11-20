@@ -1,167 +1,70 @@
-test "input budget registry declarations roundtrip without persisting derived price metadata" {
-    const prefixes = [_][]const u8{
-        "{\"llm\":{\"default\":\"local/m\",\"providers\":{\"local\":{\"base_url\":\"https://fixture.invalid/v1\",\"models\":{\"m\":{\"protocol\":\"chat\",\"context_tokens\":1000000}}}}},\"limits\":",
-    };
-    for (prefixes) |prefix| {
-        const raw = try std.mem.concat(a, u8, &.{ prefix, "{\"low_price_input\":true,\"input_margin_tokens\":5000.0,\"max_input_tokens\":\"100000\",\"safety_tokens\":1,\"max_rounds\":null}}" });
-        defer a.free(raw);
-        var parsed = try cfg.parse(a, raw);
-        defer cfg.release(&parsed);
-        try std.testing.expect(parsed.value.limits.low_price_input);
-        const empty_cache: @import("../app/model_metadata.zig").Cache = .{};
-        try @import("../app/model_resolver.zig").applyDefault(parsed.arena.allocator(), &parsed.value, &empty_cache);
-        parsed.value.model.input_price_threshold = 100000;
-        parsed.value.model.input_price_flat_limit = 1000000;
-        var cloned = try cfg.clone(a, parsed.value);
-        defer cfg.release(&cloned);
-        try std.testing.expectEqual(@as(?u32, 100000), cloned.value.model.input_price_threshold);
-        try std.testing.expectEqual(@as(?u32, 1000000), cloned.value.model.input_price_flat_limit);
-        var out: std.Io.Writer.Allocating = .init(a);
-        defer out.deinit();
-        try cfg.writeDisk(cloned.value, &out.writer);
-        try std.testing.expect(std.mem.find(u8, out.written(), "\"input_price_threshold\"") == null);
-        try std.testing.expect(std.mem.find(u8, out.written(), "\"input_price_flat_limit\"") == null);
-        const encoded = try std.json.parseFromSlice(std.json.Value, a, out.written(), .{});
-        defer encoded.deinit();
-        const limits = encoded.value.object.get("limits").?.object;
-        try std.testing.expectEqual(@as(usize, 5), limits.count());
-        inline for (@typeInfo(cfg.Limits).@"struct".field_names) |field| try std.testing.expect(limits.get(field) != null);
-        inline for (.{ "input_margin_tokens", "max_input_tokens", "safety_tokens", "max_rounds" }) |retired| {
-            try std.testing.expect(limits.get(retired) == null);
+test "input budget is checked again before a Chat fallback and cancellation wins before retry" {
+    const Probe = struct {
+        config: *cfg.Config,
+        cancel: *p.Cancellation,
+        mode: enum { fits, oversized, canceled },
+        responses: usize = 0,
+        chat: usize = 0,
+
+        fn call(raw: *anyopaque, alloc: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(p.Purpose.normal, req.purpose);
+            const input = c.rawTokens(req.system, req.tools, req.messages);
+            if (req.scope.protocol == .responses) {
+                self.responses += 1;
+                // Change the available room between the probe and its retry.
+                setBudget(self.config, if (self.mode == .fits) input else input - 1);
+                if (self.mode == .canceled) self.cancel.cancel();
+                return .{ .failure = .{ .kind = .unsupported_protocol, .message = "try chat" } };
+            }
+            try std.testing.expectEqual(p.Protocol.chat, req.scope.protocol);
+            self.chat += 1;
+            try std.testing.expectEqual(input, c.inputBudget(self.config.*));
+            return .{ .success = .{ .finish = .stop, .message = try p.textMessage(alloc, .assistant, "done") } };
         }
-        var again = try cfg.parse(a, out.written());
-        defer cfg.release(&again);
-        try std.testing.expectEqualDeep(parsed.value.limits, again.value.limits);
-        try std.testing.expect(again.value.model.input_price_threshold == null);
-        try std.testing.expect(again.value.model.input_price_flat_limit == null);
-    }
-    for ([_][]const u8{ "{\"low_price_input\":\"true\"}", "{\"compaction_enabled\":0}", "{\"command_timeout_ms\":1.5}", "{\"request_timeout_ms\":\"1000\"}", "{\"unknown_input_tokens\":\"100000\"}", "{\"low_price_input\":true,\"low_price_input\":false}" }) |limits| {
-        const raw = try std.mem.concat(a, u8, &.{ prefixes[0], limits, "}" });
-        defer a.free(raw);
-        if (cfg.parse(a, raw)) |value| {
-            var parsed = value;
-            cfg.release(&parsed);
-            return error.ExpectedInvalidPolicy;
-        } else |_| {}
-    }
-}
-test "input budget known flat pricing is distinct from unknown and stays within its proven range" {
-    var config = configuration();
-    config.limits.low_price_input = true;
-    config.model.input_price_threshold = null;
-    config.model.input_price_flat_limit = 1000000;
-    try std.testing.expectEqual(@as(usize, 995000), c.inputBudget(config));
-    try c.checkInput(config, 995000);
-    try std.testing.expectError(error.InputBudgetExceeded, c.checkInput(config, 995001));
-    // A larger manual window cannot stretch the documented flat-price range.
-    config.model.context_tokens = 2000000;
-    try std.testing.expectEqual(@as(usize, 995000), c.inputBudget(config));
-    config.model.input_price_threshold = 100000;
-    try std.testing.expectEqual(@as(usize, 95000), c.inputBudget(config));
-    config.model.input_price_threshold = null;
-    config.model.input_price_flat_limit = null;
-    try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInput(config, 1));
-    // Explicit opt-out uses the actual physical context window.
-    config.limits.low_price_input = false;
-    try std.testing.expectEqual(@as(usize, 1995903), c.inputBudget(config));
-}
-test "input budget opt in min ceilings margin unknown and physical input room" {
-    var config = configuration();
-    try std.testing.expectEqual(@as(usize, 995903), c.inputBudget(config));
-    config.limits.low_price_input = true;
-    try std.testing.expectEqual(@as(usize, 95000), c.inputBudget(config));
-    // Price policy constrains normal input only, never model output capacity.
-    try c.checkInputFor(config, .normal, 95000);
-    try std.testing.expectError(error.InputBudgetExceeded, c.checkInputFor(config, .normal, 95001));
-    try c.checkInputFor(config, .summary, 95001);
-    try std.testing.expectEqual(@as(?u32, 128000), config.model.output_tokens);
-    try std.testing.expectEqual(@as(usize, 995903), c.inputBudgetFor(config, .summary));
-    config.model.input_price_threshold = null;
-    try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInputFor(config, .normal, 100));
-    try c.checkInputFor(config, .summary, 100000);
-    config.model.input_price_threshold = 100000;
-    config.model.context_tokens = 32768;
-    try std.testing.expectEqual(@as(usize, 28671), c.inputBudget(config));
-    config.model.input_price_threshold = null;
-    try std.testing.expectEqual(@as(usize, 0), c.inputBudget(config));
-    try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInput(config, 1));
-    config.model.input_price_threshold = 1000;
-    try std.testing.expectError(error.InputBudgetExceeded, c.checkInput(config, 1));
-    config.limits.low_price_input = false;
-    try std.testing.expectEqual(@as(usize, 28671), c.inputBudget(config));
-}
-test "input budget cold default DeepSeek runs with protection enabled and no public cache" {
-    const Store = @import("../app/auth_store.zig").Store;
-    const resolver = @import("../app/model_resolver.zig");
-    const metadata = @import("../app/model_metadata.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buffer: [4096]u8 = undefined;
-    const home = buffer[0..try tmp.dir.realPath(std.testing.io, &buffer)];
-    var store = try Store.open(a, std.testing.io, home);
-    defer store.deinit();
-    var parsed = try store.loadOrInitialize();
-    defer cfg.release(&parsed);
-    const cache: metadata.Cache = .{};
-    try resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &cache);
-    try std.testing.expect(parsed.value.limits.low_price_input);
-    try std.testing.expect(parsed.value.model.input_price_threshold == null);
-    try std.testing.expectEqual(@as(?u32, 1000000), parsed.value.model.input_price_flat_limit);
-    var fake = Fake{ .config = &parsed.value };
-    var runtime = try r.Runtime.init(a, std.testing.io, &parsed.value, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    var cancel: p.Cancellation = .{};
-    const result = try runtime.run("small first request", &cancel);
-    try std.testing.expectEqual(r.Status.success, result.status);
-    try std.testing.expectEqual(@as(usize, 1), fake.normal);
-    try std.testing.expectEqual(@as(usize, 0), fake.summaries + fake.tools);
-    const state = try runtime.checkpoint();
-    try std.testing.expectEqual(@as(?u32, 1000000), state.input_price_flat_limit);
-    const bytes = try checkpoint.encode(a, state);
-    defer a.free(bytes);
-    const decoded = try checkpoint.decode(a, bytes);
-    defer decoded.deinit();
-    try std.testing.expectEqual(state.input_price_flat_limit, decoded.value.input_price_flat_limit);
-}
-test "input budget unknown and oversized first goal pause before any inference and own the goal" {
-    const large: [10000]u8 = @splat('x');
-    for ([_]bool{ false, true }) |unknown| {
+    };
+    for ([_]@FieldType(Probe, "mode"){ .fits, .oversized, .canceled }) |mode| {
         var config = configuration();
-        config.limits.low_price_input = true;
-        config.model.input_price_threshold = if (unknown) null else 7000;
-        var fake = Fake{ .config = &config };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-        defer runtime.deinit();
+        config.model.protocol = .auto;
         var cancel: p.Cancellation = .{};
-        var goal = "fixture goal".*;
-        const result = try runtime.run(if (unknown) &goal else &large, &cancel);
-        @memset(&goal, 'z');
-        try std.testing.expectEqual(r.Status.paused, result.status);
-        try std.testing.expectEqual(if (unknown) error.UnknownInputPriceThreshold else error.InputBudgetExceeded, result.detail.?);
-        try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.summaries + fake.tools);
-        try std.testing.expectEqualStrings(if (unknown) "fixture goal" else &large, runtime.messages()[runtime.protected_index].blocks[0].text);
-        try std.testing.expectEqual(@as(u64, 1000000), result.context_snapshot.?.limit);
+        var probe = Probe{ .config = &config, .cancel = &cancel, .mode = mode };
+        var tools = Fake{ .config = &config };
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, .{ .context = &probe, .call_fn = Probe.call }, tools.executor(), .{}, "");
+        defer runtime.deinit();
+        const result = try runtime.run("one goal", &cancel);
+        try std.testing.expectEqual(@as(usize, 1), probe.responses);
+        try std.testing.expectEqual(@as(usize, if (mode == .fits) 1 else 0), probe.chat);
+        try std.testing.expectEqual(@as(usize, 0), tools.tools);
+        switch (mode) {
+            .fits => try std.testing.expectEqual(r.Status.success, result.status),
+            .oversized => {
+                try std.testing.expectEqual(r.Status.failed, result.status);
+                try std.testing.expectEqual(error.ContextTooLarge, result.detail.?);
+            },
+            .canceled => {
+                try std.testing.expectEqual(r.Status.canceled, result.status);
+                try std.testing.expectEqual(error.Canceled, result.detail.?);
+            },
+        }
     }
 }
-test "input budget full tool output succeeds or pauses with closed canonical group" {
+
+test "input budget for the next round includes the entire committed tool result" {
     for ([_]bool{ true, false }) |tight| {
         var config = configuration();
-        config.limits.low_price_input = true;
-        config.model.input_price_threshold = 12000;
         config.limits.compaction_enabled = false;
         var fake = Fake{ .config = &config, .tool_mode = true };
         var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         var cancel: p.Cancellation = .{};
         if (tight) {
-            // Include Runtime's actual system preface, not just the user bytes.
             const prompt = p.Message{ .role = .user, .blocks = &.{.{ .text = "one goal" }} };
-            config.model.input_price_threshold = @intCast(c.rawTokens(runtime.system, &.{}, &.{prompt}) + cfg.Policy.input_margin_tokens + 1);
+            setBudget(&config, c.rawTokens(runtime.system, &.{}, &.{prompt}));
         }
         const result = try runtime.run("one goal", &cancel);
         if (tight) {
-            try std.testing.expectEqual(r.Status.paused, result.status);
-            try std.testing.expectEqual(error.InputBudgetExceeded, result.detail.?);
+            try std.testing.expectEqual(r.Status.failed, result.status);
+            try std.testing.expectEqual(error.ContextTooLarge, result.detail.?);
             try std.testing.expectEqual(@as(usize, 1), fake.normal);
         } else {
             try std.testing.expectEqual(r.Status.success, result.status);
@@ -177,91 +80,106 @@ test "input budget full tool output succeeds or pauses with closed canonical gro
         try std.testing.expectEqualStrings("one goal", runtime.messages()[runtime.protected_index].blocks[0].text);
     }
 }
-test "input budget appended summary instruction cannot escape the complete request ceiling" {
+
+test "input budget includes the manual summary instruction as well as the DATA view" {
     var config = configuration();
-    config.limits.low_price_input = true;
     var fake = Fake{ .config = &config };
     var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
     defer runtime.deinit();
-    const old: [4000]u8 = @splat('x');
+    const old: [12500]u8 = @splat('x');
     try seed(&runtime, &old);
-    const before = runtime.messages().ptr;
-    // The actual pure-text summary view (not native/full history) must fit.
+    const before = runtime.messages();
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     const alloc = scratch.allocator();
-    const selection = try c.planManual(alloc, config, runtime.estimator, runtime.system, &.{}, runtime.messages(), 2);
-    const instruction = try c.summaryInstruction(alloc, selection, runtime.messages());
-    const view = try c.summaryView(alloc, selection, runtime.messages());
+    const selection = try c.planManual(alloc, config, runtime.estimator, runtime.system, &.{}, before, 2);
+    const instruction = try c.summaryInstruction(alloc, selection, before);
+    const view = try c.summaryView(alloc, selection, before);
     const message: p.Message = .{ .role = .user, .blocks = &.{.{ .text = view }} };
     const summary_input = c.rawTokens(instruction, &.{}, &.{message});
-    // Invert C - min(4096, C/8) - 1 so the complete request misses
-    // the actual physical input window by exactly one token.
-    config.model.context_tokens = @intCast(@max(2, summary_input + @min(cfg.Policy.safety_tokens, summary_input / 7)));
-    try std.testing.expectEqual(summary_input - 1, c.inputBudgetFor(config, .summary));
-    try std.testing.expect(c.rawTokens("", &.{}, &.{message}) <= c.inputBudgetFor(config, .summary));
-    try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, summary_input));
-    const history = try alloc.alloc(p.Message, runtime.messages().len);
-    for (runtime.messages(), 0..) |entry, i| history[i] = try p.cloneMessage(alloc, entry);
-    const protected_index = runtime.protected_index;
+    setBudget(&config, summary_input - 1);
+    try c.checkInput(config, selection.minimum_tokens.?);
+    try c.checkInput(config, c.rawTokens("", &.{}, &.{message}));
+    try std.testing.expectError(error.ContextTooLarge, c.checkInput(config, summary_input));
     var cancel: p.Cancellation = .{};
     const result = try runtime.compactContext(&cancel);
     try std.testing.expectEqual(r.Status.failed, result.status);
     try std.testing.expectEqual(error.ContextTooLarge, result.detail.?);
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.summaries + fake.tools);
-    try std.testing.expectEqual(before, runtime.messages().ptr);
+    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
     try std.testing.expectEqual(@as(usize, 4), runtime.messages().len);
-    try std.testing.expectEqualDeep(@as([]const p.Message, history), runtime.messages());
-    try std.testing.expectEqual(protected_index, runtime.protected_index);
+    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
+    try std.testing.expectEqual(@as(usize, 2), runtime.protected_index);
     try std.testing.expectEqualDeep(r.UsageTotals{}, result.usage);
 }
-test "automatic summary complete input rejection is zero-attempt and retains accepted history" {
+
+test "automatic summary complete input rejection is zero-attempt and rolls back the staged goal" {
     try automaticSummaryLocalRejection(false);
 }
-test "automatic summary unknown Anthropic capacity is zero-attempt and retains accepted history" {
+
+test "automatic summary with unknown Anthropic capacity makes no attempt and cannot rescue oversized history" {
     try automaticSummaryLocalRejection(true);
 }
-test "input budget proactive summary uses policy threshold not one million window and retains failure" {
+
+test "proactive compaction publishes triggering occupancy and resumes only after a successful summary" {
+    const Capture = struct {
+        last_snapshot: ?u64 = null,
+        measured_before_compacting: ?u64 = null,
+        fn emit(raw: ?*anyopaque, event: r.Event, _: *const p.Cancellation) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (event) {
+                .context_snapshot => |snapshot| self.last_snapshot = snapshot.tokens,
+                .state => |phase| if (phase == .compacting) {
+                    self.measured_before_compacting = self.last_snapshot;
+                },
+                else => {},
+            }
+        }
+    };
     const old: [12500]u8 = @splat('x');
     for ([_]bool{ false, true }) |exhausted| {
         var config = configuration();
-        config.limits.low_price_input = true;
-        config.model.input_price_threshold = 10000;
         var fake = Fake{ .config = &config, .exhausted = exhausted };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+        var capture: Capture = .{};
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{ .context = &capture, .emit_fn = Capture.emit }, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
+        setBudget(&config, runtime.estimatedTokens() * 118 / 100);
         var cancel: p.Cancellation = .{};
         const result = try runtime.run("new goal", &cancel);
+        const measured = capture.measured_before_compacting.?;
+        try std.testing.expect(measured >= c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
+        try std.testing.expect(measured <= c.inputBudget(config));
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(usize, if (exhausted) 0 else 1), fake.normal);
-        try std.testing.expectEqual(@as(u64, 1000000), result.context_snapshot.?.limit);
+        try std.testing.expectEqual(@as(u64, config.model.context_tokens), result.context_snapshot.?.limit);
         if (exhausted) {
+            try std.testing.expectEqual(r.Status.paused, result.status);
             try std.testing.expectEqual(error.OutputLimitReached, result.detail.?);
+            try std.testing.expectEqual(p.FailureKind.output_limit, result.model_failure.?);
+            try std.testing.expectEqualStrings("fixture cap", result.failureText());
             try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
             try std.testing.expectEqualStrings("new goal", runtime.messages()[runtime.protected_index].blocks[0].text);
         } else {
             try std.testing.expectEqual(r.Status.success, result.status);
             try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
-            try std.testing.expect(runtime.estimatedTokens() < c.threshold(c.inputBudget(config), 50));
+            try c.checkInput(config, runtime.estimatedTokens());
         }
     }
 }
-test "input budget failed paid summary stops no fallback or automatic repeated attempt and keeps goal" {
+
+test "failed summary pauses with its cause and does not send the fitting normal request" {
     const old: [12500]u8 = @splat('x');
     for ([_]@FieldType(Fake, "summary_fault"){ .server, .transport, .invalid }) |fault| {
         var config = configuration();
-        config.limits.low_price_input = true;
-        config.model.input_price_threshold = 10000;
         var fake = Fake{ .config = &config, .summary_fault = fault };
         var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
+        setBudget(&config, runtime.estimatedTokens() * 118 / 100);
         var cancel: p.Cancellation = .{};
         const result = try runtime.run("new goal", &cancel);
         try std.testing.expectEqual(r.Status.paused, result.status);
-        // The terminal keeps the real cause: a server or transport failure is a
-        // summary failure, an empty body is an invalid summary.
         try std.testing.expectEqual(if (fault == .invalid) error.InvalidSummary else error.SummaryFailed, result.detail.?);
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
@@ -270,292 +188,142 @@ test "input budget failed paid summary stops no fallback or automatic repeated a
         if (fault == .server) {
             try std.testing.expectEqual(p.FailureKind.server, result.model_failure.?);
             try std.testing.expectEqual(@as(?u16, 503), result.http_status);
-        }
+            try std.testing.expectEqualStrings("fixture", result.failureText());
+        } else try std.testing.expect(result.model_failure == null and result.http_status == null);
     }
 }
-test "input budget summary crosses 95K price tier while normal remains blocked and unknown price manual remains independent" {
-    const old: [300000]u8 = @splat('x');
-    for ([_]bool{ false, true }) |unknown| {
+
+test "restored history is readable but the next request must fit the current window" {
+    var original = configuration();
+    var fake = Fake{ .config = &original };
+    var source = try r.Runtime.init(a, std.testing.io, &original, fake.model(), fake.executor(), .{}, "");
+    defer source.deinit();
+    const old: [12500]u8 = @splat('x');
+    try seed(&source, &old);
+    const bytes = try checkpoint.encode(a, try source.exportCheckpoint());
+    defer a.free(bytes);
+    const decoded = try checkpoint.decode(a, bytes);
+    defer decoded.deinit();
+    var current = original;
+    current.limits.compaction_enabled = false;
+    setBudget(&current, source.estimatedTokens() - 1);
+    fake.config = &current;
+    var restored = try r.Runtime.init(a, std.testing.io, &current, fake.model(), fake.executor(), .{}, "");
+    defer restored.deinit();
+    try restored.restoreCheckpoint(decoded.value);
+    try std.testing.expectEqualDeep(source.messages(), restored.messages());
+    var cancel: p.Cancellation = .{};
+    const rejected = try restored.run("continue", &cancel);
+    try std.testing.expectEqual(r.Status.failed, rejected.status);
+    try std.testing.expectEqual(error.ContextTooLarge, rejected.detail.?);
+    try std.testing.expectEqualDeep(source.messages(), restored.messages());
+    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.summaries + fake.tools);
+}
+
+test "retained prompt alone exceeding the window prevents automatic and manual summaries" {
+    for ([_]bool{ true, false }) |manual| {
         var config = configuration();
-        config.limits.low_price_input = true;
-        if (unknown) config.model.input_price_threshold = null;
         var fake = Fake{ .config = &config };
+        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+        defer runtime.deinit();
+        try seed(&runtime, "previous work");
+        setBudget(&config, c.fixedTokens(runtime.system, &.{}) - 1);
+        var cancel: p.Cancellation = .{};
+        const result = if (manual) try runtime.compactContext(&cancel) else try runtime.run("new goal", &cancel);
+        try std.testing.expectEqual(r.Status.failed, result.status);
+        try std.testing.expectEqual(error.ContextTooLarge, result.detail.?);
+        try std.testing.expectEqual(@as(usize, 0), fake.summaries + fake.normal + fake.tools);
+        try std.testing.expectEqual(@as(usize, 4), runtime.messages().len);
+        try std.testing.expectEqualStrings("previous work", runtime.messages()[1].blocks[0].text);
+        try std.testing.expectEqualStrings("recent answer", runtime.messages()[3].blocks[0].text);
+    }
+}
+
+test "a reducing manual summary can commit without authorizing an oversized normal send" {
+    const old: [12500]u8 = @splat('x');
+    const summary: [9000]u8 = @splat('s');
+    const startup: [6000]u8 = @splat('m'); // Part of the normal prompt, not of the summary request.
+    var config = configuration();
+    var fake = Fake{ .config = &config, .summary_text = &summary, .zero_input = true };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, &startup);
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    const before = runtime.estimatedTokens();
+    setBudget(&config, before - c.textTokens(&old) / 2);
+    var cancel: p.Cancellation = .{};
+    const compacted = try runtime.compactContext(&cancel);
+    try std.testing.expectEqual(r.Status.success, compacted.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+    try std.testing.expectEqual(p.Role.context, runtime.messages()[0].role);
+    try std.testing.expect(runtime.estimatedTokens() < before);
+    try std.testing.expectError(error.ContextTooLarge, c.checkInput(config, runtime.estimatedTokens()));
+    config.limits.compaction_enabled = false;
+    const rejected = try runtime.run("continue", &cancel);
+    try std.testing.expectEqual(r.Status.failed, rejected.status);
+    try std.testing.expectEqual(error.ContextTooLarge, rejected.detail.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.normal);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+}
+
+test "a committed manual summary clears the remembered rejection at the same physical budget" {
+    const old: [12500]u8 = @splat('x');
+    const long_summary: [25000]u8 = @splat('s');
+    var config = configuration();
+    var fake = Fake{ .config = &config, .summary_text = &long_summary, .zero_input = true };
+    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
+    defer runtime.deinit();
+    try seed(&runtime, &old);
+    setBudget(&config, runtime.estimatedTokens() * 118 / 100);
+    var cancel: p.Cancellation = .{};
+    const first = try runtime.run("first goal", &cancel);
+    try std.testing.expectEqual(r.Status.paused, first.status);
+    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+    const rejected_size = runtime.estimatedTokens();
+    fake.summary_text = "condensed background";
+    try std.testing.expectEqual(r.Status.success, (try runtime.compactContext(&cancel)).status);
+    try std.testing.expectEqual(@as(usize, 2), fake.summaries);
+    // At least as much context as the rejected turn, still under the same
+    // budget: a stale rejection would skip this third summary.
+    const alloc = runtime.arena.allocator();
+    try runtime.history.append(alloc, try p.textMessage(alloc, .user, &old));
+    try runtime.history.append(alloc, try p.textMessage(alloc, .assistant, "regrown answer"));
+    try std.testing.expect(runtime.estimatedTokens() >= rejected_size);
+    try c.checkInput(config, runtime.estimatedTokens());
+    try std.testing.expectEqual(r.Status.success, (try runtime.run("next goal", &cancel)).status);
+    try std.testing.expectEqual(@as(usize, 3), fake.summaries);
+    try std.testing.expectEqual(@as(usize, 1), fake.normal);
+}
+
+test "remembered rejected summary is not repeated whether the next input fits or fails" {
+    const old: [12500]u8 = @splat('x');
+    const long_summary: [25000]u8 = @splat('s');
+    for ([_]bool{ false, true }) |oversized| {
+        var config = configuration();
+        var fake = Fake{ .config = &config, .summary_text = &long_summary };
         var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
         defer runtime.deinit();
         try seed(&runtime, &old);
-        try std.testing.expect(runtime.estimatedTokens() > 95000);
-        try std.testing.expectError(if (unknown) error.UnknownInputPriceThreshold else error.InputBudgetExceeded, c.checkInput(config, runtime.estimatedTokens()));
+        setBudget(&config, runtime.estimatedTokens() * 118 / 100);
         var cancel: p.Cancellation = .{};
-        const summary = try runtime.compactContext(&cancel);
-        try std.testing.expectEqual(r.Status.success, summary.status);
-        try std.testing.expect(fake.last_summary_input > 95000 and fake.last_summary_input < c.inputBudgetFor(config, .summary));
+        const first = try runtime.run("first goal", &cancel);
+        try std.testing.expectEqual(r.Status.paused, first.status);
+        try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
         try std.testing.expectEqual(@as(usize, 1), fake.summaries);
         try std.testing.expectEqual(@as(usize, 0), fake.normal);
-        try std.testing.expect(runtime.estimatedTokens() < 95000);
-        try std.testing.expect(config.limits.low_price_input);
-        if (unknown) {
-            // Commit used physical summary budget, not a fabricated normal proof.
-            try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInput(config, runtime.estimatedTokens()));
-            const next = try runtime.run("continue", &cancel);
-            try std.testing.expectEqual(r.Status.paused, next.status);
-            try std.testing.expectEqual(error.UnknownInputPriceThreshold, next.detail.?);
+        const next = try runtime.run(if (oversized) &old else "second goal", &cancel);
+        try std.testing.expectEqual(@as(usize, 1), fake.summaries);
+        try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
+        try std.testing.expectEqualStrings("first goal", runtime.messages()[4].blocks[0].text);
+        if (oversized) {
+            try std.testing.expectEqual(r.Status.failed, next.status);
+            try std.testing.expectEqual(error.ContextTooLarge, next.detail.?);
             try std.testing.expectEqual(@as(usize, 0), fake.normal);
-            try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-        } else try c.checkInput(config, runtime.estimatedTokens());
-    }
-}
-test "input budget accepts a reducing summary even when the result still exceeds the price budget" {
-    var config = configuration();
-    config.limits.low_price_input = true;
-    config.model.input_price_threshold = 8000;
-    const summary = try a.alloc(u8, c.inputBudget(config) * 3);
-    defer a.free(summary);
-    @memset(summary, 's'); // Text alone fills the budget; retained history adds more.
-    var fake = Fake{ .config = &config, .summary_text = summary };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    const old: [12500]u8 = @splat('x');
-    try seed(&runtime, &old);
-    const before = runtime.messages();
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    const selection = try c.planManual(scratch.allocator(), config, runtime.estimator, runtime.system, &.{}, before, 2);
-    const candidate = try c.commit(scratch.allocator(), before, selection, summary);
-    const after_tokens = c.rawTokens(runtime.system, &.{}, candidate.items);
-    const before_tokens = runtime.estimatedTokens();
-    try std.testing.expect(after_tokens < before_tokens);
-    try std.testing.expect(before_tokens - after_tokens >= @max(@as(usize, 32), before_tokens / 20));
-    try std.testing.expect(after_tokens > c.inputBudget(config));
-    var cancel: p.Cancellation = .{};
-    const result = try runtime.compactContext(&cancel);
-    // The only acceptance rule is that the history got shorter; the budget is
-    // the send gate's business, so an over-budget result is still committed.
-    try std.testing.expectEqual(r.Status.success, result.status);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
-    try std.testing.expect(runtime.messages().ptr != before.ptr);
-    try std.testing.expect(c.rawTokens(runtime.system, runtime.executor.schemas, runtime.messages()) > c.inputBudget(config));
-}
-test "input budget summary physical window remains enforced" {
-    var config = configuration();
-    config.limits.low_price_input = true;
-    try c.checkInputFor(config, .summary, 100001);
-    const physical = config.model.context_tokens - cfg.Policy.safety_tokens;
-    try c.checkInputFor(config, .summary, physical - 1);
-    try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, physical));
-    config.model.input_price_threshold = null;
-    config.model.output_tokens = null; // Unknown output capacity cannot block a text-only summary preflight.
-    try c.checkInputFor(config, .summary, physical - 1);
-    try std.testing.expectError(error.UnknownInputPriceThreshold, c.checkInputFor(config, .normal, physical - 1));
-}
-test "input budget checkpoint loads history across changed current policies" {
-    for ([_]?u32{ null, 100000 }) |price| {
-        var config = configuration();
-        config.model.input_price_threshold = price;
-        var fake = Fake{ .config = &config };
-        var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-        defer runtime.deinit();
-        const state = try runtime.exportCheckpoint();
-        try std.testing.expect(state.input_budget_frozen);
-        try std.testing.expectEqual(price, state.input_price_threshold);
-        const bytes = try checkpoint.encode(a, state);
-        defer a.free(bytes);
-        var parsed = try checkpoint.decode(a, bytes);
-        defer parsed.deinit();
-        try checkpoint.validateStructure(parsed.value);
-        try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = parsed.value.system, .messages = parsed.value.messages, .tools = &.{} });
-        for (0..3) |change| {
-            var other = config;
-            switch (change) {
-                0 => other.model.context_tokens = 80000,
-                1 => other.limits.low_price_input = true,
-                else => other.model.input_price_threshold = if (price == null) 100000 else null,
-            }
-            try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = other.provider.base_url, .model = other.model.name, .protocol = .chat }, .system = parsed.value.system, .messages = parsed.value.messages, .tools = &.{} });
+            try std.testing.expectEqual(@as(usize, 5), runtime.messages().len);
+        } else {
+            try std.testing.expectEqual(r.Status.success, next.status);
+            try std.testing.expectEqual(@as(usize, 1), fake.normal);
+            try std.testing.expectEqualStrings("second goal", runtime.messages()[5].blocks[0].text);
         }
-        var unfrozen = state;
-        unfrozen.input_budget_frozen = false;
-        unfrozen.input_price_threshold = null;
-        try checkpoint.validateStructure(unfrozen);
-        try checkpoint.validateRequestHistory(a, .{ .scope = .{ .connection = config.provider.base_url, .model = config.model.name, .protocol = .chat }, .system = unfrozen.system, .messages = unfrozen.messages, .tools = &.{} });
     }
-}
-test "input budget proves an impossible compaction before paying for a summary" {
-    const old: [12500]u8 = @splat('x');
-    var config = configuration();
-    config.limits.low_price_input = true;
-    // A budget of one token is smaller than the fixed prompt alone, so no
-    // retained tail can ever fit and no summary text could be accepted.
-    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + 1;
-    var fake = Fake{ .config = &config };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    try seed(&runtime, &old);
-    try std.testing.expect(runtime.estimatedTokens() > c.inputBudget(config));
-    var cancel: p.Cancellation = .{};
-    const result = try runtime.run("new goal", &cancel);
-    try std.testing.expectEqual(r.Status.paused, result.status);
-    try std.testing.expectEqual(error.InputBudgetExceeded, result.detail.?);
-    // The proof happens before the request: not even the summary is sent.
-    try std.testing.expectEqual(@as(usize, 0), fake.summaries + fake.normal + fake.tools);
-    try std.testing.expectEqualStrings("old task", runtime.messages()[0].blocks[0].text);
-    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
-    try std.testing.expectEqualStrings("new goal", runtime.messages()[runtime.protected_index].blocks[0].text);
-}
-test "input budget refuses a manual compaction that cannot fit" {
-    const old: [12500]u8 = @splat('x');
-    var config = configuration();
-    config.limits.low_price_input = true;
-    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + 1;
-    var fake = Fake{ .config = &config };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    try seed(&runtime, &old);
-    const before = runtime.messages();
-    var cancel: p.Cancellation = .{};
-    const result = try runtime.compactContext(&cancel);
-    try std.testing.expectEqual(r.Status.paused, result.status);
-    try std.testing.expectEqual(error.InputBudgetExceeded, result.detail.?);
-    try std.testing.expectEqual(@as(usize, 0), fake.summaries);
-    try std.testing.expectEqual(before.ptr, runtime.messages().ptr);
-    try std.testing.expectEqualDeep(before, runtime.messages());
-}
-test "input budget does not pay twice for a rejected automatic summary" {
-    const old: [12500]u8 = @splat('x');
-    const long_summary: [25000]u8 = @splat('s');
-    var config = configuration();
-    config.limits.low_price_input = true;
-    var fake = Fake{ .config = &config, .summary_text = &long_summary };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    try seed(&runtime, &old);
-    // Room for the fixed prompt plus the retained tail, but far less than the
-    // returned summary: the paid result is rejected after being sent.
-    const fixed = c.fixedTokens(runtime.system, runtime.executor.schemas);
-    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + @as(u32, @intCast(fixed + 1000));
-    var cancel: p.Cancellation = .{};
-    const first = try runtime.run("first goal", &cancel);
-    try std.testing.expectEqual(r.Status.paused, first.status);
-    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
-    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
-    try std.testing.expectEqualStrings("first goal", runtime.messages()[runtime.protected_index].blocks[0].text);
-    // Same budget and a context that only grew: the same rejected summary must
-    // not be bought again, and the run reports the budget instead.
-    const second = try runtime.run("second goal", &cancel);
-    try std.testing.expectEqual(r.Status.paused, second.status);
-    try std.testing.expectEqual(error.InputBudgetExceeded, second.detail.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
-    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
-    try std.testing.expectEqualStrings("second goal", runtime.messages()[runtime.protected_index].blocks[0].text);
-}
-test "input budget skips a remembered rejected summary while the input still fits" {
-    const old: [12500]u8 = @splat('x');
-    const long_summary: [25000]u8 = @splat('s');
-    var config = configuration();
-    config.limits.low_price_input = true;
-    var fake = Fake{ .config = &config, .summary_text = &long_summary };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    try seed(&runtime, &old);
-    // The budget admits the current input but the compaction trigger is already
-    // crossed: the summary is optional here, so a rejected one must not stop
-    // later turns or be paid for twice.
-    const seeded = runtime.estimatedTokens();
-    // 18% headroom absorbs the calibration the paid summary itself causes,
-    // while 80% of that budget still sits below the seeded context.
-    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + @as(u32, @intCast(seeded * 118 / 100));
-    try std.testing.expect(seeded > c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
-    var cancel: p.Cancellation = .{};
-    const first = try runtime.run("first goal", &cancel);
-    try std.testing.expectEqual(r.Status.paused, first.status);
-    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.tools);
-    // The input still fits, so the next turn continues without another summary.
-    const second = try runtime.run("second goal", &cancel);
-    try std.testing.expectEqual(r.Status.success, second.status);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-    try std.testing.expectEqual(@as(usize, 1), fake.normal);
-    try std.testing.expectEqual(@as(usize, 0), fake.tools);
-    // Nothing was compacted: the old history and both goals are intact.
-    try std.testing.expectEqualStrings(&old, runtime.messages()[1].blocks[0].text);
-    try std.testing.expectEqualStrings("first goal", runtime.messages()[4].blocks[0].text);
-    try std.testing.expectEqualStrings("second goal", runtime.messages()[5].blocks[0].text);
-}
-test "compaction publishes the measured occupancy that triggered it" {
-    const old: [12500]u8 = @splat('x');
-    var config = configuration();
-    config.limits.low_price_input = true;
-    config.model.input_price_threshold = 10000;
-    var fake = Fake{ .config = &config };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    try seed(&runtime, &old);
-
-    const Capture = struct {
-        last_snapshot: ?u64 = null,
-        measured_before_compacting: ?u64 = null,
-        compacting: usize = 0,
-        fn emit(raw: ?*anyopaque, event: r.Event, _: *const p.Cancellation) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            switch (event) {
-                .context_snapshot => |snapshot| self.last_snapshot = snapshot.tokens,
-                .state => |phase| if (phase == .compacting) {
-                    self.compacting += 1;
-                    self.measured_before_compacting = self.last_snapshot;
-                },
-                else => {},
-            }
-        }
-    };
-    var capture: Capture = .{};
-    runtime.host = .{ .context = &capture, .emit_fn = Capture.emit };
-    var cancel: p.Cancellation = .{};
-    const result = try runtime.run("new goal", &cancel);
-    try std.testing.expectEqual(r.Status.success, result.status);
-    try std.testing.expectEqual(@as(usize, 1), capture.compacting);
-    // The display value published for the decision is the measured occupancy
-    // that crossed the trigger, not the last provider-reported total.
-    // The seeded history has no provider report yet, so a zero here would be the
-    // stale reported value rather than the measured occupancy.
-    try std.testing.expect(capture.measured_before_compacting.? > 0);
-    try std.testing.expect(capture.measured_before_compacting.? >= c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
-}
-test "a committed manual summary clears the remembered rejection" {
-    const old: [12500]u8 = @splat('x');
-    const long_summary: [25000]u8 = @splat('s');
-    const brief: []const u8 = "condensed background";
-    var config = configuration();
-    config.limits.low_price_input = true;
-    var fake = Fake{ .config = &config, .summary_text = &long_summary };
-    var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
-    defer runtime.deinit();
-    try seed(&runtime, &old);
-    const fixed = c.fixedTokens(runtime.system, runtime.executor.schemas);
-    config.model.input_price_threshold = cfg.Policy.input_margin_tokens + @as(u32, @intCast(fixed + 1000));
-    var cancel: p.Cancellation = .{};
-    // The paid summary comes back too long to shrink anything: rejected and
-    // remembered for this budget.
-    const first = try runtime.run("first goal", &cancel);
-    try std.testing.expectEqual(error.InsufficientCompaction, first.detail.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.summaries);
-
-    // A manual summary that does shrink the history must clear that memory.
-    fake.summary_text = brief;
-    const manual = try runtime.compactContext(&cancel);
-    try std.testing.expectEqual(r.Status.success, manual.status);
-    try std.testing.expectEqual(@as(usize, 2), fake.summaries);
-
-    // Regrow the context past the trigger: the next task may summarize again
-    // instead of skipping as "rejected".
-    const regrow: [20000]u8 = @splat('y');
-    const arena_alloc = runtime.arena.allocator();
-    try runtime.history.append(arena_alloc, try p.textMessage(arena_alloc, .user, &regrow));
-    try runtime.history.append(arena_alloc, try p.textMessage(arena_alloc, .assistant, "regrown answer"));
-    const next = try runtime.run("second goal", &cancel);
-    try std.testing.expectEqual(@as(usize, 3), fake.summaries);
-    try std.testing.expectEqual(r.Status.success, next.status);
 }

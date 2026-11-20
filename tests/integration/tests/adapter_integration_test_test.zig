@@ -67,7 +67,7 @@ test "Responses retains optional tool fields instead of enabling strict schemas"
 }
 test "HTTP model validates scope and pre-cancel without entering transport" {
     const configuration = cfg.Config{
-        .limits = .{ .low_price_input = false },
+
         // Intentionally not a URL: even a regression cannot contact a real host.
         .provider = .{ .base_url = "unused-test-connection", .api_key_env = "FAKE_KEY" },
         .model = .{ .name = "test-model", .context_tokens = 32768 },

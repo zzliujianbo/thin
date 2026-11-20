@@ -9,7 +9,7 @@ const p = @import("../core/protocol.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const plain =
-    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+    \\{"llm":{"default":"route/first","providers":{"route":{"base_url":"https://fixture.invalid/v1","api_key":"fake-owned-only","models":{"first":{"protocol":"chat","context_tokens":65536}}}}}}
 ;
 const Edit = struct { key: preference.Key, value: ?u32 };
 const main_edits = [_]Edit{

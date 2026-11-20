@@ -10,9 +10,9 @@ const RequestGateStub = struct {
     }
 };
 
-test "preflight shares the complete raw input but send checks the current estimate and threshold" {
+test "preflight shares the complete raw input but send checks the current estimate and window" {
     var dummy: u8 = 0;
-    var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "test", .context_tokens = 65536, .protocol = .chat, .input_price_threshold = 65000 }, .limits = .{ .compaction_enabled = false, .low_price_input = true } };
+    var config: cfg.Config = .{ .provider = .{ .base_url = "http://unused.invalid" }, .model = .{ .name = "test", .context_tokens = 65536, .protocol = .chat }, .limits = .{ .compaction_enabled = false } };
     const schemas = &[_]p.ToolSchema{.{ .name = "inspect", .description = "Inspect text", .parameters_json = "{}" }};
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = RequestGateStub.call }, .{ .context = &dummy, .schemas = schemas, .prepare_fn = RequestGateStub.prepare, .execute_fn = RequestGateStub.execute }, .{}, "");
     defer runtime.deinit();
@@ -26,10 +26,9 @@ test "preflight shares the complete raw input but send checks the current estima
     const estimate = runtime.estimator.tokens(raw);
     try std.testing.expectEqual(estimate, runtime.contextSnapshotFromRaw(raw).estimated);
     var gate: Runtime.SendGate = .{ .runtime = &runtime, .raw = raw };
-    config.model.input_price_threshold = @intCast(estimate + cfg.Policy.input_margin_tokens);
-    try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, req, .{})); // exactly fits
-    config.model.input_price_threshold = config.model.input_price_threshold.? - 1;
-    try std.testing.expectError(error.InputBudgetExceeded, gate.model().call(std.testing.allocator, req, .{}));
+    try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, req, .{}));
+    config.model.context_tokens = @intCast(estimate); // no room for the safety reserve and a reply
+    try std.testing.expectError(error.ContextTooLarge, gate.model().call(std.testing.allocator, req, .{}));
     runtime.estimator.per_mille = 1000;
     try std.testing.expectError(error.UnexpectedRequest, gate.model().call(std.testing.allocator, req, .{})); // same bytes now fit
 }
@@ -37,7 +36,7 @@ test "preflight shares the complete raw input but send checks the current estima
 test "thinking runtime normal and summary requests map current model" {
     const Stub = RequestGateStub;
     var dummy: u8 = 0;
-    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } }, .limits = .{ .low_price_input = false } };
+    var config: cfg.Config = .{ .provider = .{ .base_url = "https://api.deepseek.com" }, .model = .{ .name = "deepseek-flash", .context_tokens = 32768, .protocol = .chat, .reasoning_effort = "medium", .reasoning = .{ .format = .deepseek, .map = .{ .off = "off", .low = "low", .high = "high", .max = "max" } } } };
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
     defer runtime.deinit();
     const cancel: p.Cancellation = .{};
@@ -113,7 +112,6 @@ test "runtime checkpoint restore ignores archived policy poison and estimator wi
     state.context_official = true;
     state.output_tokens = 0;
     state.output_budget_frozen = true;
-    state.input_budget_frozen = true;
     state.poisoned = true;
     state.permission_id = 999;
     state.estimator.per_mille = 0;
@@ -177,7 +175,6 @@ test "restored foreign scope blocks normal replay but permits text-only summary 
     @memset(archived, 'q');
     inline for (.{ p.Protocol.chat, p.Protocol.responses, p.Protocol.anthropic }) |proto| {
         var config: cfg.Config = .{ .provider = .{ .base_url = "https://current.invalid/v1" }, .model = .{ .name = "current", .context_tokens = 65536, .protocol = proto, .output_tokens = 8192 } };
-        config.limits.low_price_input = false;
         var fake: Fake = .{};
         var runtime = try Runtime.init(a, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
         defer runtime.deinit();
@@ -247,8 +244,7 @@ test "compatible restored history sends under current budgets without any archiv
             return error.UnexpectedTool;
         }
     };
-    var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1", .api_key = "rotated-fake-key" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
-    config.limits.low_price_input = false;
+    const config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1", .api_key = "rotated-fake-key" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
     var fake: Fake = .{};
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
     defer runtime.deinit();
@@ -280,7 +276,6 @@ test "restored incomplete tool history never executes old tools or calls a fake 
     };
     var dummy: u8 = 0;
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
-    config.limits.low_price_input = false;
     config.limits.compaction_enabled = false;
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &dummy, .call_fn = Stub.call }, .{ .context = &dummy, .schemas = &.{}, .prepare_fn = Stub.prepare, .execute_fn = Stub.execute }, .{}, "");
     defer runtime.deinit();
@@ -368,7 +363,7 @@ test "selection preserves canonical history and closes retained auto fallback" {
     try std.testing.expect(runtime.selector.selected == null);
     try std.testing.expect(!runtime.selector.initial_attempted);
 }
-test "default low price policy refuses unknown pricing before inference and explicit optout runs" {
+test "model with only a context window can run with default limits" {
     const Fake = struct {
         calls: usize = 0,
         fn call(raw: *anyopaque, a: std.mem.Allocator, _: p.Request, _: p.ModelSink) !p.Outcome {
@@ -383,24 +378,15 @@ test "default low price policy refuses unknown pricing before inference and expl
             return error.UnexpectedTool;
         }
     };
-    for ([_]bool{ true, false }) |use_default| {
-        var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .protocol = .chat, .context_tokens = 32768 } };
-        if (!use_default) config.limits.low_price_input = false;
-        var fake: Fake = .{};
-        var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
-        defer runtime.deinit();
-        var cancel: p.Cancellation = .{};
-        const result = try runtime.run("fixture goal", &cancel);
-        if (use_default) {
-            try std.testing.expectEqual(Status.paused, result.status);
-            try std.testing.expectEqual(error.UnknownInputPriceThreshold, result.detail.?);
-            try std.testing.expectEqual(@as(usize, 0), fake.calls);
-        } else {
-            try std.testing.expectEqual(Status.success, result.status);
-            try std.testing.expectEqual(@as(usize, 1), fake.calls);
-        }
-        try std.testing.expectEqualStrings("fixture goal", runtime.messages()[0].blocks[0].text);
-    }
+    const config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .protocol = .chat, .context_tokens = 32768 } };
+    var fake: Fake = .{};
+    var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
+    defer runtime.deinit();
+    var cancel: p.Cancellation = .{};
+    const result = try runtime.run("fixture goal", &cancel);
+    try std.testing.expectEqual(Status.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("fixture goal", runtime.messages()[0].blocks[0].text);
 }
 test "poisoned actual model gate wins over pre-cancellation and invalid request for either purpose" {
     const Stub = struct {
@@ -517,7 +503,6 @@ test "canceled context preserves only missing cancellation usage and remains per
         for ([_]?u64{ 1234, 0, null }) |prior| {
             var fake: Fake = .{ .mode = mode };
             var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
-            config.limits.low_price_input = false;
             config.limits.compaction_enabled = false;
             var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute }, .{}, "");
             defer runtime.deinit();
@@ -590,7 +575,6 @@ test "terminal counts executed tool calls and distinct edited files" {
     };
     var fake: Fake = .{};
     var config: cfg.Config = .{ .provider = .{ .base_url = "https://fixture.invalid/v1" }, .model = .{ .name = "fixture", .context_tokens = 65536, .protocol = .chat } };
-    config.limits.low_price_input = false;
     config.limits.compaction_enabled = false;
     var runtime = try Runtime.init(std.testing.allocator, std.testing.io, &config, .{ .context = &fake, .call_fn = Fake.call }, .{ .context = &fake, .schemas = &.{}, .prepare_fn = Fake.prepare, .execute_fn = Fake.execute, .begin_batch_fn = Fake.beginBatch }, .{}, "");
     defer runtime.deinit();

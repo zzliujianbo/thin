@@ -8,7 +8,7 @@ const metadata = @import("model_metadata.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const fixture =
-    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"vision":{"base_url":"https://vision.invalid/v1","api_key_env":"VISION_OWN_KEY","models":{"deepseek-flash":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"MISSING_IMAGE_KEY","models":{"deepseek-flash":{}}},"similar":{"base_url":"https://similar.invalid/v1","api_key":"fake-similar","models":{"DeepSeek-Flash":{},"deepseek-v4-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+    \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"chat","context_tokens":65536}}},"vision":{"base_url":"https://vision.invalid/v1","api_key_env":"VISION_OWN_KEY","models":{"deepseek-flash":{}}},"unlogged":{"base_url":"https://unlogged.invalid/v1","api_key_env":"MISSING_IMAGE_KEY","models":{"deepseek-flash":{}}},"similar":{"base_url":"https://similar.invalid/v1","api_key":"fake-similar","models":{"DeepSeek-Flash":{},"deepseek-v4-flash":{}}}}},"limits":{"safety_tokens":100}}
 ;
 fn seed(home: []const u8, bytes: []const u8) !void {
     var store = try Store.open(a, io, home);
@@ -71,7 +71,7 @@ fn contextSurvivesImageSettings(protocol: @import("../core/protocol.zig").Protoc
         }
     };
     const source =
-        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536,"output_tokens":8192}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"low_price_input":false,"safety_tokens":100}}
+        \\{"llm":{"default":"main/chat","providers":{"main":{"base_url":"https://main.invalid/v1","api_key":"fake-primary","models":{"chat":{"protocol":"PRIMARY_PROTOCOL","context_tokens":65536,"output_tokens":8192}}},"one":{"base_url":"https://one.invalid/v1","api_key":"fake-image-one","models":{"deepseek-flash":{}}},"two":{"base_url":"https://two.invalid/v1","api_key":"fake-image-two","models":{"deepseek-flash":{}}}}},"limits":{"safety_tokens":100}}
     ;
     const document = try std.mem.replaceOwned(u8, a, source, "PRIMARY_PROTOCOL", @tagName(protocol));
     defer a.free(document);

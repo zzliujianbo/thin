@@ -43,22 +43,6 @@ fn officialContext(cache: *const metadata.Cache, entry: catalog.Entry, tokens: u
     return row.available == true and row.tokens == tokens;
 }
 
-/// Derived capabilities belong to the exact endpoint, model and concrete wire
-/// route. Always clear the preceding selection, including a frozen unknown.
-pub fn applyInputThreshold(cache: *const metadata.Cache, config: *cfg.Config) void {
-    config.model.input_price_threshold = null;
-    config.model.input_price_flat_limit = null;
-    const service = cfg.providers.Id.fromUrl(config.provider.base_url) orelse return;
-    if (config.provider.kind) |hint| if (hint != service) return;
-    if (config.model.protocol == .auto) return;
-    var entry = metadata.restoreEntry(cache, service, config.model.name) orelse return;
-    entry.model.protocol = config.model.protocol;
-    config.model.input_price_threshold = metadata.inputPriceThresholdFor(cache, entry);
-    if (config.model.input_price_threshold == null) {
-        config.model.input_price_flat_limit = metadata.inputPriceFlatLimitFor(cache, entry) orelse catalog.flatPriceLimit(entry);
-    }
-}
-
 const Protocol = @import("../core/protocol.zig").Protocol;
 
 /// Reject an unknown or contradictory protocol before any candidate is built.
@@ -133,19 +117,13 @@ fn resolveOne(config: cfg.Config, cache: *const metadata.Cache, provider: cfg.Na
         model = manual.apply(model);
         if (manual.context_tokens != null) official = false;
     }
-    // Codex is a Responses variant selected by provider; resolve it before
-    // capability/threshold lookup and before the auto authority check.
+    // Codex is a Responses variant selected by provider.
     if (cfg.isCodexProvider(provider.connection) and model.protocol == .auto) model.protocol = .responses;
     // Only the current declaration authorizes auto. An archive is history, not
     // authority to probe a protocol or borrow stale request capabilities.
     if (model.protocol == .auto and (patch == null or patch.?.protocol == null)) return error.UnknownModelProtocol;
     if (model.context_tokens == 0) return error.UnknownModelContext;
     var candidate = config;
-    candidate.provider = provider.connection;
-    candidate.model = model;
-    // Current protocol patches must precede exact-route capability lookup.
-    applyInputThreshold(cache, &candidate);
-    model = candidate.model;
     candidate.provider = provider.connection;
     candidate.model = model;
     candidate.selection_pending = false;

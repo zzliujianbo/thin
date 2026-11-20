@@ -221,8 +221,6 @@ test "empty HOME hides placeholder selection but retains initialized defaults" {
     try std.testing.expect(state.selection_name == null);
     try std.testing.expect(state.initial_context == null);
     try std.testing.expectEqual(@as(u32, 0), state.context_limit);
-    // No active priced model: the UI flag is not the global policy toggle.
-    try std.testing.expect(!state.low_price_input);
     try std.testing.expectEqual(@as(usize, 0), state.model_providers.len);
     try std.testing.expectEqualStrings("deepseek-flash", session.pending.?.value.model.name);
     const disk = try session.store.loadExisting();
@@ -234,7 +232,7 @@ test "provider menu preserves local credential aliases and actual endpoint ident
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"pending/saved","providers":{"pending":{"base_url":"https://pending.invalid/v1","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"proxy-alias":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy"},"official-one":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-official"},"official-two":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"MENU_KEY"},"empty-env":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"EMPTY_MENU_KEY"},"missing-env":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"MISSING_MENU_KEY"}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"pending/saved","providers":{"pending":{"base_url":"https://pending.invalid/v1","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"proxy-alias":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy"},"official-one":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-official"},"official-two":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"MENU_KEY"},"empty-env":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"EMPTY_MENU_KEY"},"missing-env":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key_env":"MISSING_MENU_KEY"}}}}
     );
     try fixture.env.put("MENU_KEY", "fake-env");
     try fixture.env.put("EMPTY_MENU_KEY", "");
@@ -505,7 +503,7 @@ test "checkpoint usage is display only without key and in read only viewers" {
         };
         // The live model's resolved limit, not the old checkpoint's 65536.
         try writeSessionTestConfig(fixture.tmp.dir,
-            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}},"limits":{"low_price_input":false}}
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}}}
         );
         var counter: Counter = .{};
         const host = r.Host{ .context = &counter, .emit_fn = Counter.emit, .authorize_fn = Counter.authorize };
@@ -521,7 +519,7 @@ test "checkpoint usage is display only without key and in read only viewers" {
 
         // Even with a usable key, a second reader must not acquire send rights.
         try writeSessionTestConfig(fixture.tmp.dir,
-            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key":"fake-reader-key","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}},"limits":{"low_price_input":false}}
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key":"fake-reader-key","models":{"saved":{"protocol":"chat","context_tokens":131072}}}}}}
         );
         var reader = try Session.initWithOptions(std.testing.allocator, std.testing.io, &fixture.env, fixture.home, host, .{ .resume_session = id });
         defer reader.deinit();
@@ -578,7 +576,7 @@ test "invalid or empty key environment does not block restored history and can l
     const id = try fixture.saveHistory();
     for ([_][]const u8{ "", "bad\nkey" }) |value| {
         try writeSessionTestConfig(fixture.tmp.dir,
-            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"ARCHIVE_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+            \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key_env":"ARCHIVE_TEST_KEY","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}}}
         );
         try fixture.env.put("ARCHIVE_TEST_KEY", value);
         var resumed = try fixture.open(.{ .resume_session = id });
@@ -609,12 +607,12 @@ test "concurrent checkpoint writer allows read only history without credentials"
     try std.testing.expect(!try reader.saveOnExit());
     try std.testing.expectError(error.ResumeReadOnly, reader.connection().configure("fake-not-published"));
 }
-test "changed credential and current budgets do not authenticate or reject checkpoint loading" {
+test "changed credential and model window do not authenticate or reject checkpoint loading" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
     const id = try fixture.saveHistory();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key":"fake-rotated-key","models":{"saved":{"protocol":"responses","context_tokens":131072,"output_tokens":16384}}}}},"limits":{"low_price_input":true,"max_input_tokens":12000,"input_margin_tokens":1000}}
+        \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","api_key":"fake-rotated-key","models":{"saved":{"protocol":"responses","context_tokens":131072,"output_tokens":16384}}}}},"limits":{"command_timeout_ms":12000}}
     );
     var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
@@ -623,8 +621,7 @@ test "changed credential and current budgets do not authenticate or reject check
     const current_config = resumed.app.?.config.value;
     try std.testing.expectEqual(@as(u32, 131072), current_config.model.context_tokens);
     try std.testing.expectEqual(@as(?u32, 16384), current_config.model.output_tokens);
-    try std.testing.expect(current_config.model.input_price_threshold == null);
-    try std.testing.expect(current_config.limits.low_price_input);
+    try std.testing.expectEqual(@as(u32, 12000), current_config.limits.command_timeout_ms);
     try std.testing.expectEqual(@import("../core/protocol.zig").Protocol.responses, current_config.model.protocol);
     try std.testing.expect(!resumed.read_only);
     try std.testing.expect(try resumed.saveOnExit());
@@ -654,7 +651,7 @@ test "removed alias rebinds only by an unambiguous exact endpoint" {
     defer fixture.deinit();
     const id = try fixture.saveHistory();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"renamed/saved","providers":{"renamed":{"base_url":"https://archive.invalid/v1","api_key":"fake-renamed","models":{"saved":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"renamed/saved","providers":{"renamed":{"base_url":"https://archive.invalid/v1","api_key":"fake-renamed","models":{"saved":{"protocol":"chat","context_tokens":32768}}}}}}
     );
     var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
@@ -688,7 +685,7 @@ test "official provider login imports pending archive without switching global d
     defer fixture.deinit();
     const id = try fixture.saveHistory();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"other/other","providers":{"archive":{"base_url":"https://api.deepseek.com","kind":"deepseek","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"other":{"base_url":"https://other.invalid/v1","models":{"other":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"other/other","providers":{"archive":{"base_url":"https://api.deepseek.com","kind":"deepseek","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"other":{"base_url":"https://other.invalid/v1","models":{"other":{"protocol":"chat","context_tokens":32768}}}}}}
     );
     var resumed = try fixture.open(.{ .resume_session = id });
     defer resumed.deinit();
@@ -772,7 +769,7 @@ test "custom kind does not authorize official metadata or credential borrowing" 
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"proxy/saved","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy-only","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"proxy/saved","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy-only","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}}}
     );
     var session = try fixture.open(.{});
     defer session.deinit();
@@ -807,7 +804,7 @@ test "custom kind pending resume login stays on the actual endpoint" {
     defer fixture.deinit();
     const id = try fixture.saveHistory();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","kind":"opencode_zen","models":{"saved":{"protocol":"chat","context_tokens":65536,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://archive.invalid/v1","kind":"opencode_zen","models":{"saved":{"protocol":"chat","context_tokens":65536,"output_tokens":4096}}}}}}
     );
     var session = try fixture.open(.{ .resume_session = id });
     defer session.deinit();
@@ -855,7 +852,7 @@ test "Anthropic displayable session resume preserves signed replay and never exe
     defer env.deinit();
     try env.put("HOME", home);
     try writeSessionTestConfig(tmp.dir,
-        \\{"llm":{"default":"opencode-go/claude-haiku-5-5","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"claude-haiku-5-5":{"protocol":"anthropic","context_tokens":32768,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/claude-haiku-5-5","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"claude-haiku-5-5":{"protocol":"anthropic","context_tokens":32768,"output_tokens":4096}}}}}}
     );
     var id: ids.Id = undefined;
     var expected: ?[]u8 = null;
@@ -923,7 +920,7 @@ test "Anthropic session resume invalidates null-hash replay when the schema is u
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
     try writeSessionTestConfig(fixture.tmp.dir,
-        \\{"llm":{"default":"opencode-go/claude-haiku-5-5","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","api_key":"fake-null-hash-resume","models":{"claude-haiku-5-5":{"protocol":"anthropic","context_tokens":32768,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/claude-haiku-5-5","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","api_key":"fake-null-hash-resume","models":{"claude-haiku-5-5":{"protocol":"anthropic","context_tokens":32768,"output_tokens":4096}}}}}}
     );
     var id: ids.Id = undefined;
     {
@@ -1215,8 +1212,6 @@ test "provider reasoning source DeepSeek then Go Haiku applies global default wi
             try std.testing.expectEqual(before.context_tokens, model.context_tokens);
             try std.testing.expectEqual(before.output_tokens, model.output_tokens);
             try std.testing.expectEqual(before.protocol, model.protocol);
-            try std.testing.expectEqual(before.input_price_threshold, model.input_price_threshold);
-            try std.testing.expectEqual(before.input_price_flat_limit, model.input_price_flat_limit);
             try std.testing.expect(!session.initial_default_pending);
             try std.testing.expectEqual(wanted, try persistedEffortForTest(&session));
             var disk = try session.store.loadExisting();
@@ -1247,7 +1242,7 @@ test "first activation defaults clamp without changing preference and own late c
             // Login activates the preselected alias. Declare it without a key;
             // selecting an undeclared provider before /login is not onboarding.
             try writeSessionTestConfig(tmp.dir,
-                \\{"llm":{"default":"opencode-go/gpt-6-luna","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go"}}},"limits":{"low_price_input":false}}
+                \\{"llm":{"default":"opencode-go/gpt-6-luna","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go"}}}}
             );
             var session = try Session.initWithOptions(a, io, &env, home, .{}, .{});
             defer session.deinit();
@@ -1286,7 +1281,6 @@ test "first activation defaults clamp without changing preference and own late c
             try std.testing.expectEqual(before.context_tokens, config.model.context_tokens);
             try std.testing.expectEqual(before.output_tokens, config.model.output_tokens);
             try std.testing.expectEqual(before.protocol, config.model.protocol);
-            try std.testing.expectEqual(before.input_price_threshold, config.model.input_price_threshold);
             const accepted = config.model.reasoning;
             session.metadata_cache.deinit(a);
             session.metadata_cache = .{};
@@ -1395,7 +1389,7 @@ test "effort action cannot borrow official reasoning for a proxy kind hint" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeSessionTestConfig(tmp.dir,
-        \\{"llm":{"default":"proxy/deepseek-flash","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy-effort","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"proxy/deepseek-flash","providers":{"proxy":{"base_url":"https://proxy.invalid/v1","kind":"deepseek","api_key":"fake-proxy-effort","models":{"deepseek-flash":{"protocol":"chat","context_tokens":65536}}}}}}
     );
     var buffer: [4096]u8 = undefined;
     const home = buffer[0..try tmp.dir.realPath(io, &buffer)];
@@ -1996,7 +1990,7 @@ test "login refresh opt out remains offline and explicit profiles survive availa
     }
     session.metadata_cache.directory_mask = metadata.bit(.opencode_go);
     var explicit = try cfg.parse(a,
-        \\{"llm":{"default":"opencode-go/kimi-k3","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"kimi-k3":{"context_tokens":65536,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/kimi-k3","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"kimi-k3":{"context_tokens":65536,"protocol":"chat"}}}}}}
     );
     defer cfg.release(&explicit);
     // An explicit registry patch remains selectable after the official source
@@ -2075,7 +2069,7 @@ test "raw explicit profile hides only the same provider dynamic identity" {
         row.protocol = .chat;
     }
     var explicit = try cfg.parse(a,
-        \\{"llm":{"default":"opencode-go/shared-profile","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"shared-profile":{"context_tokens":32768,"protocol":"chat"}}},"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen"}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/shared-profile","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"shared-profile":{"context_tokens":32768,"protocol":"chat"}}},"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen"}}}}
     );
     defer cfg.release(&explicit);
     const models = try session.buildModels(explicit.value);
@@ -2098,7 +2092,7 @@ test "explicit user reasoning overrides metadata and survives default persistenc
     defer source.deinit();
     // A manual registry patch is explicit; value/name similarity to metadata must not erase it.
     var parsed = try cfg.parse(a,
-        \\{"llm":{"default":"opencode-go/gpt-6-luna","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"gpt-6-luna":{"protocol":"responses","context_tokens":32768,"reasoning_effort":"high","reasoning":{"map":{"high":"user-intensive"}}}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/gpt-6-luna","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"gpt-6-luna":{"protocol":"responses","context_tokens":32768,"reasoning_effort":"high","reasoning":{"map":{"high":"user-intensive"}}}}}}}}
     );
     defer cfg.release(&parsed);
     try model_resolver.applyDefault(parsed.arena.allocator(), &parsed.value, &source.metadata_cache);
@@ -2246,7 +2240,7 @@ test "explicit raw and qualified profiles override dynamic rows including explic
     defer env.deinit();
     try env.put("HOME", home);
     try writeSessionTestConfig(tmp.dir,
-        \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"raw-override":{"context_tokens":32768,"protocol":"auto"},"qualified-override":{"context_tokens":32768,"protocol":"chat"}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{"opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","models":{"raw-override":{"context_tokens":32768,"protocol":"auto"},"qualified-override":{"context_tokens":32768,"protocol":"chat"}}}}}}
     );
     var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
@@ -2282,7 +2276,7 @@ test "new raw custom model never inherits the previous model output capability" 
     defer env.deinit();
     try env.put("HOME", home);
     try writeSessionTestConfig(tmp.dir,
-        \\{"llm":{"default":"custom/previous","providers":{"custom":{"base_url":"https://custom.invalid/v1","models":{"previous":{"protocol":"chat","context_tokens":131072,"output_tokens":65536},"custom-next":{"protocol":"chat","context_tokens":131072},"custom-declared":{"protocol":"chat","context_tokens":131072,"output_tokens":4096}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"custom/previous","providers":{"custom":{"base_url":"https://custom.invalid/v1","models":{"previous":{"protocol":"chat","context_tokens":131072,"output_tokens":65536},"custom-next":{"protocol":"chat","context_tokens":131072},"custom-declared":{"protocol":"chat","context_tokens":131072,"output_tokens":4096}}}}}}
     );
     var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{});
     defer session.deinit();
@@ -2371,7 +2365,7 @@ test "outdated cache recovers through automatic or explicit refresh only" {
         \\{"version":12,"attempted":3,"records":[{"selector":"deepseek/deepseek-flash","context_window":65536,"available":true}],"directory_mask":1,"models":[{"provider":"deepseek","id":"deepseek-flash","context_window":32768,"protocol":"chat","available":true}],"refresh":[{"generation":2,"last_attempt_ms":900,"last_success_ms":950,"successful":true},{},{},{}]}
     ;
     const config =
-        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-outdated-cache","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-outdated-cache","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}}}
     ;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -2431,7 +2425,7 @@ test "outdated cache recovers through automatic or explicit refresh only" {
 }
 test "future or damaged cache blocks cadence until the file is moved away" {
     const config =
-        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-poisoned-cache","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}},"limits":{"low_price_input":false}}
+        \\{"llm":{"default":"deepseek/deepseek-flash","providers":{"deepseek":{"base_url":"https://api.deepseek.com","kind":"deepseek","api_key":"fake-poisoned-cache","models":{"deepseek-flash":{"protocol":"chat","context_tokens":32768}}}}}}
     ;
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -2549,7 +2543,6 @@ test "proxy allowlist revalidates exact rows credentials and preserves unrelated
     try std.testing.expectEqualStrings("aux/review/raw/id", parsed.value.proxy.?.models[0]);
     try std.testing.expectEqualStrings("aux/unknown/raw", parsed.value.proxy.?.models[1]);
     try std.testing.expectEqualStrings("main/chat", parsed.value.proxy.?.models[2]);
-    try std.testing.expect(!parsed.value.limits.low_price_input);
     try std.testing.expectEqualStrings("fake-main-key", parsed.value.registry.?.find("main").?.connection.api_key.?);
 }
 test "proxy refresh switches helper routes while primary client and history stay frozen" {

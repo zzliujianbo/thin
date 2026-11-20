@@ -1,4 +1,4 @@
-//! Offline estimated-input policy: real window, price metadata and intent stay separate.
+//! Offline regressions for the physical input window and Runtime send gates.
 const std = @import("std");
 const cfg = @import("../core/config.zig");
 const c = @import("../core/context.zig");
@@ -13,8 +13,14 @@ fn configuration() cfg.Config {
         .protocol = .chat,
         .context_tokens = 1000000,
         .output_tokens = 128000,
-        .input_price_threshold = 100000,
-    }, .limits = .{ .low_price_input = false } };
+    } };
+}
+
+/// Set the physical window, including its reserve and one token of output room.
+fn setBudget(config: *cfg.Config, budget: usize) void {
+    const room = budget + 1;
+    config.model.context_tokens = @intCast(room + @min(cfg.Policy.safety_tokens, room / 7));
+    std.debug.assert(c.inputBudget(config.*) == budget);
 }
 
 const Fake = struct {
@@ -25,7 +31,6 @@ const Fake = struct {
     check_raw_budget: bool = true,
     normal: usize = 0,
     summaries: usize = 0,
-    last_summary_input: usize = 0,
     tools: usize = 0,
     tool_mode: bool = false,
     exhausted: bool = false,
@@ -40,10 +45,9 @@ const Fake = struct {
     fn call(raw: *anyopaque, alloc: std.mem.Allocator, req: p.Request, _: p.ModelSink) !p.Outcome {
         const self: *Fake = @ptrCast(@alignCast(raw));
         const estimate = c.rawTokens(req.system, req.tools, req.messages);
-        if (self.check_raw_budget) try std.testing.expect(estimate <= c.inputBudgetFor(self.config.*, req.purpose));
+        if (self.check_raw_budget) try std.testing.expect(estimate <= c.inputBudget(self.config.*));
         if (req.purpose == .summary) {
             self.summaries += 1;
-            self.last_summary_input = estimate;
             try std.testing.expectEqual(@as(usize, 0), self.normal);
             if (self.exhausted) return .{ .failure = .{ .kind = .output_limit, .message = "fixture cap", .usage = .{ .input_tokens = estimate, .output_tokens = 4096 } } };
             switch (self.summary_fault) {
@@ -115,13 +119,12 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
     if (unknown_anthropic) {
         config.model.protocol = .anthropic;
         config.model.output_tokens = null;
-        config.limits.low_price_input = true;
     }
     var fake = Fake{ .config = &config };
     var runtime = try r.Runtime.init(a, std.testing.io, &config, fake.model(), fake.executor(), .{}, "");
     defer runtime.deinit();
     // Quoting expands the actual summary DATA view beyond the original input.
-    const old: [12500]u8 = @splat('"');
+    const old: [12500]u8 = @splat(if (unknown_anthropic) @as(u8, 'x') else '"');
     try seed(&runtime, &old);
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
@@ -132,16 +135,7 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
     for (runtime.messages(), 0..) |message, i| expected[i] = try p.cloneMessage(alloc, message);
     expected[protected] = try p.textMessage(alloc, .user, goal);
     const normal_input = runtime.estimator.tokens(c.rawTokens(runtime.system, &.{}, expected));
-    const ceiling: u32 = @intCast(normal_input + cfg.Policy.input_margin_tokens - 1);
-    if (unknown_anthropic) {
-        config.model.input_price_threshold = ceiling;
-    } else {
-        // Set the actual physical input budget to normal_input - 1,
-        // including the proportional reserve for this small window.
-        config.model.context_tokens = @intCast(@max(2, normal_input + @min(cfg.Policy.safety_tokens, normal_input / 7)));
-        try std.testing.expectEqual(normal_input - 1, c.inputBudget(config));
-    }
-    try c.validateInputPolicy(config);
+    setBudget(&config, normal_input - 1);
     try std.testing.expect(config.limits.compaction_enabled);
     try std.testing.expect(normal_input > c.inputBudget(config));
     try std.testing.expect(normal_input >= c.threshold(c.inputBudget(config), cfg.Policy.compaction_trigger_percent));
@@ -155,24 +149,23 @@ fn automaticSummaryLocalRejection(unknown_anthropic: bool) !void {
     const summary_input = runtime.estimator.tokens(c.rawTokens(instruction, &.{}, &summary_messages));
     if (unknown_anthropic) {
         // Isolate protocol validation: the complete summary input really fits.
-        try c.checkInputFor(config, .summary, summary_input);
+        try c.checkInput(config, summary_input);
     } else {
-        try std.testing.expect(summary_input > c.inputBudgetFor(config, .summary));
-        try std.testing.expectError(error.ContextTooLarge, c.checkInputFor(config, .summary, summary_input));
+        try std.testing.expectError(error.ContextTooLarge, c.checkInput(config, summary_input));
     }
     var capture = Capture{ .runtime = &runtime, .allocator = alloc };
     runtime.host = .{ .context = &capture, .emit_fn = Capture.emit };
     var cancel: p.Cancellation = .{};
     const terminal = try runtime.run(goal, &cancel);
-    try std.testing.expectEqual(if (unknown_anthropic) r.Status.paused else r.Status.failed, terminal.status);
-    try std.testing.expectEqual(if (unknown_anthropic) error.InputBudgetExceeded else error.ContextTooLarge, terminal.detail.?);
+    try std.testing.expectEqual(r.Status.failed, terminal.status);
+    try std.testing.expectEqual(error.ContextTooLarge, terminal.detail.?);
     try std.testing.expect(terminal.detail.? != error.SummaryFailed and terminal.detail.? != error.InsufficientCompaction);
     try std.testing.expect(terminal.model_failure == null and terminal.http_status == null);
     try std.testing.expectEqual(@as(usize, 1), capture.failures);
     try std.testing.expectEqual(if (unknown_anthropic) error.UnknownModelOutputCapacity else error.ContextTooLarge, capture.cause.?);
     try std.testing.expectEqual(@as(?usize, protected), capture.protected_index);
     try std.testing.expectEqualDeep(@as([]const p.Message, expected), capture.history.items);
-    try std.testing.expectEqualDeep(@as([]const p.Message, if (unknown_anthropic) expected else expected[0..protected]), runtime.messages());
+    try std.testing.expectEqualDeep(@as([]const p.Message, expected[0..protected]), runtime.messages());
     try std.testing.expectEqual(protected, runtime.protected_index);
     try std.testing.expectEqual(@as(usize, 0), fake.normal + fake.summaries + fake.tools);
     try std.testing.expectEqual(@as(usize, 0), capture.compacting + capture.committed + capture.usages);

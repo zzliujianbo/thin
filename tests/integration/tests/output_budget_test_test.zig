@@ -10,14 +10,14 @@ test "provider output matrix omits optional caps and only Anthropic uses model c
                 for ([_]?u32{ null, 65536 }) |capacity| {
                     const config: cfg.Config = .{
                         .provider = connection,
-                        .limits = .{ .low_price_input = false },
+
                         .model = .{ .name = "output-fixture", .protocol = protocol, .context_tokens = window, .output_tokens = capacity, .reasoning_effort = "high", .reasoning = .{ .format = format, .map = .{ .off = if (format == .anthropic) "disabled" else if (format == .deepseek) "off" else "none", .high = "high" } } },
                     };
                     try cfg.validate(config);
                     const wire = thinking.resolve(connection.base_url, config.model.name, config.model.reasoning).wire(config.model.reasoning_effort);
                     for ([_]usize{ 1000, 120000 }) |estimated_input| {
                         for ([_]p.Purpose{ .normal, .summary }) |purpose| {
-                            try context.checkInputFor(config, purpose, estimated_input);
+                            try context.checkInput(config, estimated_input);
                             var arena = std.heap.ArenaAllocator.init(a);
                             defer arena.deinit();
                             const allocator = arena.allocator();

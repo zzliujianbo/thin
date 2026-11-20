@@ -49,14 +49,14 @@ FRAME_END = b'\x1b[?2026l' + ACK
 CSI = re.compile(rb'\x1b\[([0-9;?]*)([@-~])')
 
 # Real idle composer decorations, as rendered by src/ui/presentation.zig's
-# `prompt()`: `> ` with no model selected, and `(model) 0.0%> ` /
-# `(model) L1.6%> ` / `(model) high> ` once one is. The slot in front of the
+# `prompt()`: `> ` with no model selected, and `(model)0.0%> ` /
+# `(model)high> ` once one is. The slot in front of the
 # marker is a transient effort-confirmation level name or the retained context
-# (`?%`, `>100%`, `N.N%`), optionally prefixed by the low-price `L`. The busy
+# (`?%`, `>100%`, `N.N%`). The busy
 # marker replaces the `>` with the non-ASCII activity spinner, which this bounded
 # VT subset never stores, so a busy composer can never reach the same shape.
-_VALUE_SLOT = (r'(?:L?(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
-               r'xhigh|max|\?))')
+_VALUE_SLOT = (r'(?:\?%|>100%|[0-9]+\.[0-9]%|off|minimal|low|medium|high|'
+               r'xhigh|max|\?)')
 _IDLE_COMPOSER = re.compile(
     r'^(?:> |(?:\([^)]*\))?(?:' + _VALUE_SLOT + r')?> )$')
 
@@ -652,7 +652,7 @@ def write_config(home, url):
             'api_key': KEY,
             'models': {MODEL: {'protocol': 'chat', 'context_tokens': 32768}},
         }}},
-        'limits': {'low_price_input': False, 'request_timeout_ms': 10000,
+        'limits': {'request_timeout_ms': 10000,
                    'command_timeout_ms': 8000},
     }
     path = home / '.thin' / 'config.json'

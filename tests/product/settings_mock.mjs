@@ -78,7 +78,7 @@ export async function settingsRegressions({app,pty,execute,send}) {
         // Match the declaration-only writer's sparse nullable mappings while
         // retaining strict /login baseline equality for all declared models.
         const completeMap = Object.fromEntries(['off','minimal','low','medium','high','xhigh','max'].filter(level => map[level] != null).map(level => [level,map[level]]));
-        configBytes = JSON.stringify({llm:{default:'local/fixture-model',reasoning_effort:globalEffort,providers:{local:{base_url:url,api_key:null,kind:null,chat_max_tokens:false,api_key_env:pending?'':'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768,reasoning_effort:effort,...(unknown?{}:{reasoning:{format,map:completeMap}})}}}}},limits:{...limitDefaults,low_price_input:false,request_timeout_ms:10000}});
+        configBytes = JSON.stringify({llm:{default:'local/fixture-model',reasoning_effort:globalEffort,providers:{local:{base_url:url,api_key:null,kind:null,chat_max_tokens:false,api_key_env:pending?'':'THIN_FIXTURE_KEY',models:{'fixture-model':{protocol,context_tokens:32768,reasoning_effort:effort,...(unknown?{}:{reasoning:{format,map:completeMap}})}}}}},limits:{...limitDefaults,request_timeout_ms:10000}});
         await writeFile(configPath,configBytes,{mode:0o600});
       }
       const legacyFixtures = new Map();

@@ -120,7 +120,7 @@ def run(app):
             assert len(str(runtime)) + 14 + 32 + 5 <= 107, 'AF_UNIX socket path budget exceeded'
             (home / '.thin').mkdir(parents=True)
             project.mkdir()
-            config = {'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_RESIZE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'low_price_input': False, 'request_timeout_ms': 20000}}
+            config = {'llm': {'default': 'owned/fixture-model', 'providers': {'owned': {'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key_env': 'THIN_RESIZE_KEY', 'models': {'fixture-model': {'protocol': 'chat', 'context_tokens': 32768}}}}}, 'limits': {'request_timeout_ms': 20000}}
             path = home / '.thin/config.json'
             path.write_text(json.dumps(config))
             path.chmod(0o600)
@@ -242,15 +242,15 @@ def run(app):
                 typed_lines = [line for line in re.split(rb'\r\n|\r|\n', typed) if line.strip()]
                 assert typed_lines and typed_lines[-1].rstrip().endswith(b'> x'), 'typed cell is not on the current composer row'
                 key(b'\x15/settings\r')
-                assert b'Low-price input' in capture
+                assert b'Auto compaction' in capture
                 initial_bytes = path.read_bytes()
                 hold_resize(20, 70)  # Passive resize drops the old complete-frame ACK.
                 press(b'\r')  # Confirmation arriving before a fresh frame cannot toggle.
                 assert path.read_bytes() == initial_bytes, 'stale settings confirmation saved'
                 key(b'\r')
-                assert json.loads(path.read_text())['limits']['low_price_input'] is True
+                assert json.loads(path.read_text())['limits']['compaction_enabled'] is False
                 key(b'\r')
-                assert json.loads(path.read_text())['limits']['low_price_input'] is False
+                assert json.loads(path.read_text())['limits']['compaction_enabled'] is True
                 key(b'\x1b')
                 # Another settings frame may ACK before bare Escape expires.
                 # Do not merge the next Ctrl-U/text into that pending Escape.

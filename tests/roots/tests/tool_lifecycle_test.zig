@@ -116,5 +116,5 @@ const Fixture = struct {
     }
 };
 fn configuration() cfg.Config {
-    return .{ .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE" }, .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat }, .limits = .{ .low_price_input = false } };
+    return .{ .provider = .{ .base_url = "http://localhost", .api_key_env = "FAKE" }, .model = .{ .name = "fake", .context_tokens = 32768, .protocol = .chat } };
 }

@@ -67,7 +67,7 @@ test "every runtime display event round-trips through the wire" {
         .{ .compaction_skipped = .{ .reason = .rejected } },
         .{ .finished = .{
             .status = .paused,
-            .detail = error.InputBudgetExceeded,
+            .detail = error.InsufficientCompaction,
             .model_failure = .output_limit,
             .http_status = 429,
             .usage = .{
@@ -168,6 +168,9 @@ test "u64 values above i64.max survive number_string decoding" {
     try std.testing.expectEqual(high, decoded.event.tool_started.id);
     try std.testing.expectEqual(@as(?u64, high), decoded.event.tool_started.started_ms);
     try std.testing.expectEqual(high, decoded.event.tool_started.display_key.?.generation);
+}
+test "retired singleton setting request is rejected before dispatch" {
+    try std.testing.expectError(error.BadRequest, parseRequest(std.testing.allocator, "{\"v\":5,\"id\":1,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}"));
 }
 test "numeric and enum request fields reject wrong types instead of defaulting" {
     const a = std.testing.allocator;
