@@ -1870,13 +1870,13 @@ fn selectionBusyFrame(d: *Driver, start: usize, slot: []const u8, draft: []const
                 false;
             has_expected_rejection_notice = view.visible("Only ordinary conversation text can be queued");
             has_model_selection_idle_notice = view.visible("Model selection requires an idle, non-pasted session");
-            has_steering = view.visible("Steering queued");
+            has_steering = view.visible("Steering ");
             observed_effort_minimal = std.mem.indexOf(u8, row, "minimal") != null;
             busy_marker_present = std.mem.indexOf(u8, row, "~ ") != null;
             if (exact_composer_match and
                 (!rejected or view.visible("Only ordinary conversation text can be queued")))
             {
-                try check(!view.visible("Steering queued"));
+                try check(!has_steering);
                 return;
             }
         }

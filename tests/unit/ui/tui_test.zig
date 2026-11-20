@@ -12740,7 +12740,7 @@ test "async queue reply does not block body delivery or erase typeahead" {
     ui.pumpAsync();
     try std.testing.expectEqualStrings("typeahead", ui.editor.bytes.items);
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expect(publishedNotice(&ui, "Steering queued"));
+    try std.testing.expect(!publishedNotice(&ui, "Steering queued"));
 }
 test "late async approval cannot clear or relabel a newer permission" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 6 } };
@@ -12780,7 +12780,7 @@ test "remote queue sends bind the current epoch and are never launched locally" 
     try std.testing.expectEqual(session_client.QueueKind.steering, fake.last_enqueue_kind);
     try std.testing.expectEqualStrings("please continue", fake.text[0..fake.text_len]);
     try std.testing.expectEqualStrings("Ready", ui.notice);
-    try std.testing.expect(publishedNotice(&ui, "Steering queued"));
+    try std.testing.expect(!publishedNotice(&ui, "Steering queued"));
     try std.testing.expectEqual(@as(usize, 0), ui.inbox.snapshot().steering);
 
     ui.busy = false;

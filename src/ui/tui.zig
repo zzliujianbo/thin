@@ -1420,6 +1420,11 @@ const Ui = struct {
         if (self.notice_alias_pending == null) self.notice = "Ready";
     }
 
+    fn enqueueSucceeded(self: *Ui, kind: inbox_module.Kind) void {
+        if (kind == .follow_up) return self.publishNotice("FollowUp queued");
+        if (self.notice_alias_pending == null) self.notice = "Ready";
+    }
+
     fn completeAsync(self: *Ui, pending: *AsyncPending, completion: *remote_action.Completion) void {
         const action = completion.request.action;
         switch (pending.purpose) {
@@ -1431,7 +1436,7 @@ const Ui = struct {
             },
             .enqueue => {
                 self.clearSubmittedEditor(pending);
-                self.publishNotice(if (action.enqueue.kind == .steering) "Steering queued" else "FollowUp queued");
+                self.enqueueSucceeded(action.enqueue.kind);
             },
             .withdraw => {
                 if (completion.value != .withdrawn) return;
@@ -4875,7 +4880,7 @@ const Ui = struct {
             };
             self.wipeEditor();
             self.parser.stop_feed = true;
-            self.publishNotice(if (kind == .steering) "Steering queued" else "FollowUp queued");
+            self.enqueueSucceeded(kind);
             return;
         }
         if (self.attached_runtime == null) {
@@ -4888,7 +4893,7 @@ const Ui = struct {
         };
         self.wipeEditor();
         self.parser.stop_feed = true;
-        self.publishNotice(if (kind == .steering) "Steering queued" else "FollowUp queued");
+        self.enqueueSucceeded(kind);
     }
 
     fn dispatchNext(self: *Ui) !void {
