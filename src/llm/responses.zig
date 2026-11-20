@@ -222,9 +222,11 @@ pub const Stream = struct {
             return;
         }
         if (self.completed or self.failed) return error.InvalidStreamState;
-        var temp = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer temp.deinit();
-        const t = temp.allocator();
+        var buffer: c.EventBuffer = undefined;
+        var overflow = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer overflow.deinit();
+        var scratch = std.heap.BufferFirstAllocator.init(&buffer, overflow.allocator());
+        const t = scratch.allocator();
         const v = try c.parse(t, data);
         const typ = try c.text(v, "type");
 

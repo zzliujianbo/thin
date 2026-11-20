@@ -226,9 +226,11 @@ pub const Stream = struct {
     fn feedInner(self: *Stream, event: []const u8, data: []const u8) !void {
         if (self.poisoned or self.committed or self.failed or self.stopped) return error.InvalidStreamState;
         if (self.scope.protocol != .anthropic) return error.ReplayScopeMismatch;
-        var temp = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer temp.deinit();
-        const v = try c.parse(temp.allocator(), data);
+        var buffer: c.EventBuffer = undefined;
+        var overflow = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer overflow.deinit();
+        var scratch = std.heap.BufferFirstAllocator.init(&buffer, overflow.allocator());
+        const v = try c.parse(scratch.allocator(), data);
         const typ = try c.text(v, "type");
         if (event.len != 0 and !c.eq(event, "message") and !c.eq(event, typ)) return error.EventTypeMismatch;
         if (c.eq(typ, "ping")) return;

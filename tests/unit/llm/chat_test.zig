@@ -292,6 +292,24 @@ test "chat refuses truncation length malformed arguments duplicate IDs and unkno
     // 原始错误文本按原样保留，供直接展示与排错。
     try std.testing.expectEqualStrings("secret-key", failure.message);
 }
+test "chat retains deltas across small and oversized events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const large = try a.alloc(u8, 8192);
+    @memset(large, 'x');
+    var stream = Stream.init(a, test_support.chat_scope, .{});
+    for ([_][]const u8{ "start", large, "end" }) |chunk| {
+        const wire = try std.mem.concat(a, u8, &.{ "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"", chunk, "\"}}]}" });
+        try stream.feed("", wire);
+        @memset(wire, 0);
+    }
+    try stream.feed("", "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
+    try stream.feed("", "[DONE]");
+    const blocks = (try stream.finish()).success.message.blocks;
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "start", large, "end" }), blocks[0].text);
+}
 test "chat omits all output caps with varying model capacity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

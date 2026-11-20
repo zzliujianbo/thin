@@ -208,10 +208,11 @@ pub const Stream = struct {
             return;
         }
 
-        // 每个事件的 JSON 解析使用临时 arena；保留的数据均通过 clone/dupe 复制到 self.a。
-        var temp = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer temp.deinit();
-        const v = try c.parse(temp.allocator(), data);
+        var buffer: c.EventBuffer = undefined;
+        var overflow = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer overflow.deinit();
+        var scratch = std.heap.BufferFirstAllocator.init(&buffer, overflow.allocator());
+        const v = try c.parse(scratch.allocator(), data);
         if (v != .object) return error.InvalidEvent;
 
         // usage 可能单独出现在 choices 为空的事件中，因此先处理，每次合并并实时上报。

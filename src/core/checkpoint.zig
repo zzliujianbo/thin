@@ -59,27 +59,8 @@ pub const ToolStat = struct {
 pub const max_tool_stats = 256;
 pub const max_tool_stat_id = 128;
 
-// Count escaped output before allocating the exact encoded size.
-const Counter = struct {
-    writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
-    count: usize = 0,
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Counter = @fieldParentPtr("writer", w);
-        const n = std.Io.Writer.countSplat(data, splat);
-        self.count = std.math.add(usize, self.count, n) catch return error.WriteFailed;
-        return n;
-    }
-};
-
-fn encodedSize(state: State) !usize {
-    try basic(state);
-    var counter = Counter{};
-    std.json.Stringify.value(state, .{ .emit_null_optional_fields = true }, &counter.writer) catch return error.InputLimit;
-    return counter.count;
-}
-
 pub fn encode(a: Allocator, state: State) ![]u8 {
-    try basic(state);
+    try validateStructure(state);
     var allocating = std.Io.Writer.Allocating.init(a);
     defer allocating.deinit();
     std.json.Stringify.value(state, .{ .emit_null_optional_fields = true }, &allocating.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
@@ -212,7 +193,7 @@ pub fn decode(a: Allocator, bytes: []const u8) !std.json.Parsed(State) {
     try shape(State, tree.value);
     const parsed = try std.json.parseFromValue(State, a, tree.value, .{});
     errdefer parsed.deinit();
-    try basic(parsed.value);
+    try validateStructure(parsed.value);
     return parsed;
 }
 
@@ -220,7 +201,9 @@ fn utf8(s: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
 }
 
-fn basic(state: State) !void {
+/// Structural bounds for owned copying or saving, never a request permission.
+/// Validate in memory; only encode() needs the escaped JSON representation.
+pub fn validateStructure(state: State) !void {
     if (state.version != 2) return error.UnsupportedVersion;
     try utf8(state.system);
     if (state.tool_stats) |stats| {
@@ -252,11 +235,6 @@ fn basic(state: State) !void {
     }
 }
 
-/// Structural bounds for owned copying or saving, never a request permission.
-pub fn validateStructure(state: State) !void {
-    _ = try encodedSize(state);
-}
-
 /// Validate the ACTUAL request, independent of persisted selectors, budgets or
 /// poison flags. Used before every model boundary, including fake models.
 pub fn validateRequestHistory(a: Allocator, req: p.Request) !void {
@@ -276,7 +254,7 @@ pub fn validateRequestHistoryWire(a: Allocator, req: p.Request) ![]u8 {
         .anthropic => .anthropic,
     };
     if (wire_proto != proto) return error.IncompatibleModelProtocol;
-    try basic(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(wire_proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
+    try validateStructure(.{ .system = req.system, .messages = req.messages, .selector = llm.Selector.init(wire_proto), .estimator = .{}, .last_context_tokens = null, .permission_id = 0 });
     try common.validateRequest(req, wire_proto);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

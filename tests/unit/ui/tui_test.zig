@@ -420,6 +420,28 @@ test "rendered unacknowledged body window applies admission pressure" {
     try std.testing.expect(ui.displayBackpressured());
     body.abort();
 }
+test "body ACK releases admission pressure even with a retained prefix" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    const index = try ui.add(.assistant, "");
+    ui.draft = index;
+    const bytes = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+    bytes[1] = '\n';
+    try ui.records.items[index].append(std.testing.allocator, bytes);
+    const body = ui.records.items[index].stream.?;
+    try std.testing.expect(ui.displayBackpressured());
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+    try std.testing.expectEqual(bytes.len - 2, body.pendingBytes());
+    try std.testing.expect(!ui.displayBackpressured());
+    try body.append("xx");
+    try std.testing.expect(ui.displayBackpressured());
+}
 test "large history restore retains all records and identities" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
@@ -10533,7 +10555,7 @@ test "history reset retains an assistant decoder holding CR or partial UTF8" {
         try std.testing.expectEqual(@as(usize, if (cr) 0 else 2), stream.decoder.carry_len);
         // The retained decoder must still resolve the original source correctly.
         try ui.appendDraft(.assistant, if (cr) "\n" else "\x91\xa9");
-        try std.testing.expectEqualStrings(if (cr) "\n" else "\xf0\x9f\x91\xa9", stream.source.items);
+        try std.testing.expectEqualStrings(if (cr) "\n" else "\xf0\x9f\x91\xa9", stream.liveSource());
         try std.testing.expect(!stream.decoder.held_cr and stream.decoder.carry_len == 0);
     }
 }
@@ -11278,7 +11300,7 @@ test "canonical stream commit finalized render limit stays in mutable tail" {
     ui.frame_offset = ui.frame.len;
     ui.finishFrame();
     try std.testing.expectEqual(@as(usize, 0), body.base);
-    try std.testing.expectEqualStrings(source, body.source.items);
+    try std.testing.expectEqualStrings(source, body.liveSource());
     try std.testing.expect(!ui.records.items[index].output);
     try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
     try std.testing.expect(!std.mem.eql(u8, ui.notice, "Display commit incomplete; output retained"));
@@ -11312,7 +11334,7 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
         try std.testing.expectEqual(capacity, body.arena.queryCapacity());
         try std.testing.expectEqual(@as(usize, 0), body.base);
         try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
-        try std.testing.expectEqualStrings("# ", body.source.items);
+        try std.testing.expectEqualStrings("# ", body.liveSource());
         try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
         try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
         try std.testing.expect(ui.frame.len > 1);
@@ -11324,7 +11346,7 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
             try std.testing.expect(!body.isDrained());
             try std.testing.expectEqual(@as(usize, 0), body.base);
             try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
-            try std.testing.expectEqualStrings("# ", body.source.items);
+            try std.testing.expectEqualStrings("# ", body.liveSource());
             try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
             try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
         } else if (scenario == 1) {
@@ -11344,7 +11366,7 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
             try std.testing.expectEqual(@as(usize, 0), body.base);
             try std.testing.expect(!body.isDrained());
             try std.testing.expectEqual(@as(usize, 2), body.windowBytes());
-            try std.testing.expectEqualStrings("# ", body.source.items);
+            try std.testing.expectEqualStrings("# ", body.liveSource());
             try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].delivery_visible);
             try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
             if (scenario == 2) ui.clearPermission();
@@ -11360,7 +11382,7 @@ test "canonical stream commit empty heading EOF metadata requires a complete fre
         try std.testing.expect(body.isDrained());
         try std.testing.expectEqual(@as(usize, 2), body.base);
         try std.testing.expectEqual(@as(usize, 0), body.windowBytes());
-        try std.testing.expectEqualStrings("", body.source.items);
+        try std.testing.expectEqualStrings("", body.liveSource());
         try std.testing.expectEqual(@as(usize, 2), ui.records.items[index].delivery_visible);
         try std.testing.expectEqual(@as(usize, 0), body.arena.queryCapacity());
         try std.testing.expectEqual(@as(usize, 0), ui.records.items[index].lines.len);

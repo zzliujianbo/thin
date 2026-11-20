@@ -289,15 +289,15 @@ test "decoder state and row checkpoints survive aborted frames" {
     try body.append("A\r");
     try std.testing.expect(body.decoder.held_cr);
     try std.testing.expectEqual(@as(usize, 2), body.acceptedSourceEnd());
-    try std.testing.expectEqualStrings("A", body.source.items);
+    try std.testing.expectEqualStrings("A", body.liveSource());
     try body.append("\n\xf0\x9f");
     try std.testing.expect(!body.decoder.held_cr);
     try std.testing.expectEqual(@as(usize, 2), body.decoder.carry_len);
     try std.testing.expectEqualSlices(u8, "\xf0\x9f", body.decoder.carry[0..body.decoder.carry_len]);
-    try std.testing.expectEqualStrings("A\n", body.source.items);
+    try std.testing.expectEqualStrings("A\n", body.liveSource());
     try body.append("\x91\xa9\n");
     try std.testing.expectEqual(@as(usize, 0), body.decoder.carry_len);
-    try std.testing.expectEqualStrings("A\n👩\n", body.source.items);
+    try std.testing.expectEqualStrings("A\n👩\n", body.liveSource());
     try body.finish();
     try body.build();
     try std.testing.expectEqual(@as(usize, 2), body.visibleRows().len);
@@ -334,6 +334,51 @@ test "decoder state and row checkpoints survive aborted frames" {
     try std.testing.expect(body.isDrained());
     try std.testing.expectEqual(@as(usize, 7), body.committedSourceEnd());
 }
+test "body row ACKs leave the suffix in place until append needs its space" {
+    const a = std.testing.allocator;
+    const initial = "a\nb\nc\nd\ne\nf\ng\nh\n";
+    const extra = "**new**\n";
+    const body = try body_mod.Body.create(a, 8);
+    defer body.destroy();
+    try body.source.ensureTotalCapacityPrecise(a, initial.len);
+    try body.append(initial);
+    const start = body.liveSource().ptr;
+    // Eager retirement copied 14 + 12 + 10 + 8 + 6 suffix bytes here.
+    for (1..6) |row| {
+        try body.build();
+        try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+        const cut = 2 * row;
+        try std.testing.expectEqual(cut, body.committedSourceEnd());
+        try std.testing.expectEqual(initial.len, body.acceptedSourceEnd());
+        try std.testing.expectEqual(start + cut, body.liveSource().ptr);
+        try std.testing.expectEqualStrings(initial[cut..], body.liveSource());
+        try std.testing.expectEqual(initial.len - cut, body.pendingBytes());
+    }
+
+    // The allocation is full. Compact the six live bytes exactly once, while
+    // an older render is pinned; its checkpoint still names the same source.
+    try body.build();
+    const pinned_end = body.visibleSourceEnd();
+    try body.append(extra);
+    try std.testing.expectEqual(start, body.liveSource().ptr);
+    try std.testing.expectEqualStrings("f\ng\nh\n" ++ extra, body.liveSource());
+    try std.testing.expectEqual(extra.len, body.pendingBytes());
+    try std.testing.expectEqual(pinned_end, body.visibleSourceEnd());
+    try body.finish();
+    body.resize(4);
+    try std.testing.expectEqual(@as(usize, 0), try body.commit(1));
+    try body.build();
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const full = try engine.renderAll(arena.allocator(), initial ++ extra, 4, true, .normal);
+    try std.testing.expectEqualDeep(full.rows[5..], body.visibleRows());
+    const remaining = body.visibleRows().len;
+    try std.testing.expectEqual(remaining, try body.commit(remaining));
+    try std.testing.expect(body.isDrained());
+    try std.testing.expectEqual(initial.len + extra.len, body.committedSourceEnd());
+}
+
 test "empty heading metadata waits for a fresh checkpoint commit" {
     const body = try body_mod.Body.create(std.testing.allocator, 2);
     defer body.destroy();
@@ -473,7 +518,7 @@ test "body warm invalid rebuilds reuse arena and preserve pinned rows" {
         try std.testing.expectEqual(warm_allocs, backing.allocations);
         body.resize(4);
         try body.build();
-        try std.testing.expectEqualStrings("alpha beta gamma\ndelta\n", body.source.items);
+        try std.testing.expectEqualStrings("alpha beta gamma\ndelta\n", body.liveSource());
     }
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
 }
@@ -511,7 +556,7 @@ test "body retain reset preheat OOM clears render refs without semantic mutation
         try std.testing.expectEqual(before_finished, body.finished);
         try std.testing.expectEqual(before_dirty, body.dirty);
         try std.testing.expectEqual(before_end, body.acceptedSourceEnd());
-        try std.testing.expectEqualStrings("alpha\n", body.source.items);
+        try std.testing.expectEqualStrings("alpha\n", body.liveSource());
         backing.fail_index = std.math.maxInt(usize);
         try body.build();
         try std.testing.expectEqual(body_mod.Limit.memory, body.limit);

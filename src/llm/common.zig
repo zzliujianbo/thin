@@ -48,6 +48,10 @@ pub fn clone(a: std.mem.Allocator, v: V) !V {
     return j.clone(a, v);
 }
 
+/// Per-feed stack budget, not an event-size limit. Larger parse allocations spill
+/// into the event's temporary arena; neither allocator owns stream state.
+pub const EventBuffer = [4096]u8;
+
 /// Validate JSON grammar before constructing an owned value.
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !V {
     try json_bound.validate(a, bytes);

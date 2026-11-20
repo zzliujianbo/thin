@@ -12,6 +12,7 @@ pub const Body = struct {
     a: Allocator,
     columns: usize,
     source: std.ArrayList(u8) = .empty,
+    head: usize = 0, // source.items[head] corresponds to absolute offset base.
     base: usize = 0,
     state: scanner.State = .{},
     decoder: Decoder = .{},
@@ -39,14 +40,17 @@ pub const Body = struct {
         self.arena.deinit();
         a.destroy(self);
     }
+    pub fn liveSource(self: *const Body) []const u8 {
+        return self.source.items[self.head..];
+    }
     pub fn windowBytes(self: *const Body) usize {
-        return self.source.items.len;
+        return self.liveSource().len;
     }
     pub fn pendingBytes(self: *const Body) usize {
-        return self.source.items.len -| if (self.valid) self.consumed else 0;
+        return self.windowBytes() -| if (self.valid) self.consumed else 0;
     }
     pub fn acceptedSourceEnd(self: *const Body) usize {
-        return self.base + self.source.items.len + @intFromBool(self.decoder.held_cr);
+        return self.base + self.windowBytes() + @intFromBool(self.decoder.held_cr);
     }
     pub fn committedSourceEnd(self: *const Body) usize {
         return self.base;
@@ -62,7 +66,7 @@ pub const Body = struct {
         return self.pinned and self.rows.len == 0 and self.metadata != null and self.metadata.?.end > self.base;
     }
     pub fn isDrained(self: *const Body) bool {
-        return self.finished and self.limit == .none and self.source.items.len == 0 and self.decoder.carry_len == 0 and !self.decoder.held_cr;
+        return self.finished and self.limit == .none and self.windowBytes() == 0 and self.decoder.carry_len == 0 and !self.decoder.held_cr;
     }
     pub fn columnCount(self: *const Body) usize {
         return self.columns;
@@ -100,6 +104,20 @@ pub const Body = struct {
             try self.bytes.appendSlice(self.a, bytes);
         }
     };
+    fn appendDecoded(self: *Body, bytes: []const u8) !void {
+        const live = self.windowBytes();
+        // Only move a suffix when the tail is full and retired bytes pay for
+        // the copy. Otherwise use ArrayList's ordinary geometric growth.
+        if (bytes.len > self.source.unusedCapacitySlice().len and self.head >= live and bytes.len <= self.source.capacity - live) {
+            std.mem.copyForwards(u8, self.source.items[0..live], self.liveSource());
+            self.source.items.len = live;
+            self.head = 0;
+            self.source.appendSliceAssumeCapacity(bytes);
+        } else {
+            // A failed growth leaves both the bytes and head untouched.
+            try self.source.appendSlice(self.a, bytes);
+        }
+    }
     pub fn append(self: *Body, raw: []const u8) !void {
         if (self.finished) return;
         // Decoder callbacks can fail after advancing; stage both changes before publication.
@@ -107,7 +125,7 @@ pub const Body = struct {
         var buf: Buffer = .{ .a = self.a };
         defer buf.bytes.deinit(self.a);
         try next.feed(raw, &buf, Buffer.emit);
-        try self.source.appendSlice(self.a, buf.bytes.items);
+        try self.appendDecoded(buf.bytes.items);
         self.decoder = next;
         if (self.pinned) self.dirty = true else self.valid = false;
     }
@@ -117,7 +135,7 @@ pub const Body = struct {
         var buf: Buffer = .{ .a = self.a };
         defer buf.bytes.deinit(self.a);
         try next.finish(&buf, Buffer.emit);
-        try self.source.appendSlice(self.a, buf.bytes.items);
+        try self.appendDecoded(buf.bytes.items);
         self.decoder = next;
         self.finished = true;
         if (self.pinned) self.dirty = true else self.valid = false;
@@ -132,7 +150,7 @@ pub const Body = struct {
                 self.limit = .memory;
                 return error.OutOfMemory;
             }
-            const result = engine.render(self.arena.allocator(), self.source.items, self.base, self.state, self.finished, self.columns, true, .normal, self.max_window_bytes, self.max_rows) catch |err| {
+            const result = engine.render(self.arena.allocator(), self.liveSource(), self.base, self.state, self.finished, self.columns, true, .normal, self.max_window_bytes, self.max_rows) catch |err| {
                 self.limit = if (err == error.OutOfMemory) .memory else .window;
                 return err;
             };
@@ -164,8 +182,11 @@ pub const Body = struct {
         }
         if (cp) |checkpoint| {
             const cut = checkpoint.end - self.base;
-            std.mem.copyForwards(u8, self.source.items[0 .. self.source.items.len - cut], self.source.items[cut..]);
-            self.source.shrinkRetainingCapacity(self.source.items.len - cut);
+            self.head += cut;
+            if (self.head == self.source.items.len) {
+                self.source.items.len = 0;
+                self.head = 0;
+            }
             self.base = checkpoint.end;
             self.state = checkpoint.state;
             self.stats.retired_bytes += cut;

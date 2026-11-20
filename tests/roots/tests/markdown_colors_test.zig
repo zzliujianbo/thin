@@ -248,7 +248,7 @@ fn allocationCase(a: Allocator) !void {
         try std.testing.expectEqual(before_carry, body.decoder.carry_len);
         try std.testing.expectEqual(before_cr, body.decoder.held_cr);
         try std.testing.expectEqualSlices(u8, "\xf0\x9f", body.decoder.carry[0..body.decoder.carry_len]);
-        try std.testing.expectEqualStrings("abc", body.source.items);
+        try std.testing.expectEqualStrings("abc", body.liveSource());
         try std.testing.expect(!body.finished);
         return err;
     };
@@ -327,12 +327,12 @@ fn appendHeldCrAllocationCase(a: Allocator) !void {
         try std.testing.expectEqual(before_end, body.acceptedSourceEnd());
         try std.testing.expect(body.decoder.held_cr);
         try std.testing.expectEqual(@as(usize, 0), body.decoder.carry_len);
-        try std.testing.expectEqualStrings("abcdefgh", body.source.items);
+        try std.testing.expectEqualStrings("abcdefgh", body.liveSource());
         try std.testing.expect(!body.finished);
         return err;
     };
     try std.testing.expect(!body.decoder.held_cr);
-    try std.testing.expectEqualStrings("abcdefgh\nmore", body.source.items);
+    try std.testing.expectEqualStrings("abcdefgh\nmore", body.liveSource());
 }
 
 fn finishAllocationCase(a: Allocator, suffix: []const u8, expected: []const u8) !void {
@@ -348,12 +348,12 @@ fn finishAllocationCase(a: Allocator, suffix: []const u8, expected: []const u8) 
         try std.testing.expectEqual(before_carry, body.decoder.carry_len);
         try std.testing.expectEqual(before_cr, body.decoder.held_cr);
         try std.testing.expectEqualSlices(u8, if (before_cr) "" else suffix, body.decoder.carry[0..body.decoder.carry_len]);
-        try std.testing.expectEqualStrings("abcdefgh", body.source.items);
+        try std.testing.expectEqualStrings("abcdefgh", body.liveSource());
         try std.testing.expect(!body.finished);
         return err;
     };
     try std.testing.expect(body.finished);
     try std.testing.expect(!body.decoder.held_cr);
     try std.testing.expectEqual(@as(usize, 0), body.decoder.carry_len);
-    try std.testing.expectEqualStrings(expected, body.source.items);
+    try std.testing.expectEqualStrings(expected, body.liveSource());
 }
