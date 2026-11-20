@@ -108,15 +108,21 @@ pub const Body = struct {
         const live = self.windowBytes();
         // Only move a suffix when the tail is full and retired bytes pay for
         // the copy. Otherwise use ArrayList's ordinary geometric growth.
-        if (bytes.len > self.source.unusedCapacitySlice().len and self.head >= live and bytes.len <= self.source.capacity - live) {
-            std.mem.copyForwards(u8, self.source.items[0..live], self.liveSource());
-            self.source.items.len = live;
-            self.head = 0;
+        const fits_after_compaction = bytes.len <= self.source.capacity - live;
+        if (bytes.len <= self.source.unusedCapacitySlice().len) {
             self.source.appendSliceAssumeCapacity(bytes);
-        } else {
-            // A failed growth leaves both the bytes and head untouched.
-            try self.source.appendSlice(self.a, bytes);
+            return;
         }
+        if (self.head < live or !fits_after_compaction) {
+            if (self.source.appendSlice(self.a, bytes)) |_| return else |err| {
+                if (!fits_after_compaction) return err;
+            }
+        }
+        // If growth failed, the retired prefix may still fit this append.
+        std.mem.copyForwards(u8, self.source.items[0..live], self.liveSource());
+        self.source.items.len = live;
+        self.head = 0;
+        self.source.appendSliceAssumeCapacity(bytes);
     }
     pub fn append(self: *Body, raw: []const u8) !void {
         if (self.finished) return;

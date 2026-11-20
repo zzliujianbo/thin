@@ -5,6 +5,22 @@ test "resume save classification waits for the worker result" {
     try std.testing.expectError(error.ResumeSaveTimeout, classifySave(false, null));
     try std.testing.expectError(error.ResumeSaveTimeout, classifySave(false, error.ResumeConflict));
 }
+test "snapshot verification notices changes even when EOF stays put" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    var lease = try Lease.create(&root, test_id);
+    defer lease.deinit();
+    try lease.save(&root, "same size");
+    const snap = (try openSnapshot(&root, lease.directory_fd, test_id)).?;
+    defer fs.closeFd(snap.file.handle);
+    try checkEnd(&root, snap);
+    const times = [2]std.c.timespec{ .{ .sec = 100, .nsec = 0 }, .{ .sec = 100, .nsec = 0 } };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.utimensat(lease.directory_fd, test_id ++ ".session", &times, 0));
+    try std.testing.expectError(error.FileChanged, checkEnd(&root, snap));
+}
+
 test "resume listing is read only sorted and ignores invalid entries" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

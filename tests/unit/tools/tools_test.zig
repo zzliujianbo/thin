@@ -195,6 +195,16 @@ test "command environment excludes fake credentials even under a normally allowe
     try std.testing.expect(filtered.get("OTHER_API_KEY") == null);
     try std.testing.expectEqualStrings("C.UTF-8", filtered.get("LANG").?);
 }
+test "choose the project root for writes within a temporary project" {
+    var root: fs.Root = undefined;
+    root.path = "/tmp/project";
+    const tools: Tools = .{ .root = &root, .memory = undefined, .config = undefined, .environment = undefined };
+    try std.testing.expect(!tools.externalTmpWrite("/tmp/project/new/file", "/tmp/project/new/file"));
+    try std.testing.expect(tools.externalTmpWrite("/tmp/project-copy/file", "/tmp/project-copy/file"));
+    root.path = "/";
+    try std.testing.expect(!tools.externalTmpWrite("/tmp/file", "/tmp/file"));
+}
+
 test "project settings exact aliases protected at prepared and direct execute" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

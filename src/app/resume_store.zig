@@ -23,7 +23,7 @@ fn name(buffer: []u8, id: ids.Id, suffix: []const u8) ![:0]u8 {
     return std.fmt.bufPrintSentinel(buffer, "{s}{s}", .{ id, suffix }, 0);
 }
 
-const Snapshot = struct { file: std.Io.File, size: usize };
+const Snapshot = struct { file: std.Io.File, size: usize, mtime: std.Io.Timestamp, ctime: std.Io.Timestamp };
 
 fn openSnapshot(root: *fs.Root, dir: c_int, id: ids.Id) !?Snapshot {
     var buffer: [64]u8 = undefined;
@@ -35,12 +35,13 @@ fn openSnapshot(root: *fs.Root, dir: c_int, id: ids.Id) !?Snapshot {
     const stat = try file.stat(root.io);
     if (stat.kind != .file) return error.UnsafeResumeFile;
     if (stat.size == 0) return error.InvalidResumeLength;
-    return .{ .file = file, .size = std.math.cast(usize, stat.size) orelse return error.InvalidResumeLength };
+    return .{ .file = file, .size = std.math.cast(usize, stat.size) orelse return error.InvalidResumeLength, .mtime = stat.mtime, .ctime = stat.ctime };
 }
 
 fn checkEnd(root: *fs.Root, snap: Snapshot) !void {
-    var extra: [1]u8 = undefined;
-    if (try snap.file.readPositionalAll(root.io, &extra, snap.size) != 0) return error.FileChanged;
+    // EOF alone cannot detect a same-length edit to an already-read chunk.
+    const after = try snap.file.stat(root.io);
+    if (after.size != snap.size or !std.meta.eql(after.mtime, snap.mtime) or !std.meta.eql(after.ctime, snap.ctime)) return error.FileChanged;
 }
 
 fn readFile(root: *fs.Root, dir: c_int, id: ids.Id) !?[]u8 {

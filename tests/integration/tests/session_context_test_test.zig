@@ -54,7 +54,7 @@ test "skill catalog is sorted metadata only and ignores other roots" {
     // Skill usage is guidance next to the catalog, not base-prompt prose.
     try std.testing.expect(std.mem.indexOf(u8, runtime.system, "SKILL.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, snap.agents, "use read_file to read the full SKILL.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, runtime.system, "write_file and edit_file remain project-rooted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime.system, "write_file and edit_file may write within the project or under /tmp") != null);
     var cancel: p.Cancellation = .{};
     try std.testing.expectEqual(r.Status.success, (try runtime.run("task", &cancel)).status);
     const wire = try encodeWire(a, &runtime, .chat);

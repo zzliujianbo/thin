@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v5 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v6 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -26,11 +26,11 @@ const line_stats = @import("../util/line_stats.zig");
 const codex_login = @import("../core/codex_login.zig");
 const background = @import("../core/background_status.zig");
 
-/// Private daemon/worker IPC version. v4 adds typed background display data.
+/// Private daemon/worker IPC version. v6 removes the `setting` operation.
 /// Peers are matched exactly: there is
 /// no older-wire compatibility path, migration or automatic worker restart.
 /// A mismatched peer is refused before adoption, display or controller claim.
-pub const version: u16 = 5;
+pub const version: u16 = 6;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
 pub const max_name: usize = 1024;

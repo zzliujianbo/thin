@@ -698,8 +698,8 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
     return mask;
 }
 
-/// Only current-schema data loads; older schemas are rebuilt by a refresh
-/// claim, while future and malformed documents stay rejected.
+/// Saves use v17. The v16 directory is identical except for two retired
+/// model fields; versions before v16 require a refresh claim to rebuild.
 pub const cache_version: u32 = 17;
 
 const Document = struct {
@@ -722,8 +722,9 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             const version = raw.value.object.get("version") orelse return error.InvalidMetadata;
             if (version != .integer) return error.InvalidMetadata;
             if (version.integer < 0) return error.InvalidMetadata;
-            if (version.integer < cache_version) return error.OutdatedMetadataCache;
-            if (version.integer != cache_version) return error.InvalidMetadata;
+            const v16 = version.integer == 16;
+            if (!v16 and version.integer < cache_version) return error.OutdatedMetadataCache;
+            if (!v16 and version.integer != cache_version) return error.InvalidMetadata;
             if (raw.value.object.get("directory_mask")) |mask| {
                 if (mask != .integer or mask.integer < 0 or mask.integer > all_mask) return error.InvalidMetadata;
             }
@@ -745,8 +746,18 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
                 }
             }
             if (raw.value.object.get("models")) |models| {
-                if (models == .array) for (models.array.items) |model| {
-                    if (model != .object) return error.InvalidMetadata;
+                if (models == .array) for (models.array.items) |*model| {
+                    if (model.* != .object) return error.InvalidMetadata;
+                    if (v16) {
+                        for ([_][]const u8{ "dev_input_price_threshold", "dev_input_price_flat_limit" }) |key| {
+                            const field = model.object.fetchSwapRemove(key) orelse continue;
+                            switch (field.value) {
+                                .null => {},
+                                .integer => |n| if (n <= 0 or n > max_tokens) return error.InvalidMetadata,
+                                else => return error.InvalidMetadata,
+                            }
+                        }
+                    }
                     for ([_][]const u8{ "context_window", "dev_context_tokens" }) |key| {
                         if (model.object.get(key)) |value| switch (value) {
                             .null => {},
@@ -763,12 +774,18 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
                     }
                 };
             }
+            if (v16) {
+                const doc = try std.json.parseFromValueLeaky(Document, raw.arena.allocator(), raw.value, .{});
+                return cacheFromDocument(a, doc);
+            }
         }
     }
     var parsed = try std.json.parseFromSlice(Document, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = bytes.len });
     defer parsed.deinit();
-    const doc = parsed.value;
-    if (doc.version != cache_version) return error.InvalidMetadata;
+    return cacheFromDocument(a, parsed.value);
+}
+
+fn cacheFromDocument(a: std.mem.Allocator, doc: Document) !Cache {
     if (doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
     var result: Cache = .{ .directory_mask = doc.directory_mask, .refresh = doc.refresh };
     errdefer result.deinit(a);
@@ -876,8 +893,7 @@ pub fn claimAt(root: *fs.Root, requested: u8, manual: bool, now: u64, policy: Po
     const fd = try lock(root);
     defer fs.closeFd(fd);
     var cache = load(root) catch |err| switch (err) {
-        // Only an older document schema is rebuilt by a claim. Every other load
-        // failure stays authoritative, and nothing old is migrated on disk.
+        // Only incompatible older schemas are rebuilt by a claim.
         error.OutdatedMetadataCache => blk: {
             // The random baseline invalidates publications still in flight from
             // before the rebuild and leaves headroom for later increments.

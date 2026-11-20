@@ -415,8 +415,10 @@ pub const Tools = struct {
     }
 
     const tmp_write_prefix = "/tmp/";
-    fn isTmpWritePath(path: []const u8) bool {
-        return std.mem.startsWith(u8, path, tmp_write_prefix) and path.len > tmp_write_prefix.len;
+    // A project located under /tmp still owns its files through its open root fd.
+    fn externalTmpWrite(self: *const Tools, path: []const u8, absolute: []const u8) bool {
+        return std.mem.startsWith(u8, path, tmp_write_prefix) and path.len > tmp_write_prefix.len and
+            !std.mem.eql(u8, self.root.path, "/") and !protectedPath(absolute, self.root.path, true);
     }
 
     fn protectedPath(absolute: []const u8, protected: []const u8, creating: bool) bool {
@@ -443,9 +445,7 @@ pub const Tools = struct {
         const is_write = action == .write_file or action == .edit_file;
         const absolute = try std.fs.path.resolve(a, &.{ self.root.path, path });
         defer a.free(absolute);
-        const inside_root = std.mem.eql(u8, absolute, self.root.path) or
-            (std.mem.startsWith(u8, absolute, self.root.path) and absolute.len > self.root.path.len and absolute[self.root.path.len] == '/');
-        if (is_write and isTmpWritePath(path) and !inside_root) {
+        if (is_write and self.externalTmpWrite(path, absolute)) {
             // /tmp is the explicit external write sink. Rooted operations still
             // reject '..', NUL, symlinks and non-regular targets.
             try validatePath(path);
@@ -861,7 +861,7 @@ pub const Tools = struct {
 
             .edit_file => |edit| {
                 const edit_limit: ?usize = null;
-                var tmp_root: ?fs.Root = if (isTmpWritePath(edit.path)) try fs.Root.open(a, self.root.io, "/tmp") else null;
+                var tmp_root: ?fs.Root = if (self.externalTmpWrite(edit.path, edit.path)) try fs.Root.open(a, self.root.io, "/tmp") else null;
                 defer if (tmp_root) |*root| root.deinit();
                 const file_root = if (tmp_root) |*root| root else self.root;
                 const file_path = if (tmp_root != null) edit.path[tmp_write_prefix.len..] else edit.path;
@@ -892,7 +892,7 @@ pub const Tools = struct {
                 try j.put(a, &value, "written_bytes", try j.number(w.content.len));
                 const encoded = try j.encode(a, value);
                 errdefer a.free(encoded);
-                var tmp_root: ?fs.Root = if (isTmpWritePath(w.path)) try fs.Root.open(a, self.root.io, "/tmp") else null;
+                var tmp_root: ?fs.Root = if (self.externalTmpWrite(w.path, w.path)) try fs.Root.open(a, self.root.io, "/tmp") else null;
                 defer if (tmp_root) |*root| root.deinit();
                 const file_root = if (tmp_root) |*root| root else self.root;
                 const file_path = if (tmp_root != null) w.path[tmp_write_prefix.len..] else w.path;

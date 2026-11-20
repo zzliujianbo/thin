@@ -227,7 +227,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
     defer root.deinit();
     const a = std.testing.allocator;
     for (0..cache_version + 2) |version| {
-        if (version == cache_version) continue;
+        if (version == 16 or version == cache_version) continue;
         const body = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":[]}}", .{version});
         defer a.free(body);
         try root.writeMode(file_name, body, true, 0o600);
@@ -247,6 +247,9 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         try std.testing.expectEqual(before.inode, (try root.dir.statFile(root.io, file_name, .{})).inode);
     }
     for ([_][]const u8{
+        "{\"version\":16,\"dev_input_price_threshold\":123}",
+        "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"dev_input_price_flat_limit\":null,\"unknown\":1}]}",
+        "{\"version\":17,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",\"dev_input_price_threshold\":null}]}",
         "{\"version\":17,\"attempted\":0}",
         "{\"version\":17,\"records\":[]}",
         "{\"version\":17,\"unknown\":false}",
@@ -261,6 +264,50 @@ test "metadata rejects old future unknown and malformed cache without writing" {
         defer a.free(bytes.data);
         try std.testing.expectEqualStrings(body, bytes.data);
     }
+}
+test "version 16 cache keeps offline capabilities and refresh state until the next save" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root = try testRoot(tmp.dir);
+    defer root.deinit();
+    const a = std.testing.allocator;
+    const body =
+        \\{"version":16,"directory_mask":1,"models":[
+        \\  {"provider":"deepseek","id":"raw/id","available":true,"protocol":"chat","context_window":65536,
+        \\   "reasoning":{"format":"deepseek","map":{"off":"off","high":"high"}},"dev_protocol":"chat","dev_output_tokens":8192,
+        \\   "dev_input_price_threshold":4096,"dev_input_price_flat_limit":null}],
+        \\ "refresh":[{"generation":7,"last_attempt_ms":10,"last_success_ms":11,"successful":true},{},{},{},{"generation":23}]}
+    ;
+    try root.writeMode(file_name, body, true, 0o600);
+    var cache = try load(&root);
+    defer cache.deinit(a);
+    const entry = dynamicEntry(&cache, .deepseek, "raw/id").?;
+    try std.testing.expectEqual(@as(?u32, 65536), contextFor(&cache, entry));
+    try std.testing.expectEqual(@as(?u32, 8192), outputFor(&cache, entry));
+    try std.testing.expectEqualStrings("high", cache.directory.rows[0].reasoning.?.declaration().map.high.?);
+    try std.testing.expectEqual(Refresh{ .generation = 7, .last_attempt_ms = 10, .last_success_ms = 11, .successful = true }, cache.refresh[0]);
+    const original = try root.read(a, file_name, 0, body.len + 1);
+    defer a.free(original.data);
+    try std.testing.expectEqualStrings(body, original.data);
+
+    var claimed = try claimAt(&root, dev_bit, true, 100, .{});
+    defer claimed.cache.deinit(a);
+    const saved = try root.read(a, file_name, 0, 4096);
+    defer a.free(saved.data);
+    try std.testing.expect(std.mem.find(u8, saved.data, "\"version\":17") != null);
+    try std.testing.expect(std.mem.find(u8, saved.data, "dev_input_price_") == null);
+    var reloaded = try load(&root);
+    defer reloaded.deinit(a);
+    try std.testing.expectEqual(cache.refresh[0], reloaded.refresh[0]);
+    try std.testing.expectEqual(@as(u64, 24), reloaded.refresh[providers.Id.all.len].generation);
+    try std.testing.expectEqual(@as(?u32, 8192), outputFor(&reloaded, dynamicEntry(&reloaded, .deepseek, "raw/id").?));
+}
+test "version 16 cache validates retired fields and retained capabilities" {
+    const prefix = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",";
+    inline for (.{ "\"dev_input_price_threshold\":\"4096\"", "\"dev_input_price_flat_limit\":0", "\"dev_input_price_threshold\":4096,\"context_window\":\"8192\"" }) |fields| {
+        try std.testing.expectError(error.InvalidMetadata, parseCache(std.testing.allocator, prefix ++ fields ++ "}]}"));
+    }
+    try std.testing.expectError(error.DuplicateField, parseCache(std.testing.allocator, prefix ++ "\"dev_input_price_threshold\":null,\"dev_input_price_threshold\":4096}]}"));
 }
 test "version 15 ambiguous public profiles are outdated rather than migrated" {
     try std.testing.expectError(error.OutdatedMetadataCache, parseCache(std.testing.allocator,

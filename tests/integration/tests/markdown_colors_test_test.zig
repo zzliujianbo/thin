@@ -389,6 +389,23 @@ test "body row ACKs leave the suffix in place until append needs its space" {
     try std.testing.expectEqual(initial.len + extra.len, body.committedSourceEnd());
 }
 
+test "body append can reclaim a small retired prefix when growth fails" {
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const body = try body_mod.Body.create(backing.allocator(), 8);
+    defer body.destroy();
+    const initial = "a\nb\nc\nd\ne\nf\ng\nh\n";
+    try body.source.ensureTotalCapacityPrecise(backing.allocator(), initial.len);
+    try body.append(initial);
+    try body.build();
+    try std.testing.expectEqual(@as(usize, 1), try body.commit(1));
+    // Permit the decoder staging allocation; fail when the backing list grows.
+    backing.fail_index = backing.alloc_index + 1;
+    try body.append("x");
+    try std.testing.expect(backing.has_induced_failure);
+    try std.testing.expectEqualStrings(initial[2..] ++ "x", body.liveSource());
+    try std.testing.expectEqual(@as(usize, 2), body.committedSourceEnd());
+}
+
 test "empty heading metadata waits for a fresh checkpoint commit" {
     const body = try body_mod.Body.create(std.testing.allocator, 2);
     defer body.destroy();
