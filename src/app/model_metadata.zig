@@ -493,11 +493,31 @@ fn codexCapacity(value: std.json.Value) ?u32 {
     };
 }
 
+const curl = @import("../llm/curl_http.zig");
+
+/// Borrowed for one fetch. Discovery is not inference: any explicit proxy
+/// applies, without consulting proxy.models. No ambient process env lookup.
+pub const Request = struct {
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    explicit_url: ?[]const u8 = null,
+    timeout_ms: u32,
+    cancel: *const p.Cancellation,
+    // Unit fixtures inspect the selected route and exact wire inputs without
+    // resolving fixed production hostnames or spawning a process.
+    test_wire: if (@import("builtin").is_test) ?TestWire else void = if (@import("builtin").is_test) null else {},
+
+    const TestWire = struct {
+        context: *anyopaque,
+        get: *const fn (*anyopaque, ?*const curl.Client, []const u8, []const std.http.Header) anyerror!void,
+    };
+};
+
 /// Isolated client, fixed official URL, no redirects or credential discovery.
 /// The borrowed caller key is not mutated; the owned header copy is wiped.
-pub fn fetch(a: std.mem.Allocator, io: std.Io, id: providers.Id, key: ?[]const u8) !Listing {
+pub fn fetch(a: std.mem.Allocator, req: Request, id: providers.Id, key: ?[]const u8) !Listing {
     if (id == .openai_codex) return error.CodexCredentialRequired;
-    const body = try fetchUrl(a, io, listingUrl(id), listingKey(id, key));
+    const body = try fetchUrl(a, req, listingUrl(id), listingKey(id, key));
     defer a.free(body);
     return parseListing(a, body, id);
 }
@@ -506,46 +526,17 @@ const codex_auth = @import("../core/codex_auth.zig");
 const p = @import("../core/protocol.zig");
 const codex_listing_url = providers.Id.openai_codex.baseUrl() ++ "/models?client_version=" ++ @import("version.zig").number;
 
-const CodexJob = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    credential: *const codex_auth.RequestCredential,
-    url: []const u8,
-    done: std.atomic.Value(bool) = .init(false),
-};
-
-fn performCodex(job: *CodexJob) !Listing {
-    defer job.done.store(true, .release);
-    const body = try fetchCodexUrl(job.allocator, job.io, job.url, job.credential);
-    defer job.allocator.free(body);
-    return parseListing(job.allocator, body, .openai_codex);
-}
-
-/// Credential is borrowed only until the worker is joined. Fixed official URL;
-/// no credential discovery, redirects, persisted tokens, or request retries.
-pub fn fetchCodexListing(a: std.mem.Allocator, io: std.Io, credential: *const codex_auth.RequestCredential, cancel: ?*const p.Cancellation, timeout_ms: u32) !Listing {
-    return fetchCodexAt(a, io, credential, cancel, timeout_ms, codex_listing_url);
+/// The refresh worker borrows the credential through this synchronous request.
+/// Fixed official URL; no credential discovery, redirects or retries.
+pub fn fetchCodexListing(a: std.mem.Allocator, req: Request, credential: *const codex_auth.RequestCredential) !Listing {
+    return fetchCodexAt(a, req, credential, codex_listing_url);
 }
 
 // Private transport seam, reachable by tests only; production URL is fixed.
-fn fetchCodexAt(a: std.mem.Allocator, io: std.Io, credential: *const codex_auth.RequestCredential, cancel: ?*const p.Cancellation, timeout_ms: u32, url: []const u8) !Listing {
-    if (cancel) |c| if (c.isRequested()) return error.Canceled;
-    if (timeout_ms == 0) return error.RequestTimeout;
-    const start = std.Io.Clock.awake.now(io);
-    var job: CodexJob = .{ .allocator = a, .io = io, .credential = credential, .url = url };
-    var future = try std.Io.concurrent(io, performCodex, .{&job});
-    defer _ = future.cancel(io) catch {};
-    while (!job.done.load(.acquire)) {
-        if (cancel) |c| if (c.isRequested()) return error.Canceled;
-        if (start.untilNow(io, .awake).toMilliseconds() >= timeout_ms) return error.RequestTimeout;
-        try std.Io.sleep(io, .fromMilliseconds(5), .awake);
-    }
-    if (cancel) |c| if (c.isRequested()) return error.Canceled;
-    if (start.untilNow(io, .awake).toMilliseconds() >= timeout_ms) return error.RequestTimeout;
-    return future.await(io);
-}
-
-fn fetchCodexUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, credential: *const codex_auth.RequestCredential) ![]u8 {
+fn fetchCodexAt(a: std.mem.Allocator, req: Request, credential: *const codex_auth.RequestCredential, url: []const u8) !Listing {
+    if (req.cancel.isRequested()) return error.Canceled;
+    if (req.timeout_ms == 0) return error.RequestTimeout;
+    const start = std.Io.Clock.awake.now(req.io);
     for ([_][]const u8{ credential.access_token, credential.account_id }) |value| {
         if (value.len == 0 or value.len > 8192) return error.InvalidCredential;
         for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidCredential;
@@ -555,32 +546,24 @@ fn fetchCodexUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, credential: 
         std.crypto.secureZero(u8, authorization);
         a.free(authorization);
     }
-    var client: std.http.Client = .{ .allocator = a, .io = io };
-    defer client.deinit();
-    var request = try client.request(.GET, try std.Uri.parse(url), .{
-        .redirect_behavior = .unhandled,
-        .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" }, .user_agent = .{ .override = "ThinAgent-metadata-check/1.0" } },
-        .extra_headers = &.{ .{ .name = "Accept", .value = "application/json" }, .{ .name = "chatgpt-account-id", .value = credential.account_id }, .{ .name = "originator", .value = "thin" } },
-    });
-    defer request.deinit();
-    try request.sendBodiless();
-    var head: [8192]u8 = undefined;
-    var response = try request.receiveHead(&head);
-    if (response.head.status != .ok) return error.MetadataHttpStatus;
-    var transfer: [8192]u8 = undefined;
-    const body = try response.reader(&transfer).allocRemaining(a, .unlimited);
-    errdefer a.free(body);
-    switch (request.reader.state) {
-        .body_remaining_content_length, .body_remaining_chunk_len => return error.IncompleteMetadata,
-        else => {},
-    }
-    return body;
+    const headers = common_headers ++ [_]std.http.Header{
+        .{ .name = "Authorization", .value = authorization },
+        .{ .name = "chatgpt-account-id", .value = credential.account_id },
+        .{ .name = "originator", .value = "thin" },
+    };
+    const body = try get(a, req, url, &headers);
+    defer a.free(body);
+    var listing = try parseListing(a, body, .openai_codex);
+    errdefer listing.deinit(a);
+    if (req.cancel.isRequested()) return error.Canceled;
+    if (start.untilNow(req.io, .awake).toMilliseconds() >= req.timeout_ms) return error.RequestTimeout;
+    return listing;
 }
 
 /// Public catalog: no credentials and no provider listing key. Parsing is the
 /// same bounded models.dev parser used by tests; unusable profiles stay unknown.
-pub fn fetchDev(a: std.mem.Allocator, io: std.Io) !Listing {
-    const body = try fetchUrl(a, io, models_dev.url, null);
+pub fn fetchDev(a: std.mem.Allocator, req: Request) !Listing {
+    const body = try fetchUrl(a, req, models_dev.url, null);
     defer a.free(body);
     return parseDev(a, body);
 }
@@ -605,23 +588,79 @@ fn listingKey(id: providers.Id, key: ?[]const u8) ?[]const u8 {
 
 /// Private transport seam for owned loopback tests. Production callers can only
 /// reach it through fetch's fixed official endpoint, never through user URLs.
-fn fetchUrl(a: std.mem.Allocator, io: std.Io, url: []const u8, key: ?[]const u8) ![]u8 {
+fn fetchUrl(a: std.mem.Allocator, req: Request, url: []const u8, key: ?[]const u8) ![]const u8 {
     try cfg.validateKeySource(.{ .base_url = url, .api_key = key });
     const authorization = if (key) |k| try std.fmt.allocPrint(a, "Bearer {s}", .{k}) else null;
     defer if (authorization) |header| {
         std.crypto.secureZero(u8, header);
         a.free(header);
     };
+    if (authorization) |value| {
+        const headers = common_headers ++ [_]std.http.Header{.{ .name = "Authorization", .value = value }};
+        return get(a, req, url, &headers);
+    }
+    return get(a, req, url, &common_headers);
+}
+
+const common_headers = [_]std.http.Header{
+    .{ .name = "User-Agent", .value = "ThinAgent-metadata-check/1.0" },
+    .{ .name = "Accept-Encoding", .value = "identity" },
+    .{ .name = "Accept", .value = "application/json" },
+};
+
+fn get(a: std.mem.Allocator, req: Request, url: []const u8, headers: []const std.http.Header) ![]const u8 {
+    if (req.cancel.isRequested()) return error.Canceled;
+    if (req.timeout_ms == 0) return error.RequestTimeout;
+    // Keep the original native TLS client for direct requests, but never use it
+    // as a fallback when proxy selection, connection or verification fails.
+    var routed: ?curl.Client = if (req.explicit_url != null or curl.Client.systemProxy(req.env, url) != null)
+        try curl.Client.initModel(a, req.io, req.env, url, req.explicit_url, true)
+    else
+        null;
+    defer if (routed) |*client| client.deinit();
+    if (@import("builtin").is_test) if (req.test_wire) |wire| {
+        try wire.get(wire.context, if (routed) |*client| client else null, url, headers);
+        return error.TestWireIntercepted;
+    };
+    const client = if (routed) |*client| client else return directGet(a, req, url, headers);
+    // Metadata previously used allocRemaining(.unlimited), including models.dev.
+    const response = client.request(a, url, headers, null, req.timeout_ms, std.math.maxInt(usize), req.cancel) catch |err| {
+        if (err == error.TransportFailure and client.last_exit_code == 18) return error.IncompleteMetadata;
+        if (err == error.Timeout or (err == error.TransportFailure and client.last_exit_code == 28)) return error.RequestTimeout;
+        return err;
+    };
+    errdefer response.deinit(a);
+    if (response.status != 200) return error.MetadataHttpStatus;
+    return response.body;
+}
+
+fn directGet(a: std.mem.Allocator, req: Request, url: []const u8, headers: []const std.http.Header) ![]const u8 {
+    const start = std.Io.Clock.awake.now(req.io);
+    var done = std.atomic.Value(bool).init(false);
+    var future = try std.Io.concurrent(req.io, nativeGet, .{ a, req.io, url, headers, &done });
+    // Even on a cancellation/completion race the worker is joined and any
+    // returned body is freed before the borrowed headers go out of scope.
+    while (true) {
+        if (req.cancel.isRequested() or start.untilNow(req.io, .awake).toMilliseconds() >= req.timeout_ms) {
+            if (future.cancel(req.io)) |body| a.free(body) else |_| {}
+            return if (req.cancel.isRequested()) error.Canceled else error.RequestTimeout;
+        }
+        if (done.load(.acquire)) return future.await(req.io);
+        std.Io.sleep(req.io, .fromMilliseconds(5), .awake) catch |err| {
+            if (future.cancel(req.io)) |body| a.free(body) else |_| {}
+            return err;
+        };
+    }
+}
+
+fn nativeGet(a: std.mem.Allocator, io: std.Io, url: []const u8, headers: []const std.http.Header, done: *std.atomic.Value(bool)) ![]const u8 {
+    defer done.store(true, .release);
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
     var request = try client.request(.GET, try std.Uri.parse(url), .{
         .redirect_behavior = .unhandled,
-        .headers = .{
-            .authorization = if (authorization) |header| .{ .override = header } else .omit,
-            .accept_encoding = .{ .override = "identity" },
-            .user_agent = .{ .override = "ThinAgent-metadata-check/1.0" },
-        },
-        .extra_headers = &.{.{ .name = "Accept", .value = "application/json" }},
+        .headers = .{ .authorization = .omit, .accept_encoding = .omit, .user_agent = .omit },
+        .extra_headers = headers,
     });
     defer request.deinit();
     try request.sendBodiless();

@@ -7,12 +7,14 @@ const FakeWire = struct {
     fn wire(self: *FakeWire) Wire {
         return .{ .context = self, .begin = begin, .poll = poll, .refresh = refresh, .account = account };
     }
-    fn begin(_: ?*anyopaque, a: std.mem.Allocator, io: std.Io, _: ?*const p.Cancellation, _: u32) !device.DeviceState {
+    fn begin(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, _: ?*const p.Cancellation, _: u32) !device.DeviceState {
+        const io = client.io;
         const id = try a.dupe(u8, "device-id");
         errdefer a.free(id);
         return .{ .device_auth_id = id, .user_code = try a.dupe(u8, "ABCD"), .interval_ms = 1, .expires_at_ms = @as(i64, @intCast(std.Io.Clock.real.now(io).toMilliseconds())) + 60_000 };
     }
-    fn poll(ctx: ?*anyopaque, a: std.mem.Allocator, io: std.Io, _: *const device.DeviceState, _: ?*const p.Cancellation, _: u32) !device.PollResult {
+    fn poll(ctx: ?*anyopaque, a: std.mem.Allocator, client: *Client, _: *const device.DeviceState, _: ?*const p.Cancellation, _: u32) !device.PollResult {
+        const io = client.io;
         const self: *FakeWire = @ptrCast(@alignCast(ctx.?));
         if (self.mutate_store) |store| {
             var tx = try store.beginTransaction(null, 1000);
@@ -28,7 +30,8 @@ const FakeWire = struct {
         }
         return .{ .success = try tokens(a, io) };
     }
-    fn refresh(ctx: ?*anyopaque, a: std.mem.Allocator, io: std.Io, _: []const u8, _: ?*const p.Cancellation, _: u32) !device.TokenSet {
+    fn refresh(ctx: ?*anyopaque, a: std.mem.Allocator, client: *Client, _: []const u8, _: ?*const p.Cancellation, _: u32) !device.TokenSet {
+        const io = client.io;
         const self: *FakeWire = @ptrCast(@alignCast(ctx.?));
         self.refresh_count += 1;
         if (self.fail_refresh) return error.AmbiguousResponse;

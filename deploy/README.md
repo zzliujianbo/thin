@@ -23,14 +23,14 @@
 
 这两种是全部公开启动方式。SSH 样例使用管理员固定的 `ForceCommand /usr/local/bin/thin`，不加参数，不采用客户端指定的命令。
 
-### 推理请求如何选代理
+### 出站 HTTP(S) 请求如何选代理
 
 | 配置 | 行为 |
 | --- | --- |
 | 未设置 `proxy` 或设置为 `null` | 按目标协议读取 `HTTPS_PROXY` 或 `HTTP_PROXY`。非空小写变量优先，`NO_PROXY` / `no_proxy` 可指定直连目标。 |
-| 显式设置 `proxy` | 只有名单内的请求使用指定代理，不受 `NO_PROXY` 影响；名单外直连。空名单表示全部直连。 |
+| 显式设置 `proxy` | 推理和图片请求沿用模型名单，名单外直连。登录、令牌刷新和目录查询不属于某个模型，使用指定代理，不受名单或 `NO_PROXY` 影响。 |
 
-独立前台示例：`HTTPS_PROXY=http://127.0.0.1:7890 thin`。系统代理地址使用不带账号密码的 HTTP(S) URL，不读取 `ALL_PROXY`。使用守护服务时，在 `~/.config/thin/daemon.env` 设置变量并重启服务；仅在连接它的终端里 `export` 不会改变服务的环境。此规则不适用于目录刷新和 OAuth 登录或刷新。
+独立前台示例：`HTTPS_PROXY=http://127.0.0.1:7890 thin`。系统代理地址使用不带账号密码的 HTTP(S) URL，不读取 `ALL_PROXY`。使用守护服务时，在 `~/.config/thin/daemon.env` 设置变量并重启服务；仅在连接它的终端里 `export` 不会改变服务的环境。该规则也适用于 Codex 设备码申请、授权轮询、令牌交换和刷新，以及官方目录和公共元数据查询。本机 Unix socket 通信和浏览器里的授权页面不由 Thin 的 HTTP 代理控制。
 
 ## 2. 拓扑与所有权
 

@@ -7323,14 +7323,14 @@ test "first DeepSeek login initializes default and Shift Tab preserves budgets a
     const Session = @import("../app/session.zig").Session;
     const metadata = @import("../app/model_metadata.zig");
     const Fetch = struct {
-        fn official(a: std.mem.Allocator, _: Io, id: core_config.providers.Id, key: ?[]const u8) !metadata.Listing {
+        fn official(a: std.mem.Allocator, _: metadata.Request, id: core_config.providers.Id, key: ?[]const u8) !metadata.Listing {
             try std.testing.expectEqual(core_config.providers.Id.deepseek, id);
             try std.testing.expectEqualStrings("fake-fresh-login", key.?);
             return metadata.parseListing(a,
                 \\{"data":[{"id":"deepseek-flash","context_window":131072,"effort":{"supported_levels":["low","high","max"],"default_level":"high"}}]}
             , id);
         }
-        fn public(_: std.mem.Allocator, _: Io) !metadata.Listing {
+        fn public(_: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
             return .{ .dev_done = true };
         }
     };

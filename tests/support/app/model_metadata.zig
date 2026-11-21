@@ -26,6 +26,7 @@ fn serveMetadataChecked(io: std.Io, server: *std.Io.net.Server, response: []cons
     }
     if (check_public) {
         try std.testing.expect(std.mem.startsWith(u8, headers[0..count], "get /api.json http/1.1\r\n"));
+        try std.testing.expect(std.mem.find(u8, headers[0..count], "accept-encoding: identity\r\n") != null);
         try std.testing.expect(std.mem.find(u8, headers[0..count], "authorization:") == null);
         try std.testing.expect(std.mem.find(u8, headers[0..count], "user-agent: thinagent-metadata-check/1.0") != null);
         try std.testing.expect(std.mem.find(u8, headers[0..count], "accept: application/json") != null);
@@ -54,6 +55,9 @@ fn serveCodexFixture(io: std.Io, server: *std.Io.net.Server) !void {
         suffix = (suffix << 8) | byte;
     }
     try std.testing.expect(std.mem.startsWith(u8, headers[0..count], "get /models?client_version=" ++ @import("version.zig").number ++ " http/1.1\r\n"));
+    try std.testing.expect(std.mem.find(u8, headers[0..count], "accept-encoding: identity\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, headers[0..count], "accept: application/json\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, headers[0..count], "user-agent: thinagent-metadata-check/1.0\r\n") != null);
     try std.testing.expect(std.mem.find(u8, headers[0..count], "authorization: bearer fake-token\r\n") != null);
     try std.testing.expect(std.mem.find(u8, headers[0..count], "chatgpt-account-id: fake-account\r\n") != null);
     try std.testing.expect(std.mem.find(u8, headers[0..count], "originator: thin\r\n") != null);

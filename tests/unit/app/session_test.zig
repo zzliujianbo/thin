@@ -329,9 +329,9 @@ test "codex metadata shares the original official deadline" {
             errdefer a.free(token);
             return .{ .access_token = token, .account_id = try a.dupe(u8, "account") };
         }
-        fn fetch(_: std.mem.Allocator, _: std.Io, _: *const codex_auth.RequestCredential, _: ?*const p.Cancellation, timeout_ms: u32) !metadata.Listing {
+        fn fetch(_: std.mem.Allocator, request: metadata.Request, _: *const codex_auth.RequestCredential) !metadata.Listing {
             fetches += 1;
-            fetch_ms = timeout_ms;
+            fetch_ms = request.timeout_ms;
             return .{};
         }
     };
@@ -339,9 +339,12 @@ test "codex metadata shares the original official deadline" {
     try std.testing.expectEqual(@as(?u32, official_metadata_timeout_ms), MetadataJob.remainingCodexMs(now, now - 1));
     try std.testing.expectEqual(@as(?u32, 1), MetadataJob.remainingCodexMs(now, now + official_metadata_timeout_ms - 1));
     try std.testing.expectEqual(@as(?u32, null), MetadataJob.remainingCodexMs(now, now + official_metadata_timeout_ms));
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
     var job: MetadataJob = .{
         .allocator = std.testing.allocator,
         .io = std.testing.io,
+        .env = &env,
         .fetch = metadata.fetch,
         .dev_fetch = metadata.fetchDev,
         .manual = false,
@@ -391,7 +394,7 @@ test "codex metadata refresh borrows the exact configured alias and skips sends 
             if (reauth.load(.monotonic)) return error.OAuthReauthenticationRequired;
             return .{ .access_token = try a.dupe(u8, "fake-codex-access"), .account_id = try a.dupe(u8, "fake-codex-account") };
         }
-        fn fetch(a: std.mem.Allocator, _: std.Io, credential: *const codex_auth.RequestCredential, _: ?*const p.Cancellation, _: u32) !metadata.Listing {
+        fn fetch(a: std.mem.Allocator, _: metadata.Request, credential: *const codex_auth.RequestCredential) !metadata.Listing {
             if (!std.mem.eql(u8, credential.access_token, "fake-codex-access")) return error.UnexpectedCredential;
             return metadata.parseListing(a, "{\"models\":[{\"slug\":\"gpt-fixture\",\"visibility\":\"list\",\"context_window\":65536}]}", .openai_codex);
         }
@@ -1084,12 +1087,13 @@ test "metadata publication failures survive both stage orders while clean succes
 test "initial default adopts late public metadata without cycling or normalizing preference" {
     const Fetch = struct {
         var release: std.atomic.Value(bool) = .init(false);
-        fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+        fn official(a: std.mem.Allocator, _: metadata.Request, id: ProviderId, key: ?[]const u8) !metadata.Listing {
             try std.testing.expectEqual(ProviderId.opencode_go, id);
             try std.testing.expectEqualStrings("fake-public-effort", key.?);
             return metadata.parseListing(a, "{\"data\":[{\"id\":\"gpt-6-luna\",\"context_window\":131072}]}", id);
         }
-        fn public(a: std.mem.Allocator, io: std.Io) !metadata.Listing {
+        fn public(a: std.mem.Allocator, request: metadata.Request) !metadata.Listing {
+            const io = request.io;
             const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
             while (!release.load(.acquire)) {
                 if (std.Io.Clock.awake.now(io).toMilliseconds() >= deadline) return error.FixtureCompletionTimeout;
@@ -1412,7 +1416,7 @@ test "effort action cannot borrow official reasoning for a proxy kind hint" {
 test "timed automatic metadata refresh repeats while active capabilities stay frozen" {
     const Fixture = struct {
         var calls: std.atomic.Value(usize) = .init(0);
-        fn fetch(a: std.mem.Allocator, _: std.Io, _: ProviderId, _: ?[]const u8) !metadata.Listing {
+        fn fetch(a: std.mem.Allocator, _: metadata.Request, _: ProviderId, _: ?[]const u8) !metadata.Listing {
             const call = calls.fetchAdd(1, .monotonic);
             return metadata.parseListing(a, if (call == 0)
                 "{\"data\":[{\"id\":\"deepseek-flash\",\"protocol\":\"chat\",\"context_window\":131072}]}"
@@ -1593,11 +1597,20 @@ test "official results publish while models.dev retains an independent longer de
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expectEqualStrings("max", LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").dev_reasoning.?.declaration().map.max.?);
 }
-test "login with new credentials refreshes official metadata without waiting for stalled models.dev" {
+test "metadata refresh and login restart use the explicit proxy independently of the model allowlist" {
     const Fixture = struct {
-        fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+        const proxy_url = "http://127.0.0.1:3128";
+        var public_checked: std.atomic.Value(bool) = .init(false);
+        var public_proxy_ok: bool = false;
+        fn public(a: std.mem.Allocator, request: metadata.Request) !metadata.Listing {
+            public_proxy_ok = std.mem.eql(u8, request.explicit_url orelse "", proxy_url);
+            public_checked.store(true, .release);
+            return LayeredMetadataFixture.devStall(a, request);
+        }
+        fn official(a: std.mem.Allocator, request: metadata.Request, id: ProviderId, key: ?[]const u8) !metadata.Listing {
             if (id != .opencode_go) return error.UnexpectedProvider;
             const rotated = std.mem.eql(u8, key orelse return error.MissingFixtureKey, "fake-rotated-go");
+            try std.testing.expectEqualStrings(if (rotated) "http://127.0.0.1:8123" else proxy_url, request.explicit_url orelse "");
             return metadata.parseListing(a, if (rotated)
                 "{\"data\":[{\"id\":\"claude-haiku-5-5\",\"context_window\":131072}]}"
             else
@@ -1612,19 +1625,30 @@ test "login with new credentials refreshes official metadata without waiting for
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("HOME", home);
-    try writeOfficialMetadataTestConfig(tmp.dir, .opencode_go);
+    try writeSessionTestConfig(tmp.dir,
+        \\{"llm":{"default":"opencode-go/minimax-m2.7","providers":{
+        \\  "opencode-go":{"base_url":"https://opencode.ai/zen/go/v1","kind":"opencode_go","chat_max_tokens":true},
+        \\  "other":{"base_url":"https://other.invalid/v1","models":{"unrelated":{"protocol":"chat","context_tokens":32768}}}
+        \\}},"proxy":{"address":"127.0.0.1","port":3128,"models":["other/unrelated"]}}
+    );
     var session = try Session.initWithOptions(a, std.testing.io, &env, home, .{}, .{ .auto_refresh_models = true });
     defer session.deinit();
     session.metadata_fetch = Fixture.official;
-    session.metadata_dev_fetch = LayeredMetadataFixture.devStall;
+    session.metadata_dev_fetch = Fixture.public;
+    Fixture.public_checked.store(false, .monotonic);
     try session.connection().configureProvider(.opencode_go, "fake-initial-go");
-    try std.testing.expect(Session.pollModels(&session, true));
+    try Session.refreshModels(&session);
+    try MetadataFixture.waitDone(session.io, &Fixture.public_checked);
+    try std.testing.expect(Fixture.public_proxy_ok);
     const job = session.metadata_job.?;
     const public_started = job.dev_started_ms;
     try MetadataFixture.waitDone(session.io, &job.done);
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(job.future == null and job.dev_future != null);
+    try std.testing.expectEqual(metadata.bit(.opencode_go), job.succeeded);
     try std.testing.expectEqual(@as(?u32, 65536), LayeredMetadataFixture.row(&session.metadata_cache.directory, .opencode_go, "claude-haiku-5-5").tokens);
+    // A restarted official slot must snapshot the new endpoint, not reuse the public slot's URL.
+    try setProxyEndpoint(&session, "127.0.0.1:8123");
     try session.connection().configureProvider(.opencode_go, "fake-rotated-go");
     try std.testing.expect(Session.pollModels(&session, true));
     try std.testing.expect(session.metadata_job == job and job.future != null);
@@ -1644,7 +1668,7 @@ test "login with new credentials refreshes official metadata without waiting for
 test "login refreshes only saved provider despite prior attempt and queues behind old credentials" {
     const Fixture = struct {
         var calls: std.atomic.Value(usize) = .init(0);
-        fn fetch(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+        fn fetch(a: std.mem.Allocator, _: metadata.Request, id: ProviderId, key: ?[]const u8) !metadata.Listing {
             _ = calls.fetchAdd(1, .monotonic);
             if (id != .opencode_go) return error.UnexpectedProvider;
             const k = key orelse return error.MissingFixtureKey;
@@ -1718,14 +1742,14 @@ test "manual refresh asynchronously discovers new IDs and preserves public proto
     const Fixture = struct {
         var requested: std.atomic.Value(u8) = .init(0);
         var public_calls: std.atomic.Value(usize) = .init(0);
-        fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+        fn official(a: std.mem.Allocator, _: metadata.Request, id: ProviderId, key: ?[]const u8) !metadata.Listing {
             if (key == null or !std.mem.eql(u8, key.?, "fake-async-directory-key")) return error.InvalidFixtureKey;
             _ = requested.fetchOr(metadata.bit(id), .monotonic);
             return metadata.parseListing(a,
                 \\{"data":[{"id":"future-official-id","context_window":131072},{"id":"future-unknown","context_window":65536}]}
             , id);
         }
-        fn public(a: std.mem.Allocator, _: std.Io) !metadata.Listing {
+        fn public(a: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
             _ = public_calls.fetchAdd(1, .monotonic);
             return metadata.parseDev(a,
                 \\{"deepseek":{"npm":"@ai-sdk/deepseek","models":{"future-official-id":{}}},"opencode-go":{"npm":"@ai-sdk/openai-compatible","models":{"future-official-id":{"provider":{"npm":"@ai-sdk/openai"}}}},"opencode":{"npm":"@ai-sdk/openai-compatible","models":{"future-official-id":{"provider":{"npm":"@ai-sdk/openai"}}}}}

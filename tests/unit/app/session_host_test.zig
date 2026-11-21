@@ -670,12 +670,13 @@ test "metadata owner idle publishes real session capabilities on nonblocking pol
     const Fixture = struct {
         var official_calls: std.atomic.Value(usize) = .init(0);
         var dev_calls: std.atomic.Value(usize) = .init(0);
-        fn official(a: std.mem.Allocator, _: Io, id: providers.Id, key: ?[]const u8) !@import("model_metadata.zig").Listing {
+        const metadata = @import("model_metadata.zig");
+        fn official(a: std.mem.Allocator, _: metadata.Request, id: providers.Id, key: ?[]const u8) !metadata.Listing {
             _ = official_calls.fetchAdd(1, .monotonic);
             if (id != .deepseek or key == null or !std.mem.eql(u8, key.?, "fake-metadata-key")) return error.InvalidFixture;
-            return @import("model_metadata.zig").parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", id);
+            return metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"effort\":{\"supported_levels\":[\"low\",\"high\",\"max\"]}}]}", id);
         }
-        fn dev(_: std.mem.Allocator, _: Io) !@import("model_metadata.zig").Listing {
+        fn dev(_: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
             _ = dev_calls.fetchAdd(1, .monotonic);
             return .{ .dev_done = true };
         }

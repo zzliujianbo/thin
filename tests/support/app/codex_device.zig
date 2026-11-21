@@ -1,3 +1,35 @@
+// One owned listener plays both potential routes. CONNECT proves proxy use;
+// a TLS ClientHello proves bypass. Reject before any origin HTTP can be sent.
+fn rejectOAuthConnection(io: Io, server: *Io.net.Server, direct: bool) !void {
+    var stream = try server.accept(io);
+    defer stream.close(io);
+    var buffer: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var reader = stream.reader(io, &buffer);
+    if (direct) {
+        try std.testing.expectEqual(@as(u8, 0x16), try reader.interface.takeByte());
+        try std.testing.expectEqual(@as(u8, 0x03), try reader.interface.takeByte());
+        return;
+    }
+    var headers: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &headers);
+    var len: usize = 0;
+    while (len < headers.len) {
+        headers[len] = std.ascii.toLower(try reader.interface.takeByte());
+        len += 1;
+        if (std.mem.endsWith(u8, headers[0..len], "\r\n\r\n")) break;
+    } else return error.HeadersTooLarge;
+    var first: [96]u8 = undefined;
+    const connect = try std.fmt.bufPrint(&first, "connect 127.0.0.1:{d} http/1.1\r\n", .{server.socket.address.getPort()});
+    try std.testing.expect(std.mem.startsWith(u8, headers[0..len], connect));
+    try std.testing.expect(std.mem.find(u8, headers[0..len], "authorization:") == null);
+    try std.testing.expect(std.mem.find(u8, headers[0..len], "synthetic-refresh") == null);
+    var out: [128]u8 = undefined;
+    var writer = stream.writer(io, &out);
+    try writer.interface.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+}
+
 const Fake = struct {
     responses: []const struct { status: u16, body: []const u8 },
     index: usize = 0,

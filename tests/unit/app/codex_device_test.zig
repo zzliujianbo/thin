@@ -1,3 +1,32 @@
+test "OAuth POST uses configured proxy independent of models or HTTPS proxy with NO_PROXY" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    for ([_]enum { configured, system, bypass }{ .configured, .system, .bypass }) |mode| {
+        var server = try address.listen(io, .{});
+        defer server.deinit(io);
+        const port = server.socket.address.getPort();
+        const url = try std.fmt.allocPrint(a, "https://127.0.0.1:{d}/oauth/token", .{port});
+        defer a.free(url);
+        const proxy: cfg.ProxyConfig = .{ .address = "127.0.0.1", .port = port }; // empty models
+        const proxy_url = try proxy.url(a);
+        defer a.free(proxy_url);
+        var env = std.process.Environ.Map.init(a);
+        defer env.deinit();
+        try env.put("HTTPS_PROXY", if (mode == .configured) "not a proxy URL" else proxy_url);
+        try env.put("NO_PROXY", if (mode == .system) "" else "*");
+        var client = try initClient(a, io, &env, if (mode == .configured) proxy else null);
+        defer client.deinit();
+        // Even a route regression can only reach this test's own loopback port.
+        var http: Http = .{ .client = &client, .urls = .{ url, url, url } };
+        var job = try Io.concurrent(io, rejectOAuthConnection, .{ io, &server, mode == .bypass });
+        defer job.cancel(io) catch {};
+        try std.testing.expectError(error.TransportFailure, refreshWith(http.transport(), a, io, "synthetic-refresh", null, 3000));
+        // A pre-spawn failure cannot leave this test waiting in accept().
+        try job.cancel(io);
+    }
+}
+
 test "device begin and poll exchange use owned values" {
     const a = std.testing.allocator;
     var fake: Fake = .{ .responses = &.{ .{ .status = 200, .body = "{\"device_auth_id\":\"id\",\"user_code\":\"code\",\"interval\":\"5\"}" }, .{ .status = 403, .body = "{}" }, .{ .status = 200, .body = "{\"authorization_code\":\"a+b\",\"code_verifier\":\"v\"}" }, .{ .status = 200, .body = "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":60}" } } };

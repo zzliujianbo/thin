@@ -1,3 +1,36 @@
+test "OAuth refresh checks the latest config route before persisting intent" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [4096]u8 = undefined;
+    const home = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HTTPS_PROXY", "http://user:synthetic-secret@127.0.0.1");
+    const manager = try Manager.init(a, std.testing.io, home, &env);
+    defer manager.deinit();
+    // The manager owns its filtered snapshot; later caller changes cannot
+    // silently turn malformed proxy input into a direct refresh.
+    try env.put("HTTPS_PROXY", "");
+    var fake: FakeWire = .{};
+    manager.wire = fake.wire();
+    var initial = try manager.store.loadOrInitialize();
+    defer cfg.release(&initial);
+    const names = try merge(a, &initial.value, "codex", .{ .access_token = "old-access", .refresh_token = "old-refresh", .expires_at_ms = 1 }, true);
+    defer a.free(names);
+    try manager.store.save(initial.value);
+    try std.testing.expectError(error.InvalidProxyEnvironment, manager.source().acquire(a, "codex", null, 5000));
+    var latest = try manager.store.loadExisting();
+    defer cfg.release(&latest);
+    try std.testing.expect(!(try credential(latest.value, "codex")).refresh_pending);
+    try std.testing.expectEqual(@as(usize, 0), fake.refresh_count);
+    latest.value.proxy = .{ .address = "127.0.0.1", .port = 31337 };
+    try manager.store.save(latest.value);
+    var rotated = try manager.source().acquire(a, "codex", null, 5000);
+    defer rotated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fake.refresh_count);
+}
+
 test "source refresh commits rotation before observing cancellation" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -36,14 +36,14 @@ const PublicationFetch = struct {
     var official: [3]std.atomic.Value(usize) = .{ .init(0), .init(0), .init(0) };
     var public_calls: std.atomic.Value(usize) = .init(0);
     var hold_public: std.atomic.Value(bool) = .init(false);
-    fn fetch(_: std.mem.Allocator, _: std.Io, id: cfg.providers.Id, key: ?[]const u8) !metadata.Listing {
+    fn fetch(_: std.mem.Allocator, _: metadata.Request, id: cfg.providers.Id, key: ?[]const u8) !metadata.Listing {
         if (key == null) return error.UnexpectedNullKey;
         _ = official[@intCast(@backingInt(id))].fetchAdd(1, .monotonic);
         return .{};
     }
-    fn dev(_: std.mem.Allocator, io: std.Io) !metadata.Listing {
+    fn dev(_: std.mem.Allocator, request: metadata.Request) !metadata.Listing {
         _ = public_calls.fetchAdd(1, .monotonic);
-        while (hold_public.load(.acquire)) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        while (hold_public.load(.acquire)) try std.Io.sleep(request.io, .fromMilliseconds(1), .awake);
         return .{ .dev_done = true };
     }
     fn refresh(session: *Session) !void {

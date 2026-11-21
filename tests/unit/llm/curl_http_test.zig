@@ -1,3 +1,107 @@
+test "buffered catalog GET keeps query and caller authorization only in private config" {
+    const a = std.testing.allocator;
+    const url = "https://catalog.invalid/models?client_version=1.2&filter=a%2Fb";
+    const config = try makeHeaderConfig(a, url, &.{.{ .name = "Authorization", .value = "Bearer synthetic" }}, null, 1250, .buffered, true, null);
+    defer wipeFree(a, config);
+    for ([_][]const u8{ "request = \"GET\"\n", "url = \"" ++ url ++ "\"\n", "header = \"Authorization: Bearer synthetic\"\n", "proto = \"=https\"\n", "\nno-location\n", "proxy = \"\"\nnoproxy = \"*\"", "max-time = \"1.250\"", "write-out = \"\\n%{http_code}\"" }) |expected|
+        try std.testing.expect(std.mem.indexOf(u8, config, expected) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, config, "header = "));
+    for ([_][]const u8{ "data-binary", "insecure", "\nlocation\n" }) |forbidden|
+        try std.testing.expect(std.mem.indexOf(u8, config, forbidden) == null);
+    try std.testing.expectEqualStrings("exec /usr/bin/curl --disable --config -", script);
+}
+
+test "buffered OAuth POST preserves form data and distinguishes empty POST from GET" {
+    const a = std.testing.allocator;
+    const url = "https://auth.invalid/token";
+    for ([_][]const u8{ "code=fake%2Btoken&redirect_uri=https%3A%2F%2Fapp.invalid", "" }) |payload| {
+        const config = try makeHeaderConfig(a, url, &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }}, payload, 123, .buffered, false, null);
+        defer wipeFree(a, config);
+        try std.testing.expect(std.mem.indexOf(u8, config, "request = \"POST\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, config, "Content-Type: application/x-www-form-urlencoded") != null);
+        try std.testing.expect(std.mem.indexOf(u8, config, "Bearer") == null);
+        const prefix = "data-binary = \"";
+        const start = (std.mem.indexOf(u8, config, prefix) orelse return error.MissingPayload) + prefix.len;
+        try std.testing.expectEqualStrings(payload, config[start..][0..payload.len]);
+        try std.testing.expect(std.mem.startsWith(u8, config[start + payload.len ..], "\"\n"));
+    }
+}
+
+test "buffered request rejects insecure URLs file syntax and header injection before spawn" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var client = try Client.initRouted(a, std.testing.io, &env, null);
+    defer client.deinit();
+    var cancel: protocol.Cancellation = .{};
+    const url = "https://origin.invalid/";
+    for ([_][]const u8{ "http://origin.invalid", "file:///fixture", "https://u@origin.invalid/?q", url ++ "?q#frag", url ++ "?x\nlocation", url ++ "?x\\y" }) |bad|
+        try std.testing.expectError(error.InvalidUrl, client.request(a, bad, &.{}, null, 1, 0, &cancel));
+    for ([_]std.http.Header{ .{ .name = "@file", .value = "x" }, .{ .name = "Authorization", .value = "x\r\nX: y" } }) |h|
+        try std.testing.expectError(error.InvalidHeader, client.request(a, url, &.{h}, null, 1, 0, &cancel));
+    try std.testing.expectError(error.InvalidPayload, client.request(a, url, &.{}, "@fixture", 1, 0, &cancel));
+    const oversized = try a.alloc(u8, 1024 * 1024 + 1);
+    defer a.free(oversized);
+    @memset(oversized, 'x');
+    try std.testing.expectError(error.InvalidPayload, client.request(a, url, &.{}, oversized, 1, 0, &cancel));
+    try std.testing.expectError(error.InvalidTimeout, client.request(a, url, &.{}, null, 0, 0, &cancel));
+    cancel.cancel();
+    try std.testing.expectError(error.Canceled, client.request(a, "", &.{}, null, 0, 0, &cancel));
+    client.poisoned = true;
+    try std.testing.expectError(error.CleanupFailed, client.request(a, "", &.{}, null, 0, 0, &cancel));
+}
+
+test "bounded wire sink accepts exact body and trailer and rejects overflow without partial copy" {
+    const a = std.testing.allocator;
+    const wire = "a\x00\xff\n302";
+    for (0..wire.len + 1) |split| {
+        var writer = WireBuffer{ .a = a, .limit = wire.len };
+        defer writer.bytes.deinit(a);
+        try bufferChunk(&writer, wire[0..split]);
+        try bufferChunk(&writer, wire[split..]);
+        const response = try parseResponseBytes(a, fakeResult(wire), writer.bytes.items);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u16, 302), response.status);
+        try std.testing.expectEqualStrings(wire[0..3], response.body);
+    }
+    var writer = WireBuffer{ .a = a, .limit = 4 };
+    defer writer.bytes.deinit(a);
+    try bufferChunk(&writer, "x");
+    try std.testing.expectError(error.CurlResponseTooLarge, bufferChunk(&writer, "\n200"));
+    try std.testing.expectEqualStrings("x", writer.bytes.items);
+    writer.bytes.clearRetainingCapacity();
+    try bufferChunk(&writer, "\n204");
+    const empty = try parseResponseBytes(a, fakeResult("\n204"), writer.bytes.items);
+    defer empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), empty.body.len);
+}
+
+test "owned response and full config storage are zeroed at release" {
+    var backing: [4096]u8 = @splat(0xaa);
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const a = fba.allocator();
+    const config = try makeHeaderConfig(a, "https://auth.invalid/", &.{}, "{\"code\":\"synthetic\"}", 1, .buffered, true, null);
+    const size = config.len;
+    wipeFree(a, config);
+    try std.testing.expect(std.mem.allEqual(u8, backing[0..size], 0));
+    const response = try parseResponse(a, fakeResult("token\n200"));
+    response.deinit(a);
+    try std.testing.expect(std.mem.allEqual(u8, backing[0..5], 0));
+
+    // Fail a receive-buffer growth without starting a network request. Inspect
+    // the fixed allocator's own storage after release, not a dangling slice.
+    fba.reset();
+    @memset(&backing, 0xaa);
+    var wiping = @import("../core/config.zig").WipingAllocator{ .backing = a };
+    var sink = WireBuffer{ .a = wiping.allocator(), .limit = std.math.maxInt(usize) };
+    try bufferChunk(&sink, "synthetic token");
+    try std.testing.expectError(error.OutOfMemory, bufferChunk(&sink, &backing));
+    try std.testing.expectEqualStrings("synthetic token", sink.bytes.items);
+    const capacity = sink.bytes.capacity;
+    sink.bytes.deinit(sink.a);
+    try std.testing.expect(std.mem.allEqual(u8, backing[0..capacity], 0));
+}
+
 test "curl config quotes backslashes unicode and never interpolates script" {
     const a = std.testing.allocator;
     const key = "test-key-\\\"中文";

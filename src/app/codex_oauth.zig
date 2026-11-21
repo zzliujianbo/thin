@@ -5,6 +5,7 @@ const cfg = @import("../core/config.zig");
 const p = @import("../core/protocol.zig");
 const auth = @import("../core/codex_auth.zig");
 const device = @import("codex_device.zig");
+const Client = @import("../llm/curl_http.zig").Client;
 const store_mod = @import("auth_store.zig");
 
 const call_limit: u32 = 15_000;
@@ -21,19 +22,19 @@ pub const DeviceSink = struct {
 // Private seam for offline tests. No response bodies or secrets go to diagnostics.
 const Wire = struct {
     context: ?*anyopaque = null,
-    begin: *const fn (?*anyopaque, std.mem.Allocator, std.Io, ?*const p.Cancellation, u32) anyerror!device.DeviceState,
-    poll: *const fn (?*anyopaque, std.mem.Allocator, std.Io, *const device.DeviceState, ?*const p.Cancellation, u32) anyerror!device.PollResult,
-    refresh: *const fn (?*anyopaque, std.mem.Allocator, std.Io, []const u8, ?*const p.Cancellation, u32) anyerror!device.TokenSet,
+    begin: *const fn (?*anyopaque, std.mem.Allocator, *Client, ?*const p.Cancellation, u32) anyerror!device.DeviceState,
+    poll: *const fn (?*anyopaque, std.mem.Allocator, *Client, *const device.DeviceState, ?*const p.Cancellation, u32) anyerror!device.PollResult,
+    refresh: *const fn (?*anyopaque, std.mem.Allocator, *Client, []const u8, ?*const p.Cancellation, u32) anyerror!device.TokenSet,
     account: *const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
 };
-fn wireBegin(_: ?*anyopaque, a: std.mem.Allocator, io: std.Io, c: ?*const p.Cancellation, t: u32) !device.DeviceState {
-    return device.beginDevice(a, io, c, t);
+fn wireBegin(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, c: ?*const p.Cancellation, t: u32) !device.DeviceState {
+    return device.beginDevice(a, client, c, t);
 }
-fn wirePoll(_: ?*anyopaque, a: std.mem.Allocator, io: std.Io, s: *const device.DeviceState, c: ?*const p.Cancellation, t: u32) !device.PollResult {
-    return device.pollDevice(a, io, s, c, t);
+fn wirePoll(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, s: *const device.DeviceState, c: ?*const p.Cancellation, t: u32) !device.PollResult {
+    return device.pollDevice(a, client, s, c, t);
 }
-fn wireRefresh(_: ?*anyopaque, a: std.mem.Allocator, io: std.Io, token: []const u8, c: ?*const p.Cancellation, t: u32) !device.TokenSet {
-    return device.refresh(a, io, token, c, t);
+fn wireRefresh(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, token: []const u8, c: ?*const p.Cancellation, t: u32) !device.TokenSet {
+    return device.refresh(a, client, token, c, t);
 }
 fn wireAccount(_: ?*anyopaque, a: std.mem.Allocator, token: []const u8) ![]u8 {
     return device.accountId(a, token);
@@ -156,6 +157,8 @@ pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     store: store_mod.Store,
+    wiping: cfg.WipingAllocator,
+    route_env: std.process.Environ.Map,
     wire: Wire = production_wire,
     // Private offline fault injection; production never sets this hook.
     before_refresh_save: ?*const fn (bool) anyerror!void = null,
@@ -164,14 +167,22 @@ pub const Manager = struct {
     min_poll_interval_ms: u32 = 1000,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, home: []const u8, env: *const std.process.Environ.Map) !*Manager {
-        _ = env; // Deliberately do not inspect HOME, Pi credentials or other ambient state.
         const self = try a.create(Manager);
         errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .io = io, .store = try store_mod.Store.open(a, io, home) };
+        self.* = .{ .allocator = a, .io = io, .store = try store_mod.Store.open(a, io, home), .wiping = .{ .backing = a }, .route_env = undefined };
+        errdefer self.store.deinit();
+        // The caller's map can be temporary. Keep only the inputs initModel
+        // uses for the fixed HTTPS auth origin, never a copy of all credentials.
+        self.route_env = std.process.Environ.Map.init(self.wiping.allocator());
+        errdefer self.route_env.deinit();
+        for ([_][]const u8{ "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "CURL_CA_BUNDLE" }) |key| {
+            if (env.get(key)) |v| try self.route_env.put(key, v);
+        }
         return self;
     }
     pub fn deinit(self: *Manager) void {
         const a = self.allocator;
+        self.route_env.deinit();
         self.store.deinit();
         a.destroy(self);
     }
@@ -206,6 +217,10 @@ pub const Manager = struct {
         var access: []const u8 = current.access_token;
         var refresh: []const u8 = current.refresh_token;
         if (current.expires_at_ms -| now <= refresh_margin_ms) {
+            // Resolve the route before marking refresh pending: a local route
+            // validation failure cannot have sent or rotated the refresh token.
+            var client = try device.initClient(self.wiping.allocator(), self.io, &self.route_env, parsed.value.proxy);
+            defer client.deinit();
             // Allocate the declaration copy before the potentially rotating request.
             var intent = current;
             intent.refresh_pending = true;
@@ -219,7 +234,8 @@ pub const Manager = struct {
             tx.saveLatest(parsed.value) catch return error.OAuthCommitFailed;
             try checkCancel(cancel);
             const call_timeout = try deadline.callTime();
-            rotated = self.wire.refresh(self.wire.context, self.allocator, self.io, current.refresh_token, cancel, call_timeout) catch {
+            rotated = self.wire.refresh(self.wire.context, self.allocator, &client, current.refresh_token, cancel, call_timeout) catch |err| {
+                if (err == error.CleanupFailed) return err;
                 try checkCancel(cancel);
                 return error.OAuthRefreshFailed;
             };
@@ -291,7 +307,10 @@ pub const Manager = struct {
             return err;
         };
         initial_tx.deinit();
-        var state = self.wire.begin(self.wire.context, self.allocator, self.io, cancel, try deadline.callTime()) catch {
+        var client = try device.initClient(self.wiping.allocator(), self.io, &self.route_env, before.value.proxy);
+        defer client.deinit();
+        var state = self.wire.begin(self.wire.context, self.allocator, &client, cancel, try deadline.callTime()) catch |err| {
+            if (err == error.CleanupFailed) return err;
             try checkCancel(cancel);
             return error.OAuthDeviceFailed;
         };
@@ -306,7 +325,8 @@ pub const Manager = struct {
             try wait(self.io, deadline, cancel, interval);
             const now: i64 = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds());
             if (state.expires_at_ms <= now) return error.OAuthDeviceExpired;
-            const result = self.wire.poll(self.wire.context, self.allocator, self.io, &state, cancel, try deadline.callTime()) catch {
+            const result = self.wire.poll(self.wire.context, self.allocator, &client, &state, cancel, try deadline.callTime()) catch |err| {
+                if (err == error.CleanupFailed) return err;
                 try checkCancel(cancel);
                 return error.OAuthDeviceFailed;
             };

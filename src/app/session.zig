@@ -33,10 +33,10 @@ const codex_auth = @import("../core/codex_auth.zig");
 const p = @import("../core/protocol.zig");
 const background_status = @import("../core/background_status.zig");
 
-const MetadataFetch = *const fn (std.mem.Allocator, std.Io, ProviderId, ?[]const u8) anyerror!metadata.Listing;
-const DevFetch = *const fn (std.mem.Allocator, std.Io) anyerror!metadata.Listing;
+const MetadataFetch = *const fn (std.mem.Allocator, metadata.Request, ProviderId, ?[]const u8) anyerror!metadata.Listing;
+const DevFetch = *const fn (std.mem.Allocator, metadata.Request) anyerror!metadata.Listing;
 /// Codex listing borrows an acquired OAuth credential instead of an API key.
-const MetadataCodexFetch = *const fn (std.mem.Allocator, std.Io, *const codex_auth.RequestCredential, ?*const p.Cancellation, u32) anyerror!metadata.Listing;
+const MetadataCodexFetch = *const fn (std.mem.Allocator, metadata.Request, *const codex_auth.RequestCredential) anyerror!metadata.Listing;
 const official_metadata_timeout_ms = 8000;
 const models_dev_timeout_ms = 30000;
 const official_refresh_success = "Official model list refreshed";
@@ -120,6 +120,12 @@ const CodexLoginJob = struct {
 const MetadataJob = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
+    // Independent owned snapshots: a joined official slot may be restarted
+    // against a new config while the public request is still in flight.
+    official_proxy: ?cfg.OwnedURL = null,
+    dev_proxy: ?cfg.OwnedURL = null,
+    dev_cancel: p.Cancellation = .{},
     fetch: MetadataFetch,
     dev_fetch: DevFetch,
     keys: [ProviderId.all.len]?[]u8 = @splat(null),
@@ -166,7 +172,8 @@ const MetadataJob = struct {
             const index: usize = @intCast(@backingInt(id));
             const bit = @as(u8, 1) << @intCast(index);
             if (self.requested & bit == 0 or self.keys[index] == null) continue;
-            var values = self.fetch(self.allocator, self.io, id, self.keys[index]) catch |err| {
+            const req = self.officialRequest() orelse return;
+            var values = self.fetch(self.allocator, req, id, self.keys[index]) catch |err| {
                 if (err == error.Canceled) return;
                 continue;
             };
@@ -185,6 +192,9 @@ const MetadataJob = struct {
         if (self.codex_cancel.isRequested()) return null;
         return remainingCodexMs(self.started_ms, @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()));
     }
+    fn officialRequest(self: *MetadataJob) ?metadata.Request {
+        return .{ .io = self.io, .env = self.env, .explicit_url = self.official_proxy, .cancel = &self.codex_cancel, .timeout_ms = self.codexRemaining() orelse return null };
+    }
     /// A failed acquisition — including a credential awaiting reauthentication —
     /// never becomes a listing request, so no send bypasses the stored login.
     fn runCodex(self: *MetadataJob) void {
@@ -197,8 +207,8 @@ const MetadataJob = struct {
         const acquire_ms = self.codexRemaining() orelse return;
         var credential = source.acquire(self.allocator, alias, &self.codex_cancel, acquire_ms) catch return;
         defer credential.deinit(self.allocator);
-        const fetch_ms = self.codexRemaining() orelse return;
-        var values = self.codex_fetch(self.allocator, self.io, &credential, &self.codex_cancel, fetch_ms) catch return;
+        const req = self.officialRequest() orelse return;
+        var values = self.codex_fetch(self.allocator, req, &credential) catch return;
         defer values.deinit(self.allocator);
         metadata.mergeOfficial(self.allocator, &self.listing, &values, .openai_codex) catch return;
         self.succeeded |= metadata.bit(.openai_codex);
@@ -215,7 +225,7 @@ const MetadataJob = struct {
     }
     fn runDev(self: *MetadataJob) void {
         defer self.dev_done.store(true, .release);
-        const dev = self.dev_fetch(self.allocator, self.io) catch return;
+        const dev = self.dev_fetch(self.allocator, .{ .io = self.io, .env = self.env, .explicit_url = self.dev_proxy, .cancel = &self.dev_cancel, .timeout_ms = models_dev_timeout_ms }) catch return;
         self.dev_listing = dev;
     }
     fn wipeKeys(self: *MetadataJob) void {
@@ -226,8 +236,12 @@ const MetadataJob = struct {
         };
     }
     fn destroy(self: *MetadataJob) void {
+        self.codex_cancel.cancel();
+        self.dev_cancel.cancel();
         if (self.future) |*future| future.cancel(self.io);
         if (self.dev_future) |*future| future.cancel(self.io);
+        if (self.official_proxy) |url| self.allocator.free(url);
+        if (self.dev_proxy) |url| self.allocator.free(url);
         self.wipeKeys();
         self.releaseCodex();
         self.listing.deinit(self.allocator);
@@ -1069,12 +1083,17 @@ pub const Session = struct {
         return self.metadata_awake_ms orelse @as(i64, @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()));
     }
 
+    fn metadataProxy(self: *Session) !?cfg.OwnedURL {
+        const proxy = self.global_config.?.value.proxy orelse return null;
+        return try proxy.url(self.allocator);
+    }
+
     fn startMetadata(self: *Session, requested: u8, manual: bool) !void {
         try self.guardSelection();
         if (self.metadata_job != null) return error.MetadataRefreshBusy;
         if (requested == 0) return error.NoOfficialProvider;
         const job = try self.allocator.create(MetadataJob);
-        job.* = .{ .allocator = self.allocator, .io = self.io, .fetch = self.metadata_fetch, .dev_fetch = self.metadata_dev_fetch, .manual = manual, .started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()), .credential_revisions = self.credential_revisions };
+        job.* = .{ .allocator = self.allocator, .io = self.io, .env = self.environ, .fetch = self.metadata_fetch, .dev_fetch = self.metadata_dev_fetch, .manual = manual, .started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds()), .credential_revisions = self.credential_revisions };
         errdefer job.destroy();
         // Claim before credential lookup: unrelated unavailable aliases must
         // neither gate the public source nor consume fresh official credentials.
@@ -1106,9 +1125,12 @@ pub const Session = struct {
             job.destroy();
             return;
         }
-        if (claim.mask & metadata.provider_mask != 0)
+        if (claim.mask & metadata.provider_mask != 0) {
+            job.official_proxy = try self.metadataProxy();
             job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
+        }
         if (claim.mask & metadata.dev_bit != 0) {
+            job.dev_proxy = try self.metadataProxy();
             job.dev_started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds());
             job.dev_future = try std.Io.concurrent(self.io, MetadataJob.runDev, .{job});
         }
@@ -1175,6 +1197,9 @@ pub const Session = struct {
         job.credential_revisions = self.credential_revisions;
         job.official_published = false;
         job.started_ms = @intCast(std.Io.Clock.awake.now(self.io).toMilliseconds());
+        const proxy = try self.metadataProxy();
+        if (job.official_proxy) |url| self.allocator.free(url);
+        job.official_proxy = proxy;
         job.future = try std.Io.concurrent(self.io, MetadataJob.run, .{job});
         var old_listing = previous_listing;
         old_listing.deinit(self.allocator);
@@ -1213,6 +1238,7 @@ pub const Session = struct {
                     if (job.dev_done.load(.acquire)) {
                         future.await(self.io);
                     } else if (std.Io.Clock.awake.now(self.io).toMilliseconds() - job.dev_started_ms >= models_dev_timeout_ms) {
+                        job.dev_cancel.cancel();
                         future.cancel(self.io);
                     } else break :dev_pending;
                     job.dev_future = null;

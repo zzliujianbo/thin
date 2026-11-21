@@ -2,7 +2,9 @@
 //! The account claim is routing metadata, not a verified identity.
 const std = @import("std");
 const p = @import("../core/protocol.zig");
-const WipingAllocator = @import("../core/config.zig").WipingAllocator;
+const cfg = @import("../core/config.zig");
+const WipingAllocator = cfg.WipingAllocator;
+const curl = @import("../llm/curl_http.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -70,19 +72,38 @@ const Transport = struct {
         return self.now_fn(self.context, io);
     }
 };
-const real_transport: Transport = .{ .context = null, .post_fn = realPost, .now_fn = realNow };
+// One immutable choice of route per login (including the exchange), or refresh.
+// OAuth endpoints share an HTTPS origin and are not model-scoped.
+pub fn initClient(a: Allocator, io: Io, env: *const std.process.Environ.Map, proxy: ?cfg.ProxyConfig) !curl.Client {
+    const url = if (proxy) |configured| try configured.url(a) else null;
+    defer if (url) |owned| a.free(owned);
+    return curl.Client.initModel(a, io, env, usercode_url, url, true);
+}
+
+const Http = struct {
+    client: *curl.Client,
+    // Private test seam; production operations always use the fixed endpoints.
+    urls: [3][]const u8 = .{ usercode_url, poll_url, token_url },
+
+    fn transport(self: *Http) Transport {
+        return .{ .context = self, .post_fn = realPost, .now_fn = realNow };
+    }
+};
 fn realNow(_: ?*anyopaque, io: Io) i64 {
     return Io.Clock.real.now(io).toMilliseconds();
 }
 
-pub fn beginDevice(a: Allocator, io: Io, cancel: ?*const p.Cancellation, timeout_ms: u32) !DeviceState {
-    return beginWith(real_transport, a, io, cancel, timeout_ms);
+pub fn beginDevice(a: Allocator, client: *curl.Client, cancel: ?*const p.Cancellation, timeout_ms: u32) !DeviceState {
+    var http: Http = .{ .client = client };
+    return beginWith(http.transport(), a, client.io, cancel, timeout_ms);
 }
-pub fn pollDevice(a: Allocator, io: Io, device: *const DeviceState, cancel: ?*const p.Cancellation, timeout_ms: u32) !PollResult {
-    return pollWith(real_transport, a, io, device, cancel, timeout_ms);
+pub fn pollDevice(a: Allocator, client: *curl.Client, device: *const DeviceState, cancel: ?*const p.Cancellation, timeout_ms: u32) !PollResult {
+    var http: Http = .{ .client = client };
+    return pollWith(http.transport(), a, client.io, device, cancel, timeout_ms);
 }
-pub fn refresh(a: Allocator, io: Io, refresh_token: []const u8, cancel: ?*const p.Cancellation, timeout_ms: u32) !TokenSet {
-    return refreshWith(real_transport, a, io, refresh_token, cancel, timeout_ms);
+pub fn refresh(a: Allocator, client: *curl.Client, refresh_token: []const u8, cancel: ?*const p.Cancellation, timeout_ms: u32) !TokenSet {
+    var http: Http = .{ .client = client };
+    return refreshWith(http.transport(), a, client.io, refresh_token, cancel, timeout_ms);
 }
 
 fn validSecret(s: []const u8) bool {
@@ -127,9 +148,10 @@ fn pollWith(t: Transport, a: Allocator, io: Io, device: *const DeviceState, canc
     const temp = wiping.allocator();
     const body = try std.json.Stringify.valueAlloc(temp, .{ .device_auth_id = device.device_auth_id, .user_code = device.user_code }, .{});
     defer wipeFree(temp, body);
-    const response = try t.post(a, io, .poll, .json, body, cancel, timeout);
+    const response = try t.post(a, io, .poll, .json, body, cancel, try remaining(io, start, timeout));
     defer response.deinit(a);
     if (response.status < 200 or response.status >= 300) {
+        if (response.status < 400 or response.status == 407 or response.status >= 500) return error.DevicePollFailed;
         const code = parseError(a, response.body) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
@@ -149,11 +171,10 @@ fn pollWith(t: Transport, a: Allocator, io: Io, device: *const DeviceState, canc
     const root = try object(parsed.value);
     const code = try stringField(root, "authorization_code");
     const verifier = try stringField(root, "code_verifier");
-    const elapsed = start.untilNow(io, .awake).toMilliseconds();
-    if (elapsed >= timeout) return error.Timeout;
     const form = try formEncode(temp, &.{ .{ "grant_type", "authorization_code" }, .{ "client_id", client_id }, .{ "code", code }, .{ "code_verifier", verifier }, .{ "redirect_uri", redirect_uri } });
     defer wipeFree(temp, form);
-    const token_response = try t.post(a, io, .token, .form, form, cancel, @intCast(@as(i64, timeout) - elapsed));
+    try checkCancel(cancel);
+    const token_response = try t.post(a, io, .token, .form, form, cancel, try remaining(io, start, timeout));
     defer token_response.deinit(a);
     return .{ .success = try parseToken(a, token_response, t.now(io)) };
 }
@@ -161,11 +182,12 @@ fn refreshWith(t: Transport, a: Allocator, io: Io, token: []const u8, cancel: ?*
     if (timeout == 0) return error.InvalidTimeout;
     if (!validSecret(token)) return error.InvalidToken;
     try checkCancel(cancel);
+    const start = Io.Clock.awake.now(io);
     var wiping = WipingAllocator{ .backing = a };
     const temp = wiping.allocator();
     const form = try formEncode(temp, &.{ .{ "grant_type", "refresh_token" }, .{ "client_id", client_id }, .{ "refresh_token", token } });
     defer wipeFree(temp, form);
-    const response = try t.post(a, io, .token, .form, form, cancel, timeout);
+    const response = try t.post(a, io, .token, .form, form, cancel, try remaining(io, start, timeout));
     defer response.deinit(a);
     // No cancellation check here: a complete rotated token must reach its owner.
     return parseToken(a, response, t.now(io));
@@ -305,81 +327,24 @@ pub fn accountId(a: Allocator, access_token: []const u8) ![]u8 {
     return a.dupe(u8, id);
 }
 
-const Job = struct {
-    a: Allocator,
-    io: Io,
-    endpoint: Endpoint,
-    content: Content,
-    body: []u8,
-    result: ?Response = null,
-    failure: ?anyerror = null,
-    done: std.atomic.Value(bool) = .init(false),
-    fn run(self: *Job) void {
-        self.result = self.request() catch |err| blk: {
-            self.failure = err;
-            break :blk null;
-        };
-        self.done.store(true, .release);
-    }
-    fn request(self: *Job) !Response {
-        var wiping = WipingAllocator{ .backing = self.a };
-        var client: std.http.Client = .{ .allocator = wiping.allocator(), .io = self.io };
-        defer client.deinit();
-        const url = switch (self.endpoint) {
-            .begin => usercode_url,
-            .poll => poll_url,
-            .token => token_url,
-        };
-        const uri = try std.Uri.parse(url);
-        var req = try client.request(.POST, uri, .{ .redirect_behavior = .unhandled, .headers = .{ .content_type = .{ .override = if (self.content == .json) "application/json" else "application/x-www-form-urlencoded" }, .accept_encoding = .{ .override = "identity" } } });
-        defer req.deinit();
-        req.transfer_encoding = .{ .content_length = self.body.len };
-        try req.sendBodyComplete(self.body);
-        var redirect: [1024]u8 = undefined;
-        defer std.crypto.secureZero(u8, &redirect);
-        var response = try req.receiveHead(&redirect);
-        var transfer: [8192]u8 = undefined;
-        defer std.crypto.secureZero(u8, &transfer);
-        const reader = response.reader(&transfer);
-        const raw = try reader.allocRemaining(wiping.allocator(), .limited(max_body));
-        errdefer wipeFree(wiping.allocator(), raw);
-        switch (req.reader.state) {
-            .body_remaining_content_length, .body_remaining_chunk_len => return error.IncompleteResponse,
-            else => {},
-        }
-        // Allocate independently: allocator wrapper itself lives on this stack.
-        const body = try self.a.dupe(u8, raw);
-        wipeFree(wiping.allocator(), raw);
-        return .{ .status = @backingInt(response.head.status), .body = body };
-    }
-};
-fn realPost(_: ?*anyopaque, a: Allocator, io: Io, endpoint: Endpoint, content: Content, body: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !Response {
-    if (timeout == 0) return error.InvalidTimeout;
-    try checkCancel(cancel);
-    const start = Io.Clock.awake.now(io);
-    const owned_body = try a.dupe(u8, body);
-    defer wipeFree(a, owned_body);
-    var job: Job = .{ .a = a, .io = io, .endpoint = endpoint, .content = content, .body = owned_body };
-    var future = Io.concurrent(io, Job.run, .{&job}) catch return error.TransportFailed;
-    var interrupted: ?anyerror = null;
-    while (!job.done.load(.acquire)) {
-        if (cancel) |c| if (c.isRequested()) {
-            interrupted = error.Canceled;
-            break;
-        };
-        if (start.untilNow(io, .awake).toMilliseconds() >= timeout) {
-            interrupted = error.Timeout;
-            break;
-        }
-        Io.sleep(io, .fromMilliseconds(5), .awake) catch {
-            interrupted = error.Canceled;
-            break;
-        };
-    }
-    if (interrupted != null) future.cancel(io) else future.await(io);
-    // After join, a complete response always wins over a concurrent cancel.
-    if (job.result) |r| return r;
-    if (interrupted) |err| return err;
-    if (job.failure) |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.TransportFailed;
-    return error.TransportFailed;
+fn remaining(io: Io, start: Io.Timestamp, timeout: u32) !u32 {
+    const elapsed = @max(0, start.untilNow(io, .awake).toMilliseconds());
+    if (elapsed >= timeout) return error.Timeout;
+    return timeout - @as(u32, @intCast(elapsed));
+}
+
+fn realPost(raw: ?*anyopaque, a: Allocator, _: Io, endpoint: Endpoint, content: Content, body: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !Response {
+    const http: *Http = @ptrCast(@alignCast(raw.?));
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = if (content == .json) "application/json" else "application/x-www-form-urlencoded" },
+        .{ .name = "Accept-Encoding", .value = "identity" },
+    };
+    const uncanceled: p.Cancellation = .{};
+    var wiping = WipingAllocator{ .backing = a };
+    const temp = wiping.allocator();
+    const response = try http.client.request(temp, http.urls[@backingInt(endpoint)], &headers, body, timeout, max_body, cancel orelse &uncanceled);
+    defer response.deinit(temp);
+    // Only the returned body outlives the wiping allocator. Do not recheck
+    // cancellation after a completed response: the refresh token may rotate.
+    return .{ .status = response.status, .body = try a.dupe(u8, response.body) };
 }

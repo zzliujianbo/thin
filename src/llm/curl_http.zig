@@ -42,7 +42,7 @@ pub const Response = struct {
     body: []const u8,
 
     pub fn deinit(self: Response, a: std.mem.Allocator) void {
-        a.free(self.body);
+        wipeFree(a, @constCast(self.body));
     }
 };
 
@@ -169,13 +169,56 @@ pub const Client = struct {
                 else => error.TransportFailure,
             };
         };
-        defer a.free(result.stdout);
-        defer a.free(result.stderr);
+        defer releaseOutput(a, result);
         if (result.term) |term| switch (term) {
             .exited => |code| self.last_exit_code = code,
             else => {},
         };
         return self.acceptResult(a, result, cancel);
+    }
+
+    /// Buffered request to a caller-selected, trusted HTTPS endpoint. A null
+    /// payload means GET; even an empty non-null payload means POST. Supply
+    /// Content-Type and any credentials in headers. UTF-8 JSON/form inputs are
+    /// limited to 1 MiB. Response storage grows on demand; a zero body limit
+    /// accepts only an empty response body. Release with Response.deinit.
+    pub fn request(self: *Client, a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: ?[]const u8, timeout_ms: u32, body_limit: usize, cancel: *const protocol.Cancellation) !Response {
+        self.last_error = null;
+        self.last_exit_code = null;
+        return self.requestInner(a, url, headers, payload, timeout_ms, body_limit, cancel) catch |err| {
+            self.last_error = err;
+            return err;
+        };
+    }
+
+    fn requestInner(self: *Client, a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: ?[]const u8, timeout_ms: u32, body_limit: usize, cancel: *const protocol.Cancellation) !Response {
+        if (self.poisoned) return error.CleanupFailed;
+        try checkCancel(self.io, cancel);
+        const config = try makeHeaderConfig(a, url, headers, payload, timeout_ms, .buffered, self.explicit_route, self.proxy_url);
+        defer wipeFree(a, config);
+        // Wipe even replaced buffers during growth. Catalogs have no fixed cap;
+        // the four extra bytes are curl's status trailer, not extra body budget.
+        var wiping = @import("../core/config.zig").WipingAllocator{ .backing = a };
+        var writer = WireBuffer{ .a = wiping.allocator(), .limit = body_limit +| 4 };
+        defer writer.bytes.deinit(writer.a);
+        try checkCancel(self.io, cancel);
+        const result = try self.runWithInput(a, config, .{
+            .raw_output = true,
+            .stdout_sink = .{ .context = &writer, .write_fn = bufferChunk },
+            .output_bytes = 0, // discard stderr; unexpected diagnostics fail closed
+            .timeout_ms = timeout_ms,
+            .term_grace_ms = 200,
+            .cleanup_timeout_ms = 5000,
+        }, timeout_ms, cancel, null);
+        defer releaseOutput(a, result); // empty with sink + zero capture budget
+        if (result.term) |term| switch (term) {
+            .exited => |code| self.last_exit_code = code,
+            else => {},
+        };
+        try checkCancel(self.io, cancel);
+        if (result.canceled) return error.Canceled;
+        if (self.last_exit_code == 28) return error.Timeout;
+        return parseResponseBytes(a, result, writer.bytes.items);
     }
 
     /// Incremental HTTP body delivery on the process owner's thread. A complete
@@ -195,8 +238,7 @@ pub const Client = struct {
             .term_grace_ms = 200,
             .cleanup_timeout_ms = 5000,
         }, timeout_ms, cancel, sink);
-        defer a.free(result.stdout);
-        defer a.free(result.stderr);
+        defer releaseOutput(a, result);
         if (result.cleanup_failed or result.unreaped_pid != null) {
             self.poisoned = true;
             self.unreaped_pid = result.unreaped_pid;
@@ -237,10 +279,7 @@ pub const Client = struct {
             if (producer_error) |input_error| if (input_error != error.Canceled) return input_error;
             return err;
         };
-        errdefer {
-            a.free(result.stdout);
-            a.free(result.stderr);
-        }
+        errdefer releaseOutput(a, result);
         const producer_error = input.finish(self.io);
         // Ownership failure wins even over producer failure or cancellation.
         if (result.cleanup_failed or result.unreaped_pid != null) {
@@ -300,8 +339,14 @@ fn checkCancel(io: std.Io, cancel: *const protocol.Cancellation) !void {
 }
 
 fn wipeFree(a: std.mem.Allocator, bytes: []u8) void {
+    if (bytes.len == 0) return;
     std.crypto.secureZero(u8, bytes);
-    a.free(bytes);
+    a.rawFree(bytes, .of(u8), @returnAddress());
+}
+
+fn releaseOutput(a: std.mem.Allocator, result: process.Result) void {
+    wipeFree(a, @constCast(result.stdout));
+    wipeFree(a, @constCast(result.stderr));
 }
 
 fn freeEnv(env: *std.process.Environ.Map) void {
@@ -321,12 +366,16 @@ fn controlFree(bytes: []const u8) bool {
 }
 
 fn validateUrl(url: []const u8) !void {
+    try validateEndpoint(url, false);
+}
+
+fn validateEndpoint(url: []const u8, https_with_query: bool) !void {
     if (url.len == 0 or url.len > max_field or !controlFree(url) or
         std.mem.indexOfAny(u8, url, " \\") != null) return error.InvalidUrl;
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    if ((!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) or
+    if ((!std.ascii.eqlIgnoreCase(uri.scheme, "https") and (https_with_query or !std.ascii.eqlIgnoreCase(uri.scheme, "http"))) or
         uri.host == null or uri.host.?.isEmpty() or uri.user != null or uri.password != null or
-        uri.query != null or uri.fragment != null) return error.InvalidUrl;
+        (!https_with_query and uri.query != null) or uri.fragment != null) return error.InvalidUrl;
 }
 
 /// Size of the encoded string contents, excluding the surrounding quotes.
@@ -413,10 +462,22 @@ fn writeRoute(w: *std.Io.Writer, proxy_url: ?[]const u8) !void {
 }
 
 fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: []const u8, timeout_ms: u32, body_limit: ?u32, explicit_route: bool, proxy_url: ?[]const u8) ![]u8 {
-    const payload_bytes = try payloadConfigLen(payload);
-    try validateUrl(url);
+    return makeHeaderConfig(a, url, headers, payload, timeout_ms, .{ .stream = body_limit }, explicit_route, proxy_url);
+}
+
+const HeaderConfig = union(enum) { buffered, stream: ?u32 };
+
+fn makeHeaderConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.http.Header, payload: ?[]const u8, timeout_ms: u32, mode: HeaderConfig, explicit_route: bool, proxy_url: ?[]const u8) ![]u8 {
+    const payload_bytes = if (payload) |p| blk: {
+        if (mode == .buffered) {
+            if (p.len > 1024 * 1024) return error.InvalidPayload;
+            if (p.len == 0) break :blk 0;
+        }
+        break :blk try payloadConfigLen(p);
+    } else 0;
+    try validateEndpoint(url, mode == .buffered);
     if (timeout_ms == 0) return error.InvalidTimeout;
-    if (body_limit != null and body_limit.? == 0 or headers.len > 16) return error.InvalidPayload;
+    if ((mode == .stream and mode.stream == 0) or headers.len > 16) return error.InvalidPayload;
     var header_bytes: usize = 0;
     for (headers) |h| {
         if (h.name.len == 0 or h.name.len > 128 or h.value.len > max_key + 32 or !controlFree(h.value)) return error.InvalidHeader;
@@ -428,20 +489,30 @@ fn makeStreamConfig(a: std.mem.Allocator, url: []const u8, headers: []const std.
     const buffer = try a.alloc(u8, try configCapacity(payload_bytes, fields));
     errdefer wipeFree(a, buffer);
     var w = std.Io.Writer.fixed(buffer);
-    try w.writeAll("silent\nhttp1.1\ngloboff\nretry = 0\ninclude\nsuppress-connect-headers\nno-buffer\n" ++
-        "proto = \"=http,https\"\nproto-redir = \"=https\"\nuser-agent = \"thin\"\nrequest = \"POST\"\n" ++
-        "header = \"content-type: application/json\"\nheader = \"accept-encoding: identity\"\n");
+    try w.writeAll("silent\nhttp1.1\ngloboff\nretry = 0\n");
+    switch (mode) {
+        .stream => try w.writeAll("include\nsuppress-connect-headers\nno-buffer\n" ++
+            "proto = \"=http,https\"\nproto-redir = \"=https\"\nuser-agent = \"thin\"\nrequest = \"POST\"\n" ++
+            "header = \"content-type: application/json\"\nheader = \"accept-encoding: identity\"\n"),
+        .buffered => {
+            try w.writeAll("no-location\nproto = \"=https\"\nuser-agent = \"thin\"\n");
+            try field(&w, "request", if (payload != null) "POST" else "GET");
+        },
+    }
     if (explicit_route) try writeRoute(&w, proxy_url);
     try field(&w, "url", url);
     var header: [max_key + 162]u8 = undefined;
     defer std.crypto.secureZero(u8, &header);
     for (headers) |h| try field(&w, "header", try std.fmt.bufPrint(&header, "{s}: {s}", .{ h.name, h.value }));
-    try field(&w, "data-binary", payload);
+    if (payload) |p| try field(&w, "data-binary", p);
     var number: [32]u8 = undefined;
     try field(&w, "max-time", try std.fmt.bufPrint(&number, "{d}.{d:0>3}", .{ timeout_ms / 1000, timeout_ms % 1000 }));
     const connect_ms = @min(timeout_ms, 10000);
     try field(&w, "connect-timeout", try std.fmt.bufPrint(&number, "{d}.{d:0>3}", .{ connect_ms / 1000, connect_ms % 1000 }));
-    if (body_limit) |limit| try field(&w, "max-filesize", try std.fmt.bufPrint(&number, "{d}", .{limit}));
+    switch (mode) {
+        .stream => |body_limit| if (body_limit) |limit| try field(&w, "max-filesize", try std.fmt.bufPrint(&number, "{d}", .{limit})),
+        .buffered => try field(&w, "write-out", "\n%{http_code}"),
+    }
     @memset(buffer[w.end..], 0);
     return buffer;
 }
@@ -502,7 +573,19 @@ const StreamParser = struct {
     }
 };
 
+const WireBuffer = struct { a: std.mem.Allocator, limit: usize, bytes: std.ArrayList(u8) = .empty };
+
+fn bufferChunk(raw: *anyopaque, bytes: []const u8) !void {
+    const writer: *WireBuffer = @ptrCast(@alignCast(raw));
+    if (bytes.len > writer.limit - writer.bytes.items.len) return error.CurlResponseTooLarge;
+    try writer.bytes.appendSlice(writer.a, bytes);
+}
+
 fn parseResponse(a: std.mem.Allocator, result: process.Result) !Response {
+    return parseResponseBytes(a, result, result.stdout);
+}
+
+fn parseResponseBytes(a: std.mem.Allocator, result: process.Result, bytes: []const u8) !Response {
     if (result.cleanup_failed or result.unreaped_pid != null) return error.CleanupFailed;
     if (result.canceled) return error.Canceled;
     if (result.timed_out) return error.Timeout;
@@ -512,7 +595,6 @@ fn parseResponse(a: std.mem.Allocator, result: process.Result) !Response {
         .exited => |code| if (code != 0) return error.TransportFailure,
         else => return error.TransportFailure,
     }
-    const bytes = result.stdout;
     if (bytes.len < 4 or result.stdout_bytes != bytes.len) return error.TransportFailure;
     const suffix = bytes[bytes.len - 4 ..];
     if (suffix[0] != '\n') return error.TransportFailure;

@@ -68,6 +68,86 @@ test "metadata malformed and duplicate caches remain untouched" {
         try std.testing.expectEqualStrings(case.body, result.data);
     }
 }
+test "metadata callers select explicit or scheme proxy without moving credentials" {
+    const Probe = struct {
+        url: []const u8 = "",
+        route: enum { explicit, environment, direct } = .direct,
+        auth: ?[]const u8 = null,
+        codex: bool = false,
+
+        fn inspect(raw: *anyopaque, client: ?*const curl.Client, url: []const u8, headers: []const std.http.Header) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings(self.url, url);
+            if (self.route == .direct) {
+                try std.testing.expect(client == null);
+            } else {
+                const route = client orelse return error.MissingProxy;
+                try std.testing.expectEqual(self.route == .explicit, route.explicit_route);
+                if (self.route == .explicit) {
+                    try std.testing.expectEqualStrings("http://127.0.0.1:8081", route.proxy_url orelse return error.MissingProxy);
+                    try std.testing.expect(route.env.get("no_proxy") == null);
+                } else {
+                    try std.testing.expectEqualStrings("http://127.0.0.1:8082", route.env.get("https_proxy") orelse return error.WrongScheme);
+                    try std.testing.expect(route.env.get("http_proxy") == null);
+                    try std.testing.expectEqualStrings("*", route.env.get("no_proxy").?);
+                }
+            }
+            // Exact set (also excludes credentials on OpenCode and models.dev).
+            try std.testing.expectEqual(@as(usize, 3) + @intFromBool(self.auth != null) + @as(usize, if (self.codex) 2 else 0), headers.len);
+            try header(headers, "User-Agent", "ThinAgent-metadata-check/1.0");
+            try header(headers, "Accept-Encoding", "identity");
+            try header(headers, "Accept", "application/json");
+            if (self.auth) |value| try header(headers, "Authorization", value);
+            if (self.codex) {
+                try header(headers, "chatgpt-account-id", "sample-account");
+                try header(headers, "originator", "thin");
+            }
+        }
+        fn header(headers: []const std.http.Header, name: []const u8, value: []const u8) !void {
+            for (headers) |h| if (std.ascii.eqlIgnoreCase(name, h.name)) return std.testing.expectEqualStrings(value, h.value);
+            return error.MissingHeader;
+        }
+    };
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HTTP_PROXY", "http://127.0.0.1:8083");
+    try env.put("HTTPS_PROXY", "http://127.0.0.1:8082");
+    try env.put("NO_PROXY", "*");
+    const cancel: p.Cancellation = .{};
+    var probe: Probe = .{};
+    var req: Request = .{ .io = std.testing.io, .env = &env, .timeout_ms = 5000, .cancel = &cancel, .test_wire = .{ .context = &probe, .get = Probe.inspect } };
+    for ([_]@TypeOf(probe.route){ .explicit, .environment, .direct }) |mode| {
+        probe.route = mode;
+        if (mode == .direct) try env.put("HTTPS_PROXY", ""); // HTTP_PROXY alone cannot route an HTTPS listing.
+        req.explicit_url = if (mode == .explicit) "http://127.0.0.1:8081" else null;
+        for (providers.Id.all) |id| {
+            probe.codex = id == .openai_codex;
+            probe.url = switch (id) {
+                .deepseek => "https://api.deepseek.com/models",
+                .opencode_go => "https://opencode.ai/inference/go/v1/models",
+                .opencode_zen => "https://opencode.ai/inference/v1/models",
+                .openai_codex => "https://chatgpt.com/backend-api/codex/models?client_version=" ++ @import("version.zig").number,
+            };
+            probe.auth = switch (id) {
+                .deepseek => "Bearer sample-key",
+                .openai_codex => "Bearer sample-token",
+                else => null,
+            };
+            if (probe.codex) {
+                var token = "sample-token".*;
+                var account = "sample-account".*;
+                const credential: codex_auth.RequestCredential = .{ .access_token = &token, .account_id = &account };
+                try std.testing.expectError(error.TestWireIntercepted, fetchCodexListing(a, req, &credential));
+            } else try std.testing.expectError(error.TestWireIntercepted, fetch(a, req, id, "sample-key"));
+        }
+        probe.url = "https://models.dev/api.json";
+        probe.auth = null;
+        probe.codex = false;
+        try std.testing.expectError(error.TestWireIntercepted, fetchDev(a, req));
+    }
+}
+
 test "Codex private fetch seam uses exact headers and fixed production scope" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -77,25 +157,33 @@ test "Codex private fetch seam uses exact headers and fixed production scope" {
     defer server.deinit(io);
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/models?client_version={s}", .{ server.socket.address.getPort(), @import("version.zig").number });
     defer a.free(url);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var cancel: p.Cancellation = .{};
+    var req: Request = .{ .io = io, .env = &env, .timeout_ms = 5000, .cancel = &cancel };
     var token = [_]u8{ 'f', 'a', 'k', 'e', '-', 't', 'o', 'k', 'e', 'n' };
     var account = [_]u8{ 'f', 'a', 'k', 'e', '-', 'a', 'c', 'c', 'o', 'u', 'n', 't' };
     const credential: codex_auth.RequestCredential = .{ .access_token = &token, .account_id = &account };
     var server_job = try std.Io.concurrent(io, serveCodexFixture, .{ io, &server });
     defer server_job.cancel(io) catch {};
-    var listing = try fetchCodexAt(a, io, &credential, null, 5000, url);
+    var listing = try fetchCodexAt(a, req, &credential, url);
     defer listing.deinit(a);
     try server_job.await(io);
     try std.testing.expectEqual(bit(.openai_codex), listing.directory_mask);
     try std.testing.expectEqualStrings("fake-token", &token);
-    var canceled: p.Cancellation = .{};
-    canceled.cancel();
-    try std.testing.expectError(error.Canceled, fetchCodexAt(a, io, &credential, &canceled, 5000, url));
-    try std.testing.expectError(error.RequestTimeout, fetchCodexAt(a, io, &credential, null, 0, url));
+    req.timeout_ms = 0;
+    try std.testing.expectError(error.RequestTimeout, fetchCodexAt(a, req, &credential, url));
+    cancel.cancel();
+    try std.testing.expectError(error.Canceled, fetchCodexAt(a, req, &credential, url));
 }
 test "metadata loopback transport success redirects size short body and cleanup" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const cancel: p.Cancellation = .{};
+    const req: Request = .{ .io = io, .env = &env, .timeout_ms = 5000, .cancel = &cancel };
     const close_head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
     const streamed_oversized = try a.alloc(u8, close_head.len + 512 * 1024 + 1);
     defer a.free(streamed_oversized);
@@ -116,9 +204,9 @@ test "metadata loopback transport success redirects size short body and cleanup"
         var worker = try std.Io.concurrent(io, serveMetadata, .{ io, &server, case.response, &cleaned });
         defer worker.cancel(io) catch {};
         if (case.err) |err| {
-            try std.testing.expectError(err, fetchUrl(a, io, url, "synthetic-test-key"));
+            try std.testing.expectError(err, fetchUrl(a, req, url, "synthetic-test-key"));
         } else {
-            const body = try fetchUrl(a, io, url, null);
+            const body = try fetchUrl(a, req, url, null);
             defer a.free(body);
             if (case.response.ptr != streamed_oversized.ptr) {
                 var parsed = try parseListing(a, body, .deepseek);
@@ -518,7 +606,7 @@ test "models.dev loopback transport parses a catalog larger than old size limit"
     const document =
         \\{"deepseek":{"id":"deepseek","models":{"deepseek-flash":{"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["high","max"]}],"provider":{"npm":"@ai-sdk/openai-compatible"}}}}}
     ;
-    // A valid catalog body larger than the official provider's 512 KiB limit.
+    // A valid catalog body larger than the former 512 KiB limit.
     const body = try a.alloc(u8, 512 * 1024 + document.len + 1);
     defer a.free(body);
     @memset(body, ' ');
@@ -529,10 +617,14 @@ test "models.dev loopback transport parses a catalog larger than old size limit"
     defer server.deinit(io);
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api.json", .{server.socket.address.getPort()});
     defer a.free(url);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const cancel: p.Cancellation = .{};
+    const req: Request = .{ .io = io, .env = &env, .timeout_ms = 5000, .cancel = &cancel };
     var cleaned = std.atomic.Value(bool).init(false);
     var worker = try std.Io.concurrent(io, servePublicMetadata, .{ io, &server, response, &cleaned });
     defer worker.cancel(io) catch {};
-    const fetched = try fetchUrl(a, io, url, null);
+    const fetched = try fetchUrl(a, req, url, null);
     defer a.free(fetched);
     var listing = try parseDev(a, fetched);
     defer listing.deinit(a);
@@ -550,7 +642,7 @@ test "models.dev loopback transport parses a catalog larger than old size limit"
     const oversized_head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
     var second_worker = try std.Io.concurrent(io, servePublicMetadata, .{ io, &second, oversized_head, &second_cleaned });
     defer second_worker.cancel(io) catch {};
-    try std.testing.expectError(error.IncompleteMetadata, fetchUrl(a, io, second_url, null));
+    try std.testing.expectError(error.IncompleteMetadata, fetchUrl(a, req, second_url, null));
     try second_worker.await(io);
     try std.testing.expect(second_cleaned.load(.acquire));
 }

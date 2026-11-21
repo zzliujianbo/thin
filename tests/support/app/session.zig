@@ -132,7 +132,7 @@ fn writeOfficialMetadataTestConfig(dir: std.Io.Dir, id: ProviderId) !void {
 
 const MetadataFixture = struct {
     var calls: std.atomic.Value(usize) = .init(0);
-    fn fetch(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+    fn fetch(a: std.mem.Allocator, _: metadata.Request, id: ProviderId, key: ?[]const u8) !metadata.Listing {
         _ = calls.fetchAdd(1, .monotonic);
         if (key == null or !std.mem.startsWith(u8, key.?, "fake-")) return error.InvalidFixtureKey;
         var values: metadata.Listing = .{};
@@ -146,15 +146,15 @@ const MetadataFixture = struct {
         };
         return values;
     }
-    fn fail(_: std.mem.Allocator, _: std.Io, _: ProviderId, _: ?[]const u8) !metadata.Listing {
+    fn fail(_: std.mem.Allocator, _: metadata.Request, _: ProviderId, _: ?[]const u8) !metadata.Listing {
         return error.FixtureOffline;
     }
-    fn stall(_: std.mem.Allocator, io: std.Io, _: ProviderId, _: ?[]const u8) !metadata.Listing {
-        try std.Io.sleep(io, .fromSeconds(30), .awake);
+    fn stall(_: std.mem.Allocator, request: metadata.Request, _: ProviderId, _: ?[]const u8) !metadata.Listing {
+        try std.Io.sleep(request.io, .fromSeconds(30), .awake);
         return error.UnexpectedFixtureTimeout;
     }
     /// Offline models.dev stand-in: a successful empty public catalog.
-    fn dev(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
+    fn dev(_: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
         return .{ .dev_done = true };
     }
     fn waitDone(io: std.Io, done: *std.atomic.Value(bool)) !void {
@@ -177,10 +177,10 @@ const MetadataFixture = struct {
 const MetadataPublicationFixture = struct {
     const Fault = enum { none, cache, display };
 
-    fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, _: ?[]const u8) !metadata.Listing {
+    fn official(a: std.mem.Allocator, _: metadata.Request, id: ProviderId, _: ?[]const u8) !metadata.Listing {
         return metadata.parseListing(a, "{\"data\":[{\"id\":\"deepseek-flash\",\"context_window\":65536,\"protocol\":\"chat\"}]}", id);
     }
-    fn public(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
+    fn public(_: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
         return .{ .dev_done = true };
     }
     fn hold(io: std.Io) void {
@@ -212,6 +212,7 @@ const MetadataPublicationFixture = struct {
         job.* = .{
             .allocator = a,
             .io = io,
+            .env = &env,
             .fetch = official,
             .dev_fetch = public,
             .manual = manual,
@@ -320,7 +321,7 @@ const MetadataPublicationFixture = struct {
 const LayeredMetadataFixture = struct {
     var official_effort: std.atomic.Value(bool) = .init(false);
     var dev_calls: std.atomic.Value(usize) = .init(0);
-    fn official(a: std.mem.Allocator, _: std.Io, id: ProviderId, key: ?[]const u8) !metadata.Listing {
+    fn official(a: std.mem.Allocator, _: metadata.Request, id: ProviderId, key: ?[]const u8) !metadata.Listing {
         if (id != .opencode_go or key == null or !std.mem.startsWith(u8, key.?, "fake-")) return error.UnexpectedFixtureCredential;
         const body = if (official_effort.load(.acquire))
             "{\"data\":[{\"id\":\"gpt-6-luna\"},{\"id\":\"claude-haiku-5-5\",\"effort\":{\"supported_levels\":[\"high\"]}}]}"
@@ -328,15 +329,15 @@ const LayeredMetadataFixture = struct {
             "{\"data\":[{\"id\":\"gpt-6-luna\",\"context_window\":262144},{\"id\":\"claude-haiku-5-5\",\"context_window\":65536}]}";
         return metadata.parseListing(a, body, id);
     }
-    fn dev(a: std.mem.Allocator, _: std.Io) !metadata.Listing {
+    fn dev(a: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
         _ = dev_calls.fetchAdd(1, .monotonic);
         return metadata.parseDev(a, @embedFile("models_dev_fixture.json"));
     }
-    fn devStall(_: std.mem.Allocator, io: std.Io) !metadata.Listing {
-        try std.Io.sleep(io, .fromSeconds(60), .awake);
+    fn devStall(_: std.mem.Allocator, request: metadata.Request) !metadata.Listing {
+        try std.Io.sleep(request.io, .fromSeconds(60), .awake);
         return error.UnexpectedFixtureTimeout;
     }
-    fn devFail(_: std.mem.Allocator, _: std.Io) !metadata.Listing {
+    fn devFail(_: std.mem.Allocator, _: metadata.Request) !metadata.Listing {
         return error.FixtureOffline;
     }
     fn row(records: *const @import("model_directory.zig").Directory, provider: ProviderId, raw_id: []const u8) @import("model_directory.zig").Record {
