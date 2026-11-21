@@ -15,6 +15,12 @@ pub const CodexLink = struct {
 
     pub const callback_hint = "Open link. Paste the localhost URL here (hidden), even if it won't load. Enter.";
 
+    const compact_hint = "Paste callback URL; Enter";
+
+    pub fn callbackHint(cols: usize) []const u8 {
+        return if (cols >= callback_hint.len) callback_hint else compact_hint;
+    }
+
     pub fn returnHint(cols: usize) []const u8 {
         return if (cols >= "Esc to return".len) "Esc to return" else if (cols >= 3) "Esc" else "⎋";
     }
@@ -22,7 +28,7 @@ pub const CodexLink = struct {
     /// Only use the physical margin for native selection when its exact
     /// position was verified for this draw; otherwise leave one cell free.
     pub fn fit(url: []const u8, cols: usize, exact: bool, budget: usize) CodexLink {
-        if (url.len == 0 or cols < callback_hint.len) return .{};
+        if (url.len == 0 or cols < compact_hint.len) return .{};
         if (!exact and url.len > cols) return .{};
         const width = cols + 1;
         const rows = 1 + (url.len - 1) / width;

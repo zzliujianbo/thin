@@ -81,6 +81,16 @@ test "callback requires registered literal redirect and unique matching decoded 
         defer wipeFree(a, owned);
         try std.testing.expectError(error.InvalidOAuthCallback, flow.callbackCode(a, owned));
     }
+    for ([_]struct { []const u8, anyerror }{
+        .{ "error=access_denied&state=" ++ state, error.OAuthDenied },
+        .{ "error=access_denied&state=stale", error.InvalidOAuthCallback },
+        .{ "error=access_denied&state=" ++ state ++ "&code=", error.InvalidOAuthCallback },
+        .{ "state=" ++ state ++ "&error=access_denied&error=other", error.InvalidOAuthCallback },
+    }) |example| {
+        const owned = try std.mem.concat(a, u8, &.{ prefix, example[0] });
+        defer wipeFree(a, owned);
+        try std.testing.expectError(example[1], flow.callbackCode(a, owned));
+    }
     var limit: [max_callback_bytes + 1]u8 = @splat('x');
     const start = prefix ++ "state=" ++ state ++ "&code=";
     @memcpy(limit[0..start.len], start);

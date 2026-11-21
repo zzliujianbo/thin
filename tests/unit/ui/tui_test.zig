@@ -78,9 +78,11 @@ test "Codex render stages only current input and shows the quarantine return key
     try ui.draw();
     try std.testing.expectEqual(@as(?u64, 7), ui.pending_codex_generation);
     discardFixtureFrame(&ui);
-    ui.size.columns = url.len + 1; // URL fits, instructions do not.
+    ui.size.columns = url.len + 1; // URL fits the narrower terminal with the compact hint.
     try ui.draw();
-    try std.testing.expect(ui.pending_codex_generation == null);
+    try std.testing.expectEqual(@as(?u64, 7), ui.pending_codex_generation);
+    try std.testing.expect(std.mem.find(u8, ui.frame, url) != null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Paste callback URL; Enter") != null);
     discardFixtureFrame(&ui);
     ui.size.columns = 80;
     ui.codex_generation = 6;
@@ -92,8 +94,13 @@ test "Codex render stages only current input and shows the quarantine return key
     try ui.draw();
     try std.testing.expect(std.mem.find(u8, ui.frame, "Waiting for Codex login") != null and ui.pending_codex_generation == null);
     discardFixtureFrame(&ui);
-    ui.codex_open = false;
-    ui.codex_quarantine = true;
+    fake.codex.status = .failed;
+    fake.codex.failure = .denied;
+    ui.observeCodexLogin();
+    try ui.draw();
+    try std.testing.expect(ui.frame_codex_return and ui.pending_codex_generation == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "OpenAI Codex login denied") != null);
+    discardFixtureFrame(&ui);
     ui.size = .{ .rows = 2, .columns = 8 };
     try ui.draw();
     try std.testing.expect(ui.frame_codex_return and ui.pending_codex_generation == null);

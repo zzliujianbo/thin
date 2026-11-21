@@ -2464,6 +2464,7 @@ pub const Client = struct {
         const self = fromContext(context);
         // Only start may create a session. Never route an old callback to a
         // replacement worker or the launcher's control socket.
+        if (action == .start and generation != 0) return error.InvalidSequence;
         if (action == .submit) {
             const callback = action.submit;
             if (callback.len == 0 or callback.len > codex_login.max_callback_bytes or

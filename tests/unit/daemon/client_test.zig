@@ -746,6 +746,8 @@ test "browser callback admission rejects invalid or detached input without IPC" 
     for ([_][]const u8{ "", &oversized, "x\x00y", "\xff" }) |bytes| {
         try testing.expectError(error.InvalidInput, Client.codexLoginFn(pair.client, .{ .submit = bytes }, 1));
     }
+    try testing.expectError(error.InvalidSequence, Client.codexLoginFn(pair.client, .start, 1));
+    try testing.expect(pair.client.conn == null);
     try testing.expectError(error.StaleControl, Client.codexLoginFn(pair.client, .{ .submit = browser_test_callback }, 1));
     try expectNoFrame(&pair);
 }

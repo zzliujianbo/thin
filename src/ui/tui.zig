@@ -4126,6 +4126,18 @@ const Ui = struct {
         self.requestDraw();
     }
 
+    fn codexFailureText(failure: corecodex.Failure) []const u8 {
+        return switch (failure) {
+            .unavailable => "OpenAI Codex login unavailable",
+            .denied => "OpenAI Codex login denied",
+            .expired => "OpenAI Codex login expired",
+            .busy => "OpenAI Codex login busy",
+            .invalid_response => "OpenAI Codex login response invalid",
+            .storage => "OpenAI Codex login could not be saved",
+            .other => "OpenAI Codex login failed",
+        };
+    }
+
     fn observeCodexLogin(self: *Ui) void {
         if (!self.codex_open and !self.codex_opening) return;
         if (self.codex_opening and self.codex_from_launcher) return;
@@ -4171,15 +4183,7 @@ const Ui = struct {
             },
             .failed => {
                 self.closeCodexLogin();
-                self.notice = switch (view.failure orelse .other) {
-                    .unavailable => "OpenAI Codex login unavailable",
-                    .denied => "OpenAI Codex login denied",
-                    .expired => "OpenAI Codex login expired",
-                    .busy => "OpenAI Codex login busy",
-                    .invalid_response => "OpenAI Codex login response invalid",
-                    .storage => "OpenAI Codex login could not be saved",
-                    .other => "OpenAI Codex login failed",
-                };
+                self.notice = codexFailureText(view.failure orelse .other);
                 self.requestDraw();
             },
             .pending => {
@@ -7366,6 +7370,11 @@ const Ui = struct {
         const hint_line: []const u8 = if (codex_surface) blk: {
             if (std.mem.eql(u8, self.notice, "Ready") or std.mem.eql(u8, self.notice, pending_session_notice))
                 break :blk if (codex_return) "" else "Esc cancels";
+            // Preserve the fixed failure reason while the return screen owns input.
+            if (codex_return and state.codex_login.status == .failed) {
+                const reason = codexFailureText(state.codex_login.failure orelse .other);
+                if (std.mem.eql(u8, self.notice, reason)) break :blk reason;
+            }
             // Callback errors are local, fixed captions, never server payloads.
             if (std.mem.eql(u8, self.notice, "Invalid callback; Ctrl-U clears") or
                 std.mem.eql(u8, self.notice, "Paste the callback URL; Ctrl-U clears") or
@@ -7463,7 +7472,7 @@ const Ui = struct {
         const codex_prompt: []const u8 = if (codex_return)
             presentation.CodexLink.returnHint(cols)
         else if (link.rows != 0)
-            presentation.CodexLink.callback_hint
+            presentation.CodexLink.callbackHint(cols)
         else if (url.len != 0)
             "Resize terminal to show login link"
         else if (self.codex_submitted or self.codex_cancel_waiting or self.codex_open)

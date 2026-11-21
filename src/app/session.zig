@@ -145,6 +145,7 @@ const CodexLoginJob = struct {
                 self.view.status = .failed;
                 self.view.failure = switch (err) {
                     error.OAuthTimeout => .expired,
+                    error.OAuthDenied => .denied,
                     error.InvalidAuthorizationUrl, error.InvalidOAuthCallback => .invalid_response,
                     error.OAuthLoginConflict, error.AuthStoreBusy => .busy,
                     error.OAuthCommitFailed => .storage,

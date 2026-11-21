@@ -78,6 +78,7 @@ pub const BrowserAuth = struct {
         defer fields.deinit(a);
         var code: ?[]const u8 = null;
         var matched = false;
+        var denial: ?bool = null;
         var rest = callback[prefix.len..];
         while (true) {
             const end = std.mem.findScalar(u8, rest, '&') orelse rest.len;
@@ -86,13 +87,15 @@ pub const BrowserAuth = struct {
             const key = try decodeField(field[0..eq]);
             const value = try decodeField(field[eq + 1 ..]);
             if (key.len == 0 or (try fields.getOrPut(a, key)).found_existing) return error.InvalidOAuthCallback;
-            if (std.mem.eql(u8, key, "error")) return error.InvalidOAuthCallback;
+            if (std.mem.eql(u8, key, "error")) denial = std.mem.eql(u8, value, "access_denied");
             if (std.mem.eql(u8, key, "state")) matched = std.mem.eql(u8, value, &self.state);
             if (std.mem.eql(u8, key, "code") and value.len != 0) code = value;
             if (end == rest.len) break;
             rest = rest[end + 1 ..];
         }
         if (!matched) return error.InvalidOAuthCallback;
+        // A denial is meaningful only for this attempt, without a code field.
+        if (denial) |denied| return if (denied and !fields.contains("code")) error.OAuthDenied else error.InvalidOAuthCallback;
         return code orelse error.InvalidOAuthCallback;
     }
 };
