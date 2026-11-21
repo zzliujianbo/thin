@@ -1,3 +1,105 @@
+test "Codex render keeps a margin-ending public URL contiguous and never paints callback input" {
+    const abi = @import("../platform/terminal_abi.zig");
+    var size = std.mem.zeroes(std.c.winsize);
+    size.col = 80;
+    size.row = 24;
+    var master: c_int = undefined;
+    var slave: c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), abi.openpty(&master, &slave, null, null, &size));
+    defer _ = std.c.close(slave);
+    defer _ = std.c.close(master);
+    var terminal = fixture_terminal;
+    terminal.fd = slave; // Only the geometry probe uses this disposable PTY.
+    var fake: FakeRemote = .{};
+    fake.codex = .{ .generation = 31, .status = .pending };
+    const prefix = "https://auth.openai.com/oauth/authorize?response_type=code&state=";
+    @memcpy(fake.codex.url[0..prefix.len], prefix);
+    @memset(fake.codex.url[prefix.len..800], 's');
+    fake.codex.url_len = 800;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.terminal = &terminal;
+    ui.natural_flow = true;
+    ui.connection = .{ .context = &fake, .current_fn = FakeRemote.current, .configure_fn = FixtureConnection.configure };
+    ui.codex_open = true;
+    ui.codex_generation = 31;
+    _ = try ui.editor.insert("ordinary draft not in login panel");
+    try ui.draw();
+    const url = fake.codex.authorizationUrl();
+    const at = std.mem.find(u8, ui.frame, url) orelse return error.MissingFullLink;
+    // Exactly ten physical rows: no hard breaks inside, no EL erasing the last cell.
+    try std.testing.expect(std.mem.startsWith(u8, ui.frame[at + url.len ..], theme.reset ++ "\r\n"));
+    try std.testing.expect(std.mem.find(u8, ui.frame, presentation.CodexLink.callback_hint) != null);
+    try std.testing.expectEqual(@as(?u64, 31), ui.pending_codex_generation);
+    try std.testing.expect(ui.frame_height >= 12 and !ui.frame_sparse);
+    try std.testing.expect(std.mem.find(u8, ui.frame, ui.editor.bytes.items) == null);
+    const empty = try std.testing.allocator.dupe(u8, ui.frame);
+    defer std.testing.allocator.free(empty);
+    discardFixtureFrame(&ui);
+    ui.codex_callback.insert("http://localhost:1455/auth/callback?code=SYNTHETIC-PRIVATE");
+    try ui.draw();
+    try std.testing.expectEqualSlices(u8, empty, ui.frame); // No echo, mask, or length side channel.
+    discardFixtureFrame(&ui);
+
+    ui.size.rows = 8;
+    try ui.draw();
+    try std.testing.expect(ui.pending_codex_generation == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, prefix) == null);
+    discardFixtureFrame(&ui);
+    ui.size.rows = 24;
+    ui.terminal = &fixture_terminal; // Unknown physical margin: don't invent native wraps.
+    try ui.draw();
+    try std.testing.expect(ui.pending_codex_generation == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, prefix) == null);
+}
+
+test "Codex render stages only current input and shows the quarantine return key on a short terminal" {
+    var fake: FakeRemote = .{};
+    fake.codex = .{ .generation = 7, .status = .pending };
+    const url = "https://auth.openai.com/oauth/authorize?state=synthetic";
+    @memcpy(fake.codex.url[0..url.len], url);
+    fake.codex.url_len = url.len;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = .{ .context = &fake, .current_fn = FakeRemote.current, .configure_fn = FixtureConnection.configure };
+    ui.codex_opening = true;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Opening Codex login") != null and ui.pending_codex_generation == null);
+    discardFixtureFrame(&ui);
+    ui.codex_opening = false;
+    ui.codex_open = true;
+    ui.codex_generation = 7;
+    try ui.draw();
+    try std.testing.expectEqual(@as(?u64, 7), ui.pending_codex_generation);
+    discardFixtureFrame(&ui);
+    ui.size.columns = url.len + 1; // URL fits, instructions do not.
+    try ui.draw();
+    try std.testing.expect(ui.pending_codex_generation == null);
+    discardFixtureFrame(&ui);
+    ui.size.columns = 80;
+    ui.codex_generation = 6;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, url) == null and ui.pending_codex_generation == null);
+    discardFixtureFrame(&ui);
+    ui.codex_generation = 7;
+    ui.codex_submitted = true;
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Waiting for Codex login") != null and ui.pending_codex_generation == null);
+    discardFixtureFrame(&ui);
+    ui.codex_open = false;
+    ui.codex_quarantine = true;
+    ui.size = .{ .rows = 2, .columns = 8 };
+    try ui.draw();
+    try std.testing.expect(ui.frame_codex_return and ui.pending_codex_generation == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "Esc") != null);
+}
+
 test "restored assistant keeps a bounded canonical mirror for a large static source" {
     const a = std.testing.allocator;
     var source: std.ArrayList(u8) = .empty;
@@ -9684,7 +9786,7 @@ test "higher priority input owners hide confirmations and frame authority" {
             try screen.replay(ui.frame);
             try std.testing.expect(ui.frame_permission == null and ui.frame_stop == null);
             try std.testing.expect(!screen.visible("Y allow once") and !screen.visible("Task running"));
-            if (owner == 2) try std.testing.expect(screen.visible("Waiting for device code..."));
+            if (owner == 2) try std.testing.expect(screen.visible("Waiting for Codex login..."));
         }
     }
 }
@@ -13366,11 +13468,21 @@ test "remote stop requested for a replaced owner is never unbound by a late clos
     try std.testing.expectEqual(@as(usize, 2), fake.confirmings);
     try std.testing.expect(!ui.stop_open);
 }
-test "Codex device login binds generation and publishes success once" {
+const test_codex_link = "https://auth.openai.com/oauth/authorize?state=synthetic";
+const test_codex_callback = "http://localhost:1455/auth/callback?code=PRIVATE_SYNTHETIC&state=synthetic";
+
+fn pendingCodexFixture(generation: u64) corecodex.View {
+    var view = corecodex.View{ .generation = generation, .status = .pending, .url_len = test_codex_link.len };
+    @memcpy(view.url[0..test_codex_link.len], test_codex_link);
+    return view;
+}
+
+test "Codex browser login submits privately for its generation and publishes success once" {
     const Owner = struct {
         state: Connection.State = .{ .runtime = null, .model = "", .base_url = "" },
         starts: usize = 0,
         cancels: usize = 0,
+        submits: usize = 0,
         canceled_generation: u64 = 0,
         fn current(raw: *anyopaque) Connection.State {
             return @as(*@This(), @ptrCast(@alignCast(raw))).state;
@@ -13387,6 +13499,11 @@ test "Codex device login binds generation and publishes success once" {
                     self.cancels += 1;
                     self.canceled_generation = generation;
                 },
+                .submit => |callback| {
+                    try std.testing.expectEqual(@as(u64, 5), generation);
+                    try std.testing.expectEqualStrings(test_codex_callback, callback);
+                    self.submits += 1;
+                },
             }
         }
     };
@@ -13402,9 +13519,7 @@ test "Codex device login binds generation and publishes success once" {
     try std.testing.expect(ui.codex_open and ui.codex_generation == null and owner.starts == 1);
     ui.observeCodexLogin(); // Previous success cannot complete the new attempt.
     try std.testing.expect(ui.codex_open and ui.records.items.len == 0);
-    owner.state.codex_login = .{ .generation = 5, .status = .pending };
-    @memcpy(owner.state.codex_login.code[0..7], "ABC-123");
-    owner.state.codex_login.code_len = 7;
+    owner.state.codex_login = pendingCodexFixture(5);
     ui.observeCodexLogin();
     try std.testing.expectEqual(@as(?u64, 5), ui.codex_generation);
     ui.dirty = false;
@@ -13412,9 +13527,22 @@ test "Codex device login binds generation and publishes success once" {
     ui.observeCodexLogin();
     try std.testing.expect(!ui.dirty and !ui.display_changed);
     try ui.draw();
-    try std.testing.expect(std.mem.find(u8, ui.frame, corecodex.verification_url) != null);
-    try std.testing.expect(std.mem.find(u8, ui.frame, "ABC-123") != null);
-    discardFixtureFrame(&ui);
+    try std.testing.expect(std.mem.find(u8, ui.frame, test_codex_link) != null);
+    const keys: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed(test_codex_callback ++ "\r", keys); // First frame not acknowledged.
+    try std.testing.expect(owner.submits == 0 and ui.codex_callback.len == 0);
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\x1b[200~" ++ test_codex_callback ++ "\x1b[20", keys);
+    try ui.parser.feed("1~\r\x03tail", keys); // A paste terminator is not confirmation or cancel.
+    try std.testing.expect(owner.submits == 0 and owner.cancels == 0);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "PRIVATE_SYNTHETIC") == null);
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\rignored", keys);
+    try ui.parser.feed("\r", keys);
+    try std.testing.expect(owner.submits == 1 and ui.codex_submitted);
+    try std.testing.expect(std.mem.allEqual(u8, &ui.codex_callback.bytes, 0));
+    try std.testing.expect(ui.editor.bytes.items.len == 0 and ui.input_history.entries.items.len == 0 and ui.records.items.len == 0);
     owner.state.codex_login = .{ .generation = 4, .status = .succeeded };
     ui.observeCodexLogin();
     try std.testing.expect(ui.codex_open);
@@ -13430,6 +13558,15 @@ test "Codex device login binds generation and publishes success once" {
     owner.state.codex_login = .{ .generation = 6, .status = .pending };
     ui.observeCodexLogin();
     try std.testing.expect(!ui.codex_open and owner.cancels == 1 and owner.canceled_generation == 6);
+
+    // A delayed paste after cancellation remains private until explicit return.
+    try ui.parser.feed(test_codex_callback ++ "\r", keys);
+    try std.testing.expect(ui.codex_quarantine and ui.editor.bytes.items.len == 0);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\x1b", keys);
+    try ui.parser.expireEscape(keys);
+    try std.testing.expect(!ui.codex_quarantine);
 
     // Picker confirmation requires a completely acknowledged fresh frame.
     ui.openProviderPicker();
@@ -13452,6 +13589,10 @@ test "Codex device login binds generation and publishes success once" {
     ui.observeCodexLogin();
     try Ui.key(&ui, .escape);
     try std.testing.expectEqual(@as(u64, 7), owner.canceled_generation);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\x1b", keys);
+    try ui.parser.expireEscape(keys);
     _ = try ui.editor.insert("/login openai-codex");
     try ui.submit();
     try std.testing.expectEqualStrings("Unknown command; use /model, /login, /compact or /settings", ui.notice);
@@ -13477,7 +13618,7 @@ test "remote codex login opens only after the owner receipt and cancels its exac
     // Queue admission is not owner acceptance: no panel, no bound generation.
     try std.testing.expect(ui.codex_opening and !ui.codex_open and ui.codex_generation == null);
     try std.testing.expectEqual(@as(usize, 1), actions.next);
-    try std.testing.expectEqual(corecodex.Action.start, actions.requests[0].?.action.codex_login.action);
+    try std.testing.expect(actions.requests[0].?.action.codex_login.action == .start);
     try std.testing.expectEqual(@as(u64, 0), actions.requests[0].?.action.codex_login.generation);
     ui.observeCodexLogin();
     try std.testing.expect(!ui.codex_open and ui.records.items.len == 0);
@@ -13489,15 +13630,13 @@ test "remote codex login opens only after the owner receipt and cancels its exac
 
     // The owner accepts the start and publishes the pending attempt; the
     // deferred Esc then travels as a typed cancel for that exact generation.
-    fake.codex = .{ .generation = 5, .status = .pending };
-    @memcpy(fake.codex.code[0..7], "ABC-123");
-    fake.codex.code_len = 7;
+    fake.codex = pendingCodexFixture(5);
     actions.complete(.none, null, false);
     ui.pumpAsync();
     try std.testing.expect(ui.codex_open and ui.codex_generation == 5);
     try std.testing.expect(ui.presentationWaiting());
     try std.testing.expectEqual(@as(usize, 2), actions.next);
-    try std.testing.expectEqual(corecodex.Action.cancel, actions.requests[1].?.action.codex_login.action);
+    try std.testing.expect(actions.requests[1].?.action.codex_login.action == .cancel);
     try std.testing.expectEqual(@as(u64, 5), actions.requests[1].?.action.codex_login.generation);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 
@@ -13543,6 +13682,52 @@ test "remote codex login opens only after the owner receipt and cancels its exac
     try std.testing.expectEqualStrings("Ready", ui.notice);
     try std.testing.expectEqual(@as(usize, 0), ui.records.items.len);
 }
+test "Codex launcher login adopts its worker and drops private read tails across reconnect" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true } };
+    var actions: FakeAsync = .{};
+    defer actions.deinit();
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    ui.connection.async_actions = actions.channel();
+    ui.startCodexLogin();
+    ui.observeCodexLogin();
+    try std.testing.expect(ui.codex_opening);
+    fake.snapshot.attached = true;
+    fake.snapshot.control_epoch = 7;
+    fake.codex = pendingCodexFixture(1);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expectEqual(@as(u64, 7), ui.remote_epoch);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    const keys: input.Sink = .{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed(test_codex_callback ++ "\r", keys);
+    try std.testing.expectEqual(@as(usize, 2), actions.next);
+    try std.testing.expectEqualStrings(test_codex_callback, actions.requests[1].?.action.codex_login.action.submit);
+    try std.testing.expectEqual(@as(u64, 1), actions.requests[1].?.action.codex_login.generation);
+    try std.testing.expect(std.mem.allEqual(u8, &ui.codex_callback.bytes, 0));
+    try ui.parser.feed("\x1b[20", keys); // Start marker split by loss of ownership.
+    fake.snapshot.control_epoch = 8;
+    try ui.resetSessionView(&fake.snapshot);
+    actions.complete(.none, null, false);
+    ui.pumpAsync();
+    try std.testing.expect(ui.codex_quarantine and !ui.codex_open);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("0~" ++ test_codex_callback ++ "\x1b[201~\x1b", keys);
+    try ui.parser.expireEscape(keys);
+    try ui.parser.feed("delayed\r", keys);
+    try std.testing.expect(ui.codex_quarantine and ui.editor.bytes.items.len == 0);
+    try std.testing.expectEqual(@as(usize, 0), ui.input_history.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), actions.next);
+    try ui.parser.feed("\x1b", keys);
+    try ui.parser.expireEscape(keys);
+    try std.testing.expect(!ui.codex_quarantine);
+}
+
 test "local stop keeps gating the UI inbox without a remote barrier request" {
     var cancel: p.Cancellation = .{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);

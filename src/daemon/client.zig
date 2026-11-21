@@ -271,7 +271,7 @@ const Request = struct {
         const bytes = try self.out.finish();
         defer {
             std.crypto.secureZero(u8, bytes);
-            client.a.free(bytes);
+            self.out.a.free(bytes);
         }
         const conn = if (client.conn) |*value| value else return error.Unavailable;
         conn.writeFrame(bytes, client.waitFor(timeout_ms)) catch |err| {
@@ -363,6 +363,7 @@ const ClientMode = enum { foreground, connect };
 
 pub const Client = struct {
     a: std.mem.Allocator,
+    request_wiping: core_config.WipingAllocator,
     io: std.Io,
     uid: u32,
     environ: ?*const std.process.Environ.Map,
@@ -476,6 +477,7 @@ pub const Client = struct {
         const owned_launcher = try a.dupe(u8, launcher);
         self.* = .{
             .a = a,
+            .request_wiping = .{ .backing = a },
             .io = io,
             .uid = @intCast(std.c.getuid()),
             .environ = environ,
@@ -577,10 +579,15 @@ pub const Client = struct {
     /// object and `finish()` closes it, so `beginObjectRaw` must not be used here
     /// (it would leave the builder one level deep and `finish` rejects it).
     fn request(self: *Client, op: protocol.Op) !Request {
-        var out = protocol.Out.init(self.a);
+        // Growth and finish can release old backing storage before deinit.
+        const a = switch (op) {
+            .login, .codex_login => self.request_wiping.allocator(),
+            else => self.a,
+        };
+        var out = protocol.Out.init(a);
         errdefer out.deinit();
         const id = self.allocRequestId();
-        try out.buf.append(self.a, '{');
+        try out.buf.append(a, '{');
         try out.field("v", protocol.version);
         try out.field("id", id);
         try out.field("op", @tagName(op));
@@ -993,12 +1000,11 @@ pub const Client = struct {
             };
             cache.codex_login.generation = get.uint(login_view, "generation") orelse return error.ProtocolError;
             cache.codex_login.status = std.meta.stringToEnum(codex_login.Status, get.text(login_view, "status") orelse return error.ProtocolError) orelse return error.ProtocolError;
-            const code = get.text(login_view, "code") orelse return error.ProtocolError;
-            if (code.len > cache.codex_login.code.len) return error.ProtocolError;
-            for (code) |c| if (c < 0x21 or c > 0x7e) return error.ProtocolError;
-            if (code.len != 0 and cache.codex_login.status != .pending) return error.ProtocolError;
-            @memcpy(cache.codex_login.code[0..code.len], code);
-            cache.codex_login.code_len = @intCast(code.len);
+            if (login_view.count() != 4) return error.ProtocolError;
+            const url = get.text(login_view, "url") orelse return error.ProtocolError;
+            if (url.len != 0 and (cache.codex_login.status != .pending or !codex_login.validAuthorizationUrl(url))) return error.ProtocolError;
+            @memcpy(cache.codex_login.url[0..url.len], url);
+            cache.codex_login.url_len = @intCast(url.len);
             const failure = login_view.get("failure") orelse return error.ProtocolError;
             cache.codex_login.failure = switch (failure) {
                 .null => null,
@@ -2228,7 +2234,7 @@ pub const Client = struct {
         const bytes = try req.out.finish();
         defer {
             std.crypto.secureZero(u8, bytes);
-            self.a.free(bytes);
+            req.out.a.free(bytes);
         }
         const conn = if (self.control) |*value| value else return error.Unavailable;
         conn.writeFrame(bytes, self.waitFor(timeout_ms)) catch |err| {
@@ -2456,12 +2462,23 @@ pub const Client = struct {
 
     fn codexLoginFn(context: *anyopaque, action: codex_login.Action, generation: u64) anyerror!void {
         const self = fromContext(context);
-        // Authentication belongs to an actual session owner, not daemon setup.
-        if (self.conn == null) try self.ensureSession();
-        var req = try self.settingsRequest(.codex_login);
+        // Only start may create a session. Never route an old callback to a
+        // replacement worker or the launcher's control socket.
+        if (action == .submit) {
+            const callback = action.submit;
+            if (callback.len == 0 or callback.len > codex_login.max_callback_bytes or
+                std.mem.findScalar(u8, callback, 0) != null or !std.unicode.utf8ValidateSlice(callback)) return error.InvalidInput;
+        }
+        if (self.conn == null) {
+            if (action != .start) return error.StaleControl;
+            try self.ensureSession();
+        }
+        var req = try self.request(.codex_login);
         defer req.deinit();
+        try req.put("epoch", self.epoch);
         try req.put("action", @tagName(action));
         try req.put("generation", generation);
+        if (action == .submit) try req.put("callback", action.submit);
         var resp = try req.exchange(quick_timeout_ms);
         defer resp.deinit();
         self.refreshSnapshot();

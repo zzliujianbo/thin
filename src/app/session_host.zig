@@ -12,8 +12,8 @@
 //! - `pump` admits Bridge items only while bounded unacknowledged live
 //!   retention has room. The owner continues polling controls while a slow or
 //!   absent viewer backpressures the Runtime. IPC never reads live slices.
-//! - Connection EOF calls `disconnected`, which only revokes the controller
-//!   epoch/view. It never cancels the task and never closes the Bridge.
+//! - Connection EOF revokes its controller epoch and pending browser login.
+//!   It never cancels the conversation task or closes the Bridge.
 //!
 //! Wire semantics are documented in `.pi/daemon-backend-api.md`.
 
@@ -967,6 +967,10 @@ pub const SessionHost = struct {
     pub fn disconnected(self: *SessionHost, connection_id: u64) void {
         if (self.controller) |controller| {
             if (controller.connection != connection_id) return;
+            // The private browser rendezvous belongs to this control epoch.
+            // A replacement controller must never complete its predecessor's login.
+            const login = self.session.codexLoginView();
+            if (login.status == .pending) self.session.cancelCodexLogin(login.generation) catch {};
             // An EOF must release the confirmation barrier: otherwise automatic
             // claims stay suspended with nobody left to confirm or resume.
             self.inbox.pauseClaims(false);
@@ -1026,6 +1030,7 @@ pub const SessionHost = struct {
     /// Idempotent; a second call after a successful shutdown returns immediately.
     pub fn shutdown(self: *SessionHost) !void {
         if (self.closing) return;
+        self.session.closeCodexLogin();
         if (self.task) |*owned| {
             self.cancel.cancel();
             if (!owned.joined) owned.future.await(self.io);
@@ -1269,7 +1274,7 @@ pub const SessionHost = struct {
         }
         // Replacing the controller (takeover or same-socket re-attach) retires
         // the previous epoch's confirmation barrier; it belongs to that owner.
-        if (self.controller != null) self.inbox.pauseClaims(false);
+        if (self.controller) |old| self.disconnected(old.connection);
         self.epoch_seq +%= 1;
         if (self.epoch_seq == 0) self.epoch_seq = 1;
         self.controller = .{ .epoch = self.epoch_seq, .connection = connection_id, .permission = self.pending_permission, .delivered = self.events.reclaimed_through };
@@ -1284,8 +1289,7 @@ pub const SessionHost = struct {
         const epoch = request.u64Field("epoch") catch return errorReply(a, request.id, error.BadRequest);
         if (self.controller) |controller| {
             if (controller.epoch == epoch and controller.connection == connection_id) {
-                self.inbox.pauseClaims(false);
-                self.controller = null;
+                self.disconnected(connection_id);
             }
         }
         var out = protocol.Out.init(a);
@@ -2080,15 +2084,22 @@ pub const SessionHost = struct {
     fn handleCodexLogin(self: *SessionHost, a: std.mem.Allocator, request: *const protocol.Request, connection_id: u64) ![]u8 {
         const epoch = request.u64Field("epoch") catch return errorReply(a, request.id, error.BadRequest);
         self.requireControl(connection_id, epoch) catch |err| return errorReply(a, request.id, err);
-        const action = request.stringEnum(codex_login.Action, "action") catch return errorReply(a, request.id, error.BadRequest);
+        const action = request.stringEnum(std.meta.Tag(codex_login.Action), "action") catch return errorReply(a, request.id, error.BadRequest);
         const generation = request.u64Field("generation") catch return errorReply(a, request.id, error.BadRequest);
+        if (action != .submit and request.field("callback") != null) return errorReply(a, request.id, error.BadRequest);
         switch (action) {
             .start => {
+                if (self.closing) return errorReply(a, request.id, error.Unavailable);
+                if (generation != 0) return errorReply(a, request.id, error.InvalidSequence);
                 self.ensureIdle() catch |err| return errorReply(a, request.id, err);
                 if (self.fatal != null) return errorReply(a, request.id, error.Unavailable);
                 self.session.startCodexLogin() catch |err| return errorReply(a, request.id, err);
             },
             .cancel => self.session.cancelCodexLogin(generation) catch |err| return errorReply(a, request.id, err),
+            .submit => {
+                const callback = request.stringField("callback", codex_login.max_callback_bytes) catch |err| return errorReply(a, request.id, err);
+                self.session.submitCodexLogin(generation, callback) catch |err| return errorReply(a, request.id, err);
+            },
         }
         var out = protocol.Out.init(a);
         defer out.deinit();

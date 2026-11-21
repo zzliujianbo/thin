@@ -2,14 +2,14 @@ test "synchronous codex login requires async action" {
     var context: u8 = 0;
     try std.testing.expectError(error.AsyncRequired, Frontend.noCodexLogin(&context, .start, 1));
 }
-test "pending codex code publication wakes once" {
+test "pending codex URL publication wakes once" {
     var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
     defer frontend.view.deinit();
     defer if (frontend.retired) |retired| retired.deinit();
     frontend.view.state.codex_login = .{ .generation = 3, .status = .pending };
     const pending = try testProjection(false, "model");
-    pending.state.codex_login = .{ .generation = 3, .status = .pending, .code_len = 4 };
-    @memcpy(pending.state.codex_login.code[0..4], "ABCD");
+    pending.state.codex_login = .{ .generation = 3, .status = .pending, .url_len = frontend_test_url.len };
+    @memcpy(pending.state.codex_login.url[0..frontend_test_url.len], frontend_test_url);
     frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = pending });
     try std.testing.expect(Frontend.metadataOwned(&frontend, false));
     try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
@@ -18,18 +18,18 @@ test "identical and stale codex views do not wake" {
     var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "model"), .revision = 10 };
     defer frontend.view.deinit();
     defer if (frontend.retired) |retired| retired.deinit();
-    frontend.view.state.codex_login = .{ .generation = 3, .status = .pending, .code_len = 4 };
-    @memcpy(frontend.view.state.codex_login.code[0..4], "ABCD");
+    frontend.view.state.codex_login = .{ .generation = 3, .status = .pending, .url_len = frontend_test_url.len };
+    @memcpy(frontend.view.state.codex_login.url[0..frontend_test_url.len], frontend_test_url);
     const same = try testProjection(false, "model");
     same.state.codex_login = frontend.view.state.codex_login;
-    same.state.codex_login.code[5] = 42; // Unused array padding is not presentation.
+    same.state.codex_login.url[frontend_test_url.len] = 42; // Unused array padding is not presentation.
     frontend.adopt(.{ .generation = 1, .revision = 11, .watermark = 0, .ordered = false, .projection = same });
     try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
     const stale = try testProjection(false, "model");
     stale.state.codex_login = .{ .generation = 2, .status = .failed, .failure = .denied };
     frontend.adopt(.{ .generation = 1, .revision = 10, .watermark = 0, .ordered = false, .projection = stale });
     try std.testing.expect(!Frontend.metadataOwned(&frontend, false));
-    try std.testing.expectEqualStrings("ABCD", frontend.view.state.codex_login.userCode());
+    try std.testing.expectEqualStrings(frontend_test_url, frontend.view.state.codex_login.authorizationUrl());
 }
 test "configuration-only publications notify the UI once without polling the owner" {
     var frontend: Frontend = .{ .a = std.testing.allocator, .communication = undefined, .view = try testProjection(false, "old"), .revision = 10 };

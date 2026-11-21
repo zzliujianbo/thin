@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v6 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v7 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -26,11 +26,13 @@ const line_stats = @import("../util/line_stats.zig");
 const codex_login = @import("../core/codex_login.zig");
 const background = @import("../core/background_status.zig");
 
-/// Private daemon/worker IPC version. v6 removes the `setting` operation.
+const WipingAllocator = @import("../core/config.zig").WipingAllocator;
+
+/// Private daemon/worker IPC version. v7 replaces the device code with a browser URL.
 /// Peers are matched exactly: there is
 /// no older-wire compatibility path, migration or automatic worker restart.
 /// A mismatched peer is refused before adoption, display or controller claim.
-pub const version: u16 = 6;
+pub const version: u16 = 7;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
 pub const max_name: usize = 1024;
@@ -270,11 +272,14 @@ pub const Request = struct {
 
     pub fn deinit(self: *Request) void {
         self.wipeSecrets();
+        // Also wipe parser scratch, including obsolete buffers for escaped strings.
+        var wiping = WipingAllocator{ .backing = self.doc.arena.child_allocator };
+        self.doc.arena.child_allocator = wiping.allocator();
         self.doc.deinit();
         self.* = undefined;
     }
 
-    /// A login key is a secret that must not survive in the parsed arena.
+    /// Login keys and browser callbacks are never public projection data.
     /// `parseRequest` uses `.allocate = .alloc_always`, so this slice is an
     /// owned copy rather than a window into the caller's frame; wiping it is
     /// therefore meaningful and never mutates borrowed constants.
@@ -283,10 +288,12 @@ pub const Request = struct {
             .object => |value| value,
             else => return,
         };
-        if (object.get("key")) |value| switch (value) {
-            .string => |secret| std.crypto.secureZero(u8, @constCast(secret)),
-            else => {},
-        };
+        inline for (.{ "key", "callback" }) |name| {
+            if (object.get(name)) |value| switch (value) {
+                .string => |secret| std.crypto.secureZero(u8, @constCast(secret)),
+                else => {},
+            };
+        }
     }
 
     pub fn field(self: *const Request, name: []const u8) ?std.json.Value {
@@ -361,11 +368,12 @@ fn valueU64(value: std.json.Value) !u64 {
 pub fn parseRequest(a: std.mem.Allocator, bytes: []const u8) !Request {
     if (bytes.len == 0 or bytes.len > unix.max_frame_len) return error.BadRequest;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.BadRequest;
-    json_bound.validate(a, bytes) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadRequest;
+    // A malformed, duplicate-field or obsolete request can contain a secret
+    // before its op is known. Cover parse/validation failures as well as success.
+    var wiping = WipingAllocator{ .backing = a };
+    json_bound.validate(wiping.allocator(), bytes) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadRequest;
 
-    // `alloc_always` copies every string out of the frame, so a login key in
-    // the body is private to `doc` and can be wiped before the arena is freed.
-    var doc = std.json.parseFromSlice(std.json.Value, a, bytes, .{
+    var doc = std.json.parseFromSlice(std.json.Value, wiping.allocator(), bytes, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
     }) catch |err| return switch (err) {
@@ -392,6 +400,8 @@ pub fn parseRequest(a: std.mem.Allocator, bytes: []const u8) !Request {
     };
     const op = std.meta.stringToEnum(Op, op_name) orelse return error.BadRequest;
 
+    // Do not retain a pointer to this stack wrapper; deinit rebinds it.
+    doc.arena.child_allocator = a;
     return .{ .id = id, .op = op, .body = doc.value, .doc = doc };
 }
 
@@ -1084,7 +1094,10 @@ pub fn encodeSnapshot(out: *Out, snapshot: Snapshot) !void {
     try out.beginObject("codex_login");
     try out.field("generation", snapshot.codex_login.generation);
     try out.field("status", @tagName(snapshot.codex_login.status));
-    try out.field("code", snapshot.codex_login.userCode());
+    if (snapshot.codex_login.url_len > snapshot.codex_login.url.len) return error.BadRequest;
+    const url = snapshot.codex_login.authorizationUrl();
+    if (url.len != 0 and (snapshot.codex_login.status != .pending or !codex_login.validAuthorizationUrl(url))) return error.BadRequest;
+    try out.field("url", url);
     try out.field("failure", if (snapshot.codex_login.failure) |failure| @as(?[]const u8, @tagName(failure)) else null);
     try out.endObject();
     try out.beginObject("background");

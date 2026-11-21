@@ -141,19 +141,19 @@ test "tool_view decodes its display fields instead of an unsupported event" {
 test "u64 values above i64.max survive number_string decoding" {
     const a = std.testing.allocator;
     const high = std.math.maxInt(u64);
-    var request = try parseRequest(a, "{\"v\":6,\"id\":18446744073709551615,\"op\":\"ping\"}");
+    var request = try parseRequest(a, "{\"v\":7,\"id\":18446744073709551615,\"op\":\"ping\"}");
     defer request.deinit();
     try std.testing.expectEqual(high, request.id);
     try std.testing.expectEqual(Op.ping, request.op);
 
     // Quoted digits, floats, exponents and negatives are not integers.
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":1.0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":1e3,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":-1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":0,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":\"18446744073709551615\",\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":1.0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":1e3,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":-1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":0,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":1,\"op\":\"ping\",\"op\":\"list\"}"));
 
     const encoded = try encodeEvent(a, .{ .tool_started = .{
         .id = high,
@@ -170,11 +170,11 @@ test "u64 values above i64.max survive number_string decoding" {
     try std.testing.expectEqual(high, decoded.event.tool_started.display_key.?.generation);
 }
 test "retired singleton setting request is rejected before dispatch" {
-    try std.testing.expectError(error.BadRequest, parseRequest(std.testing.allocator, "{\"v\":6,\"id\":1,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(std.testing.allocator, "{\"v\":7,\"id\":1,\"op\":\"setting\",\"epoch\":1,\"key\":\"low_price_input\",\"value\":true}"));
 }
 test "numeric and enum request fields reject wrong types instead of defaulting" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":6,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
+    var request = try parseRequest(a, "{\"v\":7,\"id\":2,\"op\":\"effort\",\"epoch\":\"7\",\"level\":true}");
     defer request.deinit();
     try std.testing.expectError(error.BadRequest, request.u64Field("epoch"));
     try std.testing.expectError(error.BadRequest, request.u64Field("absent"));
@@ -187,16 +187,16 @@ test "numeric and enum request fields reject wrong types instead of defaulting" 
 }
 test "proxy_address accepts an empty clear and maps endpoint rejections to invalid_input" {
     const a = std.testing.allocator;
-    var cleared = try parseRequest(a, "{\"v\":6,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
+    var cleared = try parseRequest(a, "{\"v\":7,\"id\":9,\"op\":\"proxy_address\",\"epoch\":1,\"value\":\"\"}");
     defer cleared.deinit();
     try std.testing.expectEqual(Op.proxy_address, cleared.op);
     try std.testing.expectEqualStrings("", try cleared.stringField("value", 320));
 
     // A missing, null or non-string `value` is a bad request, never a clear.
     for ([_][]const u8{
-        "{\"v\":6,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
-        "{\"v\":6,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
-        "{\"v\":6,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
+        "{\"v\":7,\"id\":10,\"op\":\"proxy_address\",\"epoch\":1}",
+        "{\"v\":7,\"id\":11,\"op\":\"proxy_address\",\"epoch\":1,\"value\":null}",
+        "{\"v\":7,\"id\":12,\"op\":\"proxy_address\",\"epoch\":1,\"value\":8080}",
     }) |json| {
         var request = try parseRequest(a, json);
         defer request.deinit();
@@ -222,13 +222,13 @@ test "proxy_model request keeps the full u64 epoch and rejects loose parameters"
     try std.testing.expectEqual(true, try request.requiredBool("enabled"));
 
     // Absent, stringly or numeric enable flags are bad requests, not defaults.
-    var loose = try parseRequest(a, "{\"v\":6,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
+    var loose = try parseRequest(a, "{\"v\":7,\"id\":4,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\"}");
     defer loose.deinit();
     try std.testing.expectError(error.BadRequest, loose.requiredBool("enabled"));
-    var stringly = try parseRequest(a, "{\"v\":6,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
+    var stringly = try parseRequest(a, "{\"v\":7,\"id\":5,\"op\":\"proxy_model\",\"epoch\":1,\"name\":\"p/m\",\"enabled\":\"true\"}");
     defer stringly.deinit();
     try std.testing.expectError(error.BadRequest, stringly.requiredBool("enabled"));
-    var numeric_epoch = try parseRequest(a, "{\"v\":6,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
+    var numeric_epoch = try parseRequest(a, "{\"v\":7,\"id\":6,\"op\":\"proxy_model\",\"epoch\":\"1\",\"name\":\"p/m\",\"enabled\":false}");
     defer numeric_epoch.deinit();
     try std.testing.expectError(error.BadRequest, numeric_epoch.u64Field("epoch"));
 }
@@ -355,12 +355,21 @@ test "terminal events require complete usage and keep tool timing and keys" {
 }
 test "login key copy is wiped before the request arena is released" {
     const a = std.testing.allocator;
-    var request = try parseRequest(a, "{\"v\":6,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
+    var request = try parseRequest(a, "{\"v\":7,\"id\":1,\"op\":\"login\",\"key\":\"sk-secret\"}");
     defer request.deinit();
     const secret = request.field("key").?.string;
     try std.testing.expectEqualStrings("sk-secret", secret);
     request.wipeSecrets();
     for (secret) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+test "browser callback wipe covers the private decoded copy, not the caller frame" {
+    const bytes = "{\"v\":7,\"id\":1,\"op\":\"codex_login\",\"callback\":\"mock\\u002dsecret\"}";
+    var request = try parseRequest(std.testing.allocator, bytes);
+    defer request.deinit();
+    const callback = try request.stringField("callback", codex_login.max_callback_bytes);
+    try std.testing.expectEqualStrings("mock-secret", callback);
+    request.wipeSecrets();
+    for (callback) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 test "tool result local marker round-trips and defaults off" {
     const a = std.testing.allocator;
@@ -454,10 +463,10 @@ test "tool caption and execution wire round trips and rejects malformed fields" 
     var sequenced = try decodeEvent(a, "{\"t\":\"tool_result\",\"id\":1,\"name\":\"bash\",\"v\":\"ok\",\"display\":null,\"seq\":18446744073709551615,\"epoch\":1,\"disp_trunc\":false,\"canon_complete\":true}");
     sequenced.deinit();
 }
-test "wire version 6 is required and older packets are rejected" {
+test "wire version 7 is required and older packets are rejected" {
     const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(u16, 6), version);
-    var accepted = try parseRequest(a, "{\"v\":6,\"id\":1,\"op\":\"ping\"}");
+    try std.testing.expectEqual(@as(u16, 7), version);
+    var accepted = try parseRequest(a, "{\"v\":7,\"id\":1,\"op\":\"ping\"}");
     accepted.deinit();
     // No compatibility path for old or future peers.
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":1,\"id\":1,\"op\":\"ping\"}"));
@@ -465,7 +474,8 @@ test "wire version 6 is required and older packets are rejected" {
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":3,\"id\":1,\"op\":\"ping\"}"));
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":4,\"id\":1,\"op\":\"ping\"}"));
     try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":5,\"id\":1,\"op\":\"ping\"}"));
-    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":7,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":6,\"id\":1,\"op\":\"ping\"}"));
+    try std.testing.expectError(error.BadRequest, parseRequest(a, "{\"v\":8,\"id\":1,\"op\":\"ping\"}"));
     // Every reply envelope carries the same exact version.
     var out = Out.init(a);
     defer out.deinit();

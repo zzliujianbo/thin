@@ -10,6 +10,28 @@ fn dispatchJson(host: *SessionHost, a: std.mem.Allocator, json: []const u8, conn
     return host.dispatch(a, &request, connection, true);
 }
 
+fn expectBrowserReply(host: *SessionHost, connection: u64, json: []const u8, ok: bool) !void {
+    const a = std.testing.allocator;
+    const frame = try dispatchJson(host, a, json, connection);
+    defer a.free(frame);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, frame, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(ok, parsed.value.object.get("ok").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "PRIVATE-CALLBACK") == null);
+}
+
+fn waitBrowserView(host: *SessionHost, status: codex_login.Status) !codex_login.View {
+    const start = Io.Clock.awake.now(host.io);
+    while (start.durationTo(Io.Clock.awake.now(host.io)).toMilliseconds() < 5000) {
+        _ = try host.session.pollCodexLogin();
+        const view = host.session.codexLoginView();
+        if (view.status == status and (status != .pending or view.url_len > 0)) return view;
+        if (view.status == .failed) return error.BrowserLoginFailed;
+        try Io.sleep(host.io, .fromMilliseconds(1), .awake);
+    }
+    return error.TestTimeout;
+}
+
 const ThinkingTaskFixture = struct {
     io: std.Io,
     entered: std.atomic.Value(bool) = .init(false),

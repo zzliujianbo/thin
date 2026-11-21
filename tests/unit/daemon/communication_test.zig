@@ -160,6 +160,28 @@ test "display FIFO publication OOM retains the caller item" {
     try std.testing.expectEqual(@as(usize, 0), owner.display_head);
     try std.testing.expect(!owner.buffered());
 }
+test "obsolete browser submission is wiped before completion leaves the owner" {
+    const a = std.testing.allocator;
+    const client = try Client.init(a, std.testing.io, null, .foreground, "/test", "/test");
+    defer client.deinit();
+    var owner: Communication = .{ .client = client, .a = a, .io = std.testing.io, .wake = try Wakeup.init(), .ready = try Wakeup.init(), .identity = Communication.Identity.of(client), .revision = 0, .stream_revision = 0 };
+    defer owner.wake.deinit();
+    defer owner.ready.deinit();
+    defer owner.requests.deinit(a);
+    defer owner.completions.deinit(a);
+    defer std.debug.assert(std.c.pthread_mutex_destroy(&owner.mutex) == .SUCCESS);
+    const ticket = try owner.submit(owner.generation + 1, 1, .{ .codex_login = .{ .action = .{ .submit = "synthetic-private" }, .generation = 4 } });
+    const request = owner.takeRequest().?;
+    const owned_bytes = request.action.codex_login.action.submit;
+    owner.execute(request);
+    var completed = owner.popCompletion().?;
+    defer completed.deinit();
+    try std.testing.expectEqual(error.StaleControl, completed.completion.failure.?);
+    try std.testing.expectEqual(ticket, completed.completion.request.ticket);
+    try std.testing.expectEqual(@as(usize, 0), completed.completion.request.action.codex_login.action.submit.len);
+    try std.testing.expect(std.mem.allEqual(u8, owned_bytes, 0));
+}
+
 test "inflight session switch cannot publish a new identity before completion" {
     const a = std.testing.allocator;
     const io = std.testing.io;

@@ -1,3 +1,5 @@
+const frontend_test_url = "https://auth.openai.com/oauth/authorize?response_type=code&state=public";
+
 fn testProjection(busy: bool, model: []const u8) !*Client.Projection {
     const a = std.testing.allocator;
     const projection = try a.create(Client.Projection);

@@ -266,24 +266,63 @@ test "provider menu preserves local credential aliases and actual endpoint ident
     empty_literal.api_key = "";
     try std.testing.expect(!session.hasLocalCredential(empty_literal));
 }
-test "codex public prompt and exact-generation cancellation" {
+test "codex browser rendezvous isolates private submit, rejects replay and wakes on cancel" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
     var session = try fixture.open(.{});
     defer session.deinit();
-    var job: CodexLoginJob = .{ .io = std.testing.io, .manager = undefined, .alias = undefined, .view = .{ .generation = 7, .status = .pending } };
-    session.codex_job = &job;
-    defer session.codex_job = null;
-    try std.testing.expectError(error.InvalidSequence, session.cancelCodexLogin(6));
-    try std.testing.expect(!job.cancel.isRequested());
-    try CodexLoginJob.pending(&job, .{ .verification_url = codex_login.verification_url, .user_code = "ABCD-1234" });
-    const view = session.codexLoginView();
-    try std.testing.expectEqualStrings("ABCD-1234", view.userCode());
-    try std.testing.expect(try session.pollCodexLogin());
-    try std.testing.expect(!try session.pollCodexLogin());
-    try session.cancelCodexLogin(7);
-    try std.testing.expect(job.cancel.isRequested());
-    try std.testing.expectError(error.InvalidDevicePrompt, CodexLoginJob.pending(&job, .{ .verification_url = "https://evil.invalid/", .user_code = "CODE" }));
+    const io = std.testing.io;
+    const url = "https://auth.openai.com/oauth/authorize?state=public-state";
+    const secret = "http://localhost:1455/auth/callback?code=private-test-code&state=public-state";
+    for ([_]bool{ false, true }, 7..) |cancel, generation| {
+        var job: CodexLoginJob = .{ .io = io, .manager = undefined, .alias = undefined, .view = .{ .generation = generation, .status = .pending } };
+        session.codex_job = &job;
+        defer session.codex_job = null;
+        try std.testing.expectError(error.InvalidSequence, session.submitCodexLogin(generation, secret));
+        var out: [codex_login.max_callback_bytes]u8 = @splat(0);
+        defer std.crypto.secureZero(u8, &out);
+        var waiter = try std.Io.concurrent(io, CodexLoginJob.browserCallback, .{ &job, url, &out, &job.cancel, @as(u32, 5000) });
+        defer {
+            session.cancelCodexLogin(generation) catch {};
+            _ = waiter.await(io) catch {};
+        }
+        const start = std.Io.Clock.awake.now(io);
+        while (session.codexLoginView().url_len == 0) {
+            if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 3000) return error.TestTimeout;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        const view = session.codexLoginView();
+        try std.testing.expectEqualStrings(url, view.authorizationUrl());
+        try std.testing.expect(try session.pollCodexLogin());
+        try std.testing.expect(!try session.pollCodexLogin());
+        try std.testing.expectError(error.InvalidSequence, session.cancelCodexLogin(generation - 1));
+        try std.testing.expectError(error.InvalidSequence, session.submitCodexLogin(generation - 1, secret));
+        const oversized: [codex_login.max_callback_bytes + 1]u8 = @splat('x');
+        try std.testing.expectError(error.InputTooLarge, session.submitCodexLogin(generation, &oversized));
+        try std.testing.expectError(error.InvalidInput, session.submitCodexLogin(generation, ""));
+        if (cancel) {
+            try session.cancelCodexLogin(generation);
+            try std.testing.expectError(error.Cancelled, waiter.await(io));
+            try std.testing.expectEqual(@as(u8, 0), out[0]);
+        } else {
+            try session.connection().codexLogin(.{ .submit = secret }, generation);
+            const n = try waiter.await(io);
+            try std.testing.expectEqualStrings(secret, out[0..n]);
+        }
+        try std.testing.expectError(error.InvalidSequence, session.submitCodexLogin(generation, secret));
+        try std.testing.expectEqualStrings("", session.codexLoginView().authorizationUrl());
+        try std.testing.expectEqualStrings(url, view.authorizationUrl());
+        try std.testing.expect(std.mem.indexOf(u8, &session.codexLoginView().url, "private-test-code") == null);
+    }
+}
+
+test "codex browser prompt rejects private URL and clears rendezvous on timeout" {
+    var job: CodexLoginJob = .{ .io = std.testing.io, .manager = undefined, .alias = undefined, .view = .{ .generation = 1, .status = .pending } };
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(error.InvalidAuthorizationUrl, CodexLoginJob.browserCallback(&job, "https://auth.openai.com/oauth/authorize?code_verifier=private", &out, &job.cancel, 0));
+    try std.testing.expectError(error.OAuthTimeout, CodexLoginJob.browserCallback(&job, "https://auth.openai.com/oauth/authorize?state=s", &out, &job.cancel, 0));
+    try std.testing.expectError(error.InvalidSequence, job.submit(1, "late"));
+    try std.testing.expectEqualStrings("", job.snapshot().authorizationUrl());
 }
 test "codex login selects exact official alias without requiring credentials" {
     const official = cfg.Provider{ .base_url = ProviderId.openai_codex.baseUrl(), .kind = .openai_codex };

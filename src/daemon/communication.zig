@@ -321,6 +321,12 @@ pub const Communication = struct {
                 break :failed .none;
             };
         }
+        // The UI needs the submit tag and generation, not the secret. Wipe
+        // the private Owned copy even on stale control or failed exchange.
+        if (request.action == .codex_login and request.action.codex_login.action == .submit) {
+            std.crypto.secureZero(u8, @constCast(request.action.codex_login.action.submit));
+            request.action.codex_login.action = .{ .submit = "" };
+        }
         self.synchronizeIdentity();
         completed.view = self.view(false) catch null;
         if (completed.view == null and completed.completion.failure == null) {

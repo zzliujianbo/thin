@@ -1,4 +1,4 @@
-//! Narrow, single-attempt OpenAI Codex device authorization wire protocol.
+//! Single-attempt OpenAI Codex browser authorization and token exchange.
 //! The account claim is routing metadata, not a verified identity.
 const std = @import("std");
 const p = @import("../core/protocol.zig");
@@ -9,16 +9,14 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
-const official_verification_url = "https://auth.openai.com/codex/device";
-const usercode_url = "https://auth.openai.com/api/accounts/deviceauth/usercode";
-const poll_url = "https://auth.openai.com/api/accounts/deviceauth/token";
+const authorize_url = "https://auth.openai.com/oauth/authorize";
+const max_callback_bytes = @import("../core/codex_login.zig").max_callback_bytes;
 const token_url = "https://auth.openai.com/oauth/token";
-const redirect_uri = "https://auth.openai.com/deviceauth/callback";
+const redirect_uri = "http://localhost:1455/auth/callback";
 const max_body = 512 * 1024;
 const max_secret = 64 * 1024;
 const max_token = 16 * 1024;
 const max_depth = 32;
-const device_lifetime_ms = 15 * 60 * 1000;
 const max_expires_seconds = 365 * 24 * 60 * 60;
 
 fn wipeFree(a: Allocator, bytes: []u8) void {
@@ -37,20 +35,93 @@ pub const TokenSet = struct {
     }
 };
 
-pub const DeviceState = struct {
-    device_auth_id: []u8,
-    user_code: []u8,
-    verification_url: []const u8 = official_verification_url,
-    interval_ms: u32,
-    expires_at_ms: i64,
-    pub fn deinit(self: *DeviceState, a: Allocator) void {
-        wipeFree(a, self.device_auth_id);
-        wipeFree(a, self.user_code);
-        self.* = undefined;
+pub const BrowserAuth = struct {
+    verifier: [43]u8,
+    state: [32]u8,
+
+    pub fn init(self: *BrowserAuth, io: Io) !void {
+        // Independent random values: state is public, the verifier never leaves
+        // this process until a matching redirect is presented for exchange.
+        var entropy: [48]u8 = undefined;
+        defer std.crypto.secureZero(u8, &entropy);
+        try io.randomSecure(&entropy);
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&self.verifier, entropy[0..32]);
+        self.state = std.fmt.bytesToHex(entropy[32..].*, .lower);
+    }
+
+    pub fn deinit(self: *BrowserAuth) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+
+    pub fn authorizeUrl(self: *const BrowserAuth, a: Allocator) ![]u8 {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&self.verifier, &hash, .{});
+        var encoded: [43]u8 = undefined;
+        const challenge = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &hash);
+        const query = try formEncode(a, &.{
+            .{ "response_type", "code" },                        .{ "client_id", client_id },               .{ "redirect_uri", redirect_uri },
+            .{ "scope", "openid profile email offline_access" }, .{ "code_challenge", challenge },          .{ "code_challenge_method", "S256" },
+            .{ "state", &self.state },                           .{ "id_token_add_organizations", "true" }, .{ "codex_cli_simplified_flow", "true" },
+            .{ "originator", "thin" },
+        });
+        defer wipeFree(a, query);
+        return std.mem.concat(a, u8, &.{ authorize_url, "?", query });
+    }
+
+    // Decode into the caller's wipeable buffer. Split before decoding so an
+    // escaped '&' or '=' is data, not a second parameter. Validate even fields
+    // that the exchange ignores, including aliases of duplicate names.
+    pub fn callbackCode(self: *const BrowserAuth, a: Allocator, callback: []u8) ![]const u8 {
+        const prefix = redirect_uri ++ "?";
+        if (callback.len > max_callback_bytes or !std.mem.startsWith(u8, callback, prefix)) return error.InvalidOAuthCallback;
+        var fields: std.StringHashMapUnmanaged(void) = .empty;
+        defer fields.deinit(a);
+        var code: ?[]const u8 = null;
+        var matched = false;
+        var rest = callback[prefix.len..];
+        while (true) {
+            const end = std.mem.findScalar(u8, rest, '&') orelse rest.len;
+            const field = rest[0..end];
+            const eq = std.mem.findScalar(u8, field, '=') orelse return error.InvalidOAuthCallback;
+            const key = try decodeField(field[0..eq]);
+            const value = try decodeField(field[eq + 1 ..]);
+            if (key.len == 0 or (try fields.getOrPut(a, key)).found_existing) return error.InvalidOAuthCallback;
+            if (std.mem.eql(u8, key, "error")) return error.InvalidOAuthCallback;
+            if (std.mem.eql(u8, key, "state")) matched = std.mem.eql(u8, value, &self.state);
+            if (std.mem.eql(u8, key, "code") and value.len != 0) code = value;
+            if (end == rest.len) break;
+            rest = rest[end + 1 ..];
+        }
+        if (!matched) return error.InvalidOAuthCallback;
+        return code orelse error.InvalidOAuthCallback;
     }
 };
 
-pub const PollResult = union(enum) { pending, slow_down, success: TokenSet };
+fn decodeField(raw: []u8) ![]const u8 {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < raw.len) : (n += 1) {
+        const byte = raw[i];
+        i += 1;
+        raw[n] = switch (byte) {
+            '%' => decoded: {
+                if (raw.len - i < 2) return error.InvalidOAuthCallback;
+                const hi = std.fmt.charToDigit(raw[i], 16) catch return error.InvalidOAuthCallback;
+                const lo = std.fmt.charToDigit(raw[i + 1], 16) catch return error.InvalidOAuthCallback;
+                i += 2;
+                const c = (hi << 4) | lo;
+                if (c < 0x20 or c > 0x7e) return error.InvalidOAuthCallback;
+                break :decoded c;
+            },
+            '+' => ' ',
+            // RFC 3986 query bytes after splitting field separators. Reject raw
+            // whitespace, fragments, backslashes and non-ASCII URL spellings.
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_', '~', '!', '$', '\'', '(', ')', '*', ',', ';', '=', ':', '@', '/', '?' => byte,
+            else => return error.InvalidOAuthCallback,
+        };
+    }
+    return raw[0..n];
+}
 
 const Response = struct {
     status: u16,
@@ -59,14 +130,12 @@ const Response = struct {
         wipeFree(a, self.body);
     }
 };
-const Endpoint = enum { begin, poll, token };
-const Content = enum { json, form };
 const Transport = struct {
     context: ?*anyopaque,
-    post_fn: *const fn (?*anyopaque, Allocator, Io, Endpoint, Content, []const u8, ?*const p.Cancellation, u32) anyerror!Response,
+    post_fn: *const fn (?*anyopaque, Allocator, Io, []const u8, ?*const p.Cancellation, u32) anyerror!Response,
     now_fn: *const fn (?*anyopaque, Io) i64,
-    fn post(self: Transport, a: Allocator, io: Io, endpoint: Endpoint, content: Content, body: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !Response {
-        return self.post_fn(self.context, a, io, endpoint, content, body, cancel, timeout);
+    fn post(self: Transport, a: Allocator, io: Io, body: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !Response {
+        return self.post_fn(self.context, a, io, body, cancel, timeout);
     }
     fn now(self: Transport, io: Io) i64 {
         return self.now_fn(self.context, io);
@@ -77,13 +146,13 @@ const Transport = struct {
 pub fn initClient(a: Allocator, io: Io, env: *const std.process.Environ.Map, proxy: ?cfg.ProxyConfig) !curl.Client {
     const url = if (proxy) |configured| try configured.url(a) else null;
     defer if (url) |owned| a.free(owned);
-    return curl.Client.initModel(a, io, env, usercode_url, url, true);
+    return curl.Client.initModel(a, io, env, token_url, url, true);
 }
 
 const Http = struct {
     client: *curl.Client,
     // Private test seam; production operations always use the fixed endpoints.
-    urls: [3][]const u8 = .{ usercode_url, poll_url, token_url },
+    url: []const u8 = token_url,
 
     fn transport(self: *Http) Transport {
         return .{ .context = self, .post_fn = realPost, .now_fn = realNow };
@@ -93,13 +162,9 @@ fn realNow(_: ?*anyopaque, io: Io) i64 {
     return Io.Clock.real.now(io).toMilliseconds();
 }
 
-pub fn beginDevice(a: Allocator, client: *curl.Client, cancel: ?*const p.Cancellation, timeout_ms: u32) !DeviceState {
+pub fn exchange(a: Allocator, client: *curl.Client, code: []const u8, verifier: []const u8, cancel: ?*const p.Cancellation, timeout_ms: u32) !TokenSet {
     var http: Http = .{ .client = client };
-    return beginWith(http.transport(), a, client.io, cancel, timeout_ms);
-}
-pub fn pollDevice(a: Allocator, client: *curl.Client, device: *const DeviceState, cancel: ?*const p.Cancellation, timeout_ms: u32) !PollResult {
-    var http: Http = .{ .client = client };
-    return pollWith(http.transport(), a, client.io, device, cancel, timeout_ms);
+    return exchangeWith(http.transport(), a, client.io, code, verifier, cancel, timeout_ms);
 }
 pub fn refresh(a: Allocator, client: *curl.Client, refresh_token: []const u8, cancel: ?*const p.Cancellation, timeout_ms: u32) !TokenSet {
     var http: Http = .{ .client = client };
@@ -115,68 +180,18 @@ fn checkCancel(cancel: ?*const p.Cancellation) !void {
 fn addMillis(now: i64, ms: i64) !i64 {
     return std.math.add(i64, now, ms) catch error.InvalidResponse;
 }
-fn beginWith(t: Transport, a: Allocator, io: Io, cancel: ?*const p.Cancellation, timeout: u32) !DeviceState {
+fn exchangeWith(t: Transport, a: Allocator, io: Io, code: []const u8, verifier: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !TokenSet {
     if (timeout == 0) return error.InvalidTimeout;
-    const response = try t.post(a, io, .begin, .json, "{\"client_id\":\"" ++ client_id ++ "\"}", cancel, timeout);
-    defer response.deinit(a);
-    if (response.status < 200 or response.status >= 300) return error.DeviceRequestFailed;
-    var parsed = try parse(a, response.body);
-    defer parsed.deinit();
-    const root = try object(parsed.value);
-    const id = try stringField(root, "device_auth_id");
-    const code = try stringField(root, "user_code");
-    const interval_value = root.get("interval") orelse return error.InvalidResponse;
-    const seconds = switch (interval_value) {
-        .integer => |n| if (n >= 0 and n <= 86400) @as(u32, @intCast(n)) else return error.InvalidResponse,
-        .string => |s| std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t\r\n"), 10) catch return error.InvalidResponse,
-        else => return error.InvalidResponse,
-    };
-    if (seconds > 86400) return error.InvalidResponse;
-    const owned_id = try a.dupe(u8, id);
-    errdefer wipeFree(a, owned_id);
-    const owned_code = try a.dupe(u8, code);
-    errdefer wipeFree(a, owned_code);
-    return .{ .device_auth_id = owned_id, .user_code = owned_code, .interval_ms = @max(1000, seconds * 1000), .expires_at_ms = try addMillis(t.now(io), device_lifetime_ms) };
-}
-fn pollWith(t: Transport, a: Allocator, io: Io, device: *const DeviceState, cancel: ?*const p.Cancellation, timeout: u32) !PollResult {
-    if (timeout == 0) return error.InvalidTimeout;
-    if (!validSecret(device.device_auth_id) or !validSecret(device.user_code)) return error.InvalidDeviceState;
-    if (t.now(io) >= device.expires_at_ms) return error.DeviceExpired;
     try checkCancel(cancel);
     const start = Io.Clock.awake.now(io);
     var wiping = WipingAllocator{ .backing = a };
     const temp = wiping.allocator();
-    const body = try std.json.Stringify.valueAlloc(temp, .{ .device_auth_id = device.device_auth_id, .user_code = device.user_code }, .{});
-    defer wipeFree(temp, body);
-    const response = try t.post(a, io, .poll, .json, body, cancel, try remaining(io, start, timeout));
-    defer response.deinit(a);
-    if (response.status < 200 or response.status >= 300) {
-        if (response.status < 400 or response.status == 407 or response.status >= 500) return error.DevicePollFailed;
-        const code = parseError(a, response.body) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-        if (code) |v| {
-            defer wipeFree(a, v);
-            if (std.mem.eql(u8, v, "access_denied") or std.mem.eql(u8, v, "authorization_declined")) return error.DeviceDenied;
-            if (std.mem.eql(u8, v, "expired_token") or std.mem.eql(u8, v, "deviceauth_expired")) return error.DeviceExpired;
-            if (std.mem.eql(u8, v, "slow_down")) return .slow_down;
-            if (std.mem.eql(u8, v, "deviceauth_authorization_pending") or std.mem.eql(u8, v, "authorization_pending")) return .pending;
-        }
-        if (response.status == 403 or response.status == 404) return .pending;
-        return error.DevicePollFailed;
-    }
-    var parsed = try parse(a, response.body);
-    defer parsed.deinit();
-    const root = try object(parsed.value);
-    const code = try stringField(root, "authorization_code");
-    const verifier = try stringField(root, "code_verifier");
     const form = try formEncode(temp, &.{ .{ "grant_type", "authorization_code" }, .{ "client_id", client_id }, .{ "code", code }, .{ "code_verifier", verifier }, .{ "redirect_uri", redirect_uri } });
     defer wipeFree(temp, form);
     try checkCancel(cancel);
-    const token_response = try t.post(a, io, .token, .form, form, cancel, try remaining(io, start, timeout));
-    defer token_response.deinit(a);
-    return .{ .success = try parseToken(a, token_response, t.now(io)) };
+    const response = try t.post(a, io, form, cancel, try remaining(io, start, timeout));
+    defer response.deinit(a);
+    return parseToken(a, response, t.now(io));
 }
 fn refreshWith(t: Transport, a: Allocator, io: Io, token: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !TokenSet {
     if (timeout == 0) return error.InvalidTimeout;
@@ -187,7 +202,7 @@ fn refreshWith(t: Transport, a: Allocator, io: Io, token: []const u8, cancel: ?*
     const temp = wiping.allocator();
     const form = try formEncode(temp, &.{ .{ "grant_type", "refresh_token" }, .{ "client_id", client_id }, .{ "refresh_token", token } });
     defer wipeFree(temp, form);
-    const response = try t.post(a, io, .token, .form, form, cancel, try remaining(io, start, timeout));
+    const response = try t.post(a, io, form, cancel, try remaining(io, start, timeout));
     defer response.deinit(a);
     // No cancellation check here: a complete rotated token must reach its owner.
     return parseToken(a, response, t.now(io));
@@ -273,19 +288,6 @@ fn stringField(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     if (v != .string or !validSecret(v.string)) return error.InvalidResponse;
     return v.string;
 }
-fn parseError(a: Allocator, body: []const u8) !?[]u8 {
-    var parsed = try parse(a, body);
-    defer parsed.deinit();
-    const root = try object(parsed.value);
-    const e = root.get("error") orelse return null;
-    const s = switch (e) {
-        .string => |v| v,
-        .object => |v| try stringField(v, "code"),
-        else => return null,
-    };
-    if (!validSecret(s)) return null;
-    return try a.dupe(u8, s);
-}
 fn parseToken(a: Allocator, response: Response, now: i64) !TokenSet {
     if (response.status < 200 or response.status >= 300) return error.TokenRequestFailed;
     var parsed = try parse(a, response.body);
@@ -333,16 +335,16 @@ fn remaining(io: Io, start: Io.Timestamp, timeout: u32) !u32 {
     return timeout - @as(u32, @intCast(elapsed));
 }
 
-fn realPost(raw: ?*anyopaque, a: Allocator, _: Io, endpoint: Endpoint, content: Content, body: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !Response {
+fn realPost(raw: ?*anyopaque, a: Allocator, _: Io, body: []const u8, cancel: ?*const p.Cancellation, timeout: u32) !Response {
     const http: *Http = @ptrCast(@alignCast(raw.?));
     const headers = [_]std.http.Header{
-        .{ .name = "Content-Type", .value = if (content == .json) "application/json" else "application/x-www-form-urlencoded" },
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
         .{ .name = "Accept-Encoding", .value = "identity" },
     };
     const uncanceled: p.Cancellation = .{};
     var wiping = WipingAllocator{ .backing = a };
     const temp = wiping.allocator();
-    const response = try http.client.request(temp, http.urls[@backingInt(endpoint)], &headers, body, timeout, max_body, cancel orelse &uncanceled);
+    const response = try http.client.request(temp, http.url, &headers, body, timeout, max_body, cancel orelse &uncanceled);
     defer response.deinit(temp);
     // Only the returned body outlives the wiping allocator. Do not recheck
     // cancellation after a completed response: the refresh token may rotate.

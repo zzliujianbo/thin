@@ -251,7 +251,6 @@ pub const Frontend = struct {
 };
 
 fn codexViewChanged(old: corecodex.View, new: corecodex.View) bool {
-    if (old.generation != new.generation or old.status != new.status or old.failure != new.failure or old.code_len != new.code_len) return true;
-    const len = @min(@as(usize, old.code_len), old.code.len);
-    return !std.mem.eql(u8, old.code[0..len], new.code[0..len]);
+    return old.generation != new.generation or old.status != new.status or old.failure != new.failure or
+        !std.mem.eql(u8, old.authorizationUrl(), new.authorizationUrl());
 }

@@ -285,6 +285,56 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
     }
 }
 
+// The fake worker drives the actual v7 parser and snapshot encoder. It never
+// contacts the authorization URL or resolves a credential.
+const browser_test_url = "https://auth.openai.com/oauth/authorize?response_type=code&state=public";
+const browser_test_callback = "http://localhost:1455/auth/callback?code=fake-secret&state=public";
+
+fn serveBrowserLogin(pair: *Pair) !void {
+    const a = testing.allocator;
+    const wait: unix.Wait = .{ .io = testing.io, .timeout_ms = 2_000 };
+    var view: codex_login.View = .{};
+    for (0..4) |step| {
+        const bytes = (try pair.server.readFrame(wait)) orelse return error.Transport;
+        defer {
+            std.crypto.secureZero(u8, bytes);
+            a.free(bytes);
+        }
+        var req = try protocol.parseRequest(a, bytes);
+        defer req.deinit();
+        var out = protocol.Out.init(a);
+        defer out.deinit();
+        try out.ok(req.id);
+        switch (step) {
+            0, 2 => {
+                try testing.expectEqual(protocol.Op.codex_login, req.op);
+                try testing.expectEqual(@as(u64, 5), try req.u64Field("epoch"));
+                try testing.expectEqual(view.generation, try req.u64Field("generation"));
+                if (step == 0) {
+                    try testing.expectEqualStrings("start", try req.stringField("action", 8));
+                    try testing.expect(req.field("callback") == null);
+                    view = .{ .generation = 12, .status = .pending, .url_len = browser_test_url.len };
+                    @memcpy(view.url[0..browser_test_url.len], browser_test_url);
+                } else {
+                    try testing.expectEqualStrings("submit", try req.stringField("action", 8));
+                    const callback = try req.stringField("callback", codex_login.max_callback_bytes);
+                    try testing.expect(std.mem.eql(u8, browser_test_callback, callback));
+                    view = .{ .generation = view.generation, .status = .succeeded };
+                }
+            },
+            else => {
+                try testing.expectEqual(protocol.Op.snapshot, req.op);
+                try testing.expect(req.field("callback") == null);
+                try protocol.encodeSnapshot(&out, .{ .session = @splat('a'), .project = "/test", .owner = .foreground, .epoch = 5, .attached = true, .codex_login = view });
+            },
+        }
+        const reply = try out.finish();
+        defer a.free(reply);
+        try testing.expect(std.mem.indexOf(u8, reply, "fake-secret") == null);
+        try pair.server.writeFrame(reply, wait);
+    }
+}
+
 const SubmitFrame = struct { id: u64, req: u64 };
 
 fn readSubmitFrame(pair: *Pair, a: std.mem.Allocator) !SubmitFrame {
@@ -480,7 +530,7 @@ fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     try testing.expectEqual(@as(u64, 7), try watch.u64Field("epoch"));
     switch (behavior) {
         .watch_eof => stream.close(),
-        .watch_reject => try stream.writeFrame("{\"v\":6,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
+        .watch_reject => try stream.writeFrame("{\"v\":7,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
         .watch_timeout => {},
         else => try writePeerInitial(a, io, &stream, id, project, owner, 7, switch (behavior) {
             .snapshot => .snapshot,

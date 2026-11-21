@@ -644,12 +644,10 @@ pub const Connection = struct {
     }
 };
 
-fn validCodexCode(view: *const corecodex.View) bool {
-    if (view.code_len > view.code.len) return false;
-    for (view.userCode()) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
-    }
-    return true;
+fn codexAuthorizationUrl(view: *const corecodex.View) []const u8 {
+    if (view.url_len > view.url.len) return "";
+    const url = view.authorizationUrl();
+    return if (corecodex.validAuthorizationUrl(url)) url else "";
 }
 
 /// Configured means a local Runtime exists or a remote session is available;
@@ -866,9 +864,17 @@ const Ui = struct {
     /// Start/cancel was admitted to the async channel but the owner has not
     /// accepted it yet. No panel is displayed until the receipt arrives.
     codex_opening: bool = false,
+    codex_from_launcher: bool = false,
     codex_baseline: u64 = 0,
     codex_generation: ?u64 = null,
     codex_cancel_waiting: bool = false,
+    codex_submitted: bool = false,
+    codex_quarantine: bool = false,
+    codex_paste_allowed: bool = false,
+    codex_return_visible: bool = false,
+    frame_codex_return: bool = false,
+    displayed_codex_generation: ?u64 = null,
+    codex_callback: input.BoundedSecretInput(corecodex.max_callback_bytes) = .{},
     codex_view_hash: u64 = 0,
     settings_open: bool = false,
     settings_model_picker: enum { none, image } = .none,
@@ -892,6 +898,7 @@ const Ui = struct {
     provider_choices: provider_picker_module.Choices = .{},
     displayed_provider_generation: ?u64 = null,
     frame_provider_generation: ?u64 = null,
+    pending_codex_generation: ?u64 = null,
     secret_provider: ?core_config.providers.Id = null,
     /// Non-modal slash-command suggestions shown above the composer while the
     /// editor holds a bare command token. Local only; never executes by itself.
@@ -1183,6 +1190,7 @@ const Ui = struct {
         self.records.deinit(self.allocator);
         self.record_index.deinit(self.allocator);
         self.delivery_fences.deinit(self.allocator);
+        self.codex_callback.deinit();
         self.secret.deinit();
         self.closeModelPicker();
         self.closeResumePicker();
@@ -1296,7 +1304,7 @@ const Ui = struct {
         const epoch = if (purpose == .approve) (if (self.permission) |permission| permission.epoch else self.remote_epoch) else self.remote_epoch;
         const ticket = channel.start(epoch, action) catch |err| {
             self.allocator.free(original);
-            self.notice = self.describeError(err);
+            self.notice = if (purpose == .codex_login) @errorName(err) else self.describeError(err);
             self.publishNoticeAlias(self.asyncFailureLevel(purpose));
             return null;
         };
@@ -1353,17 +1361,16 @@ const Ui = struct {
             };
             var pending = found orelse continue;
             defer pending.deinit(self.allocator);
+            // A disconnected/replaced panel cannot be resurrected by a late receipt.
+            if (pending.purpose == .codex_login and (pending.epoch != self.remote_epoch or
+                (!self.codex_open and !self.codex_opening))) continue;
             if (completion.obsolete) {
                 if (pending.purpose == .manage and completion.request.action.manage == .saved_sessions) self.clearResumePending();
                 // A superseded login attempt must never strand an opening panel
                 // nor keep a deferred cancellation armed for a dead generation.
                 if (pending.purpose == .codex_login) {
                     const start = completion.request.action.codex_login.action == .start;
-                    self.codex_opening = false;
-                    self.codex_open = false;
-                    self.codex_generation = null;
-                    self.codex_cancel_waiting = false;
-                    self.codex_view_hash = 0;
+                    self.closeCodexLogin();
                     if (start and std.mem.eql(u8, self.notice, pending_session_notice)) self.notice = "Ready";
                     self.requestDraw();
                 }
@@ -1378,15 +1385,18 @@ const Ui = struct {
                 if (pending.purpose == .codex_login) {
                     const start = completion.request.action.codex_login.action == .start;
                     self.codex_opening = false;
-                    self.codex_cancel_waiting = false;
+                    if (completion.request.action.codex_login.action != .submit) self.codex_cancel_waiting = false;
                     self.codex_view_hash = 0;
                     if (start) {
                         // A rejected start never opened a panel; no generation
                         // was bound to this request either.
-                        self.codex_open = false;
-                        self.codex_generation = null;
-                        self.notice = self.describeError(err);
-                    } else self.notice = self.describeError(err);
+                        self.closeCodexLogin();
+                        self.notice = @errorName(err);
+                    } else if (completion.request.action.codex_login.action == .submit) {
+                        self.codex_submitted = false;
+                        self.revokeCodexInput();
+                        self.notice = "Callback not accepted; paste again";
+                    } else self.notice = @errorName(err);
                     self.requestDraw();
                     continue;
                 }
@@ -1481,23 +1491,22 @@ const Ui = struct {
                 const request = action.codex_login;
                 self.codex_opening = false;
                 if (request.action == .start) {
-                    // Only the owner's accepted RPC opens the panel; the code
-                    // itself stays ephemeral and is watched by generation.
+                    // Only the owner's accepted RPC opens the panel. A start
+                    // from an unattached launcher may have created its worker.
+                    if (self.codex_from_launcher) {
+                        if (self.remote()) |client| self.remote_epoch = client.snapshot().control_epoch;
+                        self.codex_baseline = 0;
+                        self.codex_from_launcher = false;
+                    }
                     self.codex_open = true;
                     self.codex_generation = null;
                     self.codex_view_hash = 0;
                     self.notice = "Ready";
                     self.parser.stop_feed = true;
                     self.observeCodexLogin();
-                } else {
-                    // A cancel receipt closes only the panel still bound to the
-                    // EXACT generation it targeted; a later attempt keeps its own.
-                    if (self.codex_generation) |bound| if (bound == request.generation) {
-                        self.codex_open = false;
-                        self.codex_generation = null;
-                        self.codex_view_hash = 0;
-                    };
-                    self.codex_cancel_waiting = false;
+                } else if (self.codex_generation == request.generation) {
+                    if (request.action == .cancel) self.closeCodexLogin();
+                    // Submit acceptance is not OAuth success. Wait for the owner.
                     self.notice = "Ready";
                 }
             },
@@ -1594,7 +1603,9 @@ const Ui = struct {
     /// Apply an owned remote event directly while its payload is alive. Only
     /// the terminal uses the Bridge completion path.
     fn pumpRemote(self: *Ui) !void {
-        if (self.hasAsync(.submit)) return;
+        // A launcher login start, like a first submit, may create its worker.
+        // Adopt that first epoch from the accepted receipt, not an earlier poll.
+        if (self.hasAsync(.submit) or (self.codex_opening and self.codex_from_launcher)) return;
         const client = self.remote() orelse return;
         var snapshot = client.snapshot();
         if (snapshot.control_epoch != self.remote_epoch) {
@@ -2210,6 +2221,7 @@ const Ui = struct {
     /// A new control epoch (attach/takeover/session switch) revokes every piece
     /// of display authority that belonged to the old session.
     fn resetSessionView(self: *Ui, snapshot: *const session_client.Snapshot) !void {
+        if (self.codex_open or self.codex_opening) self.closeCodexLogin();
         self.closeResumePicker();
         self.clearResumePending();
         // Revoke old frame and approval authority even if the bridge is busy.
@@ -2314,7 +2326,7 @@ const Ui = struct {
         self.secret_quarantine = false;
         self.secret.wipe();
         self.secret_provider = null;
-        self.parser.secretMode(false);
+        if (!self.codex_quarantine) self.parser.secretMode(false);
         self.input_history.deinit(self.allocator);
         self.input_history_seeded = false;
         self.dropHistoryDraft();
@@ -3248,7 +3260,9 @@ const Ui = struct {
         return self.ctrl_d_exit or interrupt.signal() != 0;
     }
     fn settingsIdle(self: *const Ui) bool {
-        return !self.busy and !self.remoteSynchronizing() and self.future == null and self.permission == null and !self.poisoned and !self.exitAuthorized() and !self.secret_mode and !self.secret_quarantine and !self.parser.pasted;
+        return !self.busy and !self.remoteSynchronizing() and self.future == null and self.permission == null and !self.poisoned and
+            !self.exitAuthorized() and !self.secret_mode and !self.secret_quarantine and !self.codex_open and
+            !self.codex_opening and !self.codex_quarantine and !self.parser.pasted;
     }
     /// No worker can still publish after its Future was joined. Check borrowed
     /// Bridge items as well as the queue, without reset's cancellation side effects.
@@ -4007,6 +4021,38 @@ const Ui = struct {
         self.provider_open = true;
         self.notice = "Ready";
     }
+    fn revokeCodexInput(self: *Ui) void {
+        self.codex_callback.wipe();
+        self.codex_paste_allowed = false;
+        self.pending_codex_generation = null;
+        self.displayed_codex_generation = null;
+    }
+
+    fn beginCodexInput(self: *Ui) void {
+        self.revokeCodexInput();
+        self.codex_submitted = false;
+        self.codex_quarantine = false;
+        self.parser.secretMode(true);
+    }
+
+    fn closeCodexLogin(self: *Ui) void {
+        self.revokeCodexInput();
+        self.codex_open = false;
+        self.codex_opening = false;
+        self.codex_from_launcher = false;
+        self.codex_submitted = false;
+        self.codex_generation = null;
+        self.codex_cancel_waiting = false;
+        self.codex_view_hash = 0;
+        // The owner can end the flow in the middle of a read/paste (including
+        // a split framing marker). Keep swallowing input until a fresh Esc.
+        self.parser.quarantineSecret();
+        self.codex_quarantine = true;
+        self.codex_return_visible = false;
+        self.frame_codex_return = false;
+        self.requestDraw();
+    }
+
     fn startCodexLogin(self: *Ui) void {
         const baseline = self.connection.current().codex_login.generation;
         if (self.connection.async_actions != null) {
@@ -4014,11 +4060,13 @@ const Ui = struct {
             // closed until the typed RPC completion arrives.
             if (self.beginAsync(.{ .codex_login = .{ .action = .start, .generation = 0 } }, .codex_login) == null) return;
             self.closeProviderPicker();
+            self.beginCodexInput();
             self.codex_baseline = baseline;
             self.codex_generation = null;
             self.codex_cancel_waiting = false;
             self.codex_view_hash = 0;
             self.codex_opening = true;
+            self.codex_from_launcher = if (self.remote()) |client| !client.snapshot().attached else false;
             self.codex_open = false;
             self.parser.stop_feed = true;
             self.requestDraw();
@@ -4026,10 +4074,11 @@ const Ui = struct {
         }
         // Local foreground owner only: the synchronous callback is the owner.
         self.connection.codexLogin(.start, 0) catch {
-            self.notice = "OpenAI Codex device login unavailable";
+            self.notice = "OpenAI Codex login unavailable";
             return;
         };
         self.closeProviderPicker();
+        self.beginCodexInput();
         self.codex_baseline = baseline;
         self.codex_generation = null;
         self.codex_cancel_waiting = false;
@@ -4043,9 +4092,15 @@ const Ui = struct {
     }
 
     fn cancelCodexLogin(self: *Ui) void {
+        self.revokeCodexInput();
+        if (self.codex_submitted and self.hasAsync(.codex_login)) {
+            self.codex_cancel_waiting = true;
+            return;
+        }
         if (self.codex_generation) |generation| {
             if (self.connection.current().codex_login.generation != generation) {
-                self.notice = "OpenAI Codex login state changed; cannot cancel";
+                self.closeCodexLogin();
+                self.notice = "OpenAI Codex login changed";
                 return;
             }
             if (self.connection.async_actions != null) {
@@ -4057,12 +4112,10 @@ const Ui = struct {
                 return;
             }
             self.connection.codexLogin(.cancel, generation) catch |err| {
-                self.notice = self.describeError(err);
+                self.notice = @errorName(err);
                 return;
             };
-            self.codex_open = false;
-            self.codex_opening = false;
-            self.codex_generation = null;
+            self.closeCodexLogin();
             self.notice = "Ready";
         } else {
             // The owner has accepted start but has not published its generation.
@@ -4074,14 +4127,29 @@ const Ui = struct {
     }
 
     fn observeCodexLogin(self: *Ui) void {
+        if (!self.codex_open and !self.codex_opening) return;
+        if (self.codex_opening and self.codex_from_launcher) return;
+        if (self.remote()) |client| {
+            const snapshot = client.snapshot();
+            if (!snapshot.attached or !snapshot.available or snapshot.control_epoch != self.remote_epoch) {
+                self.closeCodexLogin();
+                self.notice = "OpenAI Codex login disconnected";
+                return;
+            }
+        }
         if (!self.codex_open) return;
         const view = self.connection.current().codex_login;
         if (self.codex_generation == null) {
             if (view.generation == self.codex_baseline or view.status == .idle) return;
             self.codex_generation = view.generation;
         }
-        if (view.generation != self.codex_generation.?) return;
-        if (self.codex_cancel_waiting) {
+        if (view.generation != self.codex_generation.?) {
+            if (self.codex_view_hash != 0) self.requestDraw();
+            self.revokeCodexInput();
+            self.codex_view_hash = 0;
+            return;
+        }
+        if (self.codex_cancel_waiting and !self.hasAsync(.codex_login)) {
             // Consume the deferred intent exactly once. A rejected admission is
             // not retried on every poll, which would repaint the same warning.
             self.codex_cancel_waiting = false;
@@ -4089,23 +4157,20 @@ const Ui = struct {
             return;
         }
         switch (view.status) {
-            .idle => return,
+            .idle => self.closeCodexLogin(),
             .succeeded => {
-                self.codex_open = false;
-                self.codex_generation = null;
+                self.closeCodexLogin();
                 self.notice = "Ready";
                 self.publishNotice("OpenAI Codex connected");
                 self.requestDraw();
             },
             .canceled => {
-                self.codex_open = false;
-                self.codex_generation = null;
+                self.closeCodexLogin();
                 self.notice = "Ready";
                 self.requestDraw();
             },
             .failed => {
-                self.codex_open = false;
-                self.codex_generation = null;
+                self.closeCodexLogin();
                 self.notice = switch (view.failure orelse .other) {
                     .unavailable => "OpenAI Codex login unavailable",
                     .denied => "OpenAI Codex login denied",
@@ -4118,13 +4183,73 @@ const Ui = struct {
                 self.requestDraw();
             },
             .pending => {
-                const code = if (validCodexCode(&view)) view.userCode() else "";
-                const hash = std.hash.Wyhash.hash(view.generation, code);
+                const hash = std.hash.Wyhash.hash(view.generation, codexAuthorizationUrl(&view));
                 if (hash != self.codex_view_hash) {
+                    self.revokeCodexInput();
                     self.codex_view_hash = hash;
                     self.requestDraw();
                 }
             },
+        }
+    }
+
+    fn codexKey(self: *Ui, event_: input.Event) void {
+        // The parser also tags a CR or an escape sequence behind the paste
+        // terminator. Ignore the entire read tail, not just the submit key.
+        if (!self.parser.pasted and (self.parser.batch_paste or self.parser.secret_batch_paste)) return;
+        if (self.codex_quarantine) {
+            if (event_ == .escape and !self.parser.pasted and self.codex_return_visible) {
+                self.codex_quarantine = false;
+                self.codex_return_visible = false;
+                self.parser.secretMode(false);
+            }
+            return;
+        }
+        if ((event_ == .escape or event_ == .cancel) and !self.parser.pasted) {
+            self.cancelCodexLogin();
+            return;
+        }
+        const gen = self.codex_generation orelse return;
+        if (self.codex_submitted or self.codex_cancel_waiting or self.hasAsync(.codex_login) or
+            self.displayed_codex_generation != gen or (self.frame.len != 0 and self.pending_codex_generation != gen)) return;
+        switch (event_) {
+            .paste_start => {
+                self.codex_paste_allowed = true;
+                if (!self.codex_callback.failed) self.codex_callback.wipe();
+            },
+            .text => |v| {
+                if (v.pasted and !self.codex_paste_allowed) return;
+                self.codex_callback.insert(v.value);
+                if (self.codex_callback.failed) self.notice = "Invalid callback; Ctrl-U clears";
+            },
+            .backspace, .delete => self.codex_callback.erase(),
+            .clear, .kill_start => {
+                self.codex_callback.wipe();
+                self.notice = "Ready";
+            },
+            .enter => {
+                // Recheck the live owner at delivery, not just the drawn generation.
+                self.observeCodexLogin();
+                if (self.displayed_codex_generation != gen or self.parser.pasted or self.frame.len != 0) return;
+                const callback = self.codex_callback.value() orelse {
+                    self.notice = "Paste the callback URL; Ctrl-U clears";
+                    return;
+                };
+                const action: corecodex.Action = .{ .submit = callback };
+                if (self.connection.async_actions != null) {
+                    if (self.beginAsync(.{ .codex_login = .{ .action = action, .generation = gen } }, .codex_login) == null) return;
+                } else self.connection.codexLogin(action, gen) catch {
+                    self.revokeCodexInput();
+                    self.notice = "Callback not accepted; paste again";
+                    self.parser.stop_feed = true;
+                    return;
+                };
+                self.codex_submitted = true;
+                self.revokeCodexInput();
+                self.parser.secretMode(true);
+                self.requestDraw();
+            },
+            else => {},
         }
     }
 
@@ -5334,6 +5459,15 @@ const Ui = struct {
         const self: *Ui = @ptrCast(@alignCast(ctx));
         var event_ = raw_event;
         if (self.exitAuthorized()) return;
+        if (self.codex_quarantine or self.codex_open or self.codex_opening) {
+            // Private typing changes no pixels; do not repaint (or disrupt
+            // native terminal selection) for every byte of the callback.
+            const notice = self.notice;
+            const was_quarantined = self.codex_quarantine;
+            self.codexKey(event_);
+            if (!std.mem.eql(u8, notice, self.notice) or was_quarantined != self.codex_quarantine) self.requestDraw();
+            return;
+        }
         // Keyboard input must reach the next fresh draw without waiting for the
         // ordinary cadence; it still never interrupts an already-started frame.
         self.urgent_draw = true;
@@ -5359,10 +5493,6 @@ const Ui = struct {
             return;
         }
 
-        if (self.codex_open or self.codex_opening) {
-            if (event_ == .escape and !self.parser.pasted and !self.parser.batch_paste) self.cancelCodexLogin();
-            return;
-        }
         if (self.stop_open) {
             if (self.parser.batch_paste and event_ != .paste_start) return;
             self.stopKey(event_);
@@ -6235,6 +6365,9 @@ const Ui = struct {
         // now on, so they are neither canonical transcript nor completed
         // execution records, and this client no longer owns their coordinates.
         self.size = dimensions;
+        self.revokeCodexInput();
+        self.codex_return_visible = false;
+        self.frame_codex_return = false;
         self.entry_origin = null;
         self.vertical_column = null;
         self.tail_cursor_rows_up = 0;
@@ -6361,6 +6494,8 @@ const Ui = struct {
         if (self.frame.len == 0 or self.frame_offset != self.frame.len) return;
         self.entry_origin = null;
         // Resize invalidation is sticky, even if the window returns to its old size.
+        self.displayed_codex_generation = if (self.frame_fresh and self.codex_open and !self.codex_submitted) self.pending_codex_generation else null;
+        self.codex_return_visible = self.frame_fresh and self.codex_quarantine and self.frame_codex_return;
         self.displayed_stop = if (self.frame_fresh) self.frame_stop else null;
         self.displayed_permission = if (self.frame_fresh) self.frame_permission else null;
         self.displayed_permission_choice = if (self.frame_fresh) self.frame_permission_choice else null;
@@ -6900,6 +7035,9 @@ const Ui = struct {
         // Cadence is measured from the start of this draw, so its own work is
         // already counted before the next ordinary frame may be staged.
         self.last_draw_ms = self.clock_ms;
+        self.pending_codex_generation = null;
+        var painted_codex_generation: ?u64 = null;
+        self.frame_codex_return = false;
         self.refreshStop();
         self.displayed_stop = null;
         self.frame_stop = null;
@@ -6918,7 +7056,9 @@ const Ui = struct {
         const state = self.connection.current();
         self.display.seed(state.initial_context);
         self.display.setEffort(state.reasoning_effort);
-        const normal_composer = !self.secret_mode and !self.secret_quarantine and !self.settings_open and !self.provider_open and self.model_picker == null;
+        const codex_surface = self.codex_open or self.codex_opening or self.codex_quarantine;
+        const codex_return = self.codex_quarantine and !self.codex_open and !self.codex_opening;
+        const normal_composer = !codex_surface and !self.secret_mode and !self.secret_quarantine and !self.settings_open and !self.provider_open and self.model_picker == null;
         const empty_rendered: markdown.Rendered = .{ .lines = &.{}, .total_lines = 0, .truncated = false };
         const approval_lines = if (self.permission) |permission| try markdown.render(a, permission.description, .{ .columns = @max(1, cols), .max_lines = null, .markdown = false }) else empty_rendered;
         if (self.permission) |*permission| {
@@ -6926,7 +7066,7 @@ const Ui = struct {
             if (permission.clipped or permission.pasted) permission.choice = .deny;
         }
         const queue_snapshot = self.queueSnapshot();
-        const confirmation_visible = !self.secret_mode and !self.secret_quarantine and !self.codex_open and !self.codex_opening;
+        const confirmation_visible = !self.secret_mode and !self.secret_quarantine and !codex_surface;
         const modal_text: ?[]const u8 = if (!confirmation_visible) null else if (self.stop_open) blk: {
             const title = try std.fmt.allocPrint(a, "{s} | Steering {d} FollowUp {d}", .{ if (self.busy) "Task running" else "Task ended", queue_snapshot.steering, queue_snapshot.follow_up });
             const safe: []const u8 = if (self.stop_danger) "Continue" else "> Continue";
@@ -6968,7 +7108,7 @@ const Ui = struct {
         const pending_transcript = for (self.records.items[scan.start..]) |record| {
             if (record.kind != .reasoning and !record.output) break true;
         } else false;
-        const release_idle = self.idleBreaksDrawable() and !pending_transcript and !self.abandon_tail and
+        const release_idle = !codex_surface and self.idleBreaksDrawable() and !pending_transcript and !self.abandon_tail and
             self.tail_snapshot != null and (self.tail_bottom or self.tail_relative) and self.tail_height != 0 and self.tail_composer_rows == 1 and self.tail_cursor_rows_up == 0 and
             self.tail_size.columns == self.size.columns and self.tail_size.rows == self.size.rows;
         const break_count: u16 = if (release_idle) @min(256, self.idle_breaks) else 0;
@@ -7223,7 +7363,15 @@ const Ui = struct {
         // The question already contains queue counts. Keep unrelated persistent
         // notices, but do not repeat the stop confirmation or queue summary.
         const modal_hint = if (modal_text != null) try self.hint(a, state) else "";
-        const hint_line = if (modal_text == null) try self.hint(a, state) else if (std.mem.eql(u8, modal_hint, "Confirm stop")) "" else modal_hint;
+        const hint_line: []const u8 = if (codex_surface) blk: {
+            if (std.mem.eql(u8, self.notice, "Ready") or std.mem.eql(u8, self.notice, pending_session_notice))
+                break :blk if (codex_return) "" else "Esc cancels";
+            // Callback errors are local, fixed captions, never server payloads.
+            if (std.mem.eql(u8, self.notice, "Invalid callback; Ctrl-U clears") or
+                std.mem.eql(u8, self.notice, "Paste the callback URL; Ctrl-U clears") or
+                std.mem.eql(u8, self.notice, "Callback not accepted; paste again")) break :blk self.notice;
+            break :blk if (codex_return) "Login closed" else "Esc cancels";
+        } else if (modal_text == null) try self.hint(a, state) else if (std.mem.eql(u8, modal_hint, "Confirm stop")) "" else modal_hint;
         const activity_line = if (modal_text == null) try self.activityLine(a, state) else "";
         const status_rows: usize = @as(usize, @intFromBool(hint_line.len != 0)) + @as(usize, @intFromBool(activity_line.len != 0));
         // Normal output keeps its empty gap; acknowledged shell-like idle
@@ -7282,7 +7430,7 @@ const Ui = struct {
         self.frame_settings_generation = null;
         self.frame_picker_fingerprint = null;
         self.frame_proxy_fingerprint = null;
-        const menu_visible = !release_idle and self.commandMenuVisible();
+        const menu_visible = !codex_surface and !release_idle and self.commandMenuVisible();
         const menu_rows = if (menu_visible) try command_menu_module.rows(a, self.command_matches, self.command_menu.selected, cols, candidate_limit) else command_menu_module.Rows{ .lines = &.{} };
         if (menu_visible) self.command_menu.selected = @min(self.command_menu.selected, self.command_matches.len - 1);
         // All candidate menus share one bottom-pinned popup slot. Secondary
@@ -7306,17 +7454,31 @@ const Ui = struct {
         const preview_count = if (modal_text != null and self.permission != null and !self.stop_open) @min(@min(preview_limit, candidate_limit), approval_lines.lines.len) else 0;
         const preview_start = @min(self.permission_scroll, approval_lines.lines.len -| preview_count);
         const preview = approval_lines.lines[preview_start .. preview_start + preview_count];
-        const codex_view = state.codex_login;
-        const codex_code = if (self.codex_generation != null and codex_view.generation == self.codex_generation.? and codex_view.status == .pending and validCodexCode(&codex_view)) codex_view.userCode() else "";
-        const codex_popup = [_][]const u8{ corecodex.verification_url, if (codex_code.len != 0) codex_code else "Waiting for device code...", "Esc cancels" };
-        const popup_lines: []const []const u8 = if (self.codex_open) &codex_popup else if (modal_text != null and self.stop_open) queue_lines.items else if (modal_text != null and self.permission != null) preview else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (self.resume_picker != null) resume_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
+        const codex_view = &state.codex_login;
+        const input_open = self.codex_open and !self.codex_opening and !self.codex_quarantine and !self.codex_submitted and
+            !self.secret_mode and !self.secret_quarantine and
+            !self.codex_cancel_waiting and !self.hasAsync(.codex_login) and self.codex_generation == codex_view.generation and codex_view.status == .pending;
+        const url = if (input_open) codexAuthorizationUrl(codex_view) else "";
+        const link = presentation.CodexLink.fit(url, cols, native_width, body_limit);
+        const codex_prompt: []const u8 = if (codex_return)
+            presentation.CodexLink.returnHint(cols)
+        else if (link.rows != 0)
+            presentation.CodexLink.callback_hint
+        else if (url.len != 0)
+            "Resize terminal to show login link"
+        else if (self.codex_submitted or self.codex_cancel_waiting or self.codex_open)
+            "Waiting for Codex login..."
+        else
+            "Opening Codex login...";
+        const popup_lines: []const []const u8 = if (codex_surface) &.{} else if (modal_text != null and self.stop_open) queue_lines.items else if (modal_text != null and self.permission != null) preview else if (self.settings_open) settings_rows.lines else if (self.provider_open) provider_rows.lines else if (self.model_picker != null) picker_rows.lines else if (self.resume_picker != null) resume_rows.lines else if (menu_visible) menu_rows.lines else queue_lines.items;
         const selected_line = if (self.codex_open or self.stop_open or self.permission != null) @as(?usize, null) else if (self.settings_open) settings_rows.selected_line else if (self.provider_open) provider_rows.selected_line else if (self.model_picker != null) picker_rows.selected_line else if (self.resume_picker != null) resume_rows.selected_line else menu_rows.selected_line;
         // Slash candidates tint only the command token; the description stays
         // muted. Other candidate popups keep their existing full-row tone.
         const command_popup = menu_visible and !self.codex_open and !(modal_text != null and (self.stop_open or self.permission != null));
         const checked_mask: u16 = if (self.stop_open) 0 else if (self.provider_open) provider_rows.checked_mask else if (self.model_picker != null) picker_rows.checked_mask else 0;
-        const popup_gap: usize = @intFromBool(popup_lines.len != 0 and modal_text == null);
-        const content_body_limit = body_limit -| (popup_lines.len + popup_gap);
+        const popup_count = popup_lines.len + link.rows;
+        const popup_gap: usize = @intFromBool(popup_count != 0 and modal_text == null);
+        const content_body_limit = body_limit -| (popup_count + popup_gap);
         self.frame_model_epoch = null;
         self.frame_model_generation = null;
         self.frame_resume_generation = null;
@@ -7326,7 +7488,7 @@ const Ui = struct {
         // can paint over them. They join the tail as an ordinary transcript
         // prefix, so this frame defers (thinking_deferred) and the window
         // appears on the next complete ACK.
-        const reasoning_resumes = thinking != null and popup_lines.len == 0 and
+        const reasoning_resumes = thinking != null and popup_count == 0 and
             self.permission == null and !self.secret_mode and !self.secret_quarantine;
         if (reasoning_resumes or modal_text != null) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows, physical.items);
         // Transient reasoning owns a downward-growing window inside the tail. It
@@ -7344,7 +7506,7 @@ const Ui = struct {
         const overlay_visible = self.codex_open or self.stop_open or self.permission != null or popup_lines.len != 0 or menu_visible or
             self.resume_picker != null or self.model_picker != null or self.provider_open or self.settings_open;
         const wanted_body = if (self.secret_mode) @min(body_limit, secret_lines.lines.len) else if (show_thinking) @min(thinking_gap + @min(reasoning_tail_rows, thinking_lines.len), content_body_limit) else @min((if (overlay_visible) @as(usize, 0) else borrowed.len) + lines.items.len, content_body_limit);
-        const wanted_rows = @min(self.size.rows, footer_rows + popup_lines.len + popup_gap + wanted_body);
+        const wanted_rows = @min(self.size.rows, footer_rows + popup_count + popup_gap + wanted_body);
         // Reuse the ACKed footprint when content contracts. This keeps the
         // composer at its acknowledged row without inventing a full-screen
         // tail or evicting already committed transcript rows.
@@ -7369,7 +7531,7 @@ const Ui = struct {
         // advances, and account for newly borrowed rows separately.
         const candidate_menu = menu_visible or self.settings_open or self.provider_open or self.model_picker != null or self.resume_picker != null;
         self.frame_menu_extra = 0;
-        if (self.natural_flow and candidate_menu and !self.codex_open and !self.stop_open and self.permission == null and !self.secret_mode and !self.secret_quarantine) {
+        if (self.natural_flow and (candidate_menu or link.rows != 0) and !self.stop_open and self.permission == null and !self.secret_mode and !self.secret_quarantine) {
             // Child pickers share the parent's temporary footprint. Their hints
             // and search fields must not become a new minimum on dismissal.
             const normal_body = lines.items.len != 0 or borrowed_content or transcript_rows != 0 or above_content or thinking != null or queue_snapshot.preview_count != 0;
@@ -7486,7 +7648,11 @@ const Ui = struct {
         // 审批选项之外至少留一行正文；尺寸不足不属于永久的 clipped 状态。
         const hides_approval_choice = if (self.permission != null) !self.approvalFits() else false;
         if (self.size.rows < 7 or cols < 8 or hides_approval_choice) {
-            for (0..rows) |row| try putLine(writer, a, row + 1, if (row == 0) "Resize terminal" else "", cols);
+            for (0..rows) |row| {
+                const message: []const u8 = if (codex_return and row + 1 == rows) codex_prompt else if (row == 0) "Resize terminal" else "";
+                try putLine(writer, a, row + 1, message, cols);
+                if (codex_return and row + 1 == rows and text.width(codex_prompt) <= cols) self.frame_codex_return = true;
+            }
             cursor_offset = tail_out.written().len;
             try writer.writeAll("\r");
             self.frame_permission = null;
@@ -7494,7 +7660,7 @@ const Ui = struct {
             const body_rows = rows - footer_rows;
             // Menu rows are pinned to the bottom of the body, directly above the
             // composer, so the transcript above keeps its own scroll window.
-            const popup_span = @min(popup_lines.len, body_rows);
+            const popup_span = @min(popup_count, body_rows);
             const content_body_rows = body_rows -| (popup_span + popup_gap);
             visible_from = try self.drawTailBody(writer, .{
                 .a = a,
@@ -7517,7 +7683,12 @@ const Ui = struct {
             if (popup_gap != 0 and body_rows > popup_span)
                 try putStyled(writer, 1 + content_body_rows, "");
             // Shared provider palette for root, provider and model candidates.
-            for (0..popup_span) |line| {
+            if (link.rows != 0) {
+                // One logical terminal line, counted as its full physical footprint.
+                std.debug.assert(link.rows == popup_span);
+                try link.write(writer, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span));
+            }
+            for (0..@min(popup_span, popup_lines.len)) |line| {
                 const tone = if (selected_line == line) theme.accent else theme.muted;
                 const emphasis: ?usize = if (command_popup)
                     command_menu_module.labelBytes(self.command_matches.commands[menu_rows.start + line])
@@ -7529,7 +7700,7 @@ const Ui = struct {
                     try putCandidateLine(writer, a, 1 + content_body_rows + @min(popup_gap, body_rows -| popup_span) + line, popup_lines[line], cols, tone, checked_mask & (@as(u16, 1) << @intCast(line)) != 0, emphasis);
                 }
             }
-            if (popup_span == popup_lines.len) {
+            if (!codex_surface and popup_span == popup_lines.len) {
                 if (!self.stop_open and self.settings_open and settings_rows.can_confirm and
                     (!self.proxy_address_open or self.addressFits(cols)))
                 {
@@ -7562,7 +7733,14 @@ const Ui = struct {
                 try putActivityLine(writer, a, rows - composer_rows, activity_line, cols, spinner, spinner_tone);
             }
 
-            const cursor = try self.drawComposer(&tail_out, a, cols, rows, composer_rows, prepared, modal_text != null);
+            const cursor: ComposerCursor = if (codex_surface) blk: {
+                try putToneLine(writer, a, rows, codex_prompt, cols, theme.accent);
+                const offset = tail_out.written().len;
+                try writer.writeAll("\r");
+                if (link.rows != 0) painted_codex_generation = codex_view.generation;
+                if (codex_return and text.width(codex_prompt) <= cols) self.frame_codex_return = true;
+                break :blk .{ .offset = offset, .rows_up = 0, .rows = 1 };
+            } else try self.drawComposer(&tail_out, a, cols, rows, composer_rows, prepared, modal_text != null);
             cursor_offset = cursor.offset;
             cursor_rows_up = cursor.rows_up;
             rendered_composer_rows = cursor.rows;
@@ -7593,7 +7771,8 @@ const Ui = struct {
         // Include release in the trusted cursor suffix so full/sparse/recovery
         // tails all close synchronization; cursor-show remains the final marker.
         try writer.writeAll(terminal_module.sync_end ++ "\x1b[?25h");
-        const snapshot_allowed = self.permission == null and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
+        // A CRLF-indexed sparse snapshot cannot represent a native-wrapped URL.
+        const snapshot_allowed = !codex_surface and self.permission == null and self.resume_picker == null and self.model_picker == null and !self.provider_open and !self.settings_open and !menu_visible and !self.secret_mode and !self.secret_quarantine;
         var candidate = if (snapshot_allowed) try tail_frame.Snapshot.capture(self.allocator, tail_out.written(), rows, cursor_offset) else null;
         errdefer if (candidate) |*snapshot| snapshot.deinit();
         const can_diff = anchored and snapshot_allowed and physical.items.len == 0 and !self.tail_native and
@@ -7669,6 +7848,7 @@ const Ui = struct {
             self.frame_relative = false;
             self.frame_bottom = true;
         }
+        self.pending_codex_generation = painted_codex_generation;
         self.frame_fresh = true;
         self.frame_changed = self.display_changed;
         self.display_changed = false;

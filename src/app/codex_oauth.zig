@@ -11,27 +11,22 @@ const store_mod = @import("auth_store.zig");
 const call_limit: u32 = 15_000;
 const login_limit: u32 = 15 * 60_000;
 const refresh_margin_ms: i64 = 5 * 60_000;
-const verification_url = "https://auth.openai.com/codex/device";
+const max_callback_bytes = @import("../core/codex_login.zig").max_callback_bytes;
 
-pub const DevicePrompt = struct { verification_url: []const u8, user_code: []const u8 };
-pub const DeviceSink = struct {
-    context: ?*anyopaque = null,
-    pending_fn: ?*const fn (?*anyopaque, DevicePrompt) anyerror!void = null,
+pub const BrowserSink = struct {
+    context: *anyopaque,
+    callback_fn: *const fn (*anyopaque, url: []const u8, out: []u8, cancel: *const p.Cancellation, timeout_ms: u32) anyerror!usize,
 };
 
 // Private seam for offline tests. No response bodies or secrets go to diagnostics.
 const Wire = struct {
     context: ?*anyopaque = null,
-    begin: *const fn (?*anyopaque, std.mem.Allocator, *Client, ?*const p.Cancellation, u32) anyerror!device.DeviceState,
-    poll: *const fn (?*anyopaque, std.mem.Allocator, *Client, *const device.DeviceState, ?*const p.Cancellation, u32) anyerror!device.PollResult,
+    exchange: *const fn (?*anyopaque, std.mem.Allocator, *Client, []const u8, []const u8, ?*const p.Cancellation, u32) anyerror!device.TokenSet,
     refresh: *const fn (?*anyopaque, std.mem.Allocator, *Client, []const u8, ?*const p.Cancellation, u32) anyerror!device.TokenSet,
     account: *const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8,
 };
-fn wireBegin(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, c: ?*const p.Cancellation, t: u32) !device.DeviceState {
-    return device.beginDevice(a, client, c, t);
-}
-fn wirePoll(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, s: *const device.DeviceState, c: ?*const p.Cancellation, t: u32) !device.PollResult {
-    return device.pollDevice(a, client, s, c, t);
+fn wireExchange(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, code: []const u8, verifier: []const u8, c: ?*const p.Cancellation, t: u32) !device.TokenSet {
+    return device.exchange(a, client, code, verifier, c, t);
 }
 fn wireRefresh(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, token: []const u8, c: ?*const p.Cancellation, t: u32) !device.TokenSet {
     return device.refresh(a, client, token, c, t);
@@ -39,7 +34,7 @@ fn wireRefresh(_: ?*anyopaque, a: std.mem.Allocator, client: *Client, token: []c
 fn wireAccount(_: ?*anyopaque, a: std.mem.Allocator, token: []const u8) ![]u8 {
     return device.accountId(a, token);
 }
-const production_wire: Wire = .{ .begin = wireBegin, .poll = wirePoll, .refresh = wireRefresh, .account = wireAccount };
+const production_wire: Wire = .{ .exchange = wireExchange, .refresh = wireRefresh, .account = wireAccount };
 
 const Deadline = struct {
     io: std.Io,
@@ -62,19 +57,6 @@ const Deadline = struct {
 };
 fn checkCancel(cancel: ?*const p.Cancellation) !void {
     if (cancel) |c| if (c.isRequested()) return error.Cancelled;
-}
-fn wait(io: std.Io, deadline: Deadline, cancel: ?*const p.Cancellation, duration: u32) !void {
-    var left = duration;
-    while (left > 0) {
-        try checkCancel(cancel);
-        const remaining = deadline.remaining();
-        if (remaining == 0) return error.OAuthTimeout;
-        const step = @min(left, @min(remaining, 100));
-        try std.Io.sleep(io, .fromMilliseconds(step), .awake);
-        left -= step;
-    }
-    try checkCancel(cancel);
-    if (deadline.remaining() == 0) return error.OAuthTimeout;
 }
 fn headerValue(value: []const u8) bool {
     if (value.len == 0 or value.len > 16384) return false;
@@ -162,9 +144,6 @@ pub const Manager = struct {
     wire: Wire = production_wire,
     // Private offline fault injection; production never sets this hook.
     before_refresh_save: ?*const fn (bool) anyerror!void = null,
-    /// Minimum device polling interval. Production keeps the protocol's 1s;
-    /// focused tests use a short interval instead of sleeping.
-    min_poll_interval_ms: u32 = 1000,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, home: []const u8, env: *const std.process.Environ.Map) !*Manager {
         const self = try a.create(Manager);
@@ -273,84 +252,64 @@ pub const Manager = struct {
         return .{ .access_token = owned, .account_id = account, .redaction_refresh_token = owned_refresh };
     }
 
-    pub fn login(self: *Manager, provider_name: []const u8, cancel: *const p.Cancellation, sink: DeviceSink) !void {
+    pub fn login(self: *Manager, provider_name: []const u8, cancel: *const p.Cancellation, sink: BrowserSink) !void {
         if (provider_name.len == 0 or provider_name.len > 64) return error.InvalidCodexProvider;
         for (provider_name) |c| if (c <= 0x20 or c >= 0x7f or c == '/' or c == '\\') return error.InvalidCodexProvider;
         const deadline = Deadline.init(self.io, login_limit);
         try checkCancel(cancel);
         var local = self.store;
         local.expected_version = null;
-        var initial_tx = try local.beginTransaction(cancel, try deadline.callTime());
-        checkCancel(cancel) catch |err| {
-            initial_tx.deinit();
-            return err;
+        // Keep the CAS fingerprint and route, not the config or flock, while
+        // waiting for the user. Exchange must not depend on later route edits.
+        var fingerprint: [32]u8 = undefined;
+        var client = route: {
+            var tx = try local.beginTransaction(cancel, try deadline.callTime());
+            defer tx.deinit();
+            try checkCancel(cancel);
+            _ = try deadline.callTime();
+            var before = try tx.loadLatest();
+            defer cfg.release(&before);
+            try checkCancel(cancel);
+            _ = try deadline.callTime();
+            fingerprint = try baseline(before.value, provider_name);
+            break :route try device.initClient(self.wiping.allocator(), self.io, &self.route_env, before.value.proxy);
         };
-        _ = deadline.callTime() catch |err| {
-            initial_tx.deinit();
-            return err;
-        };
-        var before = initial_tx.loadLatest() catch |err| {
-            initial_tx.deinit();
-            return err;
-        };
-        defer cfg.release(&before);
-        checkCancel(cancel) catch |err| {
-            initial_tx.deinit();
-            return err;
-        };
-        _ = deadline.callTime() catch |err| {
-            initial_tx.deinit();
-            return err;
-        };
-        const fingerprint = baseline(before.value, provider_name) catch |err| {
-            initial_tx.deinit();
-            return err;
-        };
-        initial_tx.deinit();
-        var client = try device.initClient(self.wiping.allocator(), self.io, &self.route_env, before.value.proxy);
         defer client.deinit();
-        var state = self.wire.begin(self.wire.context, self.allocator, &client, cancel, try deadline.callTime()) catch |err| {
+        const temp = self.wiping.allocator();
+        var flow: device.BrowserAuth = undefined;
+        try flow.init(self.io);
+        defer flow.deinit();
+        const url = try flow.authorizeUrl(temp);
+        defer temp.free(url);
+        var callback: [max_callback_bytes]u8 = @splat(0);
+        defer std.crypto.secureZero(u8, &callback);
+        try checkCancel(cancel);
+        const human_timeout = deadline.remaining();
+        if (human_timeout == 0) return error.OAuthTimeout;
+        const n = try sink.callback_fn(sink.context, url, &callback, cancel, human_timeout);
+        try checkCancel(cancel);
+        if (deadline.remaining() == 0) return error.OAuthTimeout;
+        if (n > callback.len) return error.InvalidOAuthCallback;
+        const code = try flow.callbackCode(temp, callback[0..n]);
+        try checkCancel(cancel);
+        const timeout = try deadline.callTime();
+        var tokens = self.wire.exchange(self.wire.context, self.allocator, &client, code, &flow.verifier, cancel, timeout) catch |err| {
             if (err == error.CleanupFailed) return err;
             try checkCancel(cancel);
-            return error.OAuthDeviceFailed;
+            return error.OAuthExchangeFailed;
         };
-        defer state.deinit(self.allocator);
-        if (!std.mem.eql(u8, state.verification_url, verification_url) or !headerValue(state.user_code)) return error.InvalidDevicePrompt;
+        defer tokens.deinit(self.allocator);
+        // Exchange has succeeded: commit with a separate bounded wait,
+        // ignoring cancellation until rotation is safely persisted.
+        var tx = try local.beginTransaction(null, call_limit);
+        defer tx.deinit();
+        var latest = try tx.loadLatest();
+        defer cfg.release(&latest);
+        const latest_fingerprint = try baseline(latest.value, provider_name);
+        if (!std.mem.eql(u8, &fingerprint, &latest_fingerprint)) return error.OAuthLoginConflict;
+        const copy = try merge(self.allocator, &latest.value, provider_name, tokensCredential(tokens), true);
+        defer self.allocator.free(copy);
+        tx.saveLatest(latest.value) catch return error.OAuthCommitFailed;
         try checkCancel(cancel);
-        if (sink.pending_fn) |callback| try callback(sink.context, .{ .verification_url = verification_url, .user_code = state.user_code });
-        var interval = @max(state.interval_ms, self.min_poll_interval_ms);
-        while (true) {
-            const real_now: i64 = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds());
-            if (state.expires_at_ms <= real_now) return error.OAuthDeviceExpired;
-            try wait(self.io, deadline, cancel, interval);
-            const now: i64 = @intCast(std.Io.Clock.real.now(self.io).toMilliseconds());
-            if (state.expires_at_ms <= now) return error.OAuthDeviceExpired;
-            const result = self.wire.poll(self.wire.context, self.allocator, &client, &state, cancel, try deadline.callTime()) catch |err| {
-                if (err == error.CleanupFailed) return err;
-                try checkCancel(cancel);
-                return error.OAuthDeviceFailed;
-            };
-            switch (result) {
-                .pending => {},
-                .slow_down => interval +|= 5000,
-                .success => |tokens_value| {
-                    var tokens = tokens_value;
-                    defer tokens.deinit(self.allocator);
-                    // Exchange has succeeded: commit with a separate bounded wait,
-                    // ignoring cancellation until rotation is safely persisted.
-                    var tx = try local.beginTransaction(null, call_limit);
-                    defer tx.deinit();
-                    var latest = try tx.loadLatest();
-                    defer cfg.release(&latest);
-                    const latest_fingerprint = try baseline(latest.value, provider_name);
-                    if (!std.mem.eql(u8, &fingerprint, &latest_fingerprint)) return error.OAuthLoginConflict;
-                    const copy = try merge(self.allocator, &latest.value, provider_name, tokensCredential(tokens), true);
-                    defer self.allocator.free(copy);
-                    tx.saveLatest(latest.value) catch return error.OAuthCommitFailed;
-                    try checkCancel(cancel);
-                    return;
-                },
-            }
-        }
     }
 };

@@ -95,6 +95,23 @@ pub const Parser = struct {
         self.stop_feed = true;
     }
 
+    /// The owner may close private entry between reads. Preserve only framing
+    /// provenance, never buffered input. A partial marker can still complete;
+    /// it cannot expire into a fresh Esc that unlocks the normal composer.
+    pub fn quarantineSecret(self: *Parser) void {
+        const pasted = self.pasted;
+        const prefix = self.escape[0..self.escape_len];
+        const marker: []const u8 = if (std.mem.startsWith(u8, "\x1b[200~", prefix)) "\x1b[200~" else if (std.mem.startsWith(u8, "\x1b[201~", prefix)) "\x1b[201~" else "";
+        const n = @min(prefix.len, marker.len);
+        self.secretMode(true);
+        self.pasted = pasted;
+        self.batch_paste = true;
+        self.secret_batch_paste = true;
+        @memcpy(self.escape[0..n], marker[0..n]);
+        self.escape_len = n;
+        self.escape_paste = n != 0;
+    }
+
     fn invalid(self: *Parser, sink: Sink) !void {
         if (self.secret) try sink.emit(.{ .text = .{ .value = "\x00", .pasted = self.pasted } });
     }
@@ -296,45 +313,50 @@ pub const Parser = struct {
 };
 /// Dedicated fixed-capacity secret storage. Never allocate or copy into the editor.
 /// Invalid input is latched until explicit clear/cancel; a truncated key cannot save.
-pub const SecretInput = struct {
-    bytes: [16384]u8 = @splat(0),
-    len: usize = 0,
-    failed: bool = false,
+pub const SecretInput = BoundedSecretInput(16384);
 
-    pub fn wipe(self: *SecretInput) void {
-        std.crypto.secureZero(u8, &self.bytes);
-        self.len = 0;
-        self.failed = false;
-    }
+pub fn BoundedSecretInput(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        bytes: [capacity]u8 = @splat(0),
+        len: usize = 0,
+        failed: bool = false,
 
-    pub fn deinit(self: *SecretInput) void {
-        self.wipe();
-    }
+        pub fn wipe(self: *Self) void {
+            std.crypto.secureZero(u8, &self.bytes);
+            self.len = 0;
+            self.failed = false;
+        }
 
-    pub fn reject(self: *SecretInput) void {
-        self.wipe();
-        self.failed = true;
-    }
+        pub fn deinit(self: *Self) void {
+            self.wipe();
+        }
 
-    pub fn insert(self: *SecretInput, data: []const u8) void {
-        if (self.failed) return;
-        if (data.len > self.bytes.len - self.len) return self.reject();
-        // API keys are printable ASCII without whitespace or control characters.
-        for (data) |b| if (b < 0x21 or b > 0x7e) return self.reject();
-        @memcpy(self.bytes[self.len..][0..data.len], data);
-        self.len += data.len;
-    }
+        pub fn reject(self: *Self) void {
+            self.wipe();
+            self.failed = true;
+        }
 
-    pub fn erase(self: *SecretInput) void {
-        if (self.len == 0) return;
-        self.len -= 1;
-        std.crypto.secureZero(u8, self.bytes[self.len..][0..1]);
-    }
+        pub fn insert(self: *Self, data: []const u8) void {
+            if (self.failed) return;
+            if (data.len > self.bytes.len - self.len) return self.reject();
+            // API keys are printable ASCII without whitespace or control characters.
+            for (data) |b| if (b < 0x21 or b > 0x7e) return self.reject();
+            @memcpy(self.bytes[self.len..][0..data.len], data);
+            self.len += data.len;
+        }
 
-    pub fn value(self: *const SecretInput) ?[]const u8 {
-        return if (self.failed or self.len == 0) null else self.bytes[0..self.len];
-    }
-};
+        pub fn erase(self: *Self) void {
+            if (self.len == 0) return;
+            self.len -= 1;
+            std.crypto.secureZero(u8, self.bytes[self.len..][0..1]);
+        }
+
+        pub fn value(self: *const Self) ?[]const u8 {
+            return if (self.failed or self.len == 0) null else self.bytes[0..self.len];
+        }
+    };
+}
 
 /// 单行编辑器。保存 UTF-8 字节，光标以字节偏移表示，并保证光标始终落在字形簇边界上。
 pub const Editor = struct {

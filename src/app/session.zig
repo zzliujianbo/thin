@@ -67,23 +67,75 @@ const CodexLoginJob = struct {
     done: std.atomic.Value(bool) = .init(false),
     future: ?std.Io.Future(void) = null,
 
-    fn pending(raw: ?*anyopaque, prompt: codex_oauth.DevicePrompt) !void {
-        const self: *CodexLoginJob = @ptrCast(@alignCast(raw orelse return error.InvalidDevicePrompt));
-        if (!std.mem.eql(u8, prompt.verification_url, codex_login.verification_url) or prompt.user_code.len == 0 or prompt.user_code.len > 64) return error.InvalidDevicePrompt;
-        for (prompt.user_code) |c| if (c < 0x21 or c > 0x7e) return error.InvalidDevicePrompt;
+    // Private rendezvous: the manager lends its bounded, wipe-on-return
+    // buffer while waiting. No callback needs to be queued in Session memory.
+    wake: std.Io.Condition = .init,
+    output: ?[]u8 = null,
+    received: usize = 0,
+    prompted: bool = false,
+    deadline: std.Io.Clock.Timestamp = undefined,
+
+    fn clearUrl(self: *CodexLoginJob) void {
+        @memset(&self.view.url, 0);
+        self.view.url_len = 0;
+    }
+
+    fn browserCallback(raw: *anyopaque, url: []const u8, out: []u8, cancel: *const p.Cancellation, timeout_ms: u32) !usize {
+        const self: *CodexLoginJob = @ptrCast(@alignCast(raw));
+        if (!codex_login.validAuthorizationUrl(url)) return error.InvalidAuthorizationUrl;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        @memset(&self.view.code, 0);
-        @memcpy(self.view.code[0..prompt.user_code.len], prompt.user_code);
-        self.view.code_len = @intCast(prompt.user_code.len);
+        if (cancel.isRequested() or self.cancel.isRequested()) return error.Cancelled;
+        if (self.prompted) return error.InvalidSequence;
+        self.prompted = true;
+        self.deadline = .fromNow(self.io, .{ .clock = .awake, .raw = .fromMilliseconds(timeout_ms) });
+        self.output = out[0..@min(out.len, codex_login.max_callback_bytes)];
+        @memcpy(self.view.url[0..url.len], url);
+        self.view.url_len = @intCast(url.len);
+        defer {
+            self.output = null;
+            self.received = 0;
+            self.clearUrl();
+        }
+        errdefer std.crypto.secureZero(u8, out[0..self.received]);
+        while (self.received == 0) {
+            if (cancel.isRequested() or self.cancel.isRequested()) return error.Cancelled;
+            self.wake.waitTimeout(self.io, &self.mutex, .{ .deadline = self.deadline }) catch |err| switch (err) {
+                error.Timeout => return error.OAuthTimeout,
+                error.Canceled => return error.Cancelled,
+            };
+        }
+        if (cancel.isRequested() or self.cancel.isRequested()) return error.Cancelled;
+        return self.received;
+    }
+
+    fn submit(self: *CodexLoginJob, generation: u64, callback: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const out = self.output orelse return error.InvalidSequence;
+        if (generation != self.view.generation or self.received != 0 or self.cancel.isRequested() or self.deadline.untilNow(self.io).raw.nanoseconds >= 0) return error.InvalidSequence;
+        if (callback.len == 0) return error.InvalidInput;
+        if (callback.len > out.len) return error.InputTooLarge;
+        @memcpy(out[0..callback.len], callback);
+        self.received = callback.len;
+        self.clearUrl();
+        self.wake.signal(self.io);
+    }
+
+    fn requestCancel(self: *CodexLoginJob, generation: u64) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (generation != self.view.generation or self.view.status != .pending or self.cancel.isRequested()) return error.InvalidSequence;
+        self.cancel.cancel();
+        self.clearUrl();
+        self.wake.signal(self.io);
     }
     fn run(self: *CodexLoginJob) void {
         defer self.done.store(true, .release);
-        const result = self.manager.login(self.alias, &self.cancel, .{ .context = self, .pending_fn = pending });
+        const result = self.manager.login(self.alias, &self.cancel, .{ .context = self, .callback_fn = browserCallback });
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        @memset(&self.view.code, 0);
-        self.view.code_len = 0;
+        self.clearUrl();
         if (result) |_| {
             self.view.status = .succeeded;
         } else |err| {
@@ -92,8 +144,8 @@ const CodexLoginJob = struct {
             } else {
                 self.view.status = .failed;
                 self.view.failure = switch (err) {
-                    error.OAuthDeviceExpired, error.OAuthTimeout => .expired,
-                    error.InvalidDevicePrompt => .invalid_response,
+                    error.OAuthTimeout => .expired,
+                    error.InvalidAuthorizationUrl, error.InvalidOAuthCallback => .invalid_response,
                     error.OAuthLoginConflict, error.AuthStoreBusy => .busy,
                     error.OAuthCommitFailed => .storage,
                     else => .other,
@@ -107,8 +159,7 @@ const CodexLoginJob = struct {
         return self.view;
     }
     fn destroy(self: *CodexLoginJob, a: std.mem.Allocator) void {
-        self.cancel.cancel();
-        if (self.future) |*future| future.await(self.io);
+        std.debug.assert(self.future == null);
         self.manager.deinit();
         a.free(self.alias);
         a.destroy(self);
@@ -574,8 +625,7 @@ pub const Session = struct {
 
     /// 必须等 TUI 取消并 join worker 后再释放；Connection 不得比 Session 活得更久。
     pub fn deinit(self: *Session) void {
-        if (self.codex_job) |job| job.destroy(self.allocator);
-        self.codex_job = null;
+        self.closeCodexLogin();
         self.releaseLoadedHistory();
         if (self.metadata_job) |job| job.destroy();
         self.metadata_cache.deinit(self.allocator);
@@ -968,8 +1018,24 @@ pub const Session = struct {
 
     pub fn cancelCodexLogin(self: *Session, generation: u64) !void {
         const job = self.codex_job orelse return error.InvalidSequence;
-        if (generation != job.view.generation) return error.InvalidSequence;
-        job.cancel.cancel();
+        try job.requestCancel(generation);
+    }
+
+    /// Owner shutdown must wake and join the worker before returning a close
+    /// receipt. Do not launch a post-login metadata refresh during teardown.
+    pub fn closeCodexLogin(self: *Session) void {
+        const job = self.codex_job orelse return;
+        job.requestCancel(job.view.generation) catch {};
+        if (job.future) |*future| future.await(self.io);
+        job.future = null;
+        self.codex_view = job.snapshot();
+        self.codex_job = null;
+        job.destroy(self.allocator);
+    }
+
+    pub fn submitCodexLogin(self: *Session, generation: u64, callback: []const u8) !void {
+        const job = self.codex_job orelse return error.InvalidSequence;
+        try job.submit(generation, callback);
     }
 
     pub fn codexLoginView(self: *Session) codex_login.View {
@@ -1061,8 +1127,9 @@ pub const Session = struct {
     fn codexLogin(raw: *anyopaque, action: codex_login.Action, generation: u64) !void {
         const self: *Session = @ptrCast(@alignCast(raw));
         switch (action) {
-            .start => try self.startCodexLogin(),
+            .start => if (generation == 0) try self.startCodexLogin() else return error.InvalidSequence,
             .cancel => try self.cancelCodexLogin(generation),
+            .submit => |callback| try self.submitCodexLogin(generation, callback),
         }
     }
 

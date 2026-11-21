@@ -18,27 +18,91 @@ test "OAuth POST uses configured proxy independent of models or HTTPS proxy with
         var client = try initClient(a, io, &env, if (mode == .configured) proxy else null);
         defer client.deinit();
         // Even a route regression can only reach this test's own loopback port.
-        var http: Http = .{ .client = &client, .urls = .{ url, url, url } };
-        var job = try Io.concurrent(io, rejectOAuthConnection, .{ io, &server, mode == .bypass });
-        defer job.cancel(io) catch {};
-        try std.testing.expectError(error.TransportFailure, refreshWith(http.transport(), a, io, "synthetic-refresh", null, 3000));
-        // A pre-spawn failure cannot leave this test waiting in accept().
-        try job.cancel(io);
+        var http: Http = .{ .client = &client, .url = url };
+        for ([_]bool{ false, true }) |is_refresh| {
+            var job = try Io.concurrent(io, rejectOAuthConnection, .{ io, &server, mode == .bypass });
+            defer job.cancel(io) catch {};
+            if (is_refresh) {
+                try std.testing.expectError(error.TransportFailure, refreshWith(http.transport(), a, io, "synthetic-refresh", null, 3000));
+            } else {
+                try std.testing.expectError(error.TransportFailure, exchangeWith(http.transport(), a, io, "synthetic-code", "synthetic-verifier", null, 3000));
+            }
+            // A pre-spawn failure cannot leave this test waiting in accept().
+            try job.cancel(io);
+        }
     }
 }
 
-test "device begin and poll exchange use owned values" {
+test "browser PKCE uses fresh verifier and state and registered authorize parameters" {
     const a = std.testing.allocator;
-    var fake: Fake = .{ .responses = &.{ .{ .status = 200, .body = "{\"device_auth_id\":\"id\",\"user_code\":\"code\",\"interval\":\"5\"}" }, .{ .status = 403, .body = "{}" }, .{ .status = 200, .body = "{\"authorization_code\":\"a+b\",\"code_verifier\":\"v\"}" }, .{ .status = 200, .body = "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":60}" } } };
-    var device = try beginWith(fake.transport(), a, std.testing.io, null, 5000);
-    defer device.deinit(a);
-    try std.testing.expectEqual(@as(u32, 5000), device.interval_ms);
-    try std.testing.expect((try pollWith(fake.transport(), a, std.testing.io, &device, null, 5000)) == .pending);
-    var result = try pollWith(fake.transport(), a, std.testing.io, &device, null, 5000);
-    try std.testing.expect(result == .success);
-    defer result.success.deinit(a);
-    try std.testing.expectEqual(@as(i64, 61000), result.success.expires_at_ms);
-    try std.testing.expectEqualStrings("refresh", result.success.refresh_token);
+    var first: BrowserAuth = undefined;
+    try first.init(std.testing.io);
+    defer first.deinit();
+    var second: BrowserAuth = undefined;
+    try second.init(std.testing.io);
+    defer second.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &first.state, &second.state));
+    try std.testing.expect(!std.mem.eql(u8, &first.verifier, &second.verifier));
+    // RFC 7636 Appendix B known-answer pair, independent of production hash/encoding.
+    first.verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".*;
+    const url = try first.authorizeUrl(a);
+    defer wipeFree(a, url);
+    const expected = try std.mem.concat(a, u8, &.{
+        "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann" ++
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid+profile+email+offline_access" ++
+            "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=",
+        &first.state,
+        "&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=thin",
+    });
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, url);
+}
+
+test "callback requires registered literal redirect and unique matching decoded fields" {
+    const a = std.testing.allocator;
+    const state = "0123456789abcdef0123456789abcdef";
+    const flow: BrowserAuth = .{ .state = state.*, .verifier = undefined };
+    const prefix = redirect_uri ++ "?";
+    const query = "code=x&state=" ++ state;
+    const valid = try a.dupe(u8, prefix ++ "scope=openid+profile&st%61te=" ++ state ++ "&%63ode=a%2Bb%26c%3Dd%25");
+    defer wipeFree(a, valid);
+    try std.testing.expectEqualStrings("a+b&c=d%", try flow.callbackCode(a, valid));
+    for ([_][]const u8{
+        "x",                                             query,                                                "http://127.0.0.1:1455/auth/callback?" ++ query,  "https://localhost:1455/auth/callback?" ++ query,
+        "http://localhost:1456/auth/callback?" ++ query, "http://user@localhost:1455/auth/callback?" ++ query, "http://localhost:1455/auth/callback/?" ++ query, "http://localhost:1455/auth/%63allback?" ++ query,
+        prefix ++ "code=a",                              prefix ++ "state=" ++ state,                          prefix ++ "code=&state=" ++ state,                prefix ++ "code=a&state=other",
+        prefix ++ query ++ "&%73tate=" ++ state,         prefix ++ query ++ "&cod%65=x",                       prefix ++ query ++ "&x=1&x=2",                    prefix ++ query ++ "#",
+        prefix ++ query ++ "#fragment",                  prefix ++ query ++ "&error=access_denied",            prefix ++ query ++ "&x=%",                        prefix ++ query ++ "&x=%0",
+        prefix ++ query ++ "&x=%GG",                     prefix ++ query ++ "&%xx=x",                          prefix ++ query ++ "&x=%00",                      prefix ++ query ++ "&x=%0d%0a",
+        prefix ++ query ++ "&x=%7f",                     prefix ++ query ++ "\n",                              prefix ++ query ++ "&",                           prefix ++ query ++ "&bare",
+        prefix ++ query ++ "&=missing",                  prefix ++ query ++ " ",
+    }) |bad| {
+        const owned = try a.dupe(u8, bad);
+        defer wipeFree(a, owned);
+        try std.testing.expectError(error.InvalidOAuthCallback, flow.callbackCode(a, owned));
+    }
+    var limit: [max_callback_bytes + 1]u8 = @splat('x');
+    const start = prefix ++ "state=" ++ state ++ "&code=";
+    @memcpy(limit[0..start.len], start);
+    try std.testing.expectError(error.InvalidOAuthCallback, flow.callbackCode(a, &limit));
+    try std.testing.expectEqual(max_callback_bytes - start.len, (try flow.callbackCode(a, limit[0..max_callback_bytes])).len);
+}
+
+test "exchange form binds decoded code verifier and exact redirect in a single POST" {
+    const a = std.testing.allocator;
+    var fake: Fake = .{
+        .expected_form = "grant_type=authorization_code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&code=a%2Bb%26c%3Dd%25&code_verifier=v_-.&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+        .responses = &.{.{ .status = 200, .body = "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":60}" }},
+    };
+    var canceled: p.Cancellation = .{};
+    canceled.cancel();
+    try std.testing.expectError(error.Canceled, exchangeWith(fake.transport(), a, std.testing.io, "a+b&c=d%", "v_-.", &canceled, 5000));
+    try std.testing.expectEqual(@as(usize, 0), fake.index);
+    var result = try exchangeWith(fake.transport(), a, std.testing.io, "a+b&c=d%", "v_-.", null, 5000);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), fake.index);
+    try std.testing.expectEqual(@as(i64, 61000), result.expires_at_ms);
+    try std.testing.expectEqualStrings("refresh", result.refresh_token);
 }
 test "refresh preserves complete rotated response despite cancellation" {
     const a = std.testing.allocator;
@@ -75,17 +139,9 @@ test "token parser enforces access and refresh length limits" {
     try std.testing.expectEqual(max_token, result.access_token.len);
     try std.testing.expectEqual(max_token, result.refresh_token.len);
 }
-test "poll error classifications and missing rotation" {
+test "refresh rejects missing rotation" {
     const a = std.testing.allocator;
-    var fake: Fake = .{ .responses = &.{
-        .{ .status = 400, .body = "{\"error\":\"slow_down\"}" },
-        .{ .status = 403, .body = "{\"error\":\"access_denied\"}" },
-        .{ .status = 200, .body = "{\"access_token\":\"new\",\"expires_in\":5}" },
-    } };
-    var device: DeviceState = .{ .device_auth_id = try a.dupe(u8, "id"), .user_code = try a.dupe(u8, "code"), .interval_ms = 1000, .expires_at_ms = 9000 };
-    defer device.deinit(a);
-    try std.testing.expect((try pollWith(fake.transport(), a, std.testing.io, &device, null, 5000)) == .slow_down);
-    try std.testing.expectError(error.DeviceDenied, pollWith(fake.transport(), a, std.testing.io, &device, null, 5000));
+    var fake: Fake = .{ .responses = &.{.{ .status = 200, .body = "{\"access_token\":\"new\",\"expires_in\":5}" }} };
     try std.testing.expectError(error.InvalidResponse, refreshWith(fake.transport(), a, std.testing.io, "old", null, 5000));
 }
 test "account routing claim and form encoding" {

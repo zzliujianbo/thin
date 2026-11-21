@@ -1,3 +1,40 @@
+test "Codex login submit owns the callback and wipes it on queue abort" {
+    const Observer = struct {
+        callback: []const u8,
+        wiped: bool = false,
+
+        fn free(ctx: *anyopaque, block: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start = @intFromPtr(self.callback.ptr);
+            const base = @intFromPtr(block.ptr);
+            if (start >= base and start + self.callback.len <= base + block.len)
+                self.wiped = std.mem.allEqual(u8, self.callback, 0);
+            std.testing.allocator.rawFree(block, alignment, ra);
+        }
+    };
+    var input = "synthetic-callback".*;
+    var observer: Observer = undefined;
+    {
+        const request = try Owned.create(std.testing.allocator, 1, 2, 3, .{ .codex_login = .{
+            .action = .{ .submit = &input },
+            .generation = 4,
+        } });
+        defer request.deinit();
+        const login = request.action.codex_login;
+        @memset(&input, 'x');
+        try std.testing.expectEqualStrings("synthetic-callback", login.action.submit);
+        try std.testing.expectEqual(@as(u64, 4), login.generation);
+        observer = .{ .callback = login.action.submit };
+        request.arena.child_allocator = .{ .ptr = &observer, .vtable = &.{
+            .alloc = std.mem.Allocator.noAlloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = Observer.free,
+        } };
+    }
+    try std.testing.expect(observer.wiped);
+}
+
 test "large submitted input is owned without an ingress quota" {
     const a = std.testing.allocator;
     const draft = try a.alloc(u8, 65537);

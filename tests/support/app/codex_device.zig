@@ -23,7 +23,9 @@ fn rejectOAuthConnection(io: Io, server: *Io.net.Server, direct: bool) !void {
     const connect = try std.fmt.bufPrint(&first, "connect 127.0.0.1:{d} http/1.1\r\n", .{server.socket.address.getPort()});
     try std.testing.expect(std.mem.startsWith(u8, headers[0..len], connect));
     try std.testing.expect(std.mem.find(u8, headers[0..len], "authorization:") == null);
-    try std.testing.expect(std.mem.find(u8, headers[0..len], "synthetic-refresh") == null);
+    for ([_][]const u8{ "synthetic-refresh", "synthetic-code", "synthetic-verifier" }) |secret| {
+        try std.testing.expect(std.mem.find(u8, headers[0..len], secret) == null);
+    }
     var out: [128]u8 = undefined;
     var writer = stream.writer(io, &out);
     try writer.interface.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -35,12 +37,14 @@ const Fake = struct {
     index: usize = 0,
     now_ms: i64 = 1000,
     cancel_on_response: ?*p.Cancellation = null,
+    expected_form: ?[]const u8 = null,
     fn now(raw: ?*anyopaque, _: Io) i64 {
         const self: *Fake = @ptrCast(@alignCast(raw.?));
         return self.now_ms;
     }
-    fn post(raw: ?*anyopaque, a: Allocator, _: Io, _: Endpoint, _: Content, _: []const u8, _: ?*const p.Cancellation, _: u32) !Response {
+    fn post(raw: ?*anyopaque, a: Allocator, _: Io, form: []const u8, _: ?*const p.Cancellation, _: u32) !Response {
         const self: *Fake = @ptrCast(@alignCast(raw.?));
+        if (self.expected_form) |expected| try std.testing.expectEqualStrings(expected, form);
         if (self.index >= self.responses.len) return error.UnexpectedRequest;
         const item = self.responses[self.index];
         self.index += 1;

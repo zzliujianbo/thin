@@ -6,6 +6,40 @@ const theme = @import("theme.zig");
 const shared = @import("../presentation.zig");
 const line_stats = @import("../util/line_stats.zig");
 
+/// Public, validated ASCII only. This renderer never receives the private
+/// callback buffer (not even its length) or the ordinary draft.
+pub const CodexLink = struct {
+    url: []const u8 = "",
+    rows: usize = 0,
+    ends_at_margin: bool = false,
+
+    pub const callback_hint = "Open link. Paste the localhost URL here (hidden), even if it won't load. Enter.";
+
+    pub fn returnHint(cols: usize) []const u8 {
+        return if (cols >= "Esc to return".len) "Esc to return" else if (cols >= 3) "Esc" else "⎋";
+    }
+
+    /// Only use the physical margin for native selection when its exact
+    /// position was verified for this draw; otherwise leave one cell free.
+    pub fn fit(url: []const u8, cols: usize, exact: bool, budget: usize) CodexLink {
+        if (url.len == 0 or cols < callback_hint.len) return .{};
+        if (!exact and url.len > cols) return .{};
+        const width = cols + 1;
+        const rows = 1 + (url.len - 1) / width;
+        if (rows > budget) return .{};
+        return .{ .url = url, .rows = rows, .ends_at_margin = url.len % width == 0 };
+    }
+
+    /// Reserve physical rows but send one unbroken token. Hard breaks or
+    /// padding would change text copied from a native terminal selection.
+    pub fn write(self: CodexLink, writer: *std.Io.Writer, row: usize) !void {
+        if (row > 1) try writer.writeAll("\r\n");
+        try writer.print("{s}{s}{s}", .{ theme.link, self.url, theme.reset });
+        // EL at the right margin may erase the last URL character.
+        if (!self.ends_at_margin) try writer.writeAll("\x1b[K");
+    }
+};
+
 /// One safe physical line, capped by cells/whole clusters. ASCII dots indicate
 /// clipped suffixes; LF/TAB are spaces, never extra terminal rows.
 pub fn singleLine(a: std.mem.Allocator, bytes: []const u8, columns: usize) ![]const u8 {

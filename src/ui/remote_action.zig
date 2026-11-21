@@ -40,6 +40,17 @@ pub const Action = union(enum) {
             .submit => |v| .{ .submit = .{ .kind = v.kind, .text = try text(a, v.text) } },
             .enqueue => |v| .{ .enqueue = .{ .kind = v.kind, .text = try text(a, v.text) } },
             .configure => |v| .{ .configure = .{ .provider = v.provider, .key = try text(a, v.key) } },
+            .codex_login => |v| .{ .codex_login = .{
+                .generation = v.generation,
+                .action = switch (v.action) {
+                    .start => .start,
+                    .cancel => .cancel,
+                    .submit => |callback| submit: {
+                        if (callback.len > codex_login.max_callback_bytes) return error.InvalidOAuthCallback;
+                        break :submit .{ .submit = try text(a, callback) };
+                    },
+                },
+            } },
             .model => |v| .{ .model = try text(a, v) },
             .proxy_address => |v| .{ .proxy_address = try text(a, v) },
             .proxy => |v| .{ .proxy = .{ .model = try text(a, v.model), .enabled = v.enabled } },
@@ -77,7 +88,14 @@ pub const Owned = struct {
     }
 
     pub fn deinit(self: *Owned) void {
-        if (self.action == .configure) std.crypto.secureZero(u8, @constCast(self.action.configure.key));
+        switch (self.action) {
+            .configure => |v| std.crypto.secureZero(u8, @constCast(v.key)),
+            .codex_login => |v| switch (v.action) {
+                .submit => |callback| std.crypto.secureZero(u8, @constCast(callback)),
+                .start, .cancel => {},
+            },
+            else => {},
+        }
         self.arena.deinit();
         const a = self.a;
         a.destroy(self);

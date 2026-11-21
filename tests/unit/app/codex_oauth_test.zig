@@ -139,6 +139,42 @@ test "source rejects missing JWT account claim" {
     try std.testing.expectError(error.InvalidCodexAccount, manager.source().acquire(a, "codex", null, 5000));
     try std.testing.expectEqual(@as(usize, 0), fake.refresh_count);
 }
+test "invalid or canceled callback never exchanges or changes stored credentials" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const home = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const manager = try Manager.init(a, std.testing.io, home, &env);
+    defer manager.deinit();
+    var initial = try manager.store.loadOrInitialize();
+    defer cfg.release(&initial);
+    const names = try merge(a, &initial.value, "codex", .{ .access_token = "old-access", .refresh_token = "old-refresh", .expires_at_ms = 1 }, true);
+    defer a.free(names);
+    try manager.store.save(initial.value);
+    var fake: FakeWire = .{};
+    manager.wire = fake.wire();
+    var cancel: p.Cancellation = .{};
+    fake.callback_mode = .invalid;
+    try std.testing.expectError(error.InvalidOAuthCallback, manager.login("codex", &cancel, fake.sink()));
+    fake.callback_mode = .oversize;
+    try std.testing.expectError(error.InvalidOAuthCallback, manager.login("codex", &cancel, fake.sink()));
+    fake.callback_mode = .failed;
+    try std.testing.expectError(error.SinkFailure, manager.login("codex", &cancel, fake.sink()));
+    fake.callback_mode = .canceled;
+    fake.cancel_at_prompt = &cancel;
+    try std.testing.expectError(error.Cancelled, manager.login("codex", &cancel, fake.sink()));
+    // Already canceled: do not even prompt.
+    try std.testing.expectError(error.Cancelled, manager.login("codex", &cancel, fake.sink()));
+    try std.testing.expectEqual(@as(usize, 4), fake.prompt_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.exchange_count);
+    var latest = try manager.store.loadExisting();
+    defer cfg.release(&latest);
+    try std.testing.expectEqualStrings("old-refresh", (try credential(latest.value, "codex")).refresh_token);
+}
+
 test "login merges latest unrelated settings and refuses competing credentials" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -149,7 +185,6 @@ test "login merges latest unrelated settings and refuses competing credentials" 
     defer env.deinit();
     const manager = try Manager.init(a, std.testing.io, home, &env);
     defer manager.deinit();
-    manager.min_poll_interval_ms = 1;
     var initial = try manager.store.loadOrInitialize();
     defer cfg.release(&initial);
     var other = try store_mod.Store.open(a, std.testing.io, home);
@@ -157,14 +192,16 @@ test "login merges latest unrelated settings and refuses competing credentials" 
     var fake: FakeWire = .{ .mutate_store = &other };
     manager.wire = fake.wire();
     var cancel: p.Cancellation = .{};
-    try manager.login("codex", &cancel, .{});
+    try manager.login("codex", &cancel, fake.sink());
+    try std.testing.expectEqual(@as(usize, 1), fake.prompt_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.exchange_count);
     var latest = try other.loadExisting();
     defer cfg.release(&latest);
     try std.testing.expectEqualStrings("high", latest.value.registry.?.reasoning_effort.?);
     try std.testing.expectEqualStrings("new-refresh", (try credential(latest.value, "codex")).refresh_token);
     try std.testing.expectEqual(@as(usize, 0), (try provider(latest.value, "codex")).models.len);
     fake.change_credential = true;
-    try std.testing.expectError(error.OAuthLoginConflict, manager.login("codex", &cancel, .{}));
+    try std.testing.expectError(error.OAuthLoginConflict, manager.login("codex", &cancel, fake.sink()));
     var after = try other.loadExisting();
     defer cfg.release(&after);
     try std.testing.expectEqualStrings("parallel-refresh", (try credential(after.value, "codex")).refresh_token);
