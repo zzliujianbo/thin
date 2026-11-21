@@ -32,6 +32,60 @@ test "one ASCII trace record resolves successive displayed boundaries" {
     }
 }
 
+test "table palette survives ASCII runs and retired physical rows" {
+    try @import("text.zig").initLocale();
+    const theme = @import("theme.zig");
+    const source = "|abcdefghijk  | B\n|---          |---\n|body\nnext";
+    const header_lf = std.mem.indexOfScalar(u8, source, '\n').?;
+    const body_at = std.mem.indexOf(u8, source, "|body").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 4, 40 }) |columns| {
+        const baseline = try renderAll(a, source, columns, false, .normal);
+        var cursor: usize = 0;
+        var state: scan.State = .{};
+        for (baseline.rows) |expected| {
+            const result = try render(a, source[cursor..], cursor, state, true, columns, true, .normal, 1, 1);
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            const row = result.rows[0];
+            try std.testing.expect(row.complete and row.end > cursor);
+            try std.testing.expectEqual(expected.end, row.end);
+            try std.testing.expectEqual(expected.cells, row.cells);
+            try std.testing.expectEqual(expected.soft_wrap, row.soft_wrap);
+            try std.testing.expectEqualDeep(expected.checkpoint, row.checkpoint);
+
+            // Check the effective SGR of every glyph, not just the first pipe.
+            const want: output.Tone = if (cursor < header_lf) .table_header else if (cursor < body_at) .muted else .normal;
+            var tone: output.Tone = .normal;
+            var rest = row.text;
+            var n: usize = 0;
+            while (rest.len != 0) {
+                if (std.mem.startsWith(u8, rest, theme.reset)) {
+                    tone = .normal;
+                    rest = rest[theme.reset.len..];
+                } else if (std.mem.startsWith(u8, rest, theme.table_header)) {
+                    tone = .table_header;
+                    rest = rest[theme.table_header.len..];
+                } else if (std.mem.startsWith(u8, rest, theme.muted)) {
+                    tone = .muted;
+                    rest = rest[theme.muted.len..];
+                } else {
+                    try std.testing.expectEqual(want, tone);
+                    try std.testing.expect(n < expected.text.len);
+                    try std.testing.expectEqual(expected.text[n], rest[0]);
+                    n += 1;
+                    rest = rest[1..];
+                }
+            }
+            try std.testing.expectEqual(expected.text.len, n);
+            cursor = row.end;
+            state = row.checkpoint;
+        }
+        try std.testing.expectEqual(source.len, cursor);
+    }
+}
+
 test "preview cells include emitted user padding but exclude styling" {
     try @import("text.zig").initLocale();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

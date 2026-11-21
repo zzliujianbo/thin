@@ -4,6 +4,8 @@ const std = @import("std");
 const Style = @import("markdown_writer.zig").Style;
 
 pub const max_inline_bytes: usize = 2048;
+// Per source line, excluding LF. Table recognition never looks past two lines.
+const max_table_line_bytes = 2048;
 const depth_limit = 8;
 const Kind = enum { strong, italic, strike, link, inline_code };
 const Frame = struct {
@@ -15,6 +17,7 @@ const Frame = struct {
 };
 pub const State = struct {
     at_line_start: bool = true,
+    fence_indent: u2 = 0,
     fence: u8 = 0,
     fence_len: usize = 0,
     fence_header: bool = false,
@@ -22,6 +25,7 @@ pub const State = struct {
     fence_closing: bool = false,
     fence_count: usize = 0,
     fence_spaces: bool = false,
+    table: enum { none, header, separator } = .none,
     heading: bool = false,
     quote: bool = false,
     escaped: bool = false,
@@ -42,6 +46,12 @@ pub const Step = union(enum) { token: Token, need_more, end };
 fn style(s: State) Style {
     var out: Style = .{};
     if (s.fence != 0) out.tone = .code else if (s.heading) out.tone = .heading else if (s.quote) out.tone = .quote;
+    // A newline checkpoint belongs to the next line; don't style the LF.
+    if (!s.at_line_start) switch (s.table) {
+        .none => {},
+        .header => out.tone = .table_header,
+        .separator => out.tone = .muted,
+    };
     for (s.frames[0..s.depth]) |frame| switch (frame.kind) {
         .strong => out.bold = true,
         .italic => out.italic = true,
@@ -134,6 +144,49 @@ fn literal(source: []const u8, base: usize, offset: usize, state: State, end: us
     return consume(source, base, offset, s);
 }
 
+const TableMatch = enum { no, yes, partial };
+
+// Called only for a leading '|'. Inspect source, never consume or rewrite it:
+// accepted and rejected headers both go through the ordinary inline scanner.
+fn tableMatch(source: []const u8, final: bool) TableMatch {
+    const window = source[0..@min(source.len, max_table_line_bytes + 1)];
+    const lf = std.mem.indexOfScalar(u8, window, '\n') orelse
+        return if (final or window.len > max_table_line_bytes) .no else .partial;
+    const header = std.mem.trimEnd(u8, window[0..lf], " \t");
+    if (header.len == 1) return .no;
+    var cells: usize = 1;
+    for (header[1..], 1..) |c, i| {
+        if (c == '|' and i + 1 < header.len and !escapedAt(header, i, 1)) cells += 1;
+    }
+
+    const rest = source[lf + 1 ..];
+    if (rest.len == 0) return if (final) .no else .partial;
+    if (rest[0] != '|') return .no;
+    const bounded = rest[0..@min(rest.len, max_table_line_bytes + 1)];
+    const end = std.mem.indexOfScalar(u8, bounded, '\n') orelse bounded.len;
+    if (end > max_table_line_bytes) return .no;
+    const incomplete = end == rest.len and !final;
+    var i: usize = 1;
+    for (0..cells) |cell| {
+        while (i < end and (rest[i] == ' ' or rest[i] == '\t')) : (i += 1) {}
+        if (i < end and rest[i] == ':') i += 1;
+        const begin = i;
+        while (i < end and rest[i] == '-') : (i += 1) {}
+        if (i - begin < 3) return if (i == end and incomplete) .partial else .no;
+        if (i < end and rest[i] == ':') i += 1;
+        while (i < end and (rest[i] == ' ' or rest[i] == '\t')) : (i += 1) {}
+        if (i == end) {
+            if (incomplete) return .partial;
+            return if (cell + 1 == cells) .yes else .no;
+        }
+        if (rest[i] != '|') return .no;
+        i += 1;
+    }
+    // After an optional closing pipe only horizontal whitespace is legal.
+    if (std.mem.trim(u8, rest[i..end], " \t").len != 0) return .no;
+    return if (incomplete) .partial else .yes;
+}
+
 /// source contains valid, already sanitized UTF-8. offset is a scalar boundary.
 /// Tokens cover monotonically increasing source; empty tokens consume syntax.
 pub fn next(source: []const u8, base: usize, offset: usize, state: State, final: bool) Step {
@@ -141,6 +194,16 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
     const absolute = base + offset;
     const ch = source[offset];
     var s = state;
+
+    // Retain at most three literal leading spaces as a possible fence prefix.
+    // Only fences accept indentation; other line-start constructs stay unchanged.
+    if (s.at_line_start and ch == ' ' and s.fence_indent < 3) {
+        s.fence_indent += 1;
+        return consume(source, base, offset, s);
+    }
+    const indented = s.fence_indent != 0;
+    s.fence_indent = 0;
+    if (indented and ch != '`' and ch != '~') s.at_line_start = false;
 
     if (s.fence != 0) {
         // Opening and closing fence runs are tracked while their literal bytes
@@ -169,6 +232,7 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
     }
     if (ch == '\n') {
         s.at_line_start = true;
+        s.table = if (s.table == .header) .separator else .none;
         s.heading = false;
         s.quote = false;
         s.escaped = false;
@@ -231,6 +295,11 @@ pub fn next(source: []const u8, base: usize, offset: usize, state: State, final:
                 return consume(source, base, offset, s);
             }
         }
+        if (ch == '|' and s.table == .none) switch (tableMatch(source[offset..], final)) {
+            .partial => return .need_more,
+            .yes => s.table = .header,
+            .no => {},
+        };
         if (ch == '>') s.quote = true;
         s.at_line_start = false;
     }

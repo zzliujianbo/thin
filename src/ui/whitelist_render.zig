@@ -131,7 +131,7 @@ fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
             writer.pending.items.len == 1 and plain(writer.pending.items[0]) and cluster.width == 1 and !cluster.awaitZWJ
         else
             true;
-        if (!current.at_line_start and current.fence == 0 and current.depth == 0 and !current.heading and !current.quote and !current.escaped and current.literal_until == 0 and pending_ok) {
+        if (!current.at_line_start and current.fence == 0 and current.depth == 0 and current.table == .none and !current.heading and !current.quote and !current.escaped and current.literal_until == 0 and pending_ok) {
             const pending_width: usize = if (writer.cluster != null) 1 else 0;
             // Stay within one physical row so no row callback observes future checkpoints.
             var cap = @min(source.len - offset, writer.columns -| writer.col -| pending_width);

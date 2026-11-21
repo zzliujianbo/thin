@@ -423,7 +423,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
         await new Promise(resolve=>setTimeout(resolve,600));
         chunk({content:'# Orange heading\n\n**stream-stage-one** and [link](https://example.org) with `inline-marker`\n\n> quote-marker\n\n'});
         await new Promise(resolve=>setTimeout(resolve,600));
-        chunk({content:'```text\nconst value = 1;\nexit_code=124\n/root/thin\nexit_code=0\n```\n\n| Item | State |\n| --- | --- |\n| fixture | ready |\n| second-row | verified |\n\nstream-final-answer'});
+        chunk({content:'  ```text\nconst value = 1;\nexit_code=124\n/root/thin\nexit_code=0\n   ```\n\n| Item | State |\n| --- | --- |\n| fixture | ready |\n| second-row | verified |\n\nstream-final-answer'});
         await new Promise(resolve=>setTimeout(resolve,200));
         res.write(`data: ${JSON.stringify({id:'stream_fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: ${JSON.stringify({id:'stream_fixture',choices:[],usage:{prompt_tokens:12,completion_tokens:90,total_tokens:102,prompt_tokens_details:{cached_tokens:9},completion_tokens_details:{reasoning_tokens:30}}})}\n\ndata: [DONE]\n\n`);
         res.end();
