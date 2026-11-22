@@ -532,9 +532,12 @@ pub const Session = struct {
         const registry = config.registry orelse return error.InvalidConfig;
         var name: ?[]const u8 = null;
         if (snapshot.providerName()) |saved| {
-            if (registry.find(saved) != null) name = saved;
+            if (registry.find(saved)) |provider| {
+                const fingerprint = selections.endpoint(provider.connection.base_url);
+                if (std.mem.eql(u8, &snapshot.endpoint, &fingerprint)) name = saved;
+            }
         }
-        // Missing aliases can be rebound only by their exact endpoint, never
+        // Missing or repurposed aliases can be rebound only by their exact endpoint, never
         // by service kind or a coincidentally identical model name.
         if (name == null) {
             for (registry.providers) |provider| {
@@ -549,8 +552,9 @@ pub const Session = struct {
         }
         config.selection_pending = true;
         config.model.name = try a.dupe(u8, snapshot.model());
-        config.selected_provider = if (name orelse snapshot.providerName()) |value| try a.dupe(u8, value) else null;
-        self.selected_alias = if (config.selected_provider) |value|
+        config.selected_provider = if (name) |value| try a.dupe(u8, value) else null;
+        // Keep the historical label for display, not for login or bare model selection.
+        self.selected_alias = if (name orelse snapshot.providerName()) |value|
             try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ value, snapshot.model() })
         else
             try self.allocator.dupe(u8, snapshot.model());
@@ -1779,7 +1783,11 @@ pub const Session = struct {
 
     fn selectRegistryModel(self: *Session, selector: []const u8) !void {
         const previous = self.mutableConfig().*;
-        const raw_current = std.mem.eql(u8, selector, previous.model.name);
+        const qualified_slash: ?usize = if (std.mem.findScalar(u8, selector, '/')) |slash|
+            if (self.global_config.?.value.registry.?.find(selector[0..slash]) != null) slash else null
+        else
+            null;
+        const raw_current = qualified_slash == null and std.mem.eql(u8, selector, previous.model.name);
         const alias_current = self.selected_alias != null and std.mem.eql(u8, selector, self.selected_alias.?);
         const revision_changed = if (ProviderId.fromUrl(previous.provider.base_url)) |id|
             self.active_revision != self.credential_revisions[@intCast(@backingInt(id))]
@@ -1796,10 +1804,6 @@ pub const Session = struct {
             self.publishCheckpoint();
             return;
         };
-        const qualified_slash: ?usize = if (std.mem.findScalar(u8, selector, '/')) |slash|
-            if (self.global_config.?.value.registry.?.find(selector[0..slash]) != null) slash else null
-        else
-            null;
         const provider_name = if (retained) previous.selected_provider orelse return error.UnknownProvider else if (qualified_slash) |slash|
             selector[0..slash]
         else

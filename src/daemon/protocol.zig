@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v7 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v8 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -28,11 +28,11 @@ const background = @import("../core/background_status.zig");
 
 const WipingAllocator = @import("../core/config.zig").WipingAllocator;
 
-/// Private daemon/worker IPC version. v7 replaces the device code with a browser URL.
+/// Private daemon/worker IPC version. v8 requires worker support for OpenAI API-key login.
 /// Peers are matched exactly: there is
 /// no older-wire compatibility path, migration or automatic worker restart.
 /// A mismatched peer is refused before adoption, display or controller claim.
-pub const version: u16 = 7;
+pub const version: u16 = 8;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
 pub const max_name: usize = 1024;

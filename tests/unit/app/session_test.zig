@@ -701,6 +701,41 @@ test "removed alias rebinds only by an unambiguous exact endpoint" {
     try std.testing.expectEqualStrings("Bearer fake-renamed", resumed.app.?.client.authorization);
     try expectSessionTestHistory(&resumed);
 }
+test "repurposed saved alias yields to the renamed original endpoint" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    const id = try fixture.saveHistory();
+    try writeSessionTestConfig(fixture.tmp.dir,
+        \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://other.invalid/v1","api_key":"fake-other","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"renamed":{"base_url":"https://archive.invalid/v1","api_key":"fake-original","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}}}
+    );
+    var resumed = try fixture.open(.{ .resume_session = id });
+    defer resumed.deinit();
+    try std.testing.expectEqualStrings("renamed/saved", resumed.connection().current().selection_name.?);
+    try std.testing.expectEqualStrings("Bearer fake-original", resumed.app.?.client.authorization);
+    try expectSessionTestHistory(&resumed);
+}
+test "repurposed saved alias without matching endpoint is display only" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    const id = try fixture.saveHistory();
+    try writeSessionTestConfig(fixture.tmp.dir,
+        \\{"llm":{"default":"archive/saved","providers":{"archive":{"base_url":"https://other.invalid/v1","api_key":"fake-other","models":{"saved":{"protocol":"chat","context_tokens":65536}}}}}}
+    );
+    var resumed = try fixture.open(.{ .resume_session = id });
+    defer resumed.deinit();
+    const connection = resumed.connection();
+    try std.testing.expectEqualStrings("archive/saved", connection.current().selection_name.?);
+    try std.testing.expect(resumed.pending.?.value.selection_pending);
+    try std.testing.expect(resumed.pending.?.value.selected_provider == null);
+    try std.testing.expectError(error.UnknownProvider, connection.configure("fake-must-not-save"));
+    try std.testing.expectError(error.UnknownProvider, connection.selectModel("saved"));
+    try std.testing.expect(resumed.app == null);
+    try expectSessionTestHistory(&resumed);
+    // The same label becomes a route only after an explicit qualified choice.
+    try connection.selectModel("archive/saved");
+    try std.testing.expectEqualStrings("Bearer fake-other", resumed.app.?.client.authorization);
+    try expectSessionTestHistory(&resumed);
+}
 test "unavailable model login saves credential without dropping history or changing default" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
@@ -725,6 +760,10 @@ test "unavailable model login saves credential without dropping history or chang
 test "official provider login imports pending archive without switching global default" {
     var fixture = try SessionTestFixture.init();
     defer fixture.deinit();
+    // The archive must originate at the official endpoint it will resume on.
+    const original = try std.mem.replaceOwned(u8, std.testing.allocator, session_test_config, "https://archive.invalid/v1", "https://api.deepseek.com");
+    defer std.testing.allocator.free(original);
+    try writeSessionTestConfig(fixture.tmp.dir, original);
     const id = try fixture.saveHistory();
     try writeSessionTestConfig(fixture.tmp.dir,
         \\{"llm":{"default":"other/other","providers":{"archive":{"base_url":"https://api.deepseek.com","kind":"deepseek","models":{"saved":{"protocol":"chat","context_tokens":65536}}},"other":{"base_url":"https://other.invalid/v1","models":{"other":{"protocol":"chat","context_tokens":32768}}}}}}
@@ -790,6 +829,27 @@ test "pending login save failure destroys candidate but retains source history" 
     try std.testing.expect(original_history == Session.initialHistory(&resumed).ptr);
     try expectSessionTestHistory(&resumed);
     try std.testing.expect(resumed.global_config.?.value.registry.?.find("archive").?.connection.api_key == null);
+}
+test "declared alias qualifies a selector even when it equals the active raw model ID" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir,
+        \\{"llm":{"default":"gateway/openai/gpt-5.4","providers":{"gateway":{"base_url":"https://gateway.invalid/v1","api_key":"fake-gateway","models":{"openai/gpt-5.4":{"protocol":"responses","context_tokens":65536}}}}}}
+    );
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    const connection = session.connection();
+    // Without a declared openai alias the slash belongs to the raw ID.
+    try connection.selectModel("openai/gpt-5.4");
+    try std.testing.expectEqualStrings("gateway/openai/gpt-5.4", connection.current().selection_name.?);
+    try connection.configureProvider(.openai, "fake-platform");
+    try std.testing.expectEqualStrings("Bearer fake-gateway", session.app.?.client.authorization);
+    try connection.selectModel("openai/gpt-5.4");
+    try std.testing.expectEqualStrings("openai/gpt-5.4", connection.current().selection_name.?);
+    try std.testing.expectEqualStrings("gpt-5.4", session.app.?.config.value.model.name);
+    try std.testing.expectEqualStrings("Bearer fake-platform", session.app.?.client.authorization);
+    try connection.selectModel("gateway/openai/gpt-5.4");
+    try std.testing.expectEqualStrings("Bearer fake-gateway", session.app.?.client.authorization);
 }
 test "custom credential rotation activates only on explicit same model reselect" {
     var fixture = try SessionTestFixture.init();

@@ -1849,8 +1849,8 @@ pub const Client = struct {
             try req.put("view", "controller");
             var resp = self.exchangeOn(&owned, &req, join_timeout_ms) catch |err| return switch (err) {
                 // The dial succeeded but the peer did not complete this exact
-                // IPC greeting. A v1 worker rejects the v4 frame (and a v1 reply
-                // fails the v4 envelope), so this is fail-closed: no attach, no
+                // IPC greeting. A mismatched envelope or a peer closing on
+                // our greeting is fail-closed: no attach, no
                 // session adoption, no cursor and no display claim. Nothing is
                 // restarted, migrated or killed to make it compatible.
                 error.ProtocolError, error.Transport => error.ProtocolMismatch,
@@ -2130,9 +2130,7 @@ pub const Client = struct {
         self.control = conn;
         // From here the stored connection owns the descriptor exactly once.
         errdefer self.closeControl();
-        // The daemon socket is part of the same IPC version. A v1 daemon rejects
-        // this v4 greeting (or answers a v1 envelope), so it is refused here
-        // before any create/list/attach command is sent.
+        // Check the daemon's exact IPC version before sending create/list/attach.
         var hello = try self.request(.hello);
         defer hello.deinit();
         var greeting = self.controlExchange(&hello, quick_timeout_ms) catch |err| return switch (err) {
@@ -3037,12 +3035,6 @@ fn writeErr(io: std.Io, bytes: []const u8) void {
 // ACKed, so pages and ACK replies must be identified by content.
 
 // Emit the same two initial pages a real watch sends, including a history row.
-
-// Fake worker for the protocol-mismatch regression. The first connection
-// answers like a v1 worker (a v1 envelope), the second closes without replying
-// (a v1 worker's actual parse behaviour), the third is an exact v4 worker and
-// proves the compatible path still adopts normally. `saw_v4` proves the client
-// really sent v4 greetings, since `parseRequest` only accepts this version.
 
 // One real written submit frame: its sequential envelope id and receipt nonce.
 

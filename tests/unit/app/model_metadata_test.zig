@@ -575,10 +575,10 @@ test "metadata rejects malformed availability and duplicate cache records withou
 test "OpenAI lists exact known text routes without importing invented capabilities" {
     const a = std.testing.allocator;
     var listing = try parseListing(a,
-        \\{"data":[{"id":"gpt-4.1","protocol":"chat","context_window":1},{"id":"text-embedding-3-small"},{"id":"gpt-unknown"}]}
+        \\{"data":[{"id":"gpt-4.1","protocol":"chat","context_window":1},{"id":"gpt-4o-2024-08-06"},{"id":"gpt-5.4-nano"},{"id":"text-embedding-3-small"},{"id":"gpt-unknown"}]}
     , .openai);
     defer listing.deinit(a);
-    try std.testing.expectEqual(@as(usize, 1), listing.directory.count);
+    try std.testing.expectEqual(@as(usize, 3), listing.directory.count);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", catalog.connection(.openai).api_key_env);
     const member = listing.directory.rows[listing.directory.find(.openai, "gpt-4.1").?];
     try std.testing.expect(member.available == true and member.tokens == null and member.protocol == .auto);
@@ -595,6 +595,8 @@ test "OpenAI lists exact known text routes without importing invented capabiliti
     try std.testing.expectEqual(@as(?u32, 5000), entry.model.output_tokens);
     try std.testing.expect(capacityFor(&cache, entry) == null and entryDeclaration(&cache, entry) == null);
     try std.testing.expect(findEntry(&cache, "openai/gpt-5") == null);
+    try std.testing.expectEqual(@as(u32, 128000), findEntry(&cache, "openai/gpt-4o-2024-08-06").?.model.context_tokens);
+    try std.testing.expectEqual(Protocol.responses, findEntry(&cache, "openai/gpt-5.4-nano").?.model.protocol);
 }
 
 test "metadata official listing sends bearer credentials only to private endpoints" {
