@@ -9,12 +9,14 @@ test "independent generations preserve post-claim cooldown" {
     var migrated = try m.load(&root);
     defer migrated.deinit(t.allocator);
     try t.expectEqual(@as(?u32, 1000000), migrated.directory.rows[0].dev_context_tokens);
-    try t.expectEqual(@as(u64, 14), migrated.refresh[4].generation);
-    try t.expectEqual(@as(?u64, 800), migrated.refresh[4].last_success_ms);
+    const dev = cfg.providers.Id.all.len;
+    try t.expectEqual(m.Refresh{}, migrated.refresh[@backingInt(cfg.providers.Id.openai)]);
+    try t.expectEqual(@as(u64, 14), migrated.refresh[dev].generation);
+    try t.expectEqual(@as(?u64, 800), migrated.refresh[dev].last_success_ms);
     var claimed = try m.claimAt(&root, m.dev_bit, false, 1000, .{});
     defer claimed.cache.deinit(t.allocator);
     try t.expectEqual(m.dev_bit, claimed.mask);
-    try t.expectEqual(@as(u64, 15), claimed.generations[4]);
+    try t.expectEqual(@as(u64, 15), claimed.generations[dev]);
     for (0..3) |index| try t.expectEqual(@as(u64, 11) + index, claimed.generations[index]);
     // No successful publication: the persisted attempt still enforces cooldown.
     try t.expectEqual(@as(u8, 0), try claimMask(&root, m.dev_bit, false, 1001, .{}));
@@ -22,7 +24,7 @@ test "independent generations preserve post-claim cooldown" {
         \\{"opencode-go":{"npm":"@ai-sdk/anthropic","models":{"claude-haiku-5-5":{"limit":{"context":1000000}}}}}
     );
     defer public.deinit(t.allocator);
-    var stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 0, 14 }, 1010);
+    var stale = try m.commitClaimedAt(&root, 0, public, .{ 11, 12, 13, 0, 0, 14 }, 1010);
     defer stale.cache.deinit(t.allocator);
     try t.expectEqual(@as(u8, 0), stale.accepted);
     try t.expectEqual(@as(?u32, 1000000), stale.cache.directory.rows[0].dev_context_tokens);
@@ -75,7 +77,7 @@ test "publication generations reject delayed sources independently and distingui
     try t.expect(result.cache.directory.find(.deepseek, "obsolete") == null);
     try t.expect(result.cache.directory.rows[result.cache.directory.find(.deepseek, "fresh").?].available == true);
     try t.expectEqual(@as(?u64, 1010), result.cache.refresh[0].last_success_ms);
-    try t.expectEqual(@as(?u64, 2000), result.cache.refresh[4].last_success_ms);
+    try t.expectEqual(@as(?u64, 2000), result.cache.refresh[cfg.providers.Id.all.len].last_success_ms);
     // The opposite ordering must not let a stale public result block official.
     var a_claim = try m.claimAt(&root, both, true, 3000, .{});
     defer a_claim.cache.deinit(t.allocator);
@@ -94,7 +96,7 @@ test "publication generations reject delayed sources independently and distingui
     const retained_public = independent.cache.directory.rows[independent.cache.directory.find(.deepseek, "fresh").?];
     try t.expectEqual(@as(?u32, 262144), retained_public.dev_context_tokens);
     try t.expectEqual(@as(?u32, 8192), retained_public.dev_output_tokens);
-    try t.expectEqual(@as(?u64, 3010), independent.cache.refresh[4].last_success_ms);
+    try t.expectEqual(@as(?u64, 3010), independent.cache.refresh[cfg.providers.Id.all.len].last_success_ms);
     try t.expectEqual(@as(?u64, 4000), independent.cache.refresh[0].last_success_ms);
 }
 test "publication current generation strict tokens exhaustion and durable timing" {
@@ -171,7 +173,7 @@ test "refresh timing default deadlines and public success are independent" {
     _ = try claimMask(&root, both, false, 0, .{});
     var cache = try m.commitAt(&root, 0, .{ .dev_done = true }, 10);
     defer cache.deinit(t.allocator);
-    try t.expectEqual(@as(?u64, 10), cache.refresh[4].last_success_ms);
+    try t.expectEqual(@as(?u64, 10), cache.refresh[cfg.providers.Id.all.len].last_success_ms);
     try t.expect(cache.refresh[0].last_success_ms == null);
     try t.expectEqual(@as(u8, 0), m.eligible(&cache, both, 299999, .{}));
     try t.expectEqual(official, m.eligible(&cache, both, 300000, .{}));
@@ -224,7 +226,7 @@ test "Codex cache and independent source generation preserve authenticated listi
     try t.expectEqual(@as(?@import("../presentation/activity.zig").ReasoningEffort, .high), row.default_reasoning);
     try t.expectEqualStrings("none", row.reasoning.?.declaration().map.off.?);
     try t.expectEqual(@as(?u64, 12), saved.cache.refresh[3].last_success_ms);
-    try t.expectEqual(@as(?u64, null), saved.cache.refresh[4].last_success_ms);
+    try t.expectEqual(@as(?u64, null), saved.cache.refresh[cfg.providers.Id.all.len].last_success_ms);
     var empty = try m.parseListing(t.allocator, "{\"models\":[]}", .openai_codex);
     defer empty.deinit(t.allocator);
     var gone = try m.commitAt(&root, codex, empty, 13);
@@ -258,7 +260,7 @@ test "output exact public routes roundtrip precedence omission and identity" {
             .deepseek => 4096,
             .opencode_go => 16384,
             .opencode_zen => 32768,
-            .openai_codex => return error.UnexpectedFixtureProvider,
+            .openai_codex, .openai => return error.UnexpectedFixtureProvider,
         };
         try t.expectEqual(@as(?u32, expected), m.outputFor(&cache, entry));
         try t.expectEqual(@as(?u32, expected), entry.model.output_tokens);
@@ -571,7 +573,7 @@ test "context public exact SDK routes roundtrip official precedence and frozen e
             .deepseek => 65536,
             .opencode_go => 262144,
             .opencode_zen => 524288,
-            .openai_codex => return error.UnexpectedFixtureProvider,
+            .openai_codex, .openai => return error.UnexpectedFixtureProvider,
         };
         try t.expectEqual(@as(?u32, expected), m.contextFor(&cache, entry));
         try t.expectEqual(expected, entry.model.context_tokens);

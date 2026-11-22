@@ -201,7 +201,7 @@ fn rowDeclaration(cache: *const Cache, config: cfg.Config, index: usize) ?thinki
     // Source authority belongs to the verified provider, not fetch success.
     const official = switch (row.provider) {
         .deepseek, .openai_codex => true,
-        .opencode_go, .opencode_zen => false,
+        .opencode_go, .opencode_zen, .openai => false,
     };
     const route = if (official) (if (row.protocol != .auto) row.protocol else switch (row.provider) {
         .deepseek => Protocol.chat,
@@ -399,6 +399,12 @@ pub fn parseListing(a: std.mem.Allocator, body: []const u8, id: providers.Id) !L
         for (name.string) |c| if (c < 0x20 or c == 0x7f) return error.InvalidMetadata;
         const entry = try seen.getOrPut(a, name.string);
         if (entry.found_existing) return error.InvalidMetadata;
+        if (id == .openai) {
+            // OpenAI lists IDs across endpoint families, not just text models.
+            // Treat its payload as membership only, never as capabilities.
+            if (catalog.openaiText(name.string)) (try result.directory.upsert(a, id, name.string)).available = true;
+            continue;
+        }
         const n = if (record.object.get("context_window")) |v| try capacity(v) else null;
         const row = try result.directory.upsert(a, id, name.string);
         row.available = true;
@@ -575,6 +581,7 @@ pub fn parseDev(a: std.mem.Allocator, body: []const u8) !Listing {
 fn listingUrl(id: providers.Id) []const u8 {
     return switch (id) {
         .deepseek => comptime providers.Id.deepseek.baseUrl() ++ "/models",
+        .openai => comptime providers.Id.openai.baseUrl() ++ "/models",
         .opencode_go => "https://opencode.ai/inference/go/v1/models",
         .opencode_zen => "https://opencode.ai/inference/v1/models",
         .openai_codex => comptime providers.Id.openai_codex.baseUrl() ++ "/models",
@@ -583,7 +590,7 @@ fn listingUrl(id: providers.Id) []const u8 {
 
 fn listingKey(id: providers.Id, key: ?[]const u8) ?[]const u8 {
     // OpenCode's official listing endpoints are public, not inference calls.
-    return if (id == .deepseek) key else null;
+    return if (id == .deepseek or id == .openai) key else null;
 }
 
 /// Private transport seam for owned loopback tests. Production callers can only
@@ -737,15 +744,15 @@ pub fn eligible(cache: *const Cache, requested: u8, now: u64, policy: Policy) u8
     return mask;
 }
 
-/// Saves use v17. The v16 directory is identical except for two retired
-/// model fields; versions before v16 require a refresh claim to rebuild.
-pub const cache_version: u32 = 17;
+/// v18 adds the OpenAI source before the final models.dev refresh slot.
+/// Preserve v16/v17 claims by source, not by new array position.
+pub const cache_version: u32 = 18;
 
 const Document = struct {
     version: u32 = cache_version,
     directory_mask: u8 = 0,
     models: []const ModelRecord = &.{},
-    refresh: [providers.Id.all.len + 1]Refresh = @splat(.{}),
+    refresh: []const Refresh = &.{},
 };
 
 fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
@@ -762,13 +769,14 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
             if (version != .integer) return error.InvalidMetadata;
             if (version.integer < 0) return error.InvalidMetadata;
             const v16 = version.integer == 16;
-            if (!v16 and version.integer < cache_version) return error.OutdatedMetadataCache;
-            if (!v16 and version.integer != cache_version) return error.InvalidMetadata;
+            if (version.integer < 16) return error.OutdatedMetadataCache;
+            if (version.integer > cache_version) return error.InvalidMetadata;
+            const legacy = version.integer < 18;
             if (raw.value.object.get("directory_mask")) |mask| {
-                if (mask != .integer or mask.integer < 0 or mask.integer > all_mask) return error.InvalidMetadata;
+                if (mask != .integer or mask.integer < 0 or mask.integer > (if (legacy) @as(u8, 0x0f) else all_mask)) return error.InvalidMetadata;
             }
             if (raw.value.object.get("refresh")) |timings| {
-                if (timings != .array or timings.array.items.len != providers.Id.all.len + 1) return error.InvalidMetadata;
+                if (timings != .array or timings.array.items.len != (if (legacy) @as(usize, 5) else source_bits.len)) return error.InvalidMetadata;
                 for (timings.array.items) |timing| {
                     if (timing != .object) return error.InvalidMetadata;
                     if (timing.object.get("generation")) |value| switch (value) {
@@ -826,9 +834,16 @@ fn parseCache(a: std.mem.Allocator, bytes: []const u8) !Cache {
 
 fn cacheFromDocument(a: std.mem.Allocator, doc: Document) !Cache {
     if (doc.directory_mask & ~all_mask != 0) return error.InvalidMetadata;
-    var result: Cache = .{ .directory_mask = doc.directory_mask, .refresh = doc.refresh };
+    var result: Cache = .{ .directory_mask = doc.directory_mask };
+    if (doc.refresh.len != 0) {
+        if (doc.version < 18) {
+            @memcpy(result.refresh[0..4], doc.refresh[0..4]);
+            result.refresh[providers.Id.all.len] = doc.refresh[4];
+        } else @memcpy(&result.refresh, doc.refresh);
+    }
     errdefer result.deinit(a);
     for (doc.models) |record| {
+        if (doc.version < 18 and record.provider == .openai) return error.InvalidMetadata;
         if (record.context_window) |n| if (n == 0 or n > max_tokens) return error.InvalidMetadata;
         if (result.directory.find(record.provider, record.id) != null) return error.InvalidMetadata;
         const row = try result.directory.upsert(a, record.provider, record.id);
@@ -916,7 +931,7 @@ fn save(root: *fs.Root, cache: Cache) !void {
     };
     var writer: std.Io.Writer.Allocating = .init(root.allocator);
     defer writer.deinit();
-    try std.json.Stringify.value(Document{ .directory_mask = cache.directory_mask, .models = models, .refresh = cache.refresh }, .{}, &writer.writer);
+    try std.json.Stringify.value(Document{ .directory_mask = cache.directory_mask, .models = models, .refresh = &cache.refresh }, .{}, &writer.writer);
     try writer.writer.writeByte('\n');
     try root.writeMode(file_name, writer.written(), true, 0o600);
 }

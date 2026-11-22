@@ -126,7 +126,7 @@ fn writeOfficialMetadataTestConfig(dir: std.Io.Dir, id: ProviderId) !void {
         .opencode_zen =>
         \\{"llm":{"default":"opencode-zen/minimax-m2.7","providers":{"opencode-zen":{"base_url":"https://opencode.ai/zen/v1","kind":"opencode_zen","chat_max_tokens":true}}}}
         ,
-        .openai_codex => return error.UnexpectedFixtureProvider,
+        .openai_codex, .openai => return error.UnexpectedFixtureProvider,
     });
 }
 

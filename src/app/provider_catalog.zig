@@ -21,6 +21,18 @@ fn go(comptime name: []const u8, protocol: @import("../core/protocol.zig").Proto
     return .{ .provider = .opencode_go, .selector = "opencode-go/" ++ name, .model = .{ .name = name, .context_tokens = 32768, .protocol = protocol } };
 }
 
+// Exact text Responses routes/windows from pi-ai 1.6.0 providers/data/openai.json.
+// The OpenAI ID listing also includes embeddings, audio and other endpoints;
+// an unfamiliar ID alone is not evidence of an agent-compatible route.
+fn openai(comptime name: []const u8, context: u32) Entry {
+    return .{ .provider = .openai, .selector = "openai/" ++ name, .model = .{ .name = name, .context_tokens = context, .protocol = .responses } };
+}
+
+pub fn openaiText(name: []const u8) bool {
+    for (entries) |entry| if (entry.provider == .openai and std.mem.eql(u8, entry.model.name, name)) return true;
+    return false;
+}
+
 pub const entries = [_]Entry{
     .{ .provider = .deepseek, .selector = "deepseek/deepseek-flash", .model = .{ .name = "deepseek-flash", .context_tokens = 1000000, .protocol = .chat } },
     .{ .provider = .deepseek, .selector = "deepseek/deepseek-v4-pro", .model = .{ .name = "deepseek-v4-pro", .context_tokens = 1000000, .protocol = .chat } },
@@ -60,10 +72,26 @@ pub const entries = [_]Entry{
     go("longcat-2.5-preview-free", .chat),
     go("step-5-preview-free", .chat),
     go("cat-jam-free", .chat),
+    openai("gpt-4o", 128000),
+    openai("gpt-4o-mini", 128000),
+    openai("gpt-4.1", 1047576),
+    openai("gpt-4.1-mini", 1047576),
+    openai("gpt-4.1-nano", 1047576),
+    openai("o3", 200000),
+    openai("o4-mini", 200000),
+    openai("gpt-5", 400000),
+    openai("gpt-5-mini", 400000),
+    openai("gpt-5-nano", 400000),
+    openai("gpt-5.1", 400000),
+    openai("gpt-5.2", 400000),
+    openai("gpt-5.4", 272000),
+    openai("gpt-5.4-mini", 400000),
+    openai("gpt-5.5", 272000),
+    openai("gpt-6-luna", 272000),
 };
 
 pub fn connection(id: Id) cfg.Provider {
-    return .{ .kind = id, .base_url = id.baseUrl(), .chat_max_tokens = true };
+    return .{ .kind = id, .base_url = id.baseUrl(), .api_key_env = if (id == .openai) "OPENAI_API_KEY" else "", .chat_max_tokens = true };
 }
 pub fn find(selector: []const u8) ?Entry {
     for (entries) |entry| if (std.mem.eql(u8, selector, entry.selector)) return entry;

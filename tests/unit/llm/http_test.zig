@@ -244,6 +244,22 @@ test "model proxy route cannot silently reuse a stale direct client after alias 
     config.selected_provider = "other";
     try std.testing.expectError(error.ProxyRouteChanged, listed.checkProxyRoute(&config));
 }
+test "OpenAI platform uses the standard Responses endpoint and API key without ChatGPT headers" {
+    const a = std.testing.allocator;
+    const config: cfg.Config = .{ .provider = .{ .base_url = cfg.providers.Id.openai.baseUrl(), .kind = .openai }, .model = .{ .name = "fixture", .context_tokens = 32768, .protocol = .responses } };
+    try std.testing.expectEqual(p.WireCodec.responses, try cfg.wireCodec(config, .responses));
+    const url = try requestAddress(a, config.provider.base_url, .responses);
+    defer a.free(url);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1/responses", url);
+    var client = try Client.init(a, std.testing.io, &config, "fixture-platform-key");
+    defer client.deinit();
+    try std.testing.expectEqualStrings("Bearer fixture-platform-key", client.authorization);
+    var headers: [8]std.http.Header = undefined;
+    const extra = try client.requestHeaders(.responses, null, &headers);
+    try std.testing.expectEqual(@as(usize, 1), extra.len);
+    try std.testing.expectEqualStrings("accept", extra[0].name);
+}
+
 test "OpenCode routing headers are stable explicit and absent on other services" {
     for (cfg.providers.Id.all) |id| {
         if (std.mem.eql(u8, @tagName(id), "openai_codex")) continue;

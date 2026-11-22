@@ -125,12 +125,13 @@ test "metadata callers select explicit or scheme proxy without moving credential
             probe.codex = id == .openai_codex;
             probe.url = switch (id) {
                 .deepseek => "https://api.deepseek.com/models",
+                .openai => "https://api.openai.com/v1/models",
                 .opencode_go => "https://opencode.ai/inference/go/v1/models",
                 .opencode_zen => "https://opencode.ai/inference/v1/models",
                 .openai_codex => "https://chatgpt.com/backend-api/codex/models?client_version=" ++ @import("version.zig").number,
             };
             probe.auth = switch (id) {
-                .deepseek => "Bearer sample-key",
+                .deepseek, .openai => "Bearer sample-key",
                 .openai_codex => "Bearer sample-token",
                 else => null,
             };
@@ -315,7 +316,7 @@ test "metadata rejects old future unknown and malformed cache without writing" {
     defer root.deinit();
     const a = std.testing.allocator;
     for (0..cache_version + 2) |version| {
-        if (version == 16 or version == cache_version) continue;
+        if (version == 16 or version == 17 or version == cache_version) continue;
         const body = try std.fmt.allocPrint(a, "{{\"version\":{d},\"models\":[]}}", .{version});
         defer a.free(body);
         try root.writeMode(file_name, body, true, 0o600);
@@ -382,7 +383,7 @@ test "version 16 cache keeps offline capabilities and refresh state until the ne
     defer claimed.cache.deinit(a);
     const saved = try root.read(a, file_name, 0, 4096);
     defer a.free(saved.data);
-    try std.testing.expect(std.mem.find(u8, saved.data, "\"version\":17") != null);
+    try std.testing.expect(std.mem.find(u8, saved.data, "\"version\":18") != null);
     try std.testing.expect(std.mem.find(u8, saved.data, "dev_input_price_") == null);
     var reloaded = try load(&root);
     defer reloaded.deinit(a);
@@ -390,6 +391,19 @@ test "version 16 cache keeps offline capabilities and refresh state until the ne
     try std.testing.expectEqual(@as(u64, 24), reloaded.refresh[providers.Id.all.len].generation);
     try std.testing.expectEqual(@as(?u32, 8192), outputFor(&reloaded, dynamicEntry(&reloaded, .deepseek, "raw/id").?));
 }
+test "cache version separates OpenAI and public directory claim slots" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidMetadata, parseCache(a, "{\"version\":17,\"directory_mask\":16}"));
+    try std.testing.expectError(error.InvalidMetadata, parseCache(a, "{\"version\":18,\"refresh\":[{},{},{},{},{}]}"));
+    var cache = try parseCache(a,
+        \\{"version":18,"directory_mask":16,"refresh":[{},{},{},{},{"generation":7},{"generation":11}]}
+    );
+    defer cache.deinit(a);
+    try std.testing.expect(hasDirectory(&cache, .openai));
+    try std.testing.expectEqual(@as(u64, 7), cache.refresh[@backingInt(providers.Id.openai)].generation);
+    try std.testing.expectEqual(@as(u64, 11), cache.refresh[providers.Id.all.len].generation);
+}
+
 test "version 16 cache validates retired fields and retained capabilities" {
     const prefix = "{\"version\":16,\"models\":[{\"provider\":\"deepseek\",\"id\":\"raw/id\",";
     inline for (.{ "\"dev_input_price_threshold\":\"4096\"", "\"dev_input_price_flat_limit\":0", "\"dev_input_price_threshold\":4096,\"context_window\":\"8192\"" }) |fields| {
@@ -416,7 +430,7 @@ test "metadata stale document is rebuilt by manual and automatic claims only" {
     var listing: Listing = .{};
     defer listing.deinit(a);
     for (providers.Id.all) |id| {
-        var source = try parseListing(a, if (id == .openai_codex) "{\"models\":[{\"slug\":\"fresh\",\"visibility\":\"list\",\"context_window\":8192}]}" else "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
+        var source = try parseListing(a, if (id == .openai_codex) "{\"models\":[{\"slug\":\"fresh\",\"visibility\":\"list\",\"context_window\":8192}]}" else if (id == .openai) "{\"data\":[{\"id\":\"gpt-4.1\"}]}" else "{\"data\":[{\"id\":\"fresh\",\"context_window\":8192}]}", id);
         defer source.deinit(a);
         try mergeOfficial(a, &listing, &source, id);
     }
@@ -498,7 +512,7 @@ test "metadata empty official listing is authoritative and failed refresh preser
     var listing: Listing = .{};
     defer listing.deinit(std.testing.allocator);
     for (providers.Id.all) |id| {
-        var source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":4096}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
+        var source = try parseListing(std.testing.allocator, if (id == .openai_codex) "{\"models\":[{\"slug\":\"raw/id\",\"visibility\":\"list\",\"context_window\":4096}]}" else if (id == .openai) "{\"data\":[{\"id\":\"gpt-4o\"}]}" else "{\"data\":[{\"id\":\"raw/id\",\"context_window\":4096}]}", id);
         defer source.deinit(std.testing.allocator);
         try mergeOfficial(std.testing.allocator, &listing, &source, id);
     }
@@ -512,9 +526,9 @@ test "metadata empty official listing is authoritative and failed refresh preser
     var removed = try commit(&root, bit(.deepseek), empty);
     defer removed.deinit(std.testing.allocator);
     for (providers.Id.all) |id| {
-        const row = removed.directory.rows[removed.directory.find(id, "raw/id").?];
+        const row = removed.directory.rows[removed.directory.find(id, if (id == .openai) "gpt-4o" else "raw/id").?];
         try std.testing.expectEqual(@as(?bool, id != .deepseek), row.available);
-        try std.testing.expectEqual(if (id == .deepseek) @as(?u32, null) else @as(?u32, 4096), row.tokens);
+        try std.testing.expectEqual(if (id == .deepseek or id == .openai) @as(?u32, null) else @as(?u32, 4096), row.tokens);
     }
     try std.testing.expect(hasDirectory(&removed, .deepseek));
     try std.testing.expect(findEntry(&removed, "deepseek/deepseek-flash") == null);
@@ -558,7 +572,32 @@ test "metadata rejects malformed availability and duplicate cache records withou
         try std.testing.expectEqualStrings(case.body, bytes.data);
     }
 }
-test "metadata official listing routes only DeepSeek credentials" {
+test "OpenAI lists exact known text routes without importing invented capabilities" {
+    const a = std.testing.allocator;
+    var listing = try parseListing(a,
+        \\{"data":[{"id":"gpt-4.1","protocol":"chat","context_window":1},{"id":"text-embedding-3-small"},{"id":"gpt-unknown"}]}
+    , .openai);
+    defer listing.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), listing.directory.count);
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", catalog.connection(.openai).api_key_env);
+    const member = listing.directory.rows[listing.directory.find(.openai, "gpt-4.1").?];
+    try std.testing.expect(member.available == true and member.tokens == null and member.protocol == .auto);
+    var dev = try parseDev(a,
+        \\{"openai":{"npm":"@ai-sdk/openai","models":{"gpt-4.1":{"limit":{"context":90000,"output":5000}},"text-embedding-3-small":{},"gpt-5":{"provider":{"npm":"@ai-sdk/anthropic"}}}}}
+    );
+    defer dev.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), dev.directory.count);
+    try mergeDev(a, &listing, &dev);
+    const cache: Cache = .{ .directory = listing.directory, .directory_mask = listing.directory_mask };
+    const entry = dynamicEntry(&cache, .openai, "gpt-4.1").?;
+    try std.testing.expectEqual(Protocol.responses, entry.model.protocol);
+    try std.testing.expectEqual(@as(u32, 90000), entry.model.context_tokens);
+    try std.testing.expectEqual(@as(?u32, 5000), entry.model.output_tokens);
+    try std.testing.expect(capacityFor(&cache, entry) == null and entryDeclaration(&cache, entry) == null);
+    try std.testing.expect(findEntry(&cache, "openai/gpt-5") == null);
+}
+
+test "metadata official listing sends bearer credentials only to private endpoints" {
     try std.testing.expectEqualStrings("https://api.deepseek.com/models", listingUrl(.deepseek));
     try std.testing.expectEqualStrings("https://opencode.ai/inference/go/v1/models", listingUrl(.opencode_go));
     try std.testing.expectEqualStrings("https://opencode.ai/inference/v1/models", listingUrl(.opencode_zen));

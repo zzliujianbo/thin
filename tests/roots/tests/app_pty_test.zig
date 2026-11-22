@@ -2658,7 +2658,10 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.send("/login\r");
         try d.waitFrame(start, "Provider> ");
         start = d.used;
-        try d.send("\x1b[A"); // Wrap first row to Codex; never select its OAuth route.
+        try d.send("\x1b[A"); // Wrap to the API-key route; Codex is a separate row.
+        try d.waitFrame(start, ">   OpenAI API");
+        start = d.used;
+        try d.send("\x1b[A");
         try d.waitFrame(start, ">   OpenAI Codex/ChatGPT");
         start = d.used;
         try d.send("\x1b[A");

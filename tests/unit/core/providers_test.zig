@@ -7,6 +7,9 @@ test "provider services have distinct exact endpoints" {
     try t.expect(Id.fromUrl("https://opencode.ai.example/zen/v1") == null);
     try t.expect(Id.fromUrl("https://opencode.ai/zen/go/v1?key=foo") == null);
     try t.expect(Id.fromUrl("https://opencode.ai/zen/go/v10") == null);
+    try t.expectEqual(Id.openai, Id.fromUrl("https://api.openai.com/v1/").?);
+    try t.expect(Id.fromUrl("https://api.openai.com.example/v1") == null);
+    try t.expect(!Id.openai.usesSessionHeader());
     try t.expectEqual(Id.deepseek, Id.fromUrl("https://api.deepseek.com/v1/").?);
     try t.expectEqual(Id.opencode_go, Id.fromUrl("https://opencode.ai/inference/go/v1/").?);
     try t.expectEqual(Id.opencode_zen, Id.fromUrl("https://opencode.ai/inference/v1").?);

@@ -54,7 +54,7 @@ fn officialThree() !m.Listing {
             .deepseek => "{\"data\":[{\"id\":\"fresh-deepseek\",\"context_window\":65536}]}",
             .opencode_go => "{\"data\":[{\"id\":\"fresh-shared\"}]}",
             .opencode_zen => "{\"data\":[{\"id\":\"fresh-shared\"},{\"id\":\"fresh-native\",\"context_window\":65536,\"effort\":{\"supported_levels\":[\"off\",\"low\",\"high\"]}}]}",
-            .openai_codex => return error.UnexpectedFixtureProvider,
+            .openai_codex, .openai => return error.UnexpectedFixtureProvider,
         };
         var listing = try m.parseListing(t.allocator, body, id);
         defer listing.deinit(t.allocator);

@@ -2033,6 +2033,37 @@ test "per-agent status rows are supported before app creation" {
     try std.testing.expect(!Session.pollModels(&session, false));
     try std.testing.expect(!Session.pollModels(&session, true));
 }
+test "OpenAI API login saves a separate key without replacing Codex and selects the API model locally" {
+    var fixture = try SessionTestFixture.init();
+    defer fixture.deinit();
+    try writeSessionTestConfig(fixture.tmp.dir, session_codex_metadata_config);
+    var session = try fixture.open(.{});
+    defer session.deinit();
+    const connection = session.connection();
+    try std.testing.expectEqual(metadata.bit(.openai_codex), connection.current().configured_providers);
+    try std.testing.expectError(error.AmbiguousApiKey, connection.configureProvider(.openai_codex, "fixture-api-key"));
+    try connection.configureProvider(.openai, "fixture-api-key");
+    const logged = connection.current();
+    try std.testing.expectEqualStrings("chatgpt/gpt-fixture", logged.selection_name.?);
+    try std.testing.expectEqual(metadata.bit(.openai_codex) | metadata.bit(.openai), logged.configured_providers);
+    try std.testing.expect(session.metadata_job == null and session.codex_job == null);
+    var disk = try session.store.loadExisting();
+    defer cfg.release(&disk);
+    const registry = disk.value.registry.?;
+    try std.testing.expectEqualStrings("chatgpt/gpt-fixture", registry.default);
+    const api = registry.find("openai").?.connection;
+    const codex = registry.find("chatgpt").?.connection;
+    try std.testing.expectEqualStrings(ProviderId.openai.baseUrl(), api.base_url);
+    try std.testing.expectEqualStrings("fixture-api-key", api.api_key.?);
+    try std.testing.expect(api.codex_oauth == null and codex.api_key == null);
+    try std.testing.expectEqualStrings("fixture-refresh", codex.codex_oauth.?.refresh_token);
+    // A shipped preset is selectable immediately, without polling /models.
+    try connection.selectModel("openai/gpt-5.4");
+    const active = session.app.?.config.value;
+    try std.testing.expectEqualStrings("openai", active.selected_provider.?);
+    try std.testing.expectEqualStrings("fixture-api-key", active.provider.api_key.?);
+    try std.testing.expect(active.model.protocol == .responses and active.provider.codex_oauth == null);
+}
 test "login refresh opt out remains offline and explicit profiles survive availability filtering" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

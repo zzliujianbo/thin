@@ -1853,7 +1853,9 @@ pub const SessionHost = struct {
         try out.field("base_url", state.base_url);
         try out.field("provider", if (state.provider) |provider| provider.slug() else @as(?[]const u8, null));
         try out.beginArray("allowed_providers");
-        for (allowed) |value| try out.arrayValue(value);
+        for (providers.Id.all) |provider| {
+            if (provider != .openai_codex) try out.arrayValue(provider.slug());
+        }
         try out.endArray();
         try out.field("configured", state.configured_providers);
         try out.field("allow_custom_models", state.allow_custom_models);
@@ -2185,8 +2187,6 @@ fn providerFromSlug(slug: []const u8) ?providers.Id {
     }
     return null;
 }
-
-const allowed = [_][]const u8{ "deepseek", "opencode-zen", "opencode-go" };
 
 // ---------------------------------------------------------------------------
 // Isolated lifecycle test (temp HOME/project, no network, no real config)

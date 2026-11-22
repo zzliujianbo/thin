@@ -7,8 +7,9 @@ pub const Id = enum {
     opencode_zen,
     opencode_go,
     openai_codex,
+    openai,
 
-    pub const all = [_]Id{ .deepseek, .opencode_zen, .opencode_go, .openai_codex };
+    pub const all = [_]Id{ .deepseek, .opencode_zen, .opencode_go, .openai_codex, .openai };
 
     pub fn label(self: Id) []const u8 {
         return switch (self) {
@@ -16,6 +17,7 @@ pub const Id = enum {
             .opencode_zen => "OpenCode Zen",
             .opencode_go => "OpenCode Go",
             .openai_codex => "OpenAI Codex/ChatGPT",
+            .openai => "OpenAI API",
         };
     }
     pub fn slug(self: Id) []const u8 {
@@ -24,6 +26,7 @@ pub const Id = enum {
             .opencode_zen => "opencode-zen",
             .opencode_go => "opencode-go",
             .openai_codex => "openai-codex",
+            .openai => "openai",
         };
     }
     pub fn baseUrl(self: Id) []const u8 {
@@ -32,6 +35,7 @@ pub const Id = enum {
             .opencode_zen => "https://opencode.ai/zen/v1",
             .opencode_go => "https://opencode.ai/zen/go/v1",
             .openai_codex => "https://chatgpt.com/backend-api/codex",
+            .openai => "https://api.openai.com/v1",
         };
     }
     pub fn fromUrl(url: []const u8) ?Id {

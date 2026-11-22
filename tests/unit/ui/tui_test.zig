@@ -7351,6 +7351,34 @@ test "provider auth Go fresh Enter after pasted key restores ordinary drawn comp
     try std.testing.expect(publishedNotice(&ui, "saved locally"));
     try std.testing.expectEqualStrings("Ready", ui.notice);
 }
+test "OpenAI API picker opens the masked key prompt not Codex browser login" {
+    try text.initLocale();
+    var cancel = p.Cancellation{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var fixture = SelectionFixture{};
+    defer fixture.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.connection = fixture.connection();
+    ui.connection.configure_provider_fn = SelectionFixture.configureProvider;
+    const sink = input.Sink{ .context = &ui, .emit_fn = Ui.key };
+    try ui.parser.feed("/login\r", sink);
+    try ui.parser.feed("\x1b[A", sink); // Wrap from Current endpoint to OpenAI API.
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, core_config.providers.Id.openai.label()) != null);
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(ui.secret_mode and ui.secret_provider == .openai);
+    try ui.parser.feed("fake-ui-key", sink);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "fake-ui-key") == null);
+    try std.testing.expect(std.mem.find(u8, ui.frame, core_config.providers.Id.openai.baseUrl()) != null);
+    testAcknowledgeFullFrame(&ui);
+    try ui.parser.feed("\r", sink);
+    try std.testing.expect(fixture.key_matched and fixture.provider_saves == 1 and fixture.saved_provider == .openai);
+    try std.testing.expect(!ui.secret_mode and ui.secret.len == 0 and ui.editor.bytes.items.len == 0 and !ui.busy);
+}
 test "provider auth denies partial stale resize reopen and pasted choices" {
     var cancel = p.Cancellation{};
     var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);

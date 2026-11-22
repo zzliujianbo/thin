@@ -32,6 +32,10 @@
 
 独立前台示例：`HTTPS_PROXY=http://127.0.0.1:7890 thin`。系统代理地址使用不带账号密码的 HTTP(S) URL，不读取 `ALL_PROXY`。使用守护服务时，在 `~/.config/thin/daemon.env` 设置变量并重启服务；仅在连接它的终端里 `export` 不会改变服务的环境。该规则也适用于 Codex 授权码交换、令牌刷新，以及官方目录和公共元数据查询。本机 Unix socket 通信和浏览器里的授权页面不由 Thin 的 HTTP 代理控制。
 
+### 使用 OpenAI API Key
+
+在 `/login` 选择 `OpenAI API`，把 OpenAI 平台的 API Key 粘贴到隐藏输入框并按 Enter。然后在 `/model` 选择 `openai/…` 下的模型。请求发往 `https://api.openai.com/v1`，使用该 Key 所属 API 项目的额度，与下面的 ChatGPT 浏览器登录相互独立。不要在聊天或命令行中输入 Key。
+
 ### 通过 SSH 登录 OpenAI Codex
 
 在 Thin 运行 `/login`，选择 OpenAI Codex，把显示的授权链接复制到本机浏览器并登录。授权后浏览器会跳转到 `http://localhost:1455/auth/callback`。Thin 不监听这个端口；即使浏览器显示无法连接，也可以复制地址栏里的**完整回调地址**，粘贴回 Thin 的专用登录框并按 Enter。不要把它粘贴到聊天或 shell。整个过程不需要设备码、修改设备码权限或设置 SSH 端口转发。已有凭据可以继续使用。

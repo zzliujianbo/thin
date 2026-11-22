@@ -2426,10 +2426,11 @@ test "settings reply is one parseable JSON object with complete array elements" 
     try std.testing.expectEqual(true, root.get("ok").?.bool);
 
     const allowed_json = root.get("allowed_providers").?.array;
-    try std.testing.expect(allowed_json.items.len > 1);
-    try std.testing.expectEqual(@as(usize, 3), allowed_json.items.len);
+    try std.testing.expectEqual(@as(usize, 4), allowed_json.items.len);
     try std.testing.expectEqualStrings("deepseek", allowed_json.items[0].string);
+    try std.testing.expectEqualStrings("opencode-zen", allowed_json.items[1].string);
     try std.testing.expectEqualStrings("opencode-go", allowed_json.items[2].string);
+    try std.testing.expectEqualStrings("openai", allowed_json.items[3].string);
 
     const levels_json = root.get("effort_levels").?.array;
     try std.testing.expectEqual(@as(usize, 3), levels_json.items.len);

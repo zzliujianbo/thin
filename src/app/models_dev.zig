@@ -70,6 +70,7 @@ fn providerName(id: catalog.Id) []const u8 {
         .deepseek => "deepseek",
         .opencode_go => "opencode-go",
         .opencode_zen => "opencode",
+        .openai => "openai",
         .openai_codex => "\x00unverified-codex-source",
     };
 }
@@ -450,7 +451,7 @@ fn providerId(name: []const u8) ?providers.Id {
     return null;
 }
 
-/// Exact rows for the three supported services. Adapter identity is independent
+/// Exact rows for supported services. Adapter identity is independent
 /// of reasoning availability. All keys and profiles are safe to copy by value.
 pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory.Directory {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -460,6 +461,7 @@ pub fn parseDirectory(allocator: std.mem.Allocator, body: []const u8) !directory
     errdefer result.deinit(allocator);
     for (records) |record| {
         const id = providerId(record.provider) orelse continue;
+        if (id == .openai and (!catalog.openaiText(record.model) or record.api != .responses)) continue;
         const row = try result.upsert(allocator, id, record.model);
         row.dev_present = true;
         row.dev_protocol = record.api;
