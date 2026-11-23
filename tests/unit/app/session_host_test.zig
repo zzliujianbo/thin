@@ -1451,20 +1451,34 @@ test "bridge display metadata is stored and the approval detail survives reconne
     // Stored events are epoch-free: old history replays after takeover.
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"epoch\":0") != null);
 
+    // These live notices seal the rolling tool stage; replay needs the same boundaries.
+    host.observe(.{ .fallback = .chat }, false, true);
+    host.observe(.{ .compaction_skipped = .{ .reason = .recent } }, false, true);
     host.setPending(9, "bash", "rm -rf /var/tmp/x");
     const frame = try dispatchJson(host, a, "{\"v\":8,\"id\":22,\"op\":\"history\"}", 1);
     defer a.free(frame);
     var parsed = try parseJson(a, frame);
     defer parsed.deinit();
     var saw_permission = false;
+    var boundaries: usize = 0;
     for (parsed.value.object.get("entries").?.array.items) |entry| {
-        if (!std.mem.eql(u8, entry.object.get("t").?.string, "permission")) continue;
+        const tag = entry.object.get("t").?.string;
+        if (std.mem.eql(u8, tag, "fallback")) {
+            try std.testing.expectEqual(@as(usize, 0), boundaries);
+            boundaries += 1;
+        }
+        if (std.mem.eql(u8, tag, "compaction_skipped")) {
+            try std.testing.expectEqual(@as(usize, 1), boundaries);
+            boundaries += 1;
+        }
+        if (!std.mem.eql(u8, tag, "permission")) continue;
         try std.testing.expectEqual(@as(i64, 9), entry.object.get("id").?.integer);
         try std.testing.expectEqualStrings("bash", entry.object.get("name").?.string);
         try std.testing.expectEqualStrings("rm -rf /var/tmp/x", entry.object.get("desc").?.string);
         saw_permission = true;
     }
     try std.testing.expect(saw_permission);
+    try std.testing.expectEqual(@as(usize, 2), boundaries);
     host.clearPending();
 }
 test "long approval detail survives reconnect whole and stays approvable" {

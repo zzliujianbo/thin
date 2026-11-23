@@ -2663,8 +2663,8 @@ const Ui = struct {
     /// A caption is not a log viewer. Only typed exit metadata and recognized
     /// file/tool error names may survive in a failed automatic row.
     fn stageFailureReason(a: std.mem.Allocator, kind: shared.tools.Kind, result: r.Execution) !?[]const u8 {
-        if (result.canceled) return null;
         if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
+        if (result.canceled) return null;
         const Facts = struct { timed_out: bool = false, signal: ?i64 = null, exit_code: ?i64 = null, @"error": ?[]const u8 = null };
         const facts = std.json.parseFromSlice(Facts, a, result.text, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2704,7 +2704,16 @@ const Ui = struct {
     fn trackStageResult(self: *Ui, id: u64, failed: bool) void {
         if (self.stage_count == self.stage_ids.len) {
             const drop: usize = if (!failed and self.latestStageFailure() == 0) 1 else 0;
-            self.removeRecord(self.record_index.get(self.stage_ids[drop]).?);
+            const displaced = self.stage_ids[drop];
+            const replacement = &self.records.items[self.record_index.get(id).?];
+            // Rollover substitutes this exact new row, not an arbitrary later
+            // frame. Repeated evictions carry the same obligations forward.
+            for (self.delivery_fences.items) |*fence| {
+                if (fence.proven or fence.enqueued or fence.record_id != displaced) continue;
+                fence.record_id = id;
+                fence.generation = replacement.stream_generation;
+            }
+            self.removeRecord(self.record_index.get(displaced).?);
             for (drop..self.stage_count - 1) |i| self.stage_ids[i] = self.stage_ids[i + 1];
             self.stage_count -= 1;
         }
@@ -3142,7 +3151,7 @@ const Ui = struct {
                     return;
                 }
             },
-            .tool_result => |tool| if (!tool.local and !self.commandKind()) return,
+            .tool_result => source = false,
             .user_committed, .compacted, .compaction_failed, .compaction_skipped, .fallback => {},
             else => return,
         }
@@ -5818,13 +5827,13 @@ const Ui = struct {
         const detail = if (terminal.result == .success)
             "✓ done"
         else if (terminal.exit_code) |code|
-            if (terminal.failure) |failure|
-                try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, exit {d})", .{ status, @tagName(failure), code })
+            if (terminal.failure != null and terminal.failure != .exit)
+                try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, exit {d})", .{ status, @tagName(terminal.failure.?), code })
             else
                 try std.fmt.bufPrint(&detail_buffer, "{s} (exit {d})", .{ status, code })
         else if (terminal.signal) |signal|
-            if (terminal.failure) |failure|
-                try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, signal {d})", .{ status, @tagName(failure), signal })
+            if (terminal.failure != null and terminal.failure != .signal)
+                try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, signal {d})", .{ status, @tagName(terminal.failure.?), signal })
             else
                 try std.fmt.bufPrint(&detail_buffer, "{s} (signal {d})", .{ status, signal })
         else if (terminal.failure) |failure|
@@ -7447,6 +7456,15 @@ const Ui = struct {
                     if (i != failure and (self.stage_count - i > settled or (failure != null and failure.? < self.stage_count - settled and i == self.stage_count - settled))) continue;
                     const row = &self.records.items[self.record_index.get(id).?];
                     try row.layout(self.allocator, @max(1, cols));
+                    // Same logical tail coordinates as draft rows. Final crop
+                    // (including popups) resolves visibility; an ACKed sparse
+                    // diff establishes the same physical tail as a full write.
+                    try frame_records.append(a, .{
+                        .record_id = id,
+                        .generation = row.stream_generation,
+                        .tail_line_start = lines.items.len,
+                        .tail_rows = row.lines.len,
+                    });
                     try lines.appendSlice(a, row.lines);
                 }
                 const view_limit = views - @intFromBool(detached_active);

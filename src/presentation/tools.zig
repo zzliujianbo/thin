@@ -194,7 +194,7 @@ pub const Completion = struct {
     display: ?@import("../core/background_status.zig").Caption = null,
 
     pub fn fromExecution(result: r.Execution) Completion {
-        const outcome: Outcome = if (result.canceled) .canceled else if (result.is_error) .failed else .success;
+        const outcome: Outcome = if (result.cleanup_failed) .failed else if (result.canceled) .canceled else if (result.is_error) .failed else .success;
         const handoff = if (result.display) |display| display.action == .start and outcome == .success else false;
         return .{ .outcome = outcome, .file_stats = if (outcome == .success) result.file_stats else null, .duration_ms = if (handoff) null else result.duration_ms, .display = result.display };
     }
@@ -211,9 +211,9 @@ const reason_bytes = 512;
 /// instead of the raw envelope, and other tools expose their JSON error message
 /// or the sanitized first line of their result. An empty body has nothing to show.
 pub fn failureReason(a: std.mem.Allocator, kind: Kind, result: r.Execution) !?[]const u8 {
+    if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
     if (!result.is_error or result.canceled) return null;
     if (kind == .read) return try excerpt(a, result.text);
-    if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
     if (kind == .bash) return try bashReason(a, result.text) orelse try a.dupe(u8, "command failed");
     if (try jsonError(a, result.text)) |message| return message;
     return excerpt(a, result.text);

@@ -939,7 +939,7 @@ pub const SessionHost = struct {
 
     fn canonicalForHistory(event: r.Event) bool {
         return switch (event) {
-            .user_committed, .assistant_committed, .tool_started, .tool_result, .compacted, .compaction_failed => true,
+            .user_committed, .assistant_committed, .tool_started, .tool_result, .fallback, .compacted, .compaction_failed, .compaction_skipped => true,
             else => false,
         };
     }

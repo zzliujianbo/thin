@@ -4873,6 +4873,19 @@ test "rolling tool stage replacement owns or rolls back every allocation" {
     try std.testing.checkAllAllocationFailures(backing.allocator(), stageRolloverAllocationScenario, .{});
 }
 
+test "cleanup failure survives cancellation and stays visible after later successes" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.toolCompleted(.{ .kind = .bash, .label = "original" }, .{ .text = "private", .is_error = true, .canceled = true, .cleanup_failed = true }, false);
+    for (0..4) |_| try ui.toolCompleted(.{ .kind = .read, .label = "next" }, .{ .text = "" }, false);
+    try std.testing.expectEqual(@as(?usize, 0), ui.latestStageFailure());
+    try std.testing.expectEqualStrings("cleanup failed", ui.records.items[0].failure_reason.?);
+}
+
 test "rolling tool stage pins failure across six calls and freezes once across text and cancellation" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};
@@ -7026,7 +7039,7 @@ test "background completion is admitted before exact-id retirement" {
     const row = ui.records.items[0];
     try std.testing.expect(row.single_row);
     try std.testing.expectEqual(NoticeLevel.failure, row.notice_level);
-    try std.testing.expect(std.mem.indexOf(u8, row.body.items, "exit 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.body.items, "failed (exit 7)") != null);
     try std.testing.expect(std.mem.indexOf(u8, row.body.items, "1234ms") != null);
     ui.size = .{ .columns = 24, .rows = 12 };
     try ui.draw();
@@ -11876,6 +11889,117 @@ test "256 CR-terminated events prove every earlier sequence while the last CR wa
     try std.testing.expectEqual(@as(u64, delivery_fence_capacity + 1), ui.delivery_proven);
     try std.testing.expectEqual(@as(u64, delivery_fence_capacity + 1), fake.ack_sequence);
 }
+fn pumpStageEvent(ui: *Ui, fake: *FakeRemote, sequence: u64, event_: r.Event) !void {
+    fake.item = try session_client.ownEvent(std.testing.allocator, 1, event_);
+    fake.item.?.delivery_epoch = 9;
+    fake.item.?.delivery_sequence = sequence;
+    try ui.pumpRemote();
+}
+
+test "remote rollover waits for the displaced result's specific replacement through terminal seal" {
+    var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 1 } };
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for ([_][]const u8{ "first", "second", "third", "replacement-four", "replacement-five", "replacement-six" }, 1..) |name, seq| {
+        try pumpStageEvent(&ui, &fake, seq, .{ .tool_result = .{ .id = seq, .name = name, .result = .{ .text = "{}" } } });
+    }
+    try pumpStageEvent(&ui, &fake, 7, .{ .tool_started = .{ .id = 7, .name = "still-running" } });
+    try std.testing.expectEqual(ui.stage_ids[0], ui.delivery_fences.items[0].record_id);
+    try std.testing.expectEqual(ui.stage_ids[0], ui.delivery_fences.items[3].record_id);
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(!screen.visible("replacement-four") and screen.visible("replacement-five") and screen.visible("replacement-six"));
+    ui.frame_offset = ui.frame.len - 1;
+    ui.finishFrame();
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_range_count);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 0), fake.ack_sequence);
+    try std.testing.expectEqual(@as(usize, 2), fake.ack_range_count);
+    try std.testing.expectEqual(@as(u64, 2), fake.ack_ranges[0].first);
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_ranges[0].last);
+    try std.testing.expectEqual(@as(u64, 5), fake.ack_ranges[1].first);
+    try std.testing.expectEqual(@as(u64, 7), fake.ack_ranges[1].last);
+    fake.snapshot.busy = false;
+    try pumpStageEvent(&ui, &fake, 8, .{ .finished = .{ .status = .canceled } });
+    try ui.pumpDisplay(); // actual Bridge terminal handoff + seal
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    try ui.draw();
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("replacement-four"));
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 8), fake.ack_sequence);
+}
+
+test "reattach baseline can roll into retained live results without claiming replay as delivery" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    // watch baseline (no delivery sequences), then ordered live positions
+    // strictly after its cutoff. No drawing between the two pages.
+    for (1..4) |id| {
+        fake.item = try session_client.ownEvent(ui.allocator, 1, .{ .tool_result = .{ .id = id, .name = "baseline", .result = .{ .text = "{}" } } });
+        fake.item.?.history_replay = true;
+        fake.item.?.history_display_reset = id == 1;
+        fake.item.?.history_reset = id == 1;
+        try ui.pumpRemote();
+    }
+    try std.testing.expectEqual(@as(usize, 0), ui.delivery_fences.items.len);
+    for (4..8) |id| try pumpStageEvent(&ui, &fake, id, .{ .tool_result = .{ .id = id, .name = "live-result", .result = .{ .text = "{}" } } });
+    try std.testing.expectEqual(ui.stage_ids[2], ui.delivery_fences.items[0].record_id);
+    try pumpStageEvent(&ui, &fake, 8, .{ .assistant_committed = &.{.{ .text = "after tools" }} });
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.ack_count);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 8), fake.ack_sequence);
+}
+
+test "stage result needs a visible fresh frame even when sparse diff keeps identical physical rows" {
+    var fake = FakeRemote{};
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = remoteUi(&fake, &bridge, &cancel);
+    defer ui.deinit();
+    for (1..4) |seq| try pumpStageEvent(&ui, &fake, seq, .{ .tool_result = .{ .id = seq, .name = "identical-row", .result = .{ .text = "{}" } } });
+    // The settings popup uses the short body viewport. The frame displays
+    // its UI and can prove metadata, but none of the stage rows fit.
+    ui.size.rows = 7;
+    ui.settings_open = true;
+    try ui.draw();
+    try std.testing.expect(ui.frame_delivery_shown);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "identical-row") == null);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 0), fake.ack_sequence);
+    ui.settings_open = false;
+    ui.resize(.{ .rows = 24, .columns = 80 });
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.draw();
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_sequence);
+    try pumpStageEvent(&ui, &fake, 4, .{ .tool_result = .{ .id = 4, .name = "identical-row", .result = .{ .text = "{}" } } });
+    try ui.draw();
+    try std.testing.expect(ui.frame_sparse);
+    try std.testing.expect(std.mem.find(u8, ui.frame, "identical-row") == null);
+    try screen.replay(ui.frame);
+    try std.testing.expect(screen.visible("identical-row"));
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_sequence);
+    ui.frame_fresh = false;
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 3), fake.ack_sequence);
+    try ui.draw();
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(u64, 4), fake.ack_sequence);
+}
+
 test "a full delivery fence queue blocks polling without losing the event" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .busy = true, .control_epoch = 1 } };
     var cancel: p.Cancellation = .{};
