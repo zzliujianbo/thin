@@ -1642,7 +1642,54 @@ fn previewFrame(d: *Driver, a: std.mem.Allocator, start: usize, needle: []const 
     return error.ToolPreviewFrameTimeout;
 }
 
+fn previewPhases(d: *Driver) !void {
+    const a_paths = [_][]const u8{ "ash-probe.txt", "birch-probe.txt", "cedar-probe.txt", "elm-probe.txt", "fir-probe.txt" };
+    try d.waitIdle(0);
+    const start = d.used;
+    try d.send("preview-task\r");
+    try d.waitVisibleFrame(start, "body-amber");
+    std.debug.print("PREVIEW_GATE=body-amber\n", .{});
+    for (a_paths, 0..) |path, i| {
+        const since = d.used;
+        try d.waitVisibleFrame(since, path);
+        if (i == a_paths.len - 1) {
+            const active = (try d.acknowledgedScreen(since)).?;
+            try check(active.count(a_paths[0]) == 0); // rolled out BEFORE B starts
+        }
+        std.debug.print("PREVIEW_GATE={s}\n", .{path});
+    }
+    const transition = d.used;
+    try d.waitVisibleFrame(transition, "body-violet");
+    const frozen = (try d.acknowledgedScreen(transition)).?;
+    var counts: [a_paths.len]usize = undefined;
+    var total: usize = 0;
+    for (a_paths, 0..) |path, i| {
+        counts[i] = frozen.count(path); // native scrollback AND current grid
+        total += counts[i];
+    }
+    try check(counts[0] == 0 and counts[1] == 0 and counts[4] == 1 and total <= 3);
+    // Arm before releasing B: no A caption may be repainted, even if its
+    // screen location afterwards would be indistinguishable from a sparse diff.
+    const b_ticks = d.used;
+    std.debug.print("PREVIEW_GATE=body-violet\n", .{});
+    for ([_][]const u8{ "lime-probe.txt", "oak-probe.txt" }) |path| {
+        try d.waitVisibleFrame(d.used, path);
+        std.debug.print("PREVIEW_GATE={s}\n", .{path});
+    }
+    const finish = d.used;
+    try d.waitVisibleFrame(finish, "phase-final-answer");
+    try d.waitIdle(finish);
+    const final = (try d.acknowledgedScreen(finish)).?;
+    try check(final.count("body-amber") == 1 and final.count("body-violet") == 1 and final.count("phase-final-answer") == 1);
+    for (a_paths, counts) |path, count| {
+        try check(final.count(path) == count);
+        try check(std.mem.indexOf(u8, d.output[b_ticks..d.used], path) == null);
+    }
+    std.debug.print("PREVIEW_GATE=verified\n", .{});
+}
+
 fn toolPreview(d: *Driver, init: std.process.Init, mode: []const u8, project: []const u8) !void {
+    if (std.mem.eql(u8, mode, "tool-preview-phases")) return previewPhases(d);
     const a = init.arena.allocator();
     const target = try a.dupeSentinel(u8, try std.fs.path.join(a, &.{ project, "preview-owned.txt" }), 0);
     const canceled = std.mem.eql(u8, mode, "tool-preview-cancel");
@@ -3043,7 +3090,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         try d.waitText(start, "memory-summary-final-answer");
         try d.waitIdle(start);
         const final = try d.screen();
-        for ([_][]const u8{ "~ memory write caption-note.md", "~ memory read caption-note.md", "~ memory list core/index", "~ memory delete caption-note.md" }) |caption| {
+        try check(final.count("~ memory write caption-note.md") == 0);
+        for ([_][]const u8{ "~ memory read caption-note.md", "~ memory list core/index", "~ memory delete caption-note.md" }) |caption| {
             try check(final.count(caption) == 1);
         }
         try check(std.mem.indexOf(u8, d.output[start..d.used], "memory-summary-hidden-body") == null);
@@ -3067,7 +3115,16 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
                 found = row;
             };
             try check(found != null);
-            if (previous) |row| try check(found.? == row + 1);
+            if (previous) |row| {
+                if (std.mem.endsWith(u8, caption, "[partial]")) {
+                    var boundary = false;
+                    try check(found.? > row);
+                    for (final.grid[row + 1 .. found.?]) |line| {
+                        if (std.mem.indexOf(u8, &line, "Checking partial reads and cleanup.") != null) boundary = true;
+                    }
+                    try check(boundary);
+                } else try check(found.? == row + 1);
+            }
             previous = found;
         }
         // The failed write has no count suffix, so its measured duration can
@@ -3092,7 +3149,8 @@ fn runBody(init: std.process.Init, runtime_path: []const u8) !void {
         for (final.grid, 0..) |line, row| if (std.mem.indexOf(u8, &line, "file-stats-final-answer") != null) {
             answer = row;
         };
-        try check(answer != null and answer.? == previous.? + 3);
+        // One blank separator between the frozen captions and the new prose.
+        try check(answer != null and answer.? == previous.? + 2);
         for (final.grid[answer.? - 1]) |byte| try check(byte == ' ');
         try check(std.mem.indexOf(u8, &final.grid[final.row], "(fixture-model ") != null and std.mem.indexOf(u8, &final.grid[final.row], "%>") != null);
         try Driver.checkComposerTail(final);

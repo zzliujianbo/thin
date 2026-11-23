@@ -29,6 +29,33 @@ function gate(f, name) {
     f.waiters.set(name, () => {clearTimeout(timer); resolve();});
   });
 }
+// Separate rounds make these completed automatic calls, not just transient
+// argument deltas. Hold each next action until its predecessor was painted.
+const phaseTags = ['ash', 'birch', 'cedar', 'elm', 'fir', 'lime', 'oak'];
+const phasePath = tag => `${tag}-probe.txt`;
+async function phases(f, res, body) {
+  const i = f.requests - 1;
+  const results = body.messages.filter(m => m.role === 'tool');
+  assert.deepEqual(results.map(m => m.tool_call_id), phaseTags.slice(0, i));
+  if (i) {
+    assert.equal(JSON.parse(results.at(-1).content).written_bytes, 1);
+    assert.equal(await readFile(join(f.project, phasePath(phaseTags[i-1])), 'utf8'), 'x');
+    f.results++;
+  } else assert.equal(body.messages.at(-1).content, 'preview-task');
+  if (i === 0 || i === 5) {
+    const phase = i === 0 ? 'body-amber' : 'body-violet';
+    delta(res, {content:phase});
+    await gate(f, phase);
+  }
+  if (i === phaseTags.length) {
+    delta(res, {content:'phase-final-answer'}); end(res, 'stop'); return;
+  }
+  const tag = phaseTags[i];
+  delta(res, {tool_calls:[{index:0,id:tag,type:'function',function:{name:'write_file',
+    arguments:JSON.stringify({path:phasePath(tag),content:'x'})}}]});
+  await gate(f, phasePath(tag));
+  end(res, 'tool_calls');
+}
 const server = createServer(async (req, res) => {
   requests++;
   const f = active;
@@ -39,8 +66,9 @@ const server = createServer(async (req, res) => {
     for await (const chunk of req) { size += chunk.length; assert(size <= 512*1024); chunks.push(chunk); }
     const body = JSON.parse(Buffer.concat(chunks));
     f.requests++;
-    assert(f.requests <= (f.mode === 'cancel' ? 1 : 2), 'extra inference/summary');
+    assert(f.requests <= (f.mode === 'phases' ? phaseTags.length + 1 : f.mode === 'cancel' ? 1 : 2), 'extra inference/summary');
     res.writeHead(200, {'content-type':'text/event-stream','cache-control':'no-cache'});
+    if (f.mode === 'phases') return await phases(f, res, body);
     if (f.requests === 1) {
       assert.equal(body.messages.at(-1).content, 'preview-task');
       delta(res,{tool_calls:[{index:0,id:'preview-write',type:'function',function:{name:'write_file',arguments:''}}]});
@@ -148,11 +176,17 @@ async function run(mode, url) {
     assert.equal(result.signal,null,`${mode}: signal`);
     assert.equal(result.code,0,`${mode}: driver failed\n${output}`);
     for(const secret of ['fixture-secret-never-log','PREVIEW_RAW_CONTENT_SECRET']) assert(!output.includes(secret));
-    assert.deepEqual([...f.gates],['header','partial','path-absent',mode==='cancel'?'canceled':'finish','verified']);
-    assert.equal(f.requests,mode==='cancel'?1:2); assert.equal(f.earlyAbsence,1);
-    assert.equal(f.results,mode==='cancel'?0:2);
-    if(mode==='cancel') await absent(join(project,'preview-owned.txt'));
-    else assert.equal(await readFile(join(project,'preview-owned.txt'),'utf8'),content);
+    if (mode === 'phases') {
+      assert.deepEqual([...f.gates], ['body-amber', ...phaseTags.slice(0,5).map(phasePath), 'body-violet', ...phaseTags.slice(5).map(phasePath), 'verified']);
+      assert.equal(f.requests, phaseTags.length + 1);
+      assert.equal(f.results, phaseTags.length);
+    } else {
+      assert.deepEqual([...f.gates],['header','partial','path-absent',mode==='cancel'?'canceled':'finish','verified']);
+      assert.equal(f.requests,mode==='cancel'?1:2); assert.equal(f.earlyAbsence,1);
+      assert.equal(f.results,mode==='cancel'?0:2);
+      if(mode==='cancel') await absent(join(project,'preview-owned.txt'));
+      else assert.equal(await readFile(join(project,'preview-owned.txt'),'utf8'),content);
+    }
     assert.equal(await readFile(configPath,'utf8'),config);
     await absent(join(home,'.thin/sessions')); await stat(join(project,'.thin/sessions'));
     await absent(join(project,'.thin/settings.json'));
@@ -163,7 +197,7 @@ async function run(mode, url) {
 try {
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
   const url=`http://127.0.0.1:${server.address().port}/v1`;
-  for(const mode of ['success','cancel']) await run(mode,url);
+  for(const mode of ['success','cancel','phases']) await run(mode,url);
   console.log(`PASS test-tool-preview: scenarios=${scenarios}, HTTP=${requests}, no external APIs`);
 } catch(e) {console.error(`FAIL test-tool-preview: completed=${scenarios}, HTTP=${requests}`);throw e;}
 finally {

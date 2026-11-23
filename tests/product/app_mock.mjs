@@ -144,7 +144,8 @@ function send(res, protocol, text, calls = [], truncated = false, nativeReasonin
   const event = x => res.write(`data: ${JSON.stringify(x)}\n\n`);
 
   if (protocol === 'chat') {
-    // Chat：工具调用放在 delta.tool_calls 中，否则放文本增量。
+    // A tool batch can follow visible prose in the same response.
+    if (calls.length && text) event({id:'chat_fixture', choices:[{index:0, delta:{content:text}, finish_reason:null}]});
     const delta = calls.length ? {tool_calls: calls.map((t, index) => ({index, id:t.id, type:'function', function:{name:t.name, arguments:t.arguments}}))} : {content:text};
     // 先发送内容增量。
     event({id:'chat_fixture', choices:[{index:0, delta, finish_reason:null}]});
@@ -522,11 +523,12 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
 
       if (kind === 'file-stats') {
         assert.equal(protocol,'chat');
-        assert(rounds <= 2, 'file stats request bound');
+        assert(rounds <= 3, 'file stats request bound');
         if (rounds === 1) send(res,protocol,'',[
           tool('file_create','write_file',{path:'stats.txt',content:'a\nb\nc\nd\ne\n'}),
           tool('file_update','write_file',{path:'stats.txt',content:'a\nB\nx\nc\ne\n',overwrite:true}),
-          tool('file_read','read_file',{path:'stats.txt'}),
+          tool('file_read','read_file',{path:'stats.txt'})
+        ]); else if (rounds === 2) send(res,protocol,'Checking partial reads and cleanup.',[
           tool('file_range','read_file',{path:'stats.txt',offset:1,limit:2}),
           tool('file_clear','write_file',{path:'stats.txt',content:'',overwrite:true}),
           tool('file_failed','write_file',{path:'stats.txt',content:'must-not-write'})
@@ -878,7 +880,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
     if (kind === 'keyboard-history') { assert.equal(requests,4); assert(stalled); }
     if (kind === 'esc-cancel-tool') { assert.equal(requests,2); assert(!await exists(join(project,'esc-unwanted.txt'))); }
     if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
-    if (kind === 'file-stats') assert.equal(requests,2, 'file stats request count');
+    if (kind === 'file-stats') assert.equal(requests,3, 'file stats request count');
     if (kind === 'idle-peer') {
       assert.equal(requests,2, 'idle peer must issue exactly the two intended calls');
       // fixture-turn checks the final answer on the actual terminal.

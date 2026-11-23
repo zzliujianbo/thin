@@ -2405,6 +2405,40 @@ test "replayed history turns saved tool results into tool rows with their call c
     }
     try std.testing.expectEqual(@as(usize, 1), tools);
 }
+test "replay groups normal captions between visible prose independently of the current command" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    ui.job.kind = .command; // Current owner activity is not historical provenance.
+    try replayItem(&ui, a, .{ .assistant_committed = &.{.{ .text = "before" }} });
+    for ([_][]const u8{ "old-failure", "keep-failure", "old-success", "keep-one", "keep-two" }, 0..) |name, i| {
+        try replayItem(&ui, a, .{ .assistant_committed = &.{
+            .{ .text = "" }, .{ .tool_call = .{ .id = name, .name = name, .arguments = "{}" } },
+        } });
+        try replayItem(&ui, a, .{ .tool_result = .{ .id = i + 1, .name = name, .result = .{ .text = "{}", .is_error = i < 2 } } });
+    }
+    try replayItem(&ui, a, .{ .assistant_committed = &.{.{ .text = "after" }} });
+    try std.testing.expectEqual(@as(usize, 5), ui.records.items.len);
+    try std.testing.expectEqualStrings("before", ui.records.items[0].body.items);
+    for (ui.records.items[1..4], [_][]const u8{ "keep-failure", "keep-one", "keep-two" }) |record, name| {
+        try std.testing.expect(record.command_row and std.mem.indexOf(u8, record.body.items, name) != null);
+    }
+    try std.testing.expectEqualStrings("after", ui.records.items[4].body.items);
+    try std.testing.expect(ui.commandKind()); // Projection did not change the live task.
+    // A reattach to a live owner, unlike a seeded checkpoint, can replay the
+    // original local marker. Its adjacent literal output still appears once.
+    ui.job.kind = .prompt;
+    try replayItem(&ui, a, .{ .assistant_committed = &.{
+        .{ .text = r.local_command_note }, .{ .tool_call = .{ .id = "local_command_1", .name = "bash", .arguments = "{\"command\":\"pwd\"}" } },
+    } });
+    try replayItem(&ui, a, .{ .tool_result = .{ .id = 6, .name = "bash", .local = true, .result = .{ .text = "{\"stdout\":\"saved-output\"}" } } });
+    try std.testing.expectEqual(@as(usize, 7), ui.records.items.len);
+    try std.testing.expect(ui.records.items[5].command_row);
+    try std.testing.expect(!ui.records.items[6].command_row and std.mem.indexOf(u8, ui.records.items[6].body.items, "saved-output") != null);
+}
 test "replayed image and unknown calls keep their names and targets" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};
@@ -2441,13 +2475,13 @@ test "failed tool rows keep the bounded reason while the target clips" {
     try std.testing.expect(std.mem.startsWith(u8, record.body.items, "✗ write_file "));
     try std.testing.expect(std.mem.indexOf(u8, record.body.items, "AccessDenied") == null);
     try std.testing.expectEqualStrings("AccessDenied", record.failure_reason.?);
-    // The reason owns its own row below the clipped target.
+    // The reason shares the slot with the clipped identity.
     try record.layout(a, 40);
-    try std.testing.expectEqual(@as(usize, 2), record.lines.len);
+    try std.testing.expectEqual(@as(usize, 1), record.lines.len);
     try std.testing.expect(std.mem.startsWith(u8, record.lines[0], theme.reset ++ theme.failure ++ "✗"));
     try std.testing.expect(std.mem.indexOf(u8, record.lines[0], "...") != null);
-    try std.testing.expect(std.mem.indexOf(u8, record.lines[1], "AccessDenied") != null);
-    try std.testing.expect(@import("markdown_writer.zig").displayWidth(record.lines[1]) <= 40);
+    try std.testing.expect(std.mem.indexOf(u8, record.lines[0], "AccessDenied") != null);
+    try std.testing.expect(@import("markdown_writer.zig").displayWidth(record.lines[0]) <= 40);
 }
 test "replayed history keeps file counters and local command output rows" {
     const a = std.testing.allocator;
@@ -3151,7 +3185,7 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
         if (std.mem.find(u8, &line, "pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
-    try std.testing.expectEqual(failed_row.? + 2, pending_row.?);
+    try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
     try std.testing.expectEqual(screen.rows - 1, screen.row);
     testAcknowledgeFullFrame(&ui);
     try host.emit_fn(host.context, .{ .tool_result = .{ .id = 2, .name = "bash", .result = .{ .text = "hidden-output-json" } } }, &cancel);
@@ -3163,10 +3197,10 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
     try std.testing.expectEqualStrings("command failed", ui.records.items[0].failure_reason.?);
     try std.testing.expectEqualStrings("✓ bash pwd", ui.records.items[1].body.items);
     try ui.draw();
-    try std.testing.expect(ui.records.items[0].output);
+    try std.testing.expect(!ui.records.items[0].output);
     try std.testing.expect(!ui.records.items[0].pending_output);
-    try std.testing.expect(ui.records.items[1].pending_output);
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items[0].lines.len);
+    try std.testing.expect(!ui.records.items[1].pending_output);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items[0].lines.len);
     try std.testing.expectEqual(@as(usize, 1), ui.records.items[1].lines.len);
     try std.testing.expect(std.mem.find(u8, ui.frame, " date ✗") == null); // The previous result is not rewritten.
     try std.testing.expect(std.mem.find(u8, ui.frame, theme.reset ++ theme.success ++ "✓" ++ theme.tool_name ++ " bash " ++ theme.muted ++ "pwd") != null);
@@ -3179,8 +3213,8 @@ test "same batch bash calls own contiguous pending and result rows with FIFO lab
         if (std.mem.find(u8, &line, " bash pwd") != null) pending_row = row;
     }
     try std.testing.expect(failed_row != null and pending_row != null);
-    try std.testing.expectEqual(failed_row.? + 2, pending_row.?);
-    // Both captions are contiguous with the failure detail row between them, so the second one is the
+    try std.testing.expectEqual(failed_row.? + 1, pending_row.?);
+    // Both captions are contiguous and the reason is inline; the second is the
     // last body row; the separator, hint and composer follow it unchanged and
     // the cursor lands exactly three rows below the pending caption.
     try std.testing.expectEqual(pending_row.? + 3, screen.row);
@@ -4786,11 +4820,101 @@ test "read command errors include a safe reason after error and never display ra
     try std.testing.expect(std.mem.find(u8, ui.frame, "3ms") != null);
     testAcknowledgeFullFrame(&ui);
     try ui.toolCompleted(caption, .{ .text = "{\"private-result\":\"secret\"}\n\x1b[2J", .is_error = true }, false);
-    // 原始首行原样上行，只做单行化与控制字符清洗。
-    try std.testing.expect(std.mem.find(u8, ui.records.items[1].failure_reason.?, "{\"private-result\":\"secret\"}") != null);
+    // Unknown result bodies are never used as stage failure captions.
+    try std.testing.expectEqualStrings("tool failed", ui.records.items[1].failure_reason.?);
     try std.testing.expect(std.mem.findScalar(u8, ui.records.items[1].failure_reason.?, 0x1b) == null);
     try ui.toolCompleted(caption, .{ .text = "FileNotFound", .is_error = true, .canceled = true }, false);
     try std.testing.expectEqualStrings("- read_file README.md", ui.records.items[2].body.items);
+}
+test "stage boundaries preserve background and explicit local command chronology" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    try ui.toolCompleted(.{ .kind = .read, .label = "before-bg" }, .{ .text = "" }, false);
+    try ui.applyEvent(.{ .background_completed = .{ .id = background_status.Id.from("job"), .command = background_status.Command.from("sleep"), .result = .success, .duration_ms = 10 } }, false, true);
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    try ui.toolCompleted(.{ .kind = .read, .label = "after-bg" }, .{ .text = "" }, false);
+    try ui.applyEvent(.{ .tool_result = .{ .id = 9, .local = true, .name = "bash", .result = .{ .text = "{\"stdout\":\"local-only\",\"stderr\":\"\",\"exit_code\":0}" } } }, false, true);
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    try ui.toolCompleted(.{ .kind = .read, .label = "after-local" }, .{ .text = "" }, false);
+    try ui.applyEvent(.{ .user_committed = .{ .id = 10, .text = "next-user" } }, false, true);
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    const rows = ui.records.items;
+    try std.testing.expectEqual(@as(usize, 7), rows.len);
+    for ([_][]const u8{ "before-bg", "sleep", "after-bg", "bash", "local-only", "after-local", "next-user" }, rows) |marker, row| {
+        try std.testing.expect(std.mem.find(u8, row.body.items, marker) != null);
+    }
+}
+
+fn stageRolloverAllocationScenario(a: std.mem.Allocator) !void {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    ui.allocator = a;
+    defer ui.deinit();
+    const caption: presentation.Caption = .{ .kind = .read, .label = "owned.txt" };
+    for (0..3) |_| try ui.toolCompleted(caption, .{ .text = "" }, false);
+    const ids = ui.stage_ids;
+    ui.toolCompleted(caption, .{ .text = "AccessDenied", .is_error = true }, false) catch |err| {
+        try std.testing.expectEqualSlices(u64, &ids, &ui.stage_ids);
+        try std.testing.expectEqual(@as(usize, 3), ui.records.items.len);
+        for (ids) |id| try std.testing.expect(ui.record_index.contains(id));
+        return err;
+    };
+    try std.testing.expect(!ui.record_index.contains(ids[0]));
+    try std.testing.expectEqualStrings("AccessDenied", ui.records.items[2].failure_reason.?);
+}
+
+test "rolling tool stage replacement owns or rolls back every allocation" {
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), stageRolloverAllocationScenario, .{});
+}
+
+test "rolling tool stage pins failure across six calls and freezes once across text and cancellation" {
+    const a = std.testing.allocator;
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    var screen: @import("../tests/regular_screen.zig").Screen = .{};
+    try ui.applyEvent(.{ .assistant_committed = &.{.{ .text = "phase-intro" }} }, false, true);
+    for ([_][]const u8{ "first.txt", "failed.txt", "third.txt", "fourth.txt", "fifth.txt", "sixth.txt" }, 0..) |path, i| {
+        const caption: presentation.Caption = .{ .kind = .read, .label = path };
+        try ui.toolCompleted(caption, .{ .text = if (i == 1) "FileNotFound" else "private result", .is_error = i == 1 }, false);
+        try replayToolFrame(&ui, &screen);
+        try std.testing.expectEqual(@min(i + 1, 3), ui.stage_count);
+        try std.testing.expectEqual(1 + ui.stage_count, ui.records.items.len);
+        try std.testing.expect(!ui.records.items[ui.records.items.len - 1].output);
+        try std.testing.expect(!screen.visible("private result"));
+    }
+    try std.testing.expect(screen.visible("failed.txt") and screen.visible("FileNotFound"));
+    try std.testing.expect(!screen.visible("fourth.txt") and screen.visible("fifth.txt") and screen.visible("sixth.txt"));
+    try ui.applyEvent(.{ .tool_started = .{ .id = 7, .name = "running_tool" } }, false, true);
+    try replayToolFrame(&ui, &screen);
+    try std.testing.expect(screen.visible("running_tool") and screen.visible("failed.txt") and screen.visible("sixth.txt"));
+    try std.testing.expect(!screen.visible("fifth.txt"));
+    try ui.applyEvent(.{ .tool_result = .{ .id = 7, .name = "running_tool", .result = .{ .text = "private result" } } }, false, true);
+    try ui.applyEvent(.{ .text = "next" }, false, true);
+    try ui.applyEvent(.{ .text = " phase" }, false, true);
+    try ui.applyEvent(.{ .assistant_committed = &.{.{ .text = "next phase" }} }, false, true);
+    try replayToolFrame(&ui, &screen);
+    try std.testing.expectEqual(@as(usize, 5), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    for (ui.records.items[1..4]) |row| try std.testing.expect(row.output);
+    try ui.toolCompleted(.{ .kind = .read, .label = "last.txt" }, .{ .text = "", .canceled = true }, false);
+    try ui.applyEvent(.{ .finished = .{ .status = .canceled } }, false, true);
+    try ui.draw();
+    try std.testing.expect(std.mem.find(u8, ui.frame, "failed.txt") == null);
+    try screen.replay(ui.frame);
+    testAcknowledgeFullFrame(&ui);
+    try std.testing.expectEqual(@as(usize, 1), screen.count("last.txt"));
+    try std.testing.expectEqual(@as(usize, 1), screen.count("failed.txt"));
+    try std.testing.expectEqual(@as(usize, 0), ui.stage_count);
+    try std.testing.expect(ui.records.items[5].output);
 }
 test "sequential tool records from different frames have no gaps then final prose has one gap" {
     var cancel: p.Cancellation = .{};
@@ -6835,6 +6959,26 @@ test "background indicators stay static while idle" {
     const none = try ui.activityLine(arena.allocator(), Fixture.current(&fixture));
     try std.testing.expect(std.mem.indexOf(u8, none, "background: ") == null);
     ui.secret_mode = true;
+}
+
+test "background outcomes keep a distinct one-line caption even without color" {
+    var cancel: p.Cancellation = .{};
+    var bridge = bridge_module.Bridge.init(std.testing.allocator, std.testing.io, &cancel);
+    defer bridge.deinit();
+    var ui = fixtureUi(&bridge, &cancel);
+    defer ui.deinit();
+    for ([_]struct { background_status.Result, ?background_status.Failure, NoticeLevel, []const u8 }{
+        .{ .success, null, .success, "background: ✓ done" },
+        .{ .canceled, null, .warning, "background: − canceled" },
+        .{ .failed, .timeout, .failure, "background: ✗ failed (timeout)" },
+        .{ .canceled, .cleanup, .failure, "background: ✗ failed (cleanup)" },
+    }) |case| {
+        try ui.appendBackgroundCompletion(.{ .id = background_status.Id.from("job"), .command = background_status.Command.from("[command hidden]"), .result = case[0], .failure = case[1], .duration_ms = 100 });
+        const row = ui.records.items[ui.records.items.len - 1];
+        try std.testing.expect(row.single_row and row.notice_level == case[2]);
+        try std.testing.expect(std.mem.startsWith(u8, row.body.items, case[3]));
+        try std.testing.expect(std.mem.endsWith(u8, row.body.items, "job [command hidden] · 100ms"));
+    }
 }
 
 test "background completion is admitted before exact-id retirement" {
@@ -13784,9 +13928,7 @@ fn replayItem(ui: *Ui, a: std.mem.Allocator, event: r.Event) !void {
     defer item.deinit();
     ui.inject_epoch = item.epoch;
     ui.adoptReplayHistory(&item);
-    ui.applying_history = true;
-    defer ui.applying_history = false;
-    try ui.applyEvent(item.event, item.display_truncated, item.canonical_complete);
+    try ui.applyHistoryItem(&item);
 }
 
 fn replayToolName(messages: []const p.Message, index: usize, call_id: []const u8) []const u8 {

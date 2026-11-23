@@ -392,11 +392,10 @@ const Record = struct {
         }
 
         if (self.command_row) {
-            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns, self.duration_ms, null);
-            if (self.failure_reason) |reason| {
-                const detail = try presentation.failureReasonLine(temp, reason, columns);
-                self.lines = try temp.dupe([]const u8, &.{ line, detail });
-            } else self.lines = try temp.dupe([]const u8, &.{line});
+            const detail = if (self.failure_reason) |reason| try presentation.singleLine(temp, reason, columns / 2) else "";
+            const suffix = if (detail.len != 0 and columns >= 12) try std.fmt.allocPrint(temp, " · {s}", .{detail}) else "";
+            const line = try presentation.commandLine(temp, self.body.items, self.command_spans.items, columns -| text.width(suffix), self.duration_ms, null);
+            self.lines = try temp.dupe([]const u8, &.{if (suffix.len == 0) line else try std.fmt.allocPrint(temp, "{s}{s}{s}{s}", .{ line, theme.failure, suffix, theme.reset })});
             self.excerpt = false; // Commands indicate clipping with ... only.
             self.columns = columns;
             self.cache = arena;
@@ -1066,12 +1065,17 @@ const Ui = struct {
     display: shared.State = .{},
     active_tool: ?struct { id: u64, caption: presentation.Caption, started_ms: u64, display_key: ?p.ToolDisplayKey = null } = null,
     applying_history: bool = false,
+    history_command: bool = false,
     /// This view published the restored-conversation transcript banner. Its
     /// byte-identical footer hint / settings notice stays suppressed even if
     /// the banner is evicted; ownership resets with the rest of the view.
     history_notice_shown: bool = false,
     /// Mutable display-only tool rows; never released as immutable transcript.
     tool_views: tool_views_module.Views = .{},
+    // These owned records have no immutable output yet. The small ID window
+    // survives array moves and resizes; sealing hands it to the normal ACK path.
+    stage_ids: [3]u64 = undefined,
+    stage_count: usize = 0,
     /// Shared canonical FIFO remains the fallback for restored/legacy events.
     tool_calls: shared.tools.Queue = .{},
     /// 上一次终态用于失败详情和cleanup安全检查，不显示统计栏。
@@ -1546,6 +1550,7 @@ const Ui = struct {
 
     /// True for a locally executed !command, which projects literal streams.
     fn commandKind(self: *const Ui) bool {
+        if (self.applying_history) return self.history_command;
         if (self.remote() != null) return self.remote_kind == .command;
         return self.job.kind == .command;
     }
@@ -1638,9 +1643,9 @@ const Ui = struct {
                     // A receipt from an unrelated local event must never name
                     // this live event's record.
                     self.delivery_receipt = null;
-                    self.applying_history = item.history_replay;
-                    defer self.applying_history = false;
-                    try self.applyEvent(item.event, item.display_truncated, item.canonical_complete);
+                    if (item.history_replay) {
+                        try self.applyHistoryItem(&item);
+                    } else try self.applyEvent(item.event, item.display_truncated, item.canonical_complete);
                     // 0 means "single raw event"; a coalesced item keeps the full
                     // first..last interval so no interior raw sequence is lost.
                     const first = if (item.delivery_first_sequence == 0)
@@ -1903,7 +1908,7 @@ const Ui = struct {
     /// The UX retires a thinking window when prose starts, a tool runs, or the
     /// user hides it. That is an intentional replacement, not a lost stream.
     fn reasoningReplaced(self: *const Ui) bool {
-        return !self.show_reasoning or self.draft != null or
+        return !self.show_reasoning or self.draft != null or self.stage_count != 0 or
             self.tool_views.entries.items.len != 0 or self.active_tool != null;
     }
 
@@ -2066,6 +2071,32 @@ const Ui = struct {
         self.input_history_seeded = self.input_history.entries.items.len != 0;
     }
 
+    /// Historical results have their own local flag. The current task kind can
+    /// describe a later !command, never the entire baseline. The live owner's
+    /// history can also contain its original program-generated call marker.
+    fn applyHistoryItem(self: *Ui, item: *const session_client.Item) !void {
+        self.applying_history = true;
+        self.history_command = switch (item.event) {
+            .tool_result => |tool| tool.local,
+            .assistant_committed => |blocks| blk: {
+                var marker = false;
+                var local_call = false;
+                for (blocks) |block| switch (block) {
+                    .text => |bytes| marker = marker or std.mem.eql(u8, bytes, r.local_command_note),
+                    .tool_call => |call| local_call = local_call or r.isLocalCommand(call.id),
+                    else => {},
+                };
+                break :blk marker and local_call;
+            },
+            else => false,
+        };
+        defer {
+            self.applying_history = false;
+            self.history_command = false;
+        }
+        try self.applyEvent(item.event, item.display_truncated, item.canonical_complete);
+    }
+
     /// Poll returns only items whose epoch still matches the current controller,
     /// so a real history snapshot may reset and seed the session input history.
     /// Display replay never becomes execution: only complete, unreduced
@@ -2091,6 +2122,7 @@ const Ui = struct {
             // Replace the current view with one canonical baseline, including a
             // submit whose receipt overtook the baseline. Do not clear native
             // scrollback, the composer, pending commands, or owner barriers.
+            self.freezeToolStage();
             self.discardResizedFrame();
             self.clearPermission();
             self.clearActiveTool();
@@ -2197,6 +2229,7 @@ const Ui = struct {
     }
 
     fn settleRemoteIdle(self: *Ui) void {
+        self.freezeToolStage();
         self.remote_terminal_wait = false;
         self.busy = false;
         self.mode = null;
@@ -2295,6 +2328,7 @@ const Ui = struct {
         self.tool_calls.deinit(self.allocator);
         self.tool_calls = .{};
         self.tool_views.clear(self.allocator);
+        self.freezeToolStage();
         self.discardResizedFrame();
         for (self.records.items) |*record| record.deinit(self.allocator);
         self.records.clearRetainingCapacity();
@@ -2626,6 +2660,58 @@ const Ui = struct {
         return presentation.fromCall(self.allocator, call);
     }
 
+    /// A caption is not a log viewer. Only typed exit metadata and recognized
+    /// file/tool error names may survive in a failed automatic row.
+    fn stageFailureReason(a: std.mem.Allocator, kind: shared.tools.Kind, result: r.Execution) !?[]const u8 {
+        if (result.canceled) return null;
+        if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
+        const Facts = struct { timed_out: bool = false, signal: ?i64 = null, exit_code: ?i64 = null, @"error": ?[]const u8 = null };
+        const facts = std.json.parseFromSlice(Facts, a, result.text, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        defer if (facts) |value| value.deinit();
+        if (kind == .bash) if (facts) |parsed| {
+            if (parsed.value.timed_out) return try a.dupe(u8, "timed out");
+            if (parsed.value.signal) |signal| return try std.fmt.allocPrint(a, "signal {d}", .{signal});
+            if (parsed.value.exit_code) |code| if (code != 0) return try std.fmt.allocPrint(a, "exit {d}", .{code});
+        };
+        const name = if (facts) |parsed| parsed.value.@"error" orelse "" else result.text;
+        for ([_][]const u8{ "AccessDenied", "FileNotFound", "PermissionDenied", "IsDir", "NotDir", "InvalidUtf8", "OutsideRoot", "ProtectedSessionFile", "AmbiguousMatch", "NoMatch", "Timeout" }) |known| {
+            if (std.mem.eql(u8, name, known)) return try a.dupe(u8, known);
+        }
+        return try a.dupe(u8, if (kind == .bash) "command failed" else "tool failed");
+    }
+
+    pub fn freezeToolStage(self: *Ui) void {
+        self.stage_count = 0;
+    }
+
+    fn stageIndex(self: *const Ui, id: u64) ?usize {
+        return std.mem.indexOfScalar(u64, self.stage_ids[0..self.stage_count], id);
+    }
+
+    fn latestStageFailure(self: *const Ui) ?usize {
+        var i = self.stage_count;
+        while (i != 0) {
+            i -= 1;
+            const record = &self.records.items[self.record_index.get(self.stage_ids[i]).?];
+            if (record.command_spans.items[0].outcome == .failed) return i;
+        }
+        return null;
+    }
+
+    fn trackStageResult(self: *Ui, id: u64, failed: bool) void {
+        if (self.stage_count == self.stage_ids.len) {
+            const drop: usize = if (!failed and self.latestStageFailure() == 0) 1 else 0;
+            self.removeRecord(self.record_index.get(self.stage_ids[drop]).?);
+            for (drop..self.stage_count - 1) |i| self.stage_ids[i] = self.stage_ids[i + 1];
+            self.stage_count -= 1;
+        }
+        self.stage_ids[self.stage_count] = id;
+        self.stage_count += 1;
+    }
+
     fn toolCompleted(self: *Ui, caption: presentation.Caption, result: r.Execution, local: bool) !void {
         const completion = shared.tools.Completion.fromExecution(result);
         const outcome = completion.outcome;
@@ -2645,15 +2731,25 @@ const Ui = struct {
                 .name = name,
                 .label = label,
                 .display = effective.display,
-                .failure_reason = if (local) null else try shared.tools.failureReason(self.allocator, effective.kind, result),
+                .failure_reason = if (local) null else try stageFailureReason(self.allocator, effective.kind, result),
             };
         };
         defer observed.deinit(self.allocator);
         // The reason is owned by this completion, not by the Caption contract.
         defer if (observed.failure_reason) |reason| self.allocator.free(reason);
-        const index = try self.add(.tool, "");
         const handoff = if (effective.display) |display| display.action == .start and outcome == .success else false;
-        try self.records.items[index].setCommand(self.allocator, observed, outcome, if (handoff) null else completion.duration_ms);
+        var prepared: Record = .{ .kind = .tool };
+        errdefer prepared.deinit(self.allocator);
+        try prepared.setCommand(self.allocator, observed, outcome, if (handoff) null else completion.duration_ms);
+        try self.reserveRecord();
+        const index = self.records.items.len;
+        self.records.appendAssumeCapacity(prepared);
+        self.registerRecord(index) catch |err| {
+            _ = self.records.pop();
+            return err;
+        };
+        if (local) self.freezeToolStage() else self.trackStageResult(self.records.items[index].id, outcome == .failed);
+        self.requestDraw();
     }
 
     fn localCommandOutput(self: *Ui, data: []const u8, truncated: bool) !void {
@@ -2665,7 +2761,7 @@ const Ui = struct {
         if (truncated) _ = try self.add(.notice, "Local command result was truncated; some output is unavailable.");
     }
 
-    /// Only the currently running call is replaceable; every result owns a row.
+    /// Only the currently running call owns the animated execution clock.
     fn pendingCommand(self: *Ui, a: std.mem.Allocator, columns: usize) ![]const u8 {
         const spinner = activity.spinner(self.clock_ms);
         const caption = self.active_tool.?.caption;
@@ -2857,11 +2953,17 @@ const Ui = struct {
     fn appendDraft(self: *Ui, kind: Kind, value: []const u8) !void {
         if (value.len == 0) return;
         if (kind == .reasoning and self.draft != null) return;
-        if (kind == .assistant) self.discardReasoning();
         const prior = if (kind == .reasoning) self.reasoning else self.draft;
-        const index = prior orelse try self.add(kind, "");
-        try self.records.items[index].append(self.allocator, value);
-        if (kind == .reasoning) self.reasoning = index else self.draft = index;
+        if (prior) |index| {
+            try self.records.items[index].append(self.allocator, value);
+        } else {
+            const index = try self.add(kind, value);
+            if (kind == .reasoning) self.reasoning = index else self.draft = index;
+        }
+        if (kind == .assistant) {
+            self.freezeToolStage();
+            self.discardReasoning();
+        }
     }
 
     /// Canonical visible body replaces the draft. Reasoning is deliberately not
@@ -3040,7 +3142,8 @@ const Ui = struct {
                     return;
                 }
             },
-            .user_committed, .tool_result, .compacted, .compaction_failed, .compaction_skipped, .fallback => {},
+            .tool_result => |tool| if (!tool.local and !self.commandKind()) return,
+            .user_committed, .compacted, .compaction_failed, .compaction_skipped, .fallback => {},
             else => return,
         }
         if (candidate == null) candidate = self.newestDeliveryRecord(before.next_id);
@@ -3142,9 +3245,11 @@ const Ui = struct {
                 self.mode = state;
             },
             .user_committed => |v| {
+                _ = try self.add(.user, v.text);
+                self.clearActiveTool();
+                self.tool_views.clear(self.allocator);
                 self.draft = null;
                 self.discardReasoning();
-                _ = try self.add(.user, v.text);
             },
             .permission_cleared => |id| {
                 self.settlePermissionDelivery(id, self.inject_epoch);
@@ -3179,8 +3284,10 @@ const Ui = struct {
                 self.permission_scroll = 0;
             },
             .tool_started => |tool| {
+                const caption = try self.executionCaption(tool.name, tool.display_key);
+                if (self.commandKind()) self.freezeToolStage();
                 self.clearActiveTool();
-                self.active_tool = .{ .id = tool.id, .caption = try self.executionCaption(tool.name, tool.display_key), .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key };
+                self.active_tool = .{ .id = tool.id, .caption = caption, .started_ms = tool.started_ms orelse self.clock_ms, .display_key = tool.display_key };
                 self.fast_step = 0;
                 self.fast_next_ms = self.clock_ms +| flow_interval_ms;
             },
@@ -3232,7 +3339,11 @@ const Ui = struct {
             },
             .background_completed => |terminal| try self.appendBackgroundCompletion(terminal),
             // 这些事件对 UI 没有需要展示的内容。
-            .finished => {},
+            .finished => {
+                self.freezeToolStage();
+                self.clearActiveTool();
+                self.tool_views.clear(self.allocator);
+            },
             // Raw arguments only feed the shared meter above. Visible rows use
             // bounded typed snapshots produced before Bridge text clipping.
             .tool_preview => {},
@@ -5703,9 +5814,9 @@ const Ui = struct {
     fn appendBackgroundCompletion(self: *Ui, terminal: background_status.Terminal) !void {
         var buffer: [768]u8 = undefined;
         var detail_buffer: [96]u8 = undefined;
-        const status = if (terminal.result == .canceled) "canceled" else "failed";
+        const status = if (terminal.result == .canceled and terminal.failure != .cleanup) "− canceled" else "✗ failed";
         const detail = if (terminal.result == .success)
-            "✓"
+            "✓ done"
         else if (terminal.exit_code) |code|
             if (terminal.failure) |failure|
                 try std.fmt.bufPrint(&detail_buffer, "{s} ({s}, exit {d})", .{ status, @tagName(failure), code })
@@ -5726,7 +5837,7 @@ const Ui = struct {
         else
             try std.fmt.bufPrint(&buffer, "background: {s} {s} · {d}ms", .{ detail, command, terminal.duration_ms });
         const index = try self.addRecord(.notice, message);
-        self.records.items[index].notice_level = if (terminal.result == .success) .plain else if (terminal.result == .canceled and terminal.failure != .cleanup) .warning else .failure;
+        self.records.items[index].notice_level = if (terminal.result == .success) .success else if (terminal.result == .canceled and terminal.failure != .cleanup) .warning else .failure;
         self.records.items[index].single_row = true;
     }
 
@@ -6008,6 +6119,7 @@ const Ui = struct {
         // Shared state applies owner-produced terminal context after join.
         self.display.finish(self.last_terminal.?);
         const result = self.last_terminal.?;
+        self.freezeToolStage();
 
         // 清理失败或无法安全继续时进入 poisoned，禁止再次提交。
         self.poisoned = if (result.detail) |detail| detail == error.CleanupFailed or detail == error.UnsafeToContinue else false;
@@ -6084,6 +6196,12 @@ const Ui = struct {
         self.next_record_id += 1;
         self.records.items[index].id = id;
         self.record_index.putAssumeCapacityNoClobber(id, index);
+        // Includes locally/remote-accepted prompts which publish a prepared
+        // user record directly rather than traversing addRecord.
+        switch (self.records.items[index].kind) {
+            .user, .notice, .assistant => self.freezeToolStage(),
+            else => {},
+        }
     }
 
     fn forgetRecord(self: *Ui, index: usize) void {
@@ -7173,7 +7291,7 @@ const Ui = struct {
         var previous_kind: ?Kind = scan.previous_kind;
         for (self.records.items[scan.start..], scan.start..) |*record, index| {
             if (@import("builtin").is_test) self.draw_record_visits += 1;
-            if (record.kind == .reasoning) continue;
+            if (record.kind == .reasoning or self.stageIndex(record.id) != null) continue;
             const drafting = self.draft == index;
             if (record.output and !drafting) {
                 previous_kind = record.kind;
@@ -7315,11 +7433,23 @@ const Ui = struct {
         if (transcript_rows != 0) try releaseBorrowedPrefix(a, &out, self.frame_clear_end, &borrowed, &transcript_rows, physical.items);
         {
             const detached_active = if (self.active_tool) |active| if (active.display_key) |identity| self.tool_views.get(identity) == null else true else false;
-            if (self.tool_views.entries.items.len != 0 or detached_active) {
+            if (self.stage_count != 0 or self.tool_views.entries.items.len != 0 or detached_active) {
                 if (previous_kind) |prior| if (prior != .tool) try lines.append(a, "");
                 // Bound the mutable window, keeping the executing/next-ready
                 // call visible instead of burying it above 64 queued rows.
-                const view_limit = @max(1, self.size.rows -| 5);
+                const capacity: usize = self.stage_ids.len;
+                const failure = self.latestStageFailure();
+                const pending = self.tool_views.entries.items.len + @intFromBool(detached_active);
+                const settled = @min(self.stage_count, capacity - @intFromBool(pending != 0));
+                const views = @min(pending, capacity - settled);
+                for (self.stage_ids[0..self.stage_count], 0..) |id, i| {
+                    // Keep chronological order even when pinning an older failure.
+                    if (i != failure and (self.stage_count - i > settled or (failure != null and failure.? < self.stage_count - settled and i == self.stage_count - settled))) continue;
+                    const row = &self.records.items[self.record_index.get(id).?];
+                    try row.layout(self.allocator, @max(1, cols));
+                    try lines.appendSlice(a, row.lines);
+                }
+                const view_limit = views - @intFromBool(detached_active);
                 var view_start = if (self.tool_views.ready_count != 0) 0 else self.tool_views.entries.items.len -| view_limit;
                 if (self.active_tool) |active| if (active.display_key) |identity| {
                     for (self.tool_views.entries.items, 0..) |entry, i| if (identity.eql(entry.key)) {
@@ -7335,7 +7465,7 @@ const Ui = struct {
                 if (detached_active) try lines.append(a, try self.pendingCommand(a, @max(1, cols)));
             }
         }
-        const thinking = if (self.show_reasoning and self.draft == null and self.tool_views.entries.items.len == 0 and self.active_tool == null) self.reasoning else null;
+        const thinking = if (self.show_reasoning and self.stage_count == 0 and self.draft == null and self.tool_views.entries.items.len == 0 and self.active_tool == null) self.reasoning else null;
         var thinking_lines: []const []const u8 = &.{};
         if (thinking) |index| {
             const record = &self.records.items[index];
