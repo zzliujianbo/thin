@@ -141,7 +141,7 @@ def python_syntax(root):
             ast.parse(p.read_bytes(), filename=str(p.relative_to(root)))
 
 
-def run(argv=None, root=ROOT, executor=subprocess.run):
+def run(argv=None, root=ROOT, executor=subprocess.run, *, cache_dir=None):
     args = parse_args(argv)
     root = Path(root)
     log_root = root / ".zig-cache" / "workflow"
@@ -185,6 +185,8 @@ def run(argv=None, root=ROOT, executor=subprocess.run):
         status = "passed" if code == 0 else "build_or_infrastructure_or_unknown"
     else:
         command = command_for(args)
+        if cache_dir is not None:
+            command.extend(['--cache-dir', str(cache_dir)])
         try:
             command = normalized_command(command)
         except RuntimeError as exc:
@@ -212,5 +214,13 @@ def run(argv=None, root=ROOT, executor=subprocess.run):
     return 0 if status == "passed" else 1
 
 
+def main(argv):
+    if parse_args(argv).group == 'preflight':
+        return run(argv)
+    from tools.build_cache import managed
+    with managed(ROOT) as cache_dir:
+        return run(argv, cache_dir=cache_dir)
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main(sys.argv[1:]))
