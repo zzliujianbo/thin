@@ -1613,7 +1613,7 @@ def case_offline_approval(app, base):
         attached.send(b'\x1b[A')
         attached.pump_until(
             lambda: attached.frame_after(before) and
-            b'\x1b[7m Y allow once ' in attached.capture[before:],
+            b'\x1b[30;48;5;208m Y allow once ' in attached.capture[before:],
             'allow-once selection acknowledged', 25, guard=case.model.check)
         attached.send(b'\r')
         attached.pump_until(lambda: attached.idle_after(0, APPROVAL_ANSWER.encode()),

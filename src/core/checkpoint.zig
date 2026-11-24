@@ -129,7 +129,8 @@ fn shape(comptime T: type, v: j.Value) !void {
         .@"struct" => |info| {
             if (v != .object) return error.InvalidType;
             inline for (info.field_names) |name| {
-                if (!v.object.contains(name)) return error.MissingField;
+                // Older checkpoints lack tool approval provenance. Never infer it from text.
+                if (!v.object.contains(name) and !(T == p.ToolResult and comptime std.mem.eql(u8, name, "denied"))) return error.MissingField;
             }
             var it = v.object.iterator();
             while (it.next()) |kv| {

@@ -1,4 +1,4 @@
-//! Thin daemon/session wire protocol v8 (latest-only; see `version`).
+//! Thin daemon/session wire protocol v9 (latest-only; see `version`).
 //!
 //! Ordinary requests receive one response. `watch` switches a dedicated
 //! read-only connection to an ordered sequence of baseline/update frames.
@@ -28,11 +28,11 @@ const background = @import("../core/background_status.zig");
 
 const WipingAllocator = @import("../core/config.zig").WipingAllocator;
 
-/// Private daemon/worker IPC version. v8 requires worker support for OpenAI API-key login.
+/// Private daemon/worker IPC version. v9 adds the denied flag to tool results.
 /// Peers are matched exactly: there is
 /// no older-wire compatibility path, migration or automatic worker restart.
 /// A mismatched peer is refused before adoption, display or controller claim.
-pub const version: u16 = 8;
+pub const version: u16 = 9;
 /// Same bound as one frame; responses are checked before writeFrame.
 pub const max_response = unix.max_frame_len;
 pub const max_name: usize = 1024;
@@ -836,7 +836,8 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
                     .tool_result => |result| {
                         try element.field("k", "tool_result");
                         try element.field("id", result.call_id);
-                        try element.field("v", result.text);
+                        try element.field("v", if (result.denied) "" else result.text);
+                        if (result.denied) try element.field("denied", true);
                         try element.field("is_error", result.is_error);
                         try element.field("canceled", result.canceled);
                         try element.field("trunc", result.truncated);
@@ -900,7 +901,8 @@ fn appendEventWith(buf: *std.ArrayList(u8), a: std.mem.Allocator, event: r.Event
             try out.field("t", "tool_result");
             try out.field("id", value.id);
             try out.field("name", value.name);
-            try out.field("v", value.result.text);
+            try out.field("v", if (value.result.denied) "" else value.result.text);
+            if (value.result.denied) try out.field("denied", true);
             try out.field("is_error", value.result.is_error);
             try out.field("canceled", value.result.canceled);
             try out.field("trunc", value.result.truncated);
@@ -1302,6 +1304,7 @@ fn decodeBlock(value: std.json.Value) !p.Block {
         return .{ .tool_result = .{
             .call_id = try requireText(object, "id"),
             .text = try requireText(object, "v"),
+            .denied = try optionalBool(object, "denied") orelse false,
             .is_error = try optionalBool(object, "is_error") orelse false,
             .canceled = try optionalBool(object, "canceled") orelse false,
             .truncated = try optionalBool(object, "trunc") orelse false,
@@ -1506,13 +1509,14 @@ fn decodeEventObject(object: std.json.ObjectMap, arena: std.mem.Allocator, doc: 
             .display_key = try decodeDisplayKey(object, "key"),
         } };
     } else if (std.mem.eql(u8, kind, "tool_result")) {
-        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "canceled", "trunc", "cleanup", "display", "opts", "ms", "local", "epoch", "seq", "disp_trunc", "canon_complete" });
+        try checkToolEventFields(object, &.{ "t", "id", "name", "key", "v", "is_error", "denied", "canceled", "trunc", "cleanup", "display", "opts", "ms", "local", "epoch", "seq", "disp_trunc", "canon_complete" });
         event = .{ .tool_result = .{
             .id = try requireU64(object, "id"),
             .name = try requireText(object, "name"),
             .display_key = try decodeDisplayKey(object, "key"),
             .result = .{
                 .text = try requireText(object, "v"),
+                .denied = try optionalBool(object, "denied") orelse false,
                 .is_error = try optionalBool(object, "is_error") orelse false,
                 .canceled = try optionalBool(object, "canceled") orelse false,
                 .truncated = try optionalBool(object, "trunc") orelse false,

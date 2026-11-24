@@ -43,6 +43,7 @@ const Fake = struct {
     /// Fake 明确要求逐次审批，用于保留批准、拒绝与取消生命周期覆盖。
     explicit_denial: ?[]const u8 = "Fixture requires explicit approval; not executed.",
     last_result: []const u8 = "",
+    last_result_denied: bool = false,
     /// authorize 返回的审批决定。
     decision: r.Decision = .allow_once,
     /// 工具执行返回的文本。
@@ -177,7 +178,7 @@ const Fake = struct {
         if (self.check_direct_order) try std.testing.expectEqual(@as(usize, 1), self.direct_observed);
         // 记录历史中出现过的被拒绝工具结果，用于断言拒绝已反馈给模型。
         for (req.messages) |msg| for (msg.blocks) |block| {
-            if (block == .tool_result and block.tool_result.is_error) self.denied_seen = true;
+            if (block == .tool_result and block.tool_result.is_error and block.tool_result.denied) self.denied_seen = true;
         };
 
         // 达到 stop_after 后返回纯文本结束。
@@ -259,6 +260,7 @@ const Fake = struct {
                 self.fitted_result = value.result.truncated;
                 self.last_duration_ms = value.result.duration_ms;
                 self.last_result = value.result.text;
+                self.last_result_denied = value.result.denied;
             },
             .tool_started => |value| self.last_started_ms = value.started_ms,
             // 直接输入仍不得经宿主回显，否则与提交方已绘制的行重复。

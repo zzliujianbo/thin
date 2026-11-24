@@ -258,7 +258,7 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
         saw_hello.store(true, .release);
         if (attempt == 1) continue; // Close the second greeting unanswered.
         const reply = if (attempt == 0)
-            std.fmt.allocPrint(a, "{{\"v\":7,\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":7,\"watch\":true}}", .{ request.id, id[0..] }) catch return
+            std.fmt.allocPrint(a, "{{\"v\":8,\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":1,\"protocol\":8,\"watch\":true}}", .{ request.id, id[0..] }) catch return
         else
             std.fmt.allocPrint(a, "{{\"v\":{d},\"id\":{d},\"ok\":true,\"session\":\"{s}\",\"owner\":\"foreground\",\"pid\":{d},\"protocol\":{d},\"watch\":true}}", .{ protocol.version, request.id, id[0..], std.c.getpid(), protocol.version }) catch return;
         defer a.free(reply);
@@ -285,7 +285,7 @@ fn protocolVersionPeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listene
     }
 }
 
-// The fake worker drives the actual v8 parser and snapshot encoder. It never
+// The fake worker drives the actual v9 parser and snapshot encoder. It never
 // contacts the authorization URL or resolves a credential.
 const browser_test_url = "https://auth.openai.com/oauth/authorize?response_type=code&state=public";
 const browser_test_callback = "http://localhost:1455/auth/callback?code=fake-secret&state=public";
@@ -530,7 +530,7 @@ fn candidatePeer(a: std.mem.Allocator, io: std.Io, listener: *unix.Listener, id:
     try testing.expectEqual(@as(u64, 7), try watch.u64Field("epoch"));
     switch (behavior) {
         .watch_eof => stream.close(),
-        .watch_reject => try stream.writeFrame("{\"v\":8,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
+        .watch_reject => try stream.writeFrame("{\"v\":9,\"id\":1,\"ok\":false,\"err\":\"unavailable\"}", wait),
         .watch_timeout => {},
         else => try writePeerInitial(a, io, &stream, id, project, owner, 7, switch (behavior) {
             .snapshot => .snapshot,

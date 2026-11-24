@@ -78,6 +78,8 @@ pub const ToolResult = struct {
     text: []const u8,
     /// 工具是否执行失败。
     is_error: bool = false,
+    /// Display provenance only; providers still receive the canonical error text.
+    denied: bool = false,
     /// 是否因取消而结束。
     canceled: bool = false,
     /// 输出是否因大小限制被截断。
@@ -315,6 +317,7 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: Message) !Message {
             .call_id = try allocator.dupe(u8, r.call_id),
             .text = try allocator.dupe(u8, r.text),
             .is_error = r.is_error,
+            .denied = r.denied,
             .canceled = r.canceled,
             .truncated = r.truncated,
         } },

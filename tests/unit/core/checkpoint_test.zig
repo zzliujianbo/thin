@@ -108,6 +108,33 @@ test "checkpoint keeps display-only tool counters and reads old files without th
     defer a.free(bad);
     try std.testing.expectError(error.InvalidHistory, decode(a, bad));
 }
+test "checkpoint preserves typed denial and canonical rationale" {
+    const a = std.testing.allocator;
+    var state = fixture(.chat);
+    state.messages = &.{.{ .role = .tool, .blocks = &.{.{ .tool_result = .{
+        .call_id = "c1",
+        .text = "private rationale",
+        .is_error = true,
+        .denied = true,
+    } }} }};
+    const bytes = try encode(a, state);
+    defer a.free(bytes);
+    var parsed = try decode(a, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(state.messages, parsed.value.messages);
+}
+test "legacy results without denial provenance still load as unclassified" {
+    const a = std.testing.allocator;
+    const original = fixture(.chat);
+    const bytes = try encode(a, original);
+    defer a.free(bytes);
+    const legacy = try std.mem.replaceOwned(u8, a, bytes, ",\"denied\":false", "");
+    defer a.free(legacy);
+    try std.testing.expect(legacy.len < bytes.len);
+    var parsed = try decode(a, legacy);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(original, parsed.value);
+}
 test "checkpoint resumes files saved before estimator calibration" {
     const a = std.testing.allocator;
     const bytes = try encode(a, fixture(.chat));

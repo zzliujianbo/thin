@@ -1,3 +1,9 @@
+test "approval denial is typed and never exposes the private rationale as an error" {
+    const denied = r.Execution{ .text = "AccessDenied", .is_error = true, .denied = true };
+    try std.testing.expectEqual(Outcome.denied, Completion.fromExecution(denied).outcome);
+    try std.testing.expect((try failureReason(std.testing.allocator, .read, denied)) == null);
+    try std.testing.expectEqual(Outcome.failed, Completion.fromExecution(.{ .text = denied.text, .is_error = true }).outcome);
+}
 test "read failure captions show the raw error text with hostile bytes sanitized" {
     const a = std.testing.allocator;
     const missing = (try failureReason(a, .read, .{ .text = "FileNotFound", .is_error = true })).?;

@@ -193,7 +193,7 @@ test "bash rows show the tool name then the command and keep the slot" {
     const canonical = try caption(a, "bash", "{\"command\":\"printf owned\"}");
     defer canonical.deinit(a);
     try std.testing.expectEqualStrings(ready.label, canonical.label);
-    inline for (.{ Outcome.pending, Outcome.success, Outcome.failed, Outcome.canceled }) |outcome| {
+    inline for (.{ Outcome.pending, Outcome.success, Outcome.failed, Outcome.canceled, Outcome.denied }) |outcome| {
         const body = try commandText(a, ready, outcome, " ");
         defer a.free(body);
         const expected = switch (outcome) {
@@ -201,6 +201,7 @@ test "bash rows show the tool name then the command and keep the slot" {
             .success => "✓ bash printf owned",
             .failed => "✗ bash printf owned",
             .canceled => "- bash printf owned",
+            .denied => "! bash printf owned",
         };
         try std.testing.expectEqualStrings(expected, body);
         try std.testing.expect(std.mem.find(u8, body, "> bash ") == null);
@@ -761,7 +762,7 @@ test "long byte capped paths use complete clusters and only ascii truncation dot
 test "all tool outcome prefixes are colored without recoloring summaries or durations" {
     const a = std.testing.allocator;
     for ([_]activity.Tool{ .bash, .read, .memory, .write }) |kind| {
-        for ([_]Outcome{ .success, .failed, .canceled }) |outcome| {
+        for ([_]Outcome{ .success, .failed, .canceled, .denied }) |outcome| {
             const value: Caption = .{ .kind = kind, .label = "operation target" };
             const name = activity.toolName(kind);
             const body = try commandText(a, value, outcome, " ");
@@ -774,9 +775,10 @@ test "all tool outcome prefixes are colored without recoloring summaries or dura
                 .success => theme.success,
                 .failed => theme.failure,
                 .canceled => theme.caution,
+                .denied => theme.warning,
                 .pending => unreachable,
             };
-            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s} {s} {s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, statusGlyph(outcome), theme.tool_name, name, outcomeColor(outcome), "operation target", theme.reset, theme.duration, theme.reset });
+            const expected = try std.fmt.allocPrint(a, "{s}{s}{s}{s} {s} {s}{s}{s}{s}  250ms{s}", .{ theme.reset, color, statusGlyph(outcome), if (outcome == .denied) theme.warning else theme.tool_name, name, outcomeColor(outcome), "operation target", theme.reset, theme.duration, theme.reset });
             defer a.free(expected);
             try std.testing.expectEqualStrings(expected, line);
             // The tool name always separates the status from the command.

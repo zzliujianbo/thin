@@ -63,7 +63,9 @@ fn assertRequiredFields(comptime T: type, a: Allocator, value: j.Value) !void {
                 while (it.next()) |entry| {
                     if (!common.eq(entry.key_ptr.*, name)) try j.put(a, &missing, entry.key_ptr.*, entry.value_ptr.*);
                 }
-                try std.testing.expectError(error.MissingField, shape(T, missing));
+                if (comptime T == p.ToolResult and std.mem.eql(u8, name, "denied")) {
+                    try shape(T, missing); // Checkpoints predating the denial marker.
+                } else try std.testing.expectError(error.MissingField, shape(T, missing));
                 try assertRequiredFields(FT, a, value.object.get(name).?);
             }
         },

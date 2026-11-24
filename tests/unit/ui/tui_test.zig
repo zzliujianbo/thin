@@ -4873,6 +4873,25 @@ test "rolling tool stage replacement owns or rolls back every allocation" {
     try std.testing.checkAllAllocationFailures(backing.allocator(), stageRolloverAllocationScenario, .{});
 }
 
+test "denial is one warning tool row without a separate reason or literal output" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |local| {
+        var cancel: p.Cancellation = .{};
+        var bridge = bridge_module.Bridge.init(a, std.testing.io, &cancel);
+        defer bridge.deinit();
+        var ui = fixtureUi(&bridge, &cancel);
+        defer ui.deinit();
+        try ui.applyEvent(.{ .tool_result = .{ .id = 12, .name = "bash", .local = local, .result = .{ .is_error = true, .denied = true, .text = "private refusal detail" } } }, false, true);
+        try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+        const row = &ui.records.items[0];
+        try row.layout(a, 80);
+        try std.testing.expectEqual(@as(usize, 1), row.lines.len);
+        try std.testing.expect(std.mem.find(u8, row.lines[0], theme.warning ++ "!") != null);
+        try std.testing.expect(std.mem.find(u8, row.lines[0], theme.warning ++ " bash") != null);
+        try std.testing.expect(std.mem.find(u8, row.lines[0], "private refusal detail") == null);
+    }
+}
+
 test "cleanup failure survives cancellation and stays visible after later successes" {
     const a = std.testing.allocator;
     var cancel: p.Cancellation = .{};
@@ -5717,7 +5736,7 @@ test "approval popup offers only one-shot allow or deny and text grants no autho
         try std.testing.expect(std.mem.find(u8, ui.frame, "Y allow once") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "N deny") != null);
         // Allow once is the default, so its fixed-width segment owns the block.
-        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[7m Y allow once \x1b[0m") != null);
+        try std.testing.expect(std.mem.find(u8, ui.frame, "\x1b[30;48;5;208m Y allow once \x1b[0m") != null);
         try std.testing.expect(std.mem.find(u8, ui.frame, "TRUST") == null);
         ui.displayed_permission = ui.frame_permission;
         ui.displayed_permission_choice = ui.frame_permission_choice;
@@ -10767,7 +10786,7 @@ test "resume loading approval Escape denies without consuming list ownership" {
     actions.complete(.none, null, false);
     ui.pumpAsync();
     try std.testing.expect(ui.permission == null);
-    try std.testing.expect(publishedNotice(&ui, "Request denied"));
+    try std.testing.expect(!publishedNotice(&ui, "Request denied"));
     try std.testing.expectEqualStrings("unsent draft", ui.editor.bytes.items);
     try std.testing.expectEqual(@as(usize, 0), fake.submits);
 }
@@ -12303,7 +12322,7 @@ test "successful independent notice preserves a pending failure alias" {
     defer ui.deinit();
     ui.notice = "Could not start metadata refresh; previous cache kept";
     ui.notice_alias_pending = .{ .hash = std.hash.Wyhash.hash(0, ui.notice), .level = .failure };
-    ui.publishNotice("Allowed once");
+    ui.publishNotice("Message withdrawn");
     try std.testing.expect(ui.notice_alias_pending != null);
     ui.observeAdvisories();
     try std.testing.expect(ui.notice_alias_pending == null);
@@ -13087,12 +13106,11 @@ test "async refresh failure survives urgent approve success after notice OOM" {
     try std.testing.expect(!ui.hasAsync(.refresh) and !ui.hasAsync(.approve));
     ui.observeAdvisories();
     try std.testing.expect(ui.notice_alias_pending == null);
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
-    try std.testing.expectEqualStrings("Request denied", ui.records.items[0].body.items);
-    try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[1].notice_level);
-    try std.testing.expectEqualStrings("NoOfficialProvider", ui.records.items[1].body.items);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
+    try std.testing.expectEqual(NoticeLevel.warning, ui.records.items[0].notice_level);
+    try std.testing.expectEqualStrings("NoOfficialProvider", ui.records.items[0].body.items);
     ui.observeAdvisories();
-    try std.testing.expectEqual(@as(usize, 2), ui.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ui.records.items.len);
 }
 test "async acceptance preserves identical text that was cleared and retyped" {
     var fake = FakeRemote{ .snapshot = .{ .available = true, .attached = true, .control_epoch = 6 } };

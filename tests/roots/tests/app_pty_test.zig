@@ -1529,7 +1529,7 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try d.send("\x1b[C");
         try d.waitFrame(selected, "\x1b[7m N deny ");
     } else if (!cancel) {
-        try d.waitFrame(start, "\x1b[7m Y allow once ");
+        try d.waitFrame(start, "\x1b[30;48;5;208m Y allow once ");
     }
     const answered = d.used;
     try d.send("\r");
@@ -1539,6 +1539,9 @@ fn localCommand(d: *Driver, mode: []const u8, init: std.process.Init, project: [
         try d.waitText(answered, "Canceled");
     }
     try d.waitIdle(answered);
+    const after_choice = d.output[answered..d.used];
+    try check(std.mem.find(u8, after_choice, "Allowed once") == null and std.mem.find(u8, after_choice, "Request denied") == null);
+    if (deny) try check(std.mem.find(u8, after_choice, "\x1b[38;5;220m!") != null);
     if (accept) {
         // These labels do not occur in the command preview. They prove that
         // actual local output is visible before any subsequent inference.

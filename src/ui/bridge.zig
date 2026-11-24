@@ -92,7 +92,7 @@ const Copy = struct {
             .tool_result => |v| blk: {
                 var c = v;
                 c.call_id = self.text(v.call_id);
-                c.text = self.textBounded(v.text, item_budget);
+                c.text = if (v.denied) "" else self.textBounded(v.text, item_budget);
                 break :blk .{ .tool_result = c };
             },
         };
@@ -127,7 +127,7 @@ const Copy = struct {
                 // Local command output is rendered verbatim and may carry the
                 // exit tail; clip only model tool results, which the UI shows
                 // as captions. The Runtime keeps the complete result either way.
-                c.result.text = if (v.local) self.text(v.result.text) else self.textBounded(v.result.text, item_budget);
+                c.result.text = if (v.result.denied) "" else if (v.local) self.text(v.result.text) else self.textBounded(v.result.text, item_budget);
                 break :blk .{ .tool_result = c };
             },
             .assistant_committed => |blocks| blk: {

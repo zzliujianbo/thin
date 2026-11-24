@@ -221,8 +221,8 @@ pub const Outcome = shared.tools.Outcome;
 
 fn outcomeColor(outcome: Outcome) []const u8 {
     return switch (outcome) {
-        .pending => theme.muted,
-        .success => theme.muted,
+        .pending, .success => theme.muted,
+        .denied => theme.warning,
         .failed => theme.failure,
         .canceled => theme.caution,
     };
@@ -232,6 +232,7 @@ fn prefixColor(outcome: Outcome) []const u8 {
     return switch (outcome) {
         .pending => theme.muted, // Approval/generation slots stay neutral.
         .success => theme.success,
+        .denied => theme.warning,
         .failed => theme.failure,
         .canceled => theme.caution,
     };
@@ -245,6 +246,7 @@ pub fn statusGlyph(outcome: Outcome) []const u8 {
         .success => "\u{2713}",
         .failed => "\u{2717}",
         .canceled => "-",
+        .denied => "!",
     };
 }
 
@@ -431,7 +433,7 @@ pub fn commandLine(a: std.mem.Allocator, body: []const u8, spans: []const Comman
         // The tool name has its own colour and never joins the command flow.
         // A clipped row has no reliable name boundary, so it stays one color.
         const name_end = if (has_prefix and span.label_start != 0) @min(@max(span.label_start, name_begin), end) else name_begin;
-        if (name_end > name_begin) try out.writer.print("{s}{s}", .{ theme.tool_name, safe[name_begin..name_end] });
+        if (name_end > name_begin) try out.writer.print("{s}{s}", .{ if (span.outcome == .denied) theme.warning else theme.tool_name, safe[name_begin..name_end] });
         const command_begin = name_end;
         if (running) {
             const flow_ms = span.flow_elapsed_ms orelse active_time_ms.?;

@@ -43,6 +43,7 @@ pub const duration = "\x1b[38;5;66m";
 pub const warning = "\x1b[38;5;220m";
 pub const failure = "\x1b[38;5;203m";
 pub const caution = "\x1b[38;5;214m";
+pub const approval_allow = "\x1b[30;48;5;208m";
 /// Foreground only: the editor/background remain the terminal's defaults.
 pub const model_flow = [_][]const u8{
     "\x1b[38;5;242m", "\x1b[38;5;246m", "\x1b[38;5;250m", "\x1b[38;5;255m",

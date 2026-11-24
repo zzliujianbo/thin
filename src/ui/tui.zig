@@ -1464,7 +1464,6 @@ const Ui = struct {
             .approve => {
                 self.settlePermissionDelivery(action.approve.id, pending.epoch);
                 if (self.permission) |permission| if (permission.epoch == pending.epoch and permission.id == action.approve.id) self.clearPermission();
-                self.publishNotice(if (action.approve.decision == .deny) "Request denied" else "Allowed once");
             },
             .cancel, .cancel_clear => {
                 if (self.permission) |permission| if (permission.epoch == pending.epoch and pending.permission_id == permission.id) self.clearPermission();
@@ -2740,7 +2739,7 @@ const Ui = struct {
                 .name = name,
                 .label = label,
                 .display = effective.display,
-                .failure_reason = if (local) null else try stageFailureReason(self.allocator, effective.kind, result),
+                .failure_reason = if (local or outcome != .failed) null else try stageFailureReason(self.allocator, effective.kind, result),
             };
         };
         defer observed.deinit(self.allocator);
@@ -2846,8 +2845,8 @@ const Ui = struct {
     fn oneShotNoticeLevel(value: []const u8) NoticeLevel {
         if (std.mem.eql(u8, value, "Selection restored; NEW EMPTY CHAT (history not restored)")) return .plain;
         const plain_prefixes = [_][]const u8{
-            "Saved",             "Key saved",      "Model selected", "Setup canceled", "Stop dismissed",
-            "Message withdrawn", "Request denied", "Allowed once",
+            "Saved",             "Key saved", "Model selected", "Setup canceled", "Stop dismissed",
+            "Message withdrawn",
         };
         for (plain_prefixes) |prefix| if (std.mem.startsWith(u8, value, prefix)) return .plain;
         return .warning;
@@ -3321,7 +3320,7 @@ const Ui = struct {
                     try self.toolCompleted(caption, tool.result, local);
                     if (tool.display_key) |identity| self.tool_views.remove(self.allocator, identity);
                 }
-                if (local) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
+                if (local and !tool.result.denied) try self.localCommandOutput(tool.result.text, tool.result.truncated or display_truncated);
             },
             .context_snapshot => {},
             .usage => {},
@@ -5517,10 +5516,8 @@ const Ui = struct {
                 return;
             };
             self.settlePermissionDelivery(permission.id, permission.epoch);
-            self.publishNotice(if (decision == .deny) "Request denied" else "Allowed once");
         } else if (self.bridge.decide(permission.id, decision)) {
             self.settlePermissionDelivery(permission.id, permission.epoch);
-            self.publishNotice(if (decision == .deny) "Request denied" else "Allowed once");
         } else self.notice = "Permission expired";
         self.clearPermission();
         self.parser.stop_feed = true;
@@ -8192,7 +8189,7 @@ fn styledApprovalChoice(a: std.mem.Allocator, line: []const u8, index: usize, li
         if (!std.mem.eql(u8, line, if (allow_selected) approval_allow_label else approval_deny_label)) return line;
     } else return line;
     if (start >= end) return line;
-    return std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ line[0..start], theme.reverse, line[start..end], theme.reset, line[end..] });
+    return std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ line[0..start], if (allow_selected) theme.approval_allow else theme.reverse, line[start..end], theme.reset, line[end..] });
 }
 
 fn putToneLine(writer: *Io.Writer, a: std.mem.Allocator, row: usize, line: []const u8, columns: usize, tone: []const u8) !void {

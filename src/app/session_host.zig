@@ -890,6 +890,7 @@ pub const SessionHost = struct {
                             .result = .{
                                 .text = result.text,
                                 .is_error = result.is_error,
+                                .denied = result.denied,
                                 .canceled = result.canceled,
                                 .truncated = result.truncated,
                                 .file_stats = seededFileStats(stats, result.call_id),

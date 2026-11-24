@@ -423,6 +423,23 @@ test "allocation failure mid-body keeps the emitted prefix and returns the reser
     try t.expectEqual(@as(usize, 0), progress(&bridge).bytes);
     try t.expectEqual(@as(usize, 0), progress(&bridge).outstanding);
 }
+test "Bridge keeps approval denial metadata without copying its private body" {
+    const t = std.testing;
+    var cancel: p.Cancellation = .{};
+    var bridge = Bridge.init(t.allocator, t.io, &cancel);
+    defer bridge.deinit();
+    const host_ = bridge.host();
+    try host_.emit_fn(host_.context, .{ .tool_result = .{
+        .id = 1,
+        .name = "bash",
+        .local = true,
+        .result = .{ .text = "private rationale", .is_error = true, .denied = true },
+    } }, &cancel);
+    var item = bridge.pop().?;
+    defer item.deinit();
+    try t.expect(item.event.tool_result.result.denied);
+    try t.expectEqualStrings("", item.event.tool_result.result.text);
+}
 test "large tool result display copy is clipped without touching canonical text" {
     const t = std.testing;
     var cancel: p.Cancellation = .{};

@@ -30,6 +30,8 @@ pub const Execution = struct {
     text: []const u8,
     /// 工具失败；回填历史时以 is_error 标记。
     is_error: bool = false,
+    /// Authorization returned deny; distinct from errors in tools that ran.
+    denied: bool = false,
     /// 工具因取消而中止；结果仍会回填，保证 tool_call 有对应结果。
     canceled: bool = false,
     /// The executor reports whether its own result is incomplete.
@@ -2112,6 +2114,7 @@ pub const Runtime = struct {
                 result.duration_ms = @intCast(@max(0, began.untilNow(self.io, .awake).toMilliseconds()));
             }
 
+            result.denied = !allowed;
             result.display = prepared.display;
             // Display-only terminal aggregate. A denied, failed or canceled
             // call changed nothing we can claim; repeated paths count once.
@@ -2206,6 +2209,7 @@ pub const Runtime = struct {
             .call_id = try a.dupe(u8, id),
             .text = try a.dupe(u8, result.text),
             .is_error = result.is_error,
+            .denied = result.denied,
             .canceled = result.canceled,
             .truncated = result.truncated,
         } };

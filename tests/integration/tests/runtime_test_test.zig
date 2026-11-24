@@ -819,15 +819,19 @@ test "explicit denial prompts each time and preserves the denial reason" {
     try std.testing.expectEqual(@as(u32, 1), fake.permissions);
     try std.testing.expectEqual(@as(u32, 0), fake.executions);
     try std.testing.expect(fake.denied_seen);
+    try std.testing.expect(fake.last_result_denied);
     try std.testing.expectEqualStrings(denial, fake.last_result);
 
-    var allowed = Fake{ .decision = .allow_once, .stop_after = 2, .explicit_denial = denial };
+    // AccessDenied from an executor that actually ran is NOT an approval denial.
+    var allowed = Fake{ .decision = .allow_once, .stop_after = 2, .explicit_denial = denial, .execution_error = error.AccessDenied };
     var again = try r.Runtime.init(std.testing.allocator, std.testing.io, &config, allowed.model(), allowed.executor(), allowed.host(), "");
     defer again.deinit();
     allowed.current_runtime = &again;
     _ = try again.run("Do the task", &cancel);
     try std.testing.expectEqual(@as(u32, 2), allowed.permissions);
     try std.testing.expectEqual(@as(u32, 2), allowed.executions);
+    try std.testing.expect(!allowed.last_result_denied and !allowed.denied_seen);
+    try std.testing.expectEqualStrings("AccessDenied", allowed.last_result);
 }
 test "ordinary operations execute without asking on current and fresh Runtime" {
     var fake = Fake{ .decision = .deny, .stop_after = 2, .explicit_denial = null };

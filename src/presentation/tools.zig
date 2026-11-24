@@ -36,7 +36,7 @@ fn memoryLabel(a: std.mem.Allocator, topic: []const u8, truncated: bool) ![]cons
     return std.fmt.allocPrint(a, "{s}.md", .{topic});
 }
 
-pub const Outcome = enum { pending, success, failed, canceled };
+pub const Outcome = enum { pending, success, failed, canceled, denied };
 
 /// 字段可直接用于 Web view/DTO。detail 是有界安全文本(非HTML)，没有终端cell裁剪；
 /// unavailable(null)与实际空command/path不同。truncated不能冒充完整参数。
@@ -194,7 +194,7 @@ pub const Completion = struct {
     display: ?@import("../core/background_status.zig").Caption = null,
 
     pub fn fromExecution(result: r.Execution) Completion {
-        const outcome: Outcome = if (result.cleanup_failed) .failed else if (result.canceled) .canceled else if (result.is_error) .failed else .success;
+        const outcome: Outcome = if (result.cleanup_failed) .failed else if (result.canceled) .canceled else if (result.denied) .denied else if (result.is_error) .failed else .success;
         const handoff = if (result.display) |display| display.action == .start and outcome == .success else false;
         return .{ .outcome = outcome, .file_stats = if (outcome == .success) result.file_stats else null, .duration_ms = if (handoff) null else result.duration_ms, .display = result.display };
     }
@@ -212,7 +212,7 @@ const reason_bytes = 512;
 /// or the sanitized first line of their result. An empty body has nothing to show.
 pub fn failureReason(a: std.mem.Allocator, kind: Kind, result: r.Execution) !?[]const u8 {
     if (result.cleanup_failed) return try a.dupe(u8, "cleanup failed");
-    if (!result.is_error or result.canceled) return null;
+    if (!result.is_error or result.canceled or result.denied) return null;
     if (kind == .read) return try excerpt(a, result.text);
     if (kind == .bash) return try bashReason(a, result.text) orelse try a.dupe(u8, "command failed");
     if (try jsonError(a, result.text)) |message| return message;
