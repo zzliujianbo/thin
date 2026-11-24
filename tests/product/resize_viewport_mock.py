@@ -121,6 +121,20 @@ def check_native_selection(tm):
     assert '\n' + '\n'.join(CODE_LINES) + '\n' in logical, 'code selection lost a hard newline or indentation'
 
 
+# Each SSE delta is withheld until the controller sees the preceding screen in
+# tmux. The observations do not depend on a spinner or arbitrary sleeps.
+PREVIEW_PROMPT = 'check-inline-preview'
+PREVIEW_SUFFIX = '直接使用' * 12  # Cross a physical row before the markup closes.
+PREVIEW_BODY = '可以' + PREVIEW_SUFFIX
+PREVIEW_STAGES = (
+    ('reasoning_content', '正在推敲。', '正在推敲。'),
+    ('content', '`可以', '`可以'),
+    ('content', PREVIEW_SUFFIX, '`' + PREVIEW_BODY),
+    ('content', '`', '`' + PREVIEW_BODY + '`'),  # The backtick run may still grow.
+    ('content', '。', PREVIEW_BODY + '。'),
+)
+
+
 class OwnedService(http.server.BaseHTTPRequestHandler):
     requests = 0
     failed = None
@@ -139,18 +153,27 @@ class OwnedService(http.server.BaseHTTPRequestHandler):
             assert 0 < length <= 512 * 1024
             body = json.loads(self.rfile.read(length))
             type(self).requests += 1
-            assert type(self).allow_history_seed and type(self).requests == 1
+            assert type(self).allow_history_seed
             turns = [message.get('content') for message in body.get('messages', []) if message.get('role') == 'user']
-            assert turns and turns[-1] == 'wrap-history-seed'
+            preview = type(self).requests == 2 and turns[-1] == PREVIEW_PROMPT
+            assert preview or (type(self).requests == 1 and turns[-1] == 'wrap-history-seed')
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.end_headers()
-            chunks = [
-                {'choices': [{'index': 0, 'delta': {'content': WRAP_REPLY}, 'finish_reason': None}]},
-                {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 20, 'completion_tokens': 3, 'total_tokens': 23}},
-            ]
-            for chunk in chunks:
+            def emit(delta, finish=None):
+                chunk = {'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]}
+                if finish:
+                    chunk['usage'] = {'prompt_tokens': 20, 'completion_tokens': 3, 'total_tokens': 23}
                 self.wfile.write(('data: ' + json.dumps(chunk) + '\n\n').encode())
+                self.wfile.flush()
+
+            if preview:
+                for (field, text, _), gate in zip(PREVIEW_STAGES, self.server.preview_gates):
+                    emit({field: text})
+                    assert gate.wait(10), 'preview stage was never displayed before the next delta'
+            else:
+                emit({'content': WRAP_REPLY})
+            emit({}, 'stop')
             self.wfile.write(b'data: [DONE]\n\n')
         except Exception as exc:
             type(self).failed = exc
@@ -162,6 +185,7 @@ def run(app, wrap=False, local_command=False):
     OwnedService.failed = None
     OwnedService.allow_history_seed = False
     httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), OwnedService)
+    httpd.preview_gates = [threading.Event() for _ in PREVIEW_STAGES]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -425,6 +449,36 @@ def run(app, wrap=False, local_command=False):
                             lines[y].rstrip().endswith('%>') and x == len(lines[y].rstrip()) + 1)
 
                 wait(empty_prompt, 'draft did not clear at the idle caret')
+                if wrap and not local_command:
+                    tm('send-keys', '-t', 'owned:0.0', '-l', PREVIEW_PROMPT)
+                    tm('send-keys', '-t', 'owned:0.0', 'Enter')
+
+                    def joined_rows(*args):
+                        # -J retains the terminal's right padding. Strip it only
+                        # after joining; never trim inside a wrapped answer.
+                        return [row.rstrip(' ') for row in tm('capture-pane', '-p', '-J', *args, '-t', 'owned:0.0').splitlines()]
+
+                    def answer_rows(rows):
+                        # Exclude the preceding wrap fixture, count even a stale
+                        # delimiter-only row or a fragment of this short answer.
+                        return [row for row in rows if any(ch in row for ch in '`可以直接使用。')]
+
+                    for index, ((_, _, expected), gate) in enumerate(zip(PREVIEW_STAGES, httpd.preview_gates)):
+                        def stage_visible():
+                            pane = joined_rows()
+                            if index == 0:
+                                return expected in pane
+                            return PREVIEW_PROMPT in pane and answer_rows(pane[pane.index(PREVIEW_PROMPT) + 1:]) == [expected]
+
+                        wait(stage_visible, f'Unicode preview stage {index} missing before next SSE delta')
+                        gate.set()
+                    wait(empty_prompt, 'preview did not settle at the idle caret')
+                    transcript = joined_rows('-S', '-200')
+                    assert PREVIEW_PROMPT in transcript, 'preview turn absent from native transcript'
+                    turn = transcript[transcript.index(PREVIEW_PROMPT) + 1:]
+                    assert answer_rows(turn) == [PREVIEW_BODY + '。'], 'committed preview left stale or duplicate cells'
+                    assert '正在推敲。' not in turn and OwnedService.requests == 2 and OwnedService.failed is None
+                    print('PASS inline-preview: gated reasoning, literal increments, resolved span and exact final row')
                 tm('send-keys', '-t', 'owned:0.0', 'C-d')
 
                 def exited_cleanly():
@@ -454,6 +508,8 @@ def run(app, wrap=False, local_command=False):
                         server.kill()
                         server.wait(timeout=3)
     finally:
+        for gate in httpd.preview_gates:
+            gate.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=2)

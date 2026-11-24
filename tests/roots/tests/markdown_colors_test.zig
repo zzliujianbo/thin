@@ -68,12 +68,16 @@ const ReferenceRender = struct {
         var offset: usize = 0;
         var current = state;
         var stopped = false;
+        var preview_bytes: usize = 0;
         while (offset < source.len) {
             if ((if (max_rows) |n| sink.rows.items.len >= n else false) or (max_rows != null and offset >= @max(quantum, 1) and sink.rows.items.len != 0)) break;
             if (max_rows != null and base + offset - sink.seed.end > engine.max_row_source_bytes) return error.MarkdownRenderLimit;
             switch (scan.next(source, base, offset, current, final)) {
                 .need_more => {
                     stopped = true;
+                    sink.preview = true;
+                    if (!std.meta.eql(writer.style, output.Style{})) try writer.setStyle(.{});
+                    preview_bytes = try writer.emitSourcedBounded(source[offset..], base + offset, base + source.len, true, scan.max_preview_bytes, if (max_rows) |n| n -| sink.rows.items.len else std.math.maxInt(usize));
                     break;
                 },
                 .end => break,
@@ -93,7 +97,7 @@ const ReferenceRender = struct {
                 },
             }
         }
-        const work = offset;
+        const work = offset + preview_bytes;
         const eof = final and !stopped and offset == source.len;
         const full = if (max_rows) |n| sink.rows.items.len >= n else false;
         if (writer.hasContent() and !full) {

@@ -86,6 +86,28 @@ test "table palette survives ASCII runs and retired physical rows" {
     }
 }
 
+test "unresolved suffix paints literal wrapped rows without proving its source" {
+    try @import("text.zig").initLocale();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "**可以直接使用", "`可以直接使用`", "| A | B |\n|---|" }) |source| {
+        const preview = try render(a, source, 17, .{}, false, 4, false, .normal, 1, 64);
+        try std.testing.expect(preview.rows.len > 1);
+        var shown: std.ArrayList(u8) = .empty;
+        for (preview.rows, 0..) |row, i| {
+            if (i != 0 and preview.rows[i - 1].soft_wrap) try std.testing.expect(row.preview_continuation);
+            try std.testing.expect(!row.complete);
+            try std.testing.expectEqual(@as(usize, 17), row.end);
+            try shown.appendSlice(a, row.text);
+        }
+        const expected = try std.mem.replaceOwned(u8, a, source, "\n", "");
+        try std.testing.expectEqualStrings(expected, shown.items);
+        try std.testing.expectEqual(@as(usize, 0), preview.consumed);
+        try std.testing.expect(preview.metadata == null);
+    }
+}
+
 test "preview cells include emitted user padding but exclude styling" {
     try @import("text.zig").initLocale();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

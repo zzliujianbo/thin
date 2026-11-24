@@ -6955,7 +6955,8 @@ const Ui = struct {
             if (!full and !row.soft_wrap and !continuation) return;
             const wraps = if (row.soft_wrap and source + 1 < rows.len) blk: {
                 const next = rows[source + 1];
-                break :blk row.start < row.end and row.end == next.start and next.start < next.end and next.cells != 0;
+                break :blk next.cells != 0 and (next.preview_continuation or
+                    (row.start < row.end and row.end == next.start and next.start < next.end));
             } else false;
             try list.append(a, .{ .index = index, .stream = stream, .source_row = source, .full = full, .wraps = wraps });
         }

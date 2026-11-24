@@ -6,6 +6,7 @@ const Style = @import("markdown_writer.zig").Style;
 pub const max_inline_bytes: usize = 2048;
 // Per source line, excluding LF. Table recognition never looks past two lines.
 const max_table_line_bytes = 2048;
+pub const max_preview_bytes = @max(max_inline_bytes, 2 * max_table_line_bytes + 1);
 const depth_limit = 8;
 const Kind = enum { strong, italic, strike, link, inline_code };
 const Frame = struct {

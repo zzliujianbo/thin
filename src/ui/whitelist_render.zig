@@ -15,6 +15,8 @@ pub const Row = struct {
     /// Printing the following content can wrap natively at this boundary.
     /// A tab moved off a short row needs an explicit break. Release uses `complete`.
     soft_wrap: bool,
+    /// Display-only adjacency across a wrapped literal preview, never ACK proof.
+    preview_continuation: bool = false,
     /// Display cells written, including padding but excluding SGR bytes.
     cells: usize,
 };
@@ -37,6 +39,8 @@ const Sink = struct {
     base: usize,
     seed: Checkpoint,
     preview: bool = false,
+    literal_preview: bool = false,
+    previous_origin_end: ?usize = null,
     max_rows: ?usize,
     overflow: bool = false,
     fn emitAscii(self: *Sink, bytes: []const u8, start: usize) !void {
@@ -84,8 +88,10 @@ const Sink = struct {
             .checkpoint = cp.state,
             .complete = !self.preview,
             .soft_wrap = self.writer.row_soft_wrap,
+            .preview_continuation = self.literal_preview and !self.writer.origin_synthetic and self.previous_origin_end == self.writer.origin_start,
             .cells = self.writer.col,
         });
+        self.previous_origin_end = if (self.writer.origin_synthetic) null else end;
         self.seed = cp;
         const remaining = self.trace.items.len - covered;
         std.mem.copyForwards(TraceRecord, self.trace.items[0..remaining], self.trace.items[covered..]);
@@ -122,6 +128,7 @@ fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
     var offset: usize = 0;
     var current = state;
     var stopped = false;
+    var preview_bytes: usize = 0;
     while (offset < source.len) {
         // Work quantum is a yield point, not a hard source cap. Finish one
         // physical row first; enforce a bounded pathological-row policy below.
@@ -147,7 +154,14 @@ fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
         }
         switch (scan.next(source, base, offset, current, final)) {
             .need_more => {
+                // The markup is undecided, not the text. Paint the sanitized
+                // suffix in the mutable tail without adding scanner checkpoints.
+                // Even width-wrapped preview rows must be reparsed, not retired.
                 stopped = true;
+                sink.preview = true;
+                sink.literal_preview = true;
+                if (!std.meta.eql(writer.style, output.Style{})) try writer.setStyle(.{});
+                preview_bytes = try writer.emitSourcedBounded(source[offset..], base + offset, base + source.len, true, scan.max_preview_bytes, if (max_rows) |n| n -| sink.rows.items.len else std.math.maxInt(usize));
                 break;
             },
             .end => break,
@@ -167,7 +181,7 @@ fn renderImpl(a: std.mem.Allocator, source: []const u8, base: usize, state: scan
             },
         }
     }
-    const work = offset;
+    const work = offset + preview_bytes;
     const eof = final and !stopped and offset == source.len;
     const full = if (max_rows) |n| sink.rows.items.len >= n else false;
     if (writer.hasContent() and !full) {
