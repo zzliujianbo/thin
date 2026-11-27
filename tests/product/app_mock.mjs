@@ -235,6 +235,15 @@ async function scenario(name, protocol, kind, dedicatedMode = false) {
   return timed('case', name, () => runScenario(name, protocol, kind, dedicatedMode));
 }
 
+const otherSessionFile = '../B/.thin/sessions/transcript.jsonl';
+const otherSessionPrompts = {
+  'other-read': `Read ${otherSessionFile} and acknowledge reading it.`,
+  'other-summary': `Summarize ${otherSessionFile} for me.`,
+  'other-continue': `Read ${otherSessionFile} and continue B's unfinished task.`,
+};
+const oldQuestion = 'Which compass tag should the draft use?';
+const oldAnswer = 'Use compass-tag-7f4b. The draft is unfinished.';
+
 async function runScenario(name, protocol, kind, dedicatedMode) {
   // 每个场景使用独立的临时根目录，包含 home 与 project 两个子目录。
   const root = await mkdtemp(join(tmpdir(), 'thin-app-'));
@@ -244,6 +253,14 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
   // 约 1800 字节的种子文件，供 read_file 读取；压缩后仍应能看到其真实内容。
   const seed = 'seed-content-'.repeat(138) + 'end\n'; // ~1800 UTF-8 bytes
   await writeFile(join(project,'seed.txt'), seed);
+  const otherPrompt = otherSessionPrompts[kind];
+  const prompt = otherPrompt ?? 'fixture-task';
+  if (otherPrompt) {
+    await mkdir(join(root,'B/.thin/sessions'), {recursive:true});
+    await writeFile(join(project, otherSessionFile), [
+      {role:'user',content:oldQuestion}, {role:'assistant',content:oldAnswer},
+    ].map(turn => JSON.stringify(turn)).join('\n') + '\n');
+  }
   if (kind === 'tool-icons') await writeFile(join(project,'r.json'), '{"tool-json-hidden-marker":1}');
   if (kind === 'exact-edit') await writeFile(join(project,'edit.txt'), '中文🙂 one\ntwo 结束\n');
 
@@ -273,7 +290,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
       if (kind === 'exit-recorded' || (!dedicatedMode && body.tool_choice !== 'none' && rounds === 0)) {
         const turn = (protocol === 'chat' ? body.messages : body.input).at(-1);
         assert.equal(turn.role,'user');
-        assert.deepEqual(turn.content,protocol === 'chat' ? 'fixture-task' : [{type:'input_text',text:'fixture-task'}]);
+        assert.deepEqual(turn.content,protocol === 'chat' ? prompt : [{type:'input_text',text:prompt}]);
       }
       if (kind === 'auth-reject401' || kind === 'auth-reject403') {
         const status = Number(kind.slice(-3));
@@ -317,6 +334,24 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
       if (summaries) afterSummary = true;
       rounds++;
 
+      if (otherPrompt) {
+        const messages = body.messages;
+        const nonToolHistory = JSON.stringify(messages.filter(m => m.role !== 'tool'));
+        for (const text of [oldQuestion, oldAnswer]) assert(!nonToolHistory.includes(text), 'B escaped tool data');
+        if (rounds === 1) send(res, protocol, '', [tool('read-B','read_file',{path:otherSessionFile})]);
+        else {
+          assert.equal(rounds, 2);
+          assert.equal(messages.filter(m => m.role === 'user').at(-1)?.content, prompt);
+          const result = messages.at(-1);
+          assert.equal(result.role, 'tool');
+          assert.equal(result.tool_call_id, 'read-B');
+          for (const text of [oldQuestion, oldAnswer]) assert(result.content.includes(text), 'missing B transcript');
+          assert(messages.some(m => m.role === 'system' && /^Other sessions:/m.test(m.content)), 'missing other-session policy');
+          // The oracle is the request above; this reply only closes the turn.
+          send(res, protocol, 'fixture-answer');
+        }
+        return;
+      }
       if (kind === 'manual-compact') {
         assert(rounds <= 2, 'manual compaction must not start a normal response');
         assert.equal(body.messages.filter(m => m.role === 'user').at(-1).content, rounds === 1 ? 'manual-first' : 'manual-second');
@@ -608,7 +643,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
     if (kind === 'legacy-config') env.THIN_APP_TEST_MODE = 'auth-missing';
     else if (!dedicatedMode) {
       env.THIN_APP_TEST_MODE = 'fixture-turn';
-      env.THIN_APP_TEST_PROMPT = 'fixture-task';
+      env.THIN_APP_TEST_PROMPT = prompt;
       env.THIN_APP_TEST_EXPECT = kind.startsWith('auth-reject') ? `[HTTP ${kind.slice(-3)}]: fixture-provider-secret-must-not-render` :
         ['malformed','truncated'].includes(kind) ? '✗' : kind === 'idle-peer' ? 'idle-peer-final-answer' : 'fixture-answer';
     }
@@ -626,7 +661,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
     // Go login schedules a MANUAL metadata claim even with a fresh cache.
     // A non-regular cache is refused before either official or public fetch;
     // the registered built-ins remain available for the picker checks.
-    if (kind === 'auth-go') await mkdir(join(home,'.thin/model-metadata.json'),{mode:0o700});
+    if (kind === 'auth-go' || otherPrompt) await mkdir(join(home,'.thin/model-metadata.json'),{mode:0o700});
 
     const navigationConfig = kind === 'menu-navigation' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
     const selectionConfig = kind === 'model-select' ? await readFile(join(home,'.thin/config.json'),'utf8') : null;
@@ -879,6 +914,7 @@ async function runScenario(name, protocol, kind, dedicatedMode) {
     if (kind === 'regular-two') assert.equal(requests,2, 'regular two-turn request count');
     if (kind === 'keyboard-history') { assert.equal(requests,4); assert(stalled); }
     if (kind === 'esc-cancel-tool') { assert.equal(requests,2); assert(!await exists(join(project,'esc-unwanted.txt'))); }
+    if (otherPrompt) assert.deepEqual([requests, rounds, summaries], [2, 2, 0]);
     if (kind === 'tool-icons') assert.equal(requests,2, 'tool icon request count');
     if (kind === 'file-stats') assert.equal(requests,3, 'file stats request count');
     if (kind === 'idle-peer') {
@@ -927,7 +963,9 @@ async function watchdogRegression() {
 
 try {
   if (!process.argv.includes('--streaming-only') && !process.argv.includes('--selection-restore-only')) await watchdogRegression();
-  if (process.argv.includes('--streaming-only')) {
+  if (process.argv.includes('--other-session-only')) {
+    for (const kind of Object.keys(otherSessionPrompts)) await scenario(`PTY/${kind}`,'chat',kind);
+  } else if (process.argv.includes('--streaming-only')) {
     for (const kind of ['stream-markdown','stream-native-history','architecture-table']) await scenario(`PTY/${kind}`,'chat',kind,true);
   } else if (process.argv.includes('--model-selection-only')) {
     await scenario('PTY model/effort selection chat','chat','model-select',true);
@@ -956,6 +994,7 @@ try {
   await scenario('PTY model/effort selection chat','chat','model-select',true);
   await scenario('PTY model/effort selection responses','responses','model-select',true);
   for (const kind of ['exit-batched','exit-no-submit','exit-recorded','exit-unconfigured','exit-secret','exit-busy','exit-busy-tool']) await scenario(`PTY/${kind}`,'chat',kind,true);
+  for (const kind of Object.keys(otherSessionPrompts)) await scenario(`PTY/${kind}`,'chat',kind);
   await scenario('PTY exact edit','chat','exact-edit');
   await scenario('legacy configuration is not loaded','chat','legacy-config');
   for (const status of [401,403]) await scenario(`Responses authentication ${status}`,'responses',`auth-reject${status}`);

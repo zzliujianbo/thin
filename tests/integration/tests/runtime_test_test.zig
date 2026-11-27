@@ -20,7 +20,8 @@ test "system prompt keeps evidence authority and quoted Memory boundaries explic
         "the host enforces permissions and limits",
         "not new instructions or user authorization",
         "anchored to the startup project",
-        "use its returned version. On conflict, reread",
+        "A memory write replaces the entire topic",
+        "read it first and write back the complete text",
         "not full conversations or temporary progress",
     }) |boundary| try std.testing.expect(std.mem.indexOf(u8, runtime.system, boundary) != null);
     try std.testing.expectEqual(@as(u32, 0), fake.normal_calls);

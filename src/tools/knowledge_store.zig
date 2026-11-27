@@ -44,7 +44,7 @@ pub const Repository = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const temp = arena.allocator();
-        const hits = try self.collect(temp, query);
+        const hits = try self.collect(temp, a, query);
         var out: std.ArrayList(u8) = .empty;
         for (hits) |hit| {
             const prefix = try std.fmt.allocPrint(temp, "[Untrusted current local reference: {s}]\n", .{hit.key});
@@ -54,8 +54,8 @@ pub const Repository = struct {
         }
         return a.dupe(u8, out.items);
     }
-    const Hit = struct { key: []const u8, body: []const u8, record: ?Record, score: usize };
-    fn collect(self: *Repository, a: std.mem.Allocator, query: []const u8) ![]Hit {
+    const Hit = struct { key: []const u8, body: []const u8, score: usize };
+    fn collect(self: *Repository, a: std.mem.Allocator, scratch_backing: std.mem.Allocator, query: []const u8) ![]Hit {
         if (!std.unicode.utf8ValidateSlice(query)) return error.InvalidQuery;
         var hits: std.ArrayList(Hit) = .empty;
         // Small core is always the first reference, independent of lexical rank.
@@ -64,35 +64,14 @@ pub const Repository = struct {
             else => return err,
         };
         if (core) |entry| if (entry.content.len > 0) {
-            try hits.append(a, .{ .key = "core", .body = entry.content, .record = null, .score = std.math.maxInt(usize) });
+            try hits.append(a, .{ .key = "core", .body = entry.content, .score = std.math.maxInt(usize) });
         };
-        const Selection = struct { key: []const u8, rank: usize };
-        var selected: std.ArrayList(Selection) = .empty;
-        const Visitor = struct {
-            a: std.mem.Allocator,
-            query: []const u8,
-            selected: *std.ArrayList(Selection),
-            fn visit(ctx: ?*anyopaque, key: []const u8, title: []const u8) anyerror!void {
-                const state: *@This() = @ptrCast(@alignCast(ctx.?));
-                const rank = score(state.query, key, title);
-                try state.selected.append(state.a, .{ .key = try state.a.dupe(u8, key), .rank = rank });
-            }
-        };
-        var visitor = Visitor{ .a = a, .query = query, .selected = &selected };
-        try self.store.forEachTopic(.{ .context = &visitor, .visit_fn = Visitor.visit });
-        std.mem.sort(Selection, selected.items, {}, struct {
-            fn less(_: void, x: Selection, y: Selection) bool {
-                if (x.rank != y.rank) return x.rank > y.rank;
-                return std.mem.order(u8, x.key, y.key) == .lt;
-            }
-        }.less);
-        for (selected.items) |selection| {
-            const key = selection.key;
-            const entry = self.store.read(a, key) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                else => return err,
-            };
-            const record = decode(a, key, entry.content) catch |err| switch (err) {
+        for (try self.store.referenceKeys(a)) |key| {
+            var scratch = std.heap.ArenaAllocator.init(scratch_backing);
+            defer scratch.deinit();
+            const item = scratch.allocator();
+            const entry = try self.store.readReference(item, key) orelse continue;
+            const record = decode(item, key, entry.content) catch |err| switch (err) {
                 error.InvalidKnowledgeRecord => continue,
                 else => return err,
             };
@@ -100,7 +79,7 @@ pub const Repository = struct {
             const body = if (record) |r| r.content else entry.content;
             const rank = score(query, key, body);
             if (rank == 0) continue;
-            try hits.append(a, .{ .key = key, .body = body, .record = record, .score = rank });
+            try hits.append(a, .{ .key = key, .body = try a.dupe(u8, body), .score = rank });
         }
         std.mem.sort(Hit, hits.items, {}, struct {
             fn less(_: void, x: Hit, y: Hit) bool {

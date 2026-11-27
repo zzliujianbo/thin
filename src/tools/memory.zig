@@ -67,7 +67,7 @@ pub const Store = struct {
     }
 
     /// 读取 topic 正文；返回的 content 由 a 分配，调用方释放。
-    fn load(self: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8) !Entry {
+    fn load(self: *Store, mem: *Root, a: std.mem.Allocator, topic: []const u8, skip_legacy: bool) !Entry {
         const name = try filename(a, topic);
         defer a.free(name);
         const fd = fs.openAt(mem.dir.handle, name, .{ .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true }, 0);
@@ -77,9 +77,17 @@ pub const Store = struct {
         const stat = try file.stat(self.root.io);
         if (stat.kind != .file) return error.NotRegularFile;
         const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+        var head: [512]u8 = undefined;
+        const n = if (skip_legacy) @min(size, head.len) else 0;
+        defer std.crypto.secureZero(u8, head[0..n]);
+        if (n != 0) {
+            if (try file.readPositionalAll(self.root.io, head[0..n], 0) != n) return error.FileChanged;
+            if (legacyHead(head[0..n])) return error.LegacyMemoryRecord;
+        }
         const data = try a.alloc(u8, size);
         errdefer a.free(data);
-        if (try file.readPositionalAll(self.root.io, data, 0) != size) return error.FileChanged;
+        @memcpy(data[0..n], head[0..n]);
+        if (n < size and try file.readPositionalAll(self.root.io, data[n..], n) != size - n) return error.FileChanged;
         if ((try file.stat(self.root.io)).size != stat.size) return error.FileChanged;
         try fs.validateText(data);
         return .{ .content = data };
@@ -87,12 +95,23 @@ pub const Store = struct {
 
     /// 在锁内读取 topic。topic 先于加锁校验；返回的 Entry 由 allocator 分配，调用方释放。
     pub fn read(self: *Store, allocator: std.mem.Allocator, topic: []const u8) !Entry {
+        return self.readEntry(allocator, topic, false);
+    }
+
+    pub fn readReference(self: *Store, a: std.mem.Allocator, topic: []const u8) !?Entry {
+        return self.readEntry(a, topic, true) catch |err| switch (err) {
+            error.LegacyMemoryRecord, error.FileNotFound => null,
+            else => return err,
+        };
+    }
+
+    fn readEntry(self: *Store, allocator: std.mem.Allocator, topic: []const u8, skip_legacy: bool) !Entry {
         try validTopic(topic);
         const fd = try self.lock();
         defer fs.closeFd(fd);
         var mem = try self.directory(false);
         defer mem.deinit();
-        return self.load(&mem, allocator, topic);
+        return self.load(&mem, allocator, topic, skip_legacy);
     }
 
     /// 创建 topic；已存在返回 PathAlreadyExists。
@@ -151,7 +170,7 @@ pub const Store = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const current = self.load(&mem, a, topic) catch |err| switch (err) {
+        const current = self.load(&mem, a, topic, false) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -183,6 +202,15 @@ pub const Store = struct {
     }
 
     pub fn topics(self: *Store, a: std.mem.Allocator) ![]const []const u8 {
+        return self.topicKeys(a, false);
+    }
+
+    /// Snapshot names only; reference reads classify the opened file after unlocking.
+    pub fn referenceKeys(self: *Store, a: std.mem.Allocator) ![]const []const u8 {
+        return self.topicKeys(a, true);
+    }
+
+    fn topicKeys(self: *Store, a: std.mem.Allocator, for_retrieval: bool) ![]const []const u8 {
         const fd = try self.lock();
         defer fs.closeFd(fd);
         var dir = self.directory(false) catch |err| {
@@ -200,51 +228,18 @@ pub const Store = struct {
             if (!std.mem.endsWith(u8, item.name, ".md")) continue;
             const topic = item.name[0 .. item.name.len - 3];
             try validTopic(topic);
-            if (try self.isLegacy(&dir, a, topic)) continue;
-            try rows.append(a, try a.dupe(u8, topic));
+            if (for_retrieval) {
+                if (std.mem.eql(u8, topic, "core")) continue;
+            } else if (try self.isLegacy(&dir, a, topic)) continue;
+            try rows.ensureUnusedCapacity(a, 1);
+            rows.appendAssumeCapacity(try a.dupe(u8, topic));
         }
-        std.mem.sort([]const u8, rows.items, {}, struct {
+        if (!for_retrieval) std.mem.sort([]const u8, rows.items, {}, struct {
             fn less(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.order(u8, x, y) == .lt;
             }
         }.less);
         return rows.toOwnedSlice(a);
-    }
-
-    /// Streaming visitor over topic name and bounded first-line title. The
-    /// directory is the index: callers never receive a full index string. The
-    /// callback runs under the store lock and must not call Store methods.
-    pub const TopicVisitor = struct {
-        context: ?*anyopaque = null,
-        visit_fn: *const fn (?*anyopaque, []const u8, []const u8) anyerror!void,
-
-        fn visit(self: TopicVisitor, topic: []const u8, title: []const u8) !void {
-            return self.visit_fn(self.context, topic, title);
-        }
-    };
-
-    pub fn forEachTopic(self: *Store, visitor: TopicVisitor) !void {
-        const fd = try self.lock();
-        defer fs.closeFd(fd);
-        var dir = self.directory(false) catch |err| {
-            if (err == error.FileNotFound) return;
-            return err;
-        };
-        defer dir.deinit();
-        var it = dir.dir.iterate();
-        while (try it.next(dir.io)) |item| {
-            if (!std.mem.endsWith(u8, item.name, ".md")) continue;
-            const topic = item.name[0 .. item.name.len - 3];
-            if (std.mem.eql(u8, topic, "core")) continue;
-            try validTopic(topic);
-            if (try self.isLegacy(&dir, self.root.allocator, topic)) continue;
-            {
-                var temporary = std.heap.ArenaAllocator.init(self.root.allocator);
-                defer temporary.deinit();
-                const title = try self.firstLine(&dir, temporary.allocator(), topic);
-                try visitor.visit(topic, title);
-            }
-        }
     }
 
     pub const ListPage = struct {
@@ -333,6 +328,10 @@ pub const Store = struct {
             const n = try file.readPositionalAll(mem.io, head, 0);
             if (n != want) return false;
         }
+        return legacyHead(head);
+    }
+
+    fn legacyHead(head: []const u8) bool {
         return std.mem.find(u8, head, "\n<!-- thin-knowledge-v2 -->\n") != null or
             std.mem.find(u8, head, "\n<!-- thin-knowledge-v1 -->\n") != null;
     }

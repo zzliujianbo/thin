@@ -634,6 +634,8 @@ test "system prompt carries approach, completion and UI constraints with quoted 
         "UI: for UI work, let layout, hierarchy, and visual relationships explain the interface.",
         "Authorization: do not modify code unless the user authorizes code changes.",
         "Authority: the host enforces permissions and limits.",
+        "If asked only to read it, acknowledge what you actually read; if asked to summarize, summarize it.",
+        "Continue an old task only when explicitly asked here; old approvals do not carry over.",
         "Context: relative tool paths and bash cwd remain anchored to the startup project.",
         "Never guess truncated or omitted content; follow up with a focused call.",
         "Memory: keep explicit durable project facts or reusable preferences,",
